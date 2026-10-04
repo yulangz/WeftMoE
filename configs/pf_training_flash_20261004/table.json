@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "compiled_digest": "e09cd7591438",
+      "config_digest": "8589d164d179",
+      "contribution_windows": 2,
+      "header": "configs/pf_training_flash_20261004/weftmoe_forward_tuning_generated.hpp",
+      "key": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "gpu": "NVIDIA L20X",
+        "gpus_per_node": 8,
+        "hidden": 4096,
+        "input_layout": "dp",
+        "interconnect": "nvlink",
+        "intermediate": 2048,
+        "max_tokens": 10175,
+        "nodes": 1,
+        "top_k": 6,
+        "training": true
+      },
+      "window_tokens": 2048
+    },
+    {
+      "compiled_digest": "e09cd7591438",
+      "config_digest": "8589d164d179",
+      "contribution_windows": 2,
+      "header": "configs/pf_training_flash_20261004/weftmoe_forward_tuning_generated.hpp",
+      "key": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "gpu": "NVIDIA L20X",
+        "gpus_per_node": 8,
+        "hidden": 4096,
+        "input_layout": "dp",
+        "interconnect": "nvlink",
+        "intermediate": 2048,
+        "max_tokens": 25820,
+        "nodes": 1,
+        "top_k": 6,
+        "training": true
+      },
+      "window_tokens": 2048
+    },
+    {
+      "compiled_digest": "e09cd7591438",
+      "config_digest": "1e2197cb5660",
+      "contribution_windows": 3,
+      "header": "configs/pf_training_flash_20261004/weftmoe_forward_tuning_generated.hpp",
+      "key": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "gpu": "NVIDIA L20X",
+        "gpus_per_node": 8,
+        "hidden": 4096,
+        "input_layout": "dp",
+        "interconnect": "nvlink+gin",
+        "intermediate": 2048,
+        "max_tokens": 10390,
+        "nodes": 2,
+        "top_k": 6,
+        "training": true
+      },
+      "window_tokens": 3072
+    },
+    {
+      "compiled_digest": "e09cd7591438",
+      "config_digest": "1e2197cb5660",
+      "contribution_windows": 3,
+      "header": "configs/pf_training_flash_20261004/weftmoe_forward_tuning_generated.hpp",
+      "key": {
+        "dtype": "bfloat16",
+        "experts": 256,
+        "gpu": "NVIDIA L20X",
+        "gpus_per_node": 8,
+        "hidden": 4096,
+        "input_layout": "dp",
+        "interconnect": "nvlink+gin",
+        "intermediate": 2048,
+        "max_tokens": 25964,
+        "nodes": 2,
+        "top_k": 6,
+        "training": true
+      },
+      "window_tokens": 3072
+    }
+  ]
+}

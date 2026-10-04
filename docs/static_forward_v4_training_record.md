@@ -1,5 +1,184 @@
 # V4 ring 训练对接记录
 
+## 2026-10-04：配置驱动的训练 autotune 与 Flash 复测
+
+优化摘要：接通按 shape/拓扑生成、编译和选优的完整训练 autotune；放大
+ring 的 B、调整 D，并将长文 FC1 改为 N256 / 2 stages。新一轮完整
+FWD+BWD 中，EP8 的 8K/20K 耗时下降 **14.0% / 22.2%**，EP16 下降
+**4.8% / 13.5%**。BWD 的 tile/stage 消融未获得稳定收益，保留原参数。
+**调优后仍慢于 Megatron + DeepEP**；另有一个网络候选在确认中卡住，
+已剔除，但根因未定位。本轮没有修改 CUDA 算法或修复该等待问题。
+
+### 自动搜索入口与最终参数
+
+原有工具已经有配置展开、编译缓存和选优逻辑，缺的是当前 PF 动态训练
+FWD+BWD 的评分入口。新增 `tools/autotune_training.py` 和
+`configs/pf_training_autotune.json`，复用既有参数校验、资源过滤、native
+object cache、并行构建和确认选择逻辑，不再依靠手改各 shape 的头文件。
+H/I/E/top-k、token 档、节点和每节点 GPU 数由 CLI 输入，配置描述搜索空间。
+使用方法及参数含义见 [autotune 文档](autotune.md)。
+
+| 项目 | EP8 单机 | EP16 双机 |
+|---|---|---|
+| B / D | 2048 / 2 | 3072 / 3 |
+| FC1/FC2 N，K | 256 / 256，128 | 相同 |
+| FC1/FC2 static stages | 2 / 2 | 相同 |
+| BWD | dU/dX N256；dW M128/N256；K64；activation 4 stages、dW 3 stages | 相同 |
+| prepared max_tokens：8K / 20K trace | 10175 / 25820 | 10390 / 25964 |
+
+实际使用同一份 compiled profile：`e09cd7591438`。B/D 是准备时参数，不
+进入 CUDA 编译 key；同一模型的两种拓扑不需要为这些容量参数重复编译。
+初次基准构建约 301.5 秒；EP16 复用后，依赖检查、链接和 adapter 构建约
+10.4 秒，没有重新编译 CUDA 源码。单机初筛每个候选包含两个 token 档，
+约 29–30 秒；双机约 80 秒，包含计时区间外的进程/通信池准备和 trace 回放。
+
+冻结头文件和四个 `training=true` 表项在
+[`configs/pf_training_flash_20261004`](../configs/pf_training_flash_20261004/README.md)。
+最终对照通过 `WEFTMOE_AUTOTUNE_TABLE` 实际加载了自动导出的表。
+key 使用真实 prepared capacity，不把 nominal 8192/20480 当作容量。
+这是 PF 专用库，关闭额外 prefill/DT 入口选择；未替换默认 DT、其它模型
+或原冻结库。组合 ID 同时覆盖 FWD/BWD 参数，避免载入错误的 BWD 配置。
+
+### 各步消融与收益
+
+搜索用同一条 32 步动态 trace：完整 untimed replay，然后 8 warmup +
+24 measured。分数为两档 rank-max p50 的等权几何平均。每阶段保留
+incumbent，前两名正反顺序各测一次，至少改善 0.5% 才切换，并校验五项
+输出/梯度。以下初筛 ms **不能与最终 80 步 trace 的 ms 直接混算收益**。
+
+第一步，搜索 B/D；GEMM 保持原来的宽 prefill 入口不变：
+
+| 拓扑 | B / D | 8K ms | 20K ms |
+|---|---|---:|---:|
+| EP8 | 512 / 8（原值） | 36.669 | 102.640 |
+| EP8 | 1024 / 4 | 33.223 | 87.317 |
+| EP8 | **2048 / 2** | **31.928** | **81.145** |
+| EP8 | 4096 / 1 | 33.761 | 83.282 |
+| EP8 | 2048 / 4 | 32.151 | 81.860 |
+| EP16 | 768 / 6（原值） | 39.453 | 106.595 |
+| EP16 | 1536 / 3 | 38.261 | 99.030 |
+| EP16 | 4608 / 1 | 44.530 | 112.787 |
+| EP16 | **3072 / 3** | **38.507** | **96.955** |
+
+确认后，ring 阶段的综合耗时下降 EP8 **16.61%**、EP16 **5.91%**。
+较大的 B 改变窗口内的任务密度、padding 和流水组织；本轮测量的是整体
+效果，没有把这几项分别归因为已测出的 GPU 时间。
+
+第二步，在选定 B/D 上搜索 FWD；括号中为 FC1/FC2 N、K、static stages：
+
+| FWD 配置 | EP8：8K / 20K ms | EP16：8K / 20K ms |
+|---|---|---|
+| 原宽入口（128/256，128，3/2） | 31.785 / 81.456 | 38.724 / 96.553 |
+| **256/256，128，2/2** | **31.162 / 79.688** | **37.766 / 95.258** |
+| 128/256，64，3/3 | 32.457 / 82.696 | 39.272 / 97.462 |
+
+确认后，FWD 调参又使完整周期综合耗时下降 EP8 **1.72%**、EP16 **3.20%**。
+这里是完整周期收益，不是独立 FC1 GEMM 的加速比。原库宏里的窄入口
+N64/N128 在这些长文 case 不活跃，实际对照是上表的宽入口。
+最初另有 N256/K64/4-stage 组合，因其附带的 legacy FC1 3-stage staging
+超过共享内存预算，编译前就被过滤；发布配置已移除这个必然无效的组合。
+
+第三步，固定前两步参数，分别尝试 dW M256/N128、activation stages 3、
+dW stages 2。初筛如下：
+
+| BWD 配置 | EP8：8K / 20K ms | EP16：8K / 20K ms |
+|---|---|---|
+| 原值 | 31.681 / 79.434 | 37.610 / 94.788 |
+| dW M256/N128 | 31.253 / 79.659 | 37.964 / 94.298 |
+| activation stages 3 | 31.115 / 80.764 | 38.051 / 95.192 |
+| dW stages 2 | 32.412 / 81.852 | 38.953 / 96.670 |
+
+两种拓扑的确认结果均保留原 BWD，未将初筛的小幅波动登记为收益。
+这是一轮有限的分阶段搜索，不是全部参数组合的全局最优证明。
+
+### 最终同负载对照
+
+形状和随机负载沿用下一节：H4096/I2048/E256/top-k6，每 rank 的 tokens
+按 nominal 附近 σ=10% 的正态分布生成、截断到 ±3σ，路由有 σ=0.5 的
+共享 expert bias。不是实际模型采集的 route trace。
+
+本次另跑一轮 PF 未调优、PF 调优、Megatron + DeepEP，每档完整回放
+80 步，再 20 warmup + 60 measured；下面均为 **60 个 rank-max 样本的 p50**，
+不是与上一轮样本混合后的 p50。Megatron 仍使用单机 80 SM / 双机 48 SM、
+真实 TEGroupedMLP、selective `moe_act` 和此前相同的融合配置。
+两边均保留 routed X 与 FC1 gate/up，BWD 重算 gated SwiGLU、不重算 FC1。
+
+| 拓扑 / nominal T每卡 | PF 未调优 ms | PF 调优 ms | 耗时下降 | Megatron DeepEP ms | 调优 PF 相对 Megatron |
+|---|---:|---:|---:|---:|---:|
+| EP8 / 8192 | 36.5411 | 31.4364 | **13.97%** | 22.9898 | +36.74% |
+| EP8 / 20480 | 101.2710 | 78.7509 | **22.24%** | 52.7426 | +49.31% |
+| EP16 / 8192 | 39.7691 | 37.8442 | **4.84%** | 30.9829 | +22.15% |
+| EP16 / 20480 | 106.2185 | 91.9099 | **13.47%** | 70.5138 | +30.34% |
+
+等效 useful GEMM TFLOPS/card：
+
+| 拓扑 / T | PF 未调优 | PF 调优 | Megatron DeepEP |
+|---|---:|---:|---:|
+| EP8 / 8192 | 199.61 | 233.53 | 319.04 |
+| EP8 / 20480 | 183.28 | 234.68 | 352.81 |
+| EP16 / 8192 | 186.15 | 194.50 | 237.64 |
+| EP16 / 20480 | 175.32 | 201.50 | 264.09 |
+
+计算仍为逐 step 的 `18 × sum(actual T_rank) × K × H × I / EP / seconds`，
+再取 median、除以 1e12。18=FWD 6+BWD 12；不计 padding、repack、SwiGLU
+elementwise 等额外工作，不使用 nominal T 除以 p50 来代替逐 step 统计。
+时间包含完整 eager FWD+BWD、释放与 device synchronize；排除输入生成、
+首次编译、固定池分配/IPC 准备，保留每次权重 repack 和每步实际 buffer 工作。
+
+12 个本轮性能 JSON 的逐 rank route/gate hash、tokens、received rows 和
+prepared capacities 均匹配，且与上一轮两组 PF 历史 trace 一致。
+Megatron 四个结果中所有 rank 在计时段新增编译图均为 0。
+上一轮未调优 PF 为 36.7235/101.9872、39.8510/105.7693 ms；较快 DeepEP
+为 22.9785/52.5710、30.7498/69.9667 ms。本轮基线复测与其接近，收益并非
+来自更换负载或采用更慢的 Megatron 设置。
+
+### 内存、数值与未解决问题
+
+native 持久区 `compute_bytes + gin_bytes + notify_bytes`，单位 MiB/rank：
+
+| 拓扑 / T | 未调优 | 调优 | 增量 |
+|---|---:|---:|---:|
+| EP8 / 8192 | 2608.34 | 4245.61 | +1637.27 |
+| EP8 / 20480 | 4407.02 | 5856.51 | +1449.49 |
+| EP16 / 8192 | 4072.06 | 6918.81 | +2846.75 |
+| EP16 / 20480 | 6393.55 | 9180.52 | +2786.98 |
+
+这次是明确的空间换时间，持久区增加约 **1.4–2.8 GiB/rank**，超过此前
+“500 MB 以下不用顾忌”的量级。上表不是整进程峰值，也没有包含 Torch
+保存激活、梯度及 allocator reserved；不能把它当作净总显存增量。
+默认搜索预算为 native 持久区 12 GiB；需要更紧预算时修改配置再搜索。
+
+最终 PF 与 Megatron 均通过 EP8/EP16、8K/20K、每档两步的共同数值校验，
+覆盖 output/dX/dGate/dW1/dW2。门限仍为 rtol=0.02、atol=1e-4、relative
+L2 < 1%。新通用参考按本地专家逐个计算，再以 FP32 合并跨专家/跨 rank
+output/dX/dGate，不复制全局权重；与旧参考的 BF16 逐次累加不同，因此
+误差数字不能直接当作相对历史的精度提升。最终最大 relative L2：PF
+0.01163%，Megatron 0.29531%，两者全部通过逐元素检查。
+
+**失败候选保留：** 初始 EP16 搜索的 B2304/D2 初筛为 38.597/96.742 ms，
+首轮确认也成功，但第二轮在首个性能 JSON 前持续占满 GPU、数分钟无进展。
+人工终止这两个已定位的测试进程组后，两节点显存正常释放，未发现本轮
+新增 GPU Xid。该组合已从默认空间剔除，全部确认重跑；根因未定位，不能
+宣称排除组合就修复了底层同步问题。工具现会拒绝任何确认轮失败的候选，
+不使用其部分成绩导出。其余最终选中配置完成了本节所有重复运行和校验。
+
+两节点目标均锁 1620 MHz、功耗上限 700 W。最终对照的进程级监控含
+warmup/数值校验等，共 3920 个 GPU 样本，实测 1440–1620 MHz，43 个
+样本低于目标、46 个样本带软件功耗限制标志。因此仍不是严格恒频实验，
+不作频率归一化，也不把这些样本比例当作计时区间内的降频比例。
+
+工具里程碑提交：`2b9ca94`（训练 config/编译/选择/导出）、`df1dbd2`
+（确认失败处理、剔除异常候选）。相关 static-forward/unified autotune
+测试 15 项通过；另跑旧 topology 测试时，未改动的 Forward 入口仍有
+`--candidate incumbent` 名称失配失败，本轮未改该无关入口。
+
+原始证据：`build/pf_flash_autotune/automatic_ep8/`、
+`automatic_ep16/`（初次失败保留）、`automatic_ep16_retry/`、
+`comparison/`、`summary.json` 和对应 `*_clocks.log`。
+最终调优库 SHA256 为 `33565b1f42831f27f7a3cd7fc6772843401ea99efe7494e058d3c2a6b65d3fee`；
+未调优库仍为 `8663aea76fff12915b96deae9753515e2bfa171066fc27236a2673080c2c5bf5`。
+全部作业已退出，两节点均确认 0 MiB GPU 占用、空闲 SM 时钟 1620 MHz。
+
 ## 2026-10-04：Flash 尺寸、变长热点负载与 Megatron 对照
 
 本轮使用仓库历史报告中的 DeepSeek-V4-Flash routed-expert 尺寸：
@@ -7,7 +186,7 @@ H4096/I2048/E256/top-k6、BF16 SwiGLU。它是单个 MoE 层的完整训练
 FWD+BWD，不是整模型训练 step；不含 router projection/top-k、shared
 expert、attention、optimizer，也不复现模型特有的量化或其它激活策略。
 
-结论：**当前 PF 在这四档均慢于 Megatron + DeepEP**，耗时高
+本轮未 autotune 的结论：**PF 在这四档均慢于 Megatron + DeepEP**，耗时高
 29.6%–94.0%；只有双机两档快于 Megatron + NCCL。小尺寸上的优势没有
 自动泛化到 Flash。本轮仅完成尺寸构建、验证和 benchmark，没有性能修复。
 

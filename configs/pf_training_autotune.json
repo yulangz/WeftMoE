@@ -33,10 +33,7 @@
        "forward.static_v4_fc1_stages": 2, "forward.static_v4_fc2_stages": 2},
       {"forward.fc1_tile_n": 128, "forward.tile_k": 64,
        "forward.fc1_stages": 3, "forward.fc2_stages": 2,
-       "forward.static_v4_fc1_stages": 3, "forward.static_v4_fc2_stages": 3},
-      {"forward.fc1_tile_n": 256, "forward.tile_k": 64,
-       "forward.fc1_stages": 3, "forward.fc2_stages": 2,
-       "forward.static_v4_fc1_stages": 4, "forward.static_v4_fc2_stages": 4}
+       "forward.static_v4_fc1_stages": 3, "forward.static_v4_fc2_stages": 3}
     ]
   },
   "backward": {
