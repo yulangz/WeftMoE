@@ -1,5 +1,184 @@
 # V4 ring 训练对接记录
 
+## 2026-10-04：Flash 尺寸、变长热点负载与 Megatron 对照
+
+本轮使用仓库历史报告中的 DeepSeek-V4-Flash routed-expert 尺寸：
+H4096/I2048/E256/top-k6、BF16 SwiGLU。它是单个 MoE 层的完整训练
+FWD+BWD，不是整模型训练 step；不含 router projection/top-k、shared
+expert、attention、optimizer，也不复现模型特有的量化或其它激活策略。
+
+结论：**当前 PF 在这四档均慢于 Megatron + DeepEP**，耗时高
+29.6%–94.0%；只有双机两档快于 Megatron + NCCL。小尺寸上的优势没有
+自动泛化到 Flash。本轮仅完成尺寸构建、验证和 benchmark，没有性能修复。
+
+### 完整 FWD+BWD 结果
+
+单位 ms，均为两轮合并后的 rank-max p50。最后一列大于零表示 PF 更慢。
+DeepEP 80/48 指单机 80 SM、双机 48 SM，而不是在两个轮次间切换配置。
+
+| 拓扑 / nominal T每卡 | PF | Megatron NCCL | DeepEP 20 SM | DeepEP 80/48 SM | PF 相对较快 DeepEP 耗时 |
+|---|---:|---:|---:|---:|---:|
+| EP8 / 8192 | 36.7235 | 25.4283 | 24.7668 | 22.9785 | +59.82% |
+| EP8 / 20480 | 101.9872 | 58.2629 | 57.0120 | 52.5710 | +94.00% |
+| EP16 / 8192 | 39.8510 | 56.1553 | 34.0550 | 30.7498 | +29.60% |
+| EP16 / 20480 | 105.7693 | 134.9669 | 78.6683 | 69.9667 | +51.17% |
+
+PF 对 NCCL 的耗时变化依次为 +44.42%、+75.05%、−29.03%、−21.63%。
+DeepEP 从 20 SM 改为 80/48 SM 后，四档耗时降低
+7.22% / 7.79% / 9.71% / 11.06%；主结论使用这组更快的基线。
+
+等效 TFLOPS/卡，同样对逐步吞吐取 p50。每步按实际全局输入 token 数
+计算 `18 * sum(T_rank) * K * H * I / world / wall_seconds / 1e12`；
+FWD 为 6RHI，BWD 为 12RHI。不计 padding、elementwise 的额外 FLOPs，
+但它们、通信和主机开销均计入时间；不是纯 GEMM 或 cached-BWD TFLOPS。
+
+| 拓扑 / nominal T每卡 | PF | Megatron NCCL | DeepEP 20 SM | DeepEP 80/48 SM |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 198.8 | 291.2 | 296.2 | 320.0 |
+| EP8 / 20480 | 183.0 | 319.6 | 324.9 | 353.4 |
+| EP16 / 8192 | 185.6 | 132.8 | 215.6 | 238.7 |
+| EP16 / 20480 | 175.9 | 138.1 | 237.3 | 265.2 |
+
+PF A/B 两轮 p50 分别为 36.8021/36.6921、102.3804/101.4949、
+39.8510/39.8350、106.2691/105.1251 ms；较快 DeepEP 为
+22.9737/22.9906、52.5988/52.5710、30.9970/30.7311、
+69.9667/70.1412 ms。差距在反序复测中仍成立，不是选取某一慢轮的结果。
+全部均值、p95、逐步/逐 rank 样本保留在 JSON。
+
+### 输入、缓存与计时
+
+- 沿用之前的 `variable_tokens_random_routes`，不是前一轮的历史固定均衡
+  数据，也不是从实际模型采集的 route trace。每 rank 的 T 从 nominal
+  8192/20480、标准差 10%、截断 ±3σ 的正态分布独立采样；每步重新生成
+  X/dY、routes/gates，共享专家 logit bias 的标准差为 0.5，制造跨源热点。
+- seed=123，各实现消费相同的逐 rank 输入序列和权重。专家权重在本轮内
+  不更新，但 PF 每次调用的 repack 仍计时，没有复用已删除的 M 快路径。
+- 单机 EP8 使用第一台节点的八卡；双机 EP16 使用两台各八卡。PF 保留
+  B512/D8、B768/D6 和 network lanes/Qdispatch/Qreturn=32/8/16。
+  只为 H4096/I2048 重建尺寸 specialization，未优化生产 kernel 或重新
+  autotune GEMM/ring；此前冻结的 H2048/I512 库及结果没有被覆盖。
+- Megatron 使用真实 dispatcher + TEGroupedMLP，TP1/expert-TP1、EP8/16，
+  permutation/activation fusion 均开启，selective `moe_act`：双方保存
+  routed X 和 FC1 gate/up，BWD 重算 gated SwiGLU、不重算 FC1。
+  保留 Megatron 默认非 deterministic 模式，没有人为关闭快路径。
+- NCCL all-to-all 与 DeepEP 都测。DeepEP 比较默认 20 SM 和历史 Flash
+  配置的 EP8=80、EP16=48 SM；这只是两个通信资源配置的比较，不声称
+  对 Megatron 做了穷尽调参。
+- 每配置两轮：A 为 PF→NCCL→DeepEP20→DeepEP80/48，B 反序。每轮先
+  untimed replay 全部 80 步，再 20 warmup + 60 measured。先逐步取
+  rank-max，合并两轮全部 120 个样本取 p50，不挑快轮、不删长尾。
+- 计时边界为 `forward → backward → 释放 tape/gradients → device sync`；
+  固定 runtime/通信 buffer 初始化、IPC 建链、输入生成和首次编译不计时。
+  每次调用的 notify、分配、权重重排、计算、通信和释放均在计时内。
+  这是充分预热的动态 eager 循环，不是 cached-BWD 单独计时，也未使用
+  CUDA Graph。脚本中的 host forward/backward 分界不是 GPU 阶段计时，
+  本节不据此拆分 FWD/BWD kernel 性能。
+
+实测负载如下；“rank 倾斜”是单步最忙 rank 的接收行数 / rank 均值，
+“专家倾斜”是最热专家行数 / 全局专家均值。它们均不是人工平衡的负载。
+
+| 拓扑 / nominal T每卡 | 实际 T每卡范围 | 实际 T每卡均值 | rank 倾斜 p50 / max | 专家倾斜 p50 / max |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 5861–10175 | 8138.1 | 1.35 / 2.18 | 8.22 / 18.45 |
+| EP8 / 20480 | 14931–25776 | 20619.3 | 1.32 / 1.62 | 8.14 / 15.95 |
+| EP16 / 8192 | 5861–10390 | 8150.2 | 1.66 / 2.58 | 8.27 / 18.47 |
+| EP16 / 20480 | 14931–25964 | 20608.0 | 1.57 / 1.90 | 8.13 / 15.93 |
+
+32 组 JSON、共 1920 个 measured rank-max 样本已核对。相同 case 的
+逐 rank T/routes/gates SHA256、实际接收行数及容量一致，接收行数满足
+`sum(received_rows) = K * sum(T_rank)`；24 组 Megatron 记录的所有 rank
+在测量期间新增编译 graph 数均为 0。软件版本：Torch 2.9.1+cu129、
+Megatron-Core 0.17.0、TE 2.14.1+27de67e1、DeepEP 1.2.1+567632d，
+双方实际加载 NCCL 2.31.2；Torch 编译时的 2.27.5 不作为运行库版本。
+
+### 时钟边界
+
+两节点 L20X 都显式执行 `nvidia-smi -lgc 1620,1620`，功耗上限同为
+700 W（硬件允许的最大值），没有再用 1980 MHz。首次 EP8 预跑仅保留在
+`pilot_*`，不进入正式统计；重锁后重做 A/B 两轮，并增加运行期间的频率、
+功耗及 clock-event 采样。
+
+**锁定目标不等于全程实际恒频。** 重锁后的 Flash 大负载仍采到低于
+1620 MHz 的频率，范围为 1455–1620 MHz，且有软件功耗限制标志。
+7480 个 GPU 采样中有 102 个低于目标、117 个报告 software power cap。
+因此本节只能称为相同 1620 MHz 锁定目标、相同 700 W 功耗上限的对照，
+不能称作严格恒频的纯 kernel 消融。
+采样覆盖整个进程，包括初始化、输入生成和预热；个别 NVML 采样超时。
+不据这些采样推算测量区间的平均频率，也不对时间/TFLOPS 作频率修正。
+
+### 正确性与数值口径
+
+PF、Megatron/NCCL、Megatron/DeepEP 分别在 EP8/EP16 的 nominal
+T256/8192/20480 与 Torch reference 比较 output、dX、dGate、dW1、dW2；
+216 个 rank-step、1080 个 tensor 检查通过。EP16/20K 仅对不计时的 Torch
+reference 按专家 checkpoint，保持相同算术和归约顺序，避免保存整个全局
+batch 的 autograd 中间值；被测算子的 `moe_act` 缓存策略没有变化。
+
+旧小尺寸的 `atol=2e-5` 在 Megatron Flash 检查中也会触发：EP8/8K 的
+dX 在已报错 rank 的约 3200万–3700 万元素中，2–9 个接近零的元素差约
+2.4e-5–3.1e-5。保留原始失败日志 `strict_atol_alltoall_ep8.log`。本轮双方
+统一使用 `rtol=0.02, atol=1e-4`，同时要求每个 tensor 的相对 L2 误差
+低于 1%，并记录完整误差指标；没有只放宽 PF 的阈值。
+
+实测最大相对 L2 误差，单位为百分比，合并所有验证规模/rank：
+
+| 实现 | output | dX | dGate | dW1 | dW2 |
+|---|---:|---:|---:|---:|---:|
+| PF | 0.35756% | 0.36026% | 0.01265% | 0.02110% | 0.01159% |
+| Megatron NCCL | 0.35758% | 0.35766% | 0.00002% | 0.01248% | 0.01057% |
+| Megatron DeepEP | 0.37905% | 0.38206% | 0.00944% | 0.02019% | 0.01191% |
+
+### 对尺寸泛化的含义
+
+本轮未做性能修复，不能把只改 H/I 的 specialization 当成 Flash 最优配置。
+相对之前 H2048/I512/E64/top-k4 的小尺寸基准，有两个可直接计算的变化：
+
+- 每输入 token 的有效 GEMM 工作量增加 12 倍，但专家权重总量增加
+  **32 倍**。EP8 每卡原始 BF16 专家权重从 48 MiB 增至 1536 MiB，
+  EP16 从 24 MiB 增至 768 MiB；原有权重访问/repack 成本不能按小模型
+  的占比外推。
+- PF 前向每个完整 source 窗口仍包含八个源 rank。按全局专家平均，
+  B512 窗口的有效行数从 `8*512*4/64=256` 降为
+  `8*512*6/256=96`；B768 从 384 降为 144。M128 的分块、专家热点、
+  padding 和权重复用条件都已改变，不能只看整次调用的 8K/20K。
+
+这些是后续分阶段 profiling、B/D 与 GEMM tile 消融的候选依据，**不是**
+本轮已经测出的瓶颈占比，也不能据此把所有差距归咎于通信或某一个 GEMM。
+9/13 的 Flash 历史数据使用 1980 MHz、固定均衡负载和独立阶段 p50，
+不可与本轮动态整轮 p50 直接计算优化收益。
+
+### 构建与产物
+
+生产源码仍是 M7e。新 profile 只覆盖 H/I，复用既有配置：
+`configs/static_flash_training_20261004/weftmoe_forward_tuning_generated.hpp`。
+构建参数与前轮相同，仅替换 generated-header 的目录：
+
+```sh
+export NCCL_INCLUDE_DIR=/usr/include
+export NCCL_LIB_DIR=/usr/lib/x86_64-linux-gnu
+export NVCCFLAGS="-lineinfo -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 \
+  -I$PWD/configs/static_flash_training_20261004 \
+  -DWEFTMOE_FWD_STATIC_V4_NETWORK_LANES=32 \
+  -DWEFTMOE_FWD_STATIC_V4_PACKET_ROWS=8 \
+  -DWEFTMOE_FWD_STATIC_V4_RETURN_PACKET_ROWS=16"
+/opt/.venv/bin/python build_native.py lib --output build/pf_flash_workload/libweftmoe.so --jobs 4
+/opt/.venv/bin/python tools/build_tensor_runtime.py --library build/pf_flash_workload/libweftmoe.so
+```
+
+Flash native library SHA256：
+`8663aea76fff12915b96deae9753515e2bfa171066fc27236a2673080c2c5bf5`。
+第一次直接加载旧 H2048/I512 库被尺寸校验拒绝，日志保留在
+`old_shape_rejected_ep8.log`；不是驱动故障，未绕过形状检查。
+
+原始产物在 `build/pf_flash_workload/`：`build.py`、`run.py`、`validate.py`、
+`summarize.py`、`parity_*`、正式 `{a,b}_*` 节点日志、`*_clocks.log` 和
+最终 `summary.json`。benchmark 复用 `tools/benchmark_training.py` 与
+`benchmarks/megatron_training_backend.py`，没有新增生产功能或细粒度单测。
+`run.py verify 8 16` 验证，`run.py a 8 16` / `run.py b 8 16` 测量；
+正式计时没有并行编译或其它 GPU 测试。
+全部作业正常退出，结束后确认两节点均 0 MiB GPU 占用，锁定目标仍为
+1620 MHz；没有遗留测试或监控进程。
+
 ## 2026-10-04：历史固定负载原样复测
 
 结论：10 月 1 日旧 PF 的四档整轮结果可复现，本轮与历史差异均小于 0.4%。
