@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--prime-trace", action="store_true",
                         help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
+    parser.add_argument("--verify", action="store_true",
+                        help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -146,6 +148,19 @@ def main():
                 group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
                 hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
                 max_rows=max_rows, training=True, max_saved=2)
+        if args.verify:
+            from benchmarks.training_reference import verify_step
+            for step, (cpu_routes, cpu_gates) in enumerate(batches):
+                x, dy = rand(cpu_routes.shape[0], args.hidden), rand(cpu_routes.shape[0], args.hidden)
+                errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy)
+                per_rank_errors = [None] * world
+                dist.all_gather_object(per_rank_errors, errors)
+                if rank == 0:
+                    print("TRAINING_PARITY_JSON " + json.dumps(dict(
+                        nominal_tokens_per_rank=tokens, step=step,
+                        errors=per_rank_errors)), flush=True)
+            runtime.close()
+            continue
         samples = []
         forward_samples = []
         priming_steps = len(batches) if args.prime_trace else 0
@@ -180,6 +195,8 @@ def main():
             compile_graphs = [None] * world
             dist.all_gather_object(compile_graphs,
                 torch._dynamo.utils.counters["stats"]["unique_graphs"] - compile_graphs_before)
+        workspace = [None] * world
+        dist.all_gather_object(workspace, runtime.native.usage() if args.backend != "megatron" else None)
         if rank == 0:
             slowest = [max(row[i] for row in per_rank) for i in range(args.samples)]
             measured_tokens = [workload["tokens"][args.warmups:] for workload in workloads]
@@ -216,6 +233,7 @@ def main():
                 forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
                 checkpoint="routed X + FC1 gate/up; recompute gated SwiGLU in backward",
                 implementation=getattr(runtime, "metadata", {}),
+                gpu=torch.cuda.get_device_name(), per_rank_workspace=workspace,
                 extension=os.environ.get("WEFTMOE_TENSOR_EXTENSION")
                           if args.backend != "megatron" else None)), flush=True)
         runtime.close()

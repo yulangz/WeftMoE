@@ -1,5 +1,67 @@
 # Forward / Backward autotune
 
+## PF 动态训练 FWD+BWD 搜索（2026-10-04）
+
+`tools/autotune_training.py` 使用 `configs/pf_training_autotune.json`，按传入
+H/I/E/top-k、EP 拓扑和 token 规模自动生成组合头文件、编译、计时、校验、选优。
+这条入口测 **完整 eager FWD+BWD+释放+device synchronize**，不能和下面
+推理 CUDA Graph 的选优分数互换。输入生成、首次编译、固定池准备/IPC 建连
+不计时；每个候选都先完整回放一次动态 trace，再 warmup 和采样。
+
+```bash
+python tools/autotune_training.py \
+  --config configs/pf_training_autotune.json \
+  --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --tokens 8192 20480 --gpus-per-node 8 --jobs 4 \
+  --output build/tune-flash-ep8
+
+# 相同配置用于多机；远端要求相同 Python、共享源码和编译缓存路径。
+python tools/autotune_training.py \
+  --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --tokens 8192 20480 --gpus-per-node 8 \
+  --remotes root@HOST1 --master-addr LOCAL_IP --ssh-port 2222 \
+  --output build/tune-flash-ep16
+```
+
+换模型只改 shape 参数；`--remotes` 可以列多台同构节点，不把 EP16 写进
+搜索逻辑。GPU 必须空闲，并事先按实验要求固定目标频率；工具不擅自改变
+时钟/功耗。编译依赖沿用 `build_native.py` 的 `WEFTMOE_ROOT`、CUDA、
+NCCL 等环境设置，运行将 NCCL/UCX/CUDA 和动态库路径传给远端。
+`--dry-run` 只展开配置并做资源检查，不编译或占用 GPU。
+
+配置分为：
+
+- `base_header`：当前冻结 profile，预处理展开 FWD/BWD 默认值后，显式注入
+  新 H/I；不会把旧模型尺寸留在 BWD。`v4` 声明通信几何。
+- `ring.local/network`：B/D 配对候选。它们只影响 prepare，**不增加编译数**。
+- `forward/backward`：`fixed` 为分组公共覆盖；`variants` 为耦合的 tile/stage
+  组合，`axes` 为可选笛卡尔搜索轴，例如 `"backward.dw_tile_m": [128, 256]`。
+  使用现有参数名、资源约束和显存检查；不合法资源组合在编译前淘汰。
+- `stages`：默认 ring → FWD → BWD，每步携带上一轮胜者，保留 incumbent。
+  可再加 `ring` 做最后的 B/D 联合回查。这是有预算的分阶段搜索，报告的是
+  **本次搜索空间内实测胜者**，不声称全局最优。
+
+编译复用现有 native object cache（包含命令、源码/头文件依赖和编译器），
+并在总 `--jobs` 预算内并行准备唯一编译配置。计时期间不编译、不并跑候选。
+组合 binary 的 tuning ID 同时包含 FWD、BWD、通信参数，避免 BWD 换了而
+查表仍误认为同一配置。生成的 profile 独立保存，不替换 DT/其他模型的库。
+
+候选使用相同 seed 的正态 token 波动和带热点偏置的随机路由，校对各 rank
+trace hash。分数为各 token 档 rank-max p50 的等权几何平均；原始分项全部
+保留。前两名（含 incumbent）正反顺序复测，默认提升至少 0.5% 才切换。
+入围者验证 output/dX/dGate/dW1/dW2，最终胜者再验证全部目标 token 档；
+Torch reference 每次只保留一个本地专家的计算图，跨 rank FP32 合并结果，
+不复制全局权重。共同门限为 rtol=0.02、atol=1e-4、relative L2 < 1%。
+这是 BF16 数值校验，不是 batch-invariance 的逐位证明。
+
+结果在 `result.json`，各编译、计时和校验日志保留。成功后才生成 `table.json`：
+`training=true`，key 包含实际准备的 `max_tokens`（不是 nominal tokens）。
+配合选中 `_runtime*.so` 和 `WEFTMOE_AUTOTUNE_TABLE` 使用；不同 trace 如果
+改变 prepared capacity，需要相应的新表项，不能把一个样本的胜者推广到任意
+容量。表只查参数，不在训练进程中自动跑搜索，也不在同一进程热切换 .so。
+`workspace_limit_bytes` 只约束 native 持久池（compute+GIN+notify），不含
+权重、按实际路由保存的训练激活或 Torch allocator reserved。
+
 ## V4 inference 离线搜索（2026-09-30）
 
 `tools/autotune_forward.py` 复用原有内容寻址 JIT、资源过滤、正反顺序复测和

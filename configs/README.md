@@ -5,6 +5,13 @@ and backward execution on single-node and multi-node systems. Input dimensions
 and parallel topology are supplied separately by the caller. Compiler, library,
 and network settings are not kernel hyperparameters.
 
+`pf_training_autotune.json` is the PF **full FWD+BWD** search. It uses staged
+ring/FWD/BWD candidates and a variable-token, random-route workload rather than
+the independent phase grids described below. The same file accepts different
+model dimensions and local/multi-node topologies through
+`tools/autotune_training.py`; see [training autotune](../docs/autotune.md).
+Its search candidates are not a claim of measured optimal parameters.
+
 Each parameter contains a nonempty array of candidate values. The first values
 form the incumbent configuration and the defaults used when autotuning is
 disabled; the Cartesian product defines the search space. A single value fixes a parameter for that search. Supported values and
