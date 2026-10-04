@@ -1,5 +1,97 @@
 # V4 ring 训练对接记录
 
+## 2026-10-04：历史固定负载原样复测
+
+结论：10 月 1 日旧 PF 的四档整轮结果可复现，本轮与历史差异均小于 0.4%。
+当前 PF 相对同机复测的旧 PF，单机 8K 慢 7.24%，单机 20K 约持平；双机
+8K/20K 慢 4.14%/4.20%。整轮仍比本轮冻结 V3 低 18.9%–34.8%，但不能用
+这一优势抵消相对旧 PF 的剩余回退。本轮仅复测，不修改生产算子或 benchmark。
+
+### 对齐的对象与边界
+
+- 原样使用 `eb371c2:tools/benchmark_training.py`，文件保存在
+  `build/pf_variable_workload/benchmark_fixed.py`。两者 SHA256 完全一致：
+  `d5f9f333737dc7523e58d41d4536e89ea59c39407a977af2aee710909b06ede5`。
+- 旧 PF 为 `build/pf_backward_packed_storage/`；library/extension 的 SHA256
+  与文末 10 月 1 日验收一致。当前 PF 使用 M7e 的 `build/pf_peer_bindings/`，
+  V3 使用 `build/pf_training_v3_reference/`；均使用冻结二进制，没有重编译。
+  旧 PF 保留当时的 M 快路径，未为测试关掉，也没有将 M 移回当前实现。
+- Python TensorRuntime 相对 `eb371c2` 仅 close 多出两阶段 IPC 退休处理，
+  forward/backward 热路径未改。旧 PF/V3 的 wrapper 只恢复原 close 合同；
+  close 在计时外，不改变输入或计算路径。
+- 两节点 L20X 固定 1620 MHz，H2048/I512/E64/top-k4、BF16。EP8 与历史
+  一样使用第二台节点 `10.10.19.233` 的八卡，EP16 使用两节点。
+  PF 的 ring 分别为 B512/D8、B768/D6；不重新调参。
+- 每 rank 固定 T8192/20480。X/dY/权重只生成一次，seed=123+rank；路由为
+  `(token*17 + rank*31 + slot*53) % 64`，均衡且每轮不变；gate 为原脚本
+  的固定 uniform 随机值，不改成上一轮 balanced 模式的 softmax scores。
+  容量保留原值 `max_tokens=T`、`max_rows=2*T*K+local_experts*128`。
+- 固定输入不等于复用一次 FWD 的计算结果：每步仍重新
+  `forward → backward → 释放 tape/gradients → synchronize`，权重 repack、
+  tensor 准备和 collective 均保留在 wall 计时内。runtime 初始准备不计时。
+- 每版本两轮，均为 50 warmup + 200 measured；A 轮为旧 PF→当前 PF→V3，
+  B 轮反转为 V3→当前 PF→旧 PF。先逐步取 rank-max，再合并全部 400 个
+  样本取 p50，不挑较快轮，不将两个独立阶段 p50 相加。
+
+### 完整 FWD+BWD 对照
+
+全部为 ms；“历史 PF”指 `eb371c2`，不是 V3。
+
+| 拓扑 / T每卡 | 10/1 历史 PF | 旧 PF 本轮 | 当前 PF 本轮 | V3 本轮 | 当前相对旧 PF 耗时变化 |
+|---|---:|---:|---:|---:|---:|
+| EP8 / 8192 | 3.9251 | 3.9134 | 4.1967 | 6.4340 | +7.24% |
+| EP8 / 20480 | 8.6734 | 8.6395 | 8.6938 | 11.0289 | +0.63%，约持平 |
+| EP16 / 8192 | 6.4983 | 6.4930 | 6.7618 | 9.2053 | +4.14% |
+| EP16 / 20480 | 14.1127 | 14.1148 | 14.7070 | 18.1269 | +4.20% |
+
+当前 PF 对本轮 V3 的耗时降低依次为 34.77% / 21.17% / 26.54% / 18.87%。
+10 月 1 日 V3 整轮为 6.4008 / 10.9488 / 9.1194 / 17.6598 ms；本轮 V3
+双机 20K 波动较大，A/B 两轮分别 18.4377 / 17.8312 ms，均保留，不挑更慢
+的一轮扩大 PF 优势。旧 PF 双机 20K 两轮为 14.1146 / 14.1159 ms。
+
+等效 TFLOPS/卡：以 `18*T*K*H*I / wall_seconds / 1e12` 换算上述整轮
+p50；只计有效 GEMM FLOPs，通信/准备/释放仍计入时间。工作量固定，不能
+拿这些数值与变长 workload 的逐步吞吐分布直接作严格单变量消融。
+
+| 拓扑 / T每卡 | 10/1 历史 PF | 旧 PF 本轮 | 当前 PF 本轮 | V3 本轮 |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 157.6 | 158.0 | 147.4 | 96.1 |
+| EP8 / 20480 | 178.3 | 179.0 | 177.8 | 140.2 |
+| EP16 / 8192 | 95.2 | 95.3 | 91.5 | 67.2 |
+| EP16 / 20480 | 109.6 | 109.5 | 105.1 | 85.3 |
+
+### 历史独立阶段的回顾
+
+10 月 1 日另有 native 阶段基准：固定形状 tensor 预热后复用，权重计时外
+发布；BWD 从已保存 X/GU 开始。下面仅回顾旧数据，不是本轮阶段复测，
+也不将它们相加冒充上面的真实循环。单位 ms：
+
+| 拓扑 / T每卡 | 历史 PF FWD | 历史 PF cached BWD | 历史 V3 FWD | 历史 V3 cached BWD |
+|---|---:|---:|---:|---:|
+| EP8 / 8192 | 1.4973 | 1.7655 | 1.7239 | 2.1275 |
+| EP8 / 20480 | 3.2100 | 4.6068 | 3.5702 | 5.0457 |
+| EP16 / 8192 | 3.1679 | 2.8405 | 3.4346 | 2.8522 |
+| EP16 / 20480 | 6.9941 | 6.6202 | 7.2390 | 7.0022 |
+
+历史 native 与 M7e 的含临时 tensor 分配阶段基准也有边界差别，不能把所有
+数字的差额都解释成 GPU kernel 回退。当前静态调度与 Return 的性能门禁仍
+保持开放；本轮固定 workload 配对已经证明剩余差距不能全归因于动态路由。
+未增加 kernel 消融，因此不将回退进一步精确分摊到某一个改动。
+
+### 证据与复现
+
+本轮产物在 `build/pf_fixed_workload/`：`run.py`、旧 teardown wrapper、
+`{a,b}_{historical,current,v3}_ep8.log`、对应 `ep16_node{0,1}.log`、
+`summarize.py`、含逐轮/逐 rank 原始样本的 `summary.json`。
+24 组记录的形状、50/200 次数、rank-max 和 p50 均已核对，总计 4800 个
+measured rank-max 样本。历史整轮值直接读取 `build/pf_training_timeline/`
+的原始 JSON，而非仅转抄四舍五入后的表格。
+
+复现入口：`/opt/.venv/bin/python build/pf_fixed_workload/run.py`，先确认两
+节点均空闲且锁定 1620 MHz。本次未运行编译、autotune 或并行 GPU 作业。
+结束后确认两节点均 0 MiB GPU 占用。没有新增生产代码、细粒度单测或恢复
+已删除的优化，也没有把上一轮变长 Megatron 数字混进此固定负载对照。
+
 ## 2026-10-04：均衡路由 + 动态 tokens 对照
 
 本轮只增加 benchmark 的 `--route-distribution balanced`，生产算子仍使用
