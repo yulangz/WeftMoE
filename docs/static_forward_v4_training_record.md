@@ -94,8 +94,20 @@ Flash EP8/EP16、256/8K/20K、每档两步随机路由的 output/dX/dGate/dW1/dW
 
 小尺寸 H2048/I512/E64/K4 已通过 EP8/EP16、1/64/8K/20K、每档两步的
 完整五项数值校验；B16/D1、实际 T256/prepared capacity 40K 的热点/空
-rank、peer payload 复用及 CUDA Graph 销毁/offload 检查也通过。小尺寸
-性能复测尚待补齐。**本轮第一个代码里程碑只合入 vector W1 重排**；
+rank、peer payload 复用及 CUDA Graph 销毁/offload 检查也通过。
+小尺寸沿用原 GEMM/B/D profile，按旧→新、新→旧各测一次完整训练周期，
+同样 32 步 trace、8/24、完整 prime。两轮 p50（ms）如下：
+
+| 拓扑 / T | 原库：第一轮 / 第二轮 | vector W1：第一轮 / 第二轮 |
+|---|---:|---:|
+| EP8 / 8K | 5.606 / 5.598 | 5.586 / 5.578 |
+| EP8 / 20K | 12.263 / 12.467 | 12.243 / 12.175 |
+| EP16 / 8K | 9.717 / 9.737 | 9.666 / 9.690 |
+| EP16 / 20K | 22.809 / 22.999 | 22.978 / 22.920 |
+
+小尺寸整体按基本持平看待，双机 20K 两轮平均差约 +0.2%，不宣称每点都
+获益，也没有用函数布局差异再做专用优化。本轮尚未重测 Megatron。
+**本轮第一个代码里程碑 `fb374b1` 只合入 vector W1 重排**；
 dX batch 参数化暂留为未验收候选，未导出新最优表。
 没有新增细粒度单测。已有 backward/static-forward/unified autotune 测试
 29 项、13 subtests 通过；更大集合 57 项通过、7 项失败，失败都在旧
@@ -119,6 +131,8 @@ Flash V3。既不能否认历史领先，也不能用历史毫秒数证明当前
 `verify_*`、`clocks_*`、`geometry*`；此前分阶段/均衡/D8/Megatron 消融及
 单步 trace 也保留在该目录。候选 CUDA 库与头文件均冻结在
 `candidates/cache/`，测量期间没有并发 GPU 作业或编译。
+双机 Flash 部分进程级时钟监控记录 4800 个 GPU 样本，1425–1620 MHz，
+13 个低于目标；含准备、诊断与等待期，不等于计时窗口内的降频比例。
 
 ## 2026-10-04：配置驱动的训练 autotune 与 Flash 复测
 
