@@ -8,7 +8,8 @@
 同一 Flash EP8 动态 trace 的两轮完整 FWD+BWD，前者降低约 2.4 ms；
 后者在 20K 再降低约 4.5 ms。**尚未达到超过 Megatron 的目标**。
 这些改动不缓存权重值，不改变 GEMM K 累加次序、ring credit 或 dX→dW
-严格先后关系；默认 dX batch 仍为 2，训练搜索配置增加 4、8 两个候选。
+严格先后关系；默认 dX batch 仍为 2。4、8 与后面的扩大窗口参数暂只用于
+实验，稳定性未通过前不加入默认训练搜索。
 
 ### 已确认的规模相关问题
 
@@ -52,6 +53,14 @@ Megatron `deterministic_mode=True` 的随机结果 23.183/52.955 ms，与默认
 未发现逐条 WGMMA 串行化；不能把 legacy 入口的编译警告当作当前入口
 的回退证据。dW 已按专家实际 padded rows 加权划分，也不是简单均分专家。
 
+还有尚未完成消融的参数继承问题：当前 Flash BWD unified math/control
+寄存器配额为 208/88，来自小尺寸上的 Y2；历史 Flash profile
+`configs/communication_spsc_20260916/flash.hpp` 则为 224/56。本文原 Y2
+记录已明确它不是所有模型的通用默认值。10 月 4 日训练搜索只比较了 B/D、
+少数 N/K/stage 与 dW tile，未搜索这组配额；因此“已 autotune”不等于已
+排除资源划分问题。但没有这两个配额在当前同一 PF 代码上的配对消融前，
+不能把它登记为已证实的回退原因或优化收益。
+
 ### 第一组实际改动的消融
 
 全部为 H4096/I2048/E256/K6、EP8 单机、B2048/D2。使用相同 32 步
@@ -92,6 +101,15 @@ Flash EP8/EP16、256/8K/20K、每档两步随机路由的 output/dX/dGate/dW1/dW
 不使用进度轮询；日志和 interposer 位于实验目录，没有进入生产代码。
 额外日志仍可能扰动时序，六轮成功不等于已修复此前的正常路径等待。
 
+进一步将 trace 加长到 256 步，每档先 prime 256 次、再 8/248，共连续
+512 次调用；只在建池后打印一次地址，保留原 host 等待。前两轮均完成，
+第三轮再次在 20K 卡住，最终由 420 秒进程超时收尾。两节点显存均归零。
+现场 CUDA-GDB 再次看到驻留的 static BWD，部分 CTA 在调度轮询、部分
+在 cluster join；attach/detach 没有恢复进展。最初按普通指针导出的
+status/scheduler 全为零，未验证 GPU memory-space，**不能作为计数器证据**。
+后续三轮长回放完成（其中首轮被调试器中途暂停，只用于诊断），没有新增
+有效的根因证据。这些长 trace 不与 32 步性能表直接比较，batch8 仍未验收。
+
 小尺寸 H2048/I512/E64/K4 已通过 EP8/EP16、1/64/8K/20K、每档两步的
 完整五项数值校验；B16/D1、实际 T256/prepared capacity 40K 的热点/空
 rank、peer payload 复用及 CUDA Graph 销毁/offload 检查也通过。
@@ -106,13 +124,80 @@ rank、peer payload 复用及 CUDA Graph 销毁/offload 检查也通过。
 | EP16 / 20K | 22.809 / 22.999 | 22.978 / 22.920 |
 
 小尺寸整体按基本持平看待，双机 20K 两轮平均差约 +0.2%，不宣称每点都
-获益，也没有用函数布局差异再做专用优化。本轮尚未重测 Megatron。
+获益，也没有用函数布局差异再做专用优化。随后补测的 Flash Megatron
+配对见下一节；小尺寸本轮没有重测 Megatron。
 **本轮第一个代码里程碑 `fb374b1` 只合入 vector W1 重排**；
 dX batch 参数化暂留为未验收候选，未导出新最优表。
 没有新增细粒度单测。已有 backward/static-forward/unified autotune 测试
 29 项、13 subtests 通过；更大集合 57 项通过、7 项失败，失败都在旧
 `test_forward_autotune.py` 的宏清单/网格/SMEM 精确断言，参见此前
 [autotune 记录](autotune.md)的已知失败，不能宣称完整测试集通过。
+
+### 最新同 trace 配对：已验收 vector-only vs Megatron
+
+仅使用 vector W1、dX batch2、原窗口的冻结库，**不包含以下未验收候选**。
+shape 为 H4096/I2048/E256/K6，两节点目标 1620 MHz；EP8 为单机八卡。
+与 Megatron TEGroupedMLP + DeepEP + `moe_act` 比较，通信配额沿用此前
+筛选的 EP8=80 SM、EP16=48 SM。两边均保留 X/G/U、BWD 重算 gated SwiGLU；
+共同边界包含每步 FWD/BWD、动态分配请求和释放，不含固定池准备/IPC 建连。
+32 步相同随机热点变长 trace、完整 prime、8 warmup + 24 measured；
+先 PF→Megatron，再 Megatron→PF。四次运行的各 rank workload hash 均一致。
+
+| 拓扑 / T | PF 两轮 rank-max wall p50 / ms | Megatron 两轮 p50 / ms | 两轮 p50 均值比：PF 慢 |
+|---|---:|---:|---:|
+| EP8 / 8K | 29.338 / 29.118 | 23.171 / 23.199 | 26.1% |
+| EP8 / 20K | 77.899 / 77.443 | 53.001 / 52.789 | 46.8% |
+| EP16 / 8K | 36.997 / 37.039 | 31.591 / 30.597 | 19.1% |
+| EP16 / 20K | 93.197 / 94.477 | 71.023 / 71.505 | 31.7% |
+
+20K 的 CUDA stream BWD 区间：EP8 PF 51.76–52.00 ms、Megatron
+31.86–31.97 ms；EP16 PF 59.78–60.53 ms、Megatron 42.74–42.95 ms。
+因此剩余差距主要在 BWD，不只是 FWD 权重重排。8K 已是 canonical BWD，
+仍有差距，也说明不能把所有回退归给分窗。stream 区间包含 host 间隙，
+不是裸 kernel 时间，不能直接相加或当作纯 GEMM 的耗时。
+
+原始记录为 `candidates/matched{0,1}_{pf,megatron}_ep*.log`，正式计时期间
+没有并发 GPU 作业、编译或调试器。PF 产物另存于
+`candidates/frozen/vector_dx2_20261005/`。时钟日志从单机首轮 PF 完成后
+开始，因此不覆盖整张表；采样仍有少量低于 1620 MHz 的点，不能声称
+每个 kernel 全程严格恒频。本表不与此前 80 步 trace 直接计算改善比例。
+
+### 未验收：独立 BWD 窗口与 Return proxy 顺序
+
+尝试增加数值参数 `backward.return_window_scale=1/2`：只在原 contribution
+字节预算内放大 bounded dX 聚行窗口，相应减少在途窗口数，不扩大 FWD
+X/S/C。窗口还必须受 dX slot 容量约束，保证最坏窗口可以完整驻留；否则
+一个跨远隔专家 M-block 的 packet 可能等待复用其首行槽位的后续 block。
+
+初版候选 `85b62f12d83e`（scale2、dX batch2、尚无 proxy fence）通过 EP8 的 256/8K/20K
+随机五项校验，以及 EP8/EP16 的 B16/D1、容量 40K、实际 17/513 tokens
+集中到一个 rank 的回绕/空专家校验。**但 EP16 普通随机 20K dX 校验失败**：
+rank1/5 relative L2 为 1.01%/1.73%，rank2 最大绝对误差 0.00562；这不是
+允许的 BF16 尾差。候选未进入性能评分，没有调宽参考门限。失败后精确终止
+该测试的两节点 torchrun，显存均归零；重新运行相同校验，以及额外 12 步
+20K 校验均通过，说明不能仅按确定性 shape 算错解释，也不能把重试通过
+当作修复。12 步重试日志于 06:01:48 前写完，新 fence 库于 06:02:21
+才完成链接，确认这两次重试仍使用初版代码。
+
+代码检查发现 Return packer 从 generic vector-store 写出的 dX 槽位发起
+TMA 读取前缺少显式 async-proxy fence。已补一个最小候选，在现有 queue/
+mailbox acquire 后、每个 TMA issuer 的首次读取前执行
+`fence.proxy.async.global`，尚在消融验证，不提前声称解释或修复了上述
+数值偏差、或此前 batch8 的等待。跨 proxy 顺序依据
+[PTX fence.proxy 语义](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-membar)。
+新增窗口参数、dX batch 参数和该 fence 均尚未提交或导出为最优配置。
+
+fence 候选的双机 20K、12 步共同五项校验通过，但随后 256 步 trace
+长回放完成 8K 后，在 20K 再次持续等待（`stress_window2_proxy_ep16`，
+420 秒超时，两节点显存归零）。**dX batch2 也能复现，不能把等待仅归因于
+batch8，更不能把 fence 当作修复**。本次 CUDA-GDB 以显式 global 地址空间
+成功读取 scheduler、ring state/blocks/slots；rank8 有 712 个 dX 块，
+660 个已完成并退休，剩余 52 个均在 window7（source group1、token
+window3），它们 `input_rows == rows`、对应 slot credit 为零且都是首代
+空槽。dU 的 651 个 canonical M-block 全部完成。按 `input_ready` 的三个
+条件，等待缩小到本地 source-window reservation，尚需追溯缺失的
+Return/Reduce credit。rank0 的 dX/dW 完成计数也已取得，不能把此现场
+解释为 GEMM 计算时间长。status 指针读取失败仍不作为计数器证据。
 
 ### V3 历史结果的口径
 
@@ -129,8 +214,13 @@ Flash V3。既不能否认历史领先，也不能用历史毫秒数证明当前
 
 原始证据位于 `build/pf_flash_diagnosis/`：`candidates/perf*_ep8.log`、
 `verify_*`、`clocks_*`、`geometry*`；此前分阶段/均衡/D8/Megatron 消融及
-单步 trace 也保留在该目录。候选 CUDA 库与头文件均冻结在
-`candidates/cache/`，测量期间没有并发 GPU 作业或编译。
+单步 trace 也保留在该目录。性能表对应的候选 CUDA 库与头文件保存在
+`candidates/cache/`，正式测量期间没有并发 GPU 作业或编译。注意 native
+cache 按配置命名、源码变化会原位更新库，并非不可变归档：
+`85b62f12d83e` 已被后续 fence 构建覆盖，不能再用该路径复现初版窗口
+失败。新 fence 库另存于 `candidates/frozen/window2_proxy_20261005/`，
+SHA256 为 `07ed73ee80e86bbd163ddc213fa7f7f6aa18b475070ea892e17947a651faf9d6`；
+后续诊断改为独立复制产物后测试。
 双机 Flash 部分进程级时钟监控记录 4800 个 GPU 样本，1425–1620 MHz，
 13 个低于目标；含准备、诊断与等待期，不等于计时窗口内的降频比例。
 
