@@ -37,9 +37,26 @@ NCCL 等环境设置，运行将 NCCL/UCX/CUDA 和动态库路径传给远端。
 - `forward/backward`：`fixed` 为分组公共覆盖；`variants` 为耦合的 tile/stage
   组合，`axes` 为可选笛卡尔搜索轴，例如 `"backward.dw_tile_m": [128, 256]`。
   使用现有参数名、资源约束和显存检查；不合法资源组合在编译前淘汰。
-- `stages`：默认 ring → FWD → BWD，每步携带上一轮胜者，保留 incumbent。
+- `stages`：默认 ring → FWD → BWD → BWD Return，每步携带上一轮胜者，保留 incumbent。
   可再加 `ring` 做最后的 B/D 联合回查。这是有预算的分阶段搜索，报告的是
   **本次搜索空间内实测胜者**，不声称全局最优。
+
+`backward.dx_claim_tiles` 控制 bounded Return 路径中，一次 dAB gather
+复用给多少个相邻 dX N-cluster tile，可选 1/2/4/8/16，默认 2。
+默认训练搜索比较2/4/8。它只改变静态任务的批量粒度，不切换 GEMM、
+通信协议或累加次序；canonical dX 不受此参数影响。较大 batch 减少重复
+gather，较小 batch 保留更多 N 方向并行度，不能假定总是选最大值。
+
+`backward.return_window_scale` 在原有 BWD contribution 字节预算内，将
+bounded dX 聚行窗口设为原来的 1 或 2 倍（默认 1），相应减少在途窗口数。
+它不放大 FWD X/S/C，也不增加预算来避开 ring。较粗窗口减少专家尾块，
+但可能加重 credit 等待；同时受 dX slot 容量约束，确保一个最坏窗口能够
+完整驻留，避免跨 M-block packet 的循环等待。候选仍需数值、稳定性和
+反序性能确认。默认训练搜索联合比较倍率1/2；Flash单机选出batch4/scale2，
+双机选出batch8/scale2，20K的配对完整周期分别降低6.51%/7.50%，8K基本持平。
+两者通过大规模数值、极小ring/热点路由及长回放；不把这个结果硬编码成
+shape或拓扑分支。失败现场、验收范围及原始记录见
+[训练记录](static_forward_v4_training_record.md)。
 
 编译复用现有 native object cache（包含命令、源码/头文件依赖和编译器），
 并在总 `--jobs` 预算内并行准备唯一编译配置。计时期间不编译、不并跑候选。

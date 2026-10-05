@@ -177,7 +177,8 @@ class Benchmark:
         extension = self.compiler.directory(candidate) / ("_runtime" + sysconfig.get_config_var("EXT_SUFFIX"))
         env = {k: v for k, v in os.environ.items()
                if k.startswith(("NCCL_", "UCX_", "CUDA_")) or k == "LD_LIBRARY_PATH"}
-        env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1", WEFTMOE_TENSOR_EXTENSION=str(extension))
+        env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1", WEFTMOE_TENSOR_EXTENSION=str(extension),
+                   NCCL_DEBUG_FILE=str(self.output / f"{label}.nccl.%h.%p.log"))
         processes, logs, paths = [], [], []
         start = time.monotonic()
         print(f"START {label}", flush=True)

@@ -6,16 +6,19 @@
 64-bit 除法/取模；bounded BWD 的相邻 dX N-cluster tile 批量大小从固定 2
 变成 `backward.dx_claim_tiles`，一次 gather 可供多个 N tile 复用。
 同一 Flash EP8 动态 trace 的两轮完整 FWD+BWD，前者降低约 2.4 ms；
-后者在 20K 再降低约 4.5 ms。**尚未达到超过 Megatron 的目标**。
+后者在 20K 再降低约 4.5 ms。后续联合搜索 dX 粒度和独立窗口，
+在已含 vector W1 的基线上，EP8/EP16 的20K又降低6.51%/7.50%，8K基本持平。
+**尚未达到超过 Megatron 的目标**。
 这些改动不缓存权重值，不改变 GEMM K 累加次序、ring credit 或 dX→dW
-严格先后关系；默认 dX batch 仍为 2。4、8 与后面的扩大窗口参数暂只用于
-实验，稳定性未通过前不加入默认训练搜索。
+严格先后关系；算子默认 dX batch 仍为2、窗口倍率仍为1。完成联合验证后，
+默认训练搜索已加入batch2/4/8、窗口倍率1/2，不按模型名选择实现。
 
 同步正确性补充：定位到 BWD 两个 CTA 读到不同代的任务 mailbox，改为
 显式 cluster 级 release/acquire，并补齐 Return generic store→TMA read
 的 proxy fence。Flash 三轮双机长回放（每 rank 共3072次训练调用）、
 两模型 EP8/EP16 的数值与小模型生命周期回归通过；没有新增 buffer。
-这是正确性里程碑，尚未完成其性能配对，不把它登记为性能收益。
+这是正确性里程碑，两模型八档配对耗时变化为−0.90%～+1.63%，
+不把它登记为性能收益。
 
 ### 已确认的规模相关问题
 
@@ -278,7 +281,7 @@ EP8/EP16、1/64/8K/20K、各两步也通过。小尺寸 B16/D1、实际 T256/容
 40K 的热点/空 rank、peer payload 复用、CUDA Graph 销毁/offload 检查
 均通过。未新增单元测试或生产诊断分支。
 本次代码里程碑只包含 cluster 内存顺序和 Return proxy fence，不包含
-实验中的 batch/window 参数化，也不修改默认调优表。性能配对另行完成；
+实验中的 batch/window 参数化，也不修改默认调优表。性能配对见下一节；
 原窗口对照库 `registers/frozen/reg208_88` 已有相同 Return fence，能独立
 消融 cluster 修正；小尺寸旧 vector 库没有此 fence，需按两项合并修正
 报告，不能冒充单因素消融。
@@ -287,6 +290,97 @@ EP8/EP16、1/64/8K/20K、各两步也通过。小尺寸 B16/D1、实际 T256/容
 ready/route dumps；最后一轮另有 `compute_gdb_rank4.log`、
 `mailbox_gdb_rank4.log` 和两次 shared-memory 快照。所有调试运行均不计入
 性能评分；新候选独立保存在 `build/pf_flash_diagnosis/mailbox/`。
+
+### 同步修正的配对成本
+
+提交 `895c756` 后，保持原 GEMM、dX batch2、原窗口，两个模型分别跑
+旧→新、新→旧；同一32步变长热点 trace、完整 prime、8/24、rank-max
+完整 FWD+BWD wall p50，单位 ms。逐 rank workload hash 全部一致。
+Flash 旧库为同有 Return proxy fence 的 `reg208_88`，只消融 cluster
+修正；小尺寸旧库为 vector W1 版本，比较的是两项内存顺序修正的合计。
+
+| 模型 / EP / T | 旧：第一轮 / 第二轮 | 新：第一轮 / 第二轮 | 两轮均值耗时变化 |
+|---|---:|---:|---:|
+| Flash / EP8 / 8K | 29.112 / 28.675 | 29.159 / 29.570 | +1.63% |
+| Flash / EP8 / 20K | 77.537 / 76.536 | 77.475 / 77.956 | +0.88% |
+| Flash / EP16 / 8K | 36.711 / 36.587 | 36.926 / 37.150 | +1.06% |
+| Flash / EP16 / 20K | 93.270 / 93.371 | 93.672 / 93.197 | +0.12% |
+| 小尺寸 / EP8 / 8K | 5.574 / 5.618 | 5.587 / 5.504 | −0.90% |
+| 小尺寸 / EP8 / 20K | 12.114 / 12.117 | 12.249 / 12.282 | +1.24% |
+| 小尺寸 / EP16 / 8K | 9.734 / 9.689 | 9.696 / 9.765 | +0.20% |
+| 小尺寸 / EP16 / 20K | 22.929 / 23.637 | 22.880 / 23.346 | −0.73% |
+
+没有把这一正确性修正登记为性能收益，也不把小差异都解释为指令的净成本。
+日志在 `mailbox/paired/`，计时期间没有编译、调试器或其它 GPU 作业。
+全程记录频率：Flash EP8 node0 为1800个样本，最低1500 MHz；Flash
+EP16 两节点为5184/5192个样本，最低1455/1485 MHz。按 utilization>90%
+且功耗>300 W 粗筛，低于1620 MHz的样本分别为21/407、18/495、12/517；
+未与 kernel 精确对齐，不做频率归一化。小尺寸所有采样均为1620 MHz。
+随后用同一 autotune 入口联合搜索 dX batch2/4/8 与窗口倍率1/2，
+不切换模型专属实现；实验配置为 `build/pf_flash_diagnosis/return_search.json`。
+
+### dX 粒度与独立窗口联合搜索
+
+六个组合全部保持同一 GEMM、同一 source contribution 字节预算和严格的
+dX→dW 顺序。EP8/EP16 复用同一批六份编译产物，只有 prepare 时的 B/D
+不同。先完成所有编译，再逐候选执行32步完整 prime、8/24；每阶段保留
+incumbent，入围者正反顺序确认。以下是完整 FWD+BWD 的 rank-max wall
+p50，单位 ms，不与最终80步 trace 的数值混算。
+
+| 拓扑 / T | 原 batch2/scale1，两轮 | 候选，两轮 | 两轮均值耗时变化 |
+|---|---:|---:|---:|
+| EP8 / 8K | 29.692 / 29.304 | batch4/scale2：29.263 / 29.301 | −0.73% |
+| EP8 / 20K | 78.032 / 78.062 | batch4/scale2：72.767 / 73.173 | −6.51% |
+| EP16 / 8K | 36.989 / 36.922 | batch8/scale2：36.602 / 37.042 | −0.36% |
+| EP16 / 20K | 94.561 / 93.707 | batch8/scale2：86.781 / 87.359 | −7.50% |
+
+8K 使用 canonical 路径，不把不足1%的差异归于这两个 bounded 参数。
+EP16 的自动选优按两档等权几何平均确认改善4.00%；原配置与胜者均通过
+256及最终8K/20K、各两步的 output/dX/dGate/dW1/dW2共同参考。
+EP8 候选的256和8K/20K也通过，但原配置256校验的第二条 JSON 被 NCCL
+日志拼到同一行，导致工具记作 `incomplete result`，决策原因为
+`incumbent_not_confirmed`。原日志不修改、不把它改名为完整通过；已将
+NCCL日志按进程分离，随后独立补验原配置256/8K/20K，各两步全部通过。
+
+稳定性：batch8/scale2完成三轮EP16长回放，每档prime256次再8/248，
+每rank共3072次完整FWD+BWD；第三轮无并发编译，三轮均无调试器attach，
+使用原有host等待方式。batch4/scale2的EP8同样完成一轮，每rank1024次。
+两种拓扑的选中配置还通过B16/D1、prepared capacity40K、实际17/513 tokens
+每档两步的热点/空rank五项共同oracle，显式覆盖slot回绕与容量约束。
+日志在 `return_validation/`。没有新增细粒度单测，没有增加contribution
+字节预算；默认训练配置现已开放这两个数值搜索轴。
+
+最终80步trace、完整prime、20/60得到EP8 29.276/72.839 ms，EP16
+36.732/84.542 ms（8K/20K）。这些数值不与上表32步结果计算收益，也没有
+把更早的Megatron成绩拼成新的最终配对。两档/两拓扑仍未证明超过Megatron。
+
+双机首次启动继承 shell 的 `NCCL_IB_DISABLE=1`，六个候选均在 GIN 初始化
+时报 `NCCL_GIN_TYPE_NONE`，未进入性能计时。确认进程退出和两节点显存归零
+后，按既有网络设置显式启用RDMA重跑；失败目录保留，不计入上表。
+有效日志为 `return_search_ep8/`、`return_search_ib_ep16/`；六份库在修改
+后续CUDA源代码前冻结到 `return_frozen/`，含SHA256、配置和当时源码diff。
+时钟记录仍在 `return_search_ep16/clocks_node*.csv`，覆盖失败启动与有效重跑。
+每节点20488/20504个样本，均为1425–1620 MHz；utilization>90%、功耗>300 W
+的粗筛样本中，77/1533、87/1547低于目标，不作频率归一化或严格恒频声明。
+
+### 下一组数值消融：GEMM K与dW分区轮数（未验收）
+
+新增实验参数 `backward.activation_tile_k=64/128`，dW保持K64；两阶段
+复用同一SMEM arena，但分别计算stage间距。K128激活A使用两个K64 TMA
+slab，权重MN-major map的K box扩为128，保留每个输出原有的K16累加次序。
+另外把现有按实际padded K加权的dW静态区间细分成若干轮，cluster按轮
+循环处理其预定区间；`backward.dw_partition_rounds=1/8/32/128`控制粒度。
+仍不使用共享动态claim，不做split-K、不提前dW，不按模型名切换实现。
+其目的分别是减少长归约的流水握手、检验专家数据的L2复用；目前只是待测
+假设，不据代码结构宣称收益。默认仍为K64、单轮，既有公开搜索尚未开启
+这两项。实验配置为 `weight_search.json`、`gemm_search.json`。
+
+现有Backward/static-forward/unified/defaults共30项CPU测试通过，没有新增
+单元测试；额外topology测试的Forward子项仍请求不存在的`incumbent`
+候选而失败，对应Forward工具及配置未修改。五份库已并行编译完成并冻结：
+K64配1/8/32/128轮，以及K128配1轮。local/network的REG168、SHARED2048、
+LOCAL0、STACK0/72均不变；GPU数值与性能尚待验证，不能据资源相同宣称无回退。
+构建及源码快照位于 `build/pf_flash_diagnosis/gemm_candidates/`。
 
 ### V3 历史结果的口径
 

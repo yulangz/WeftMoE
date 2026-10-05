@@ -6,7 +6,7 @@
     "return_packet_rows": 16,
     "network_prefill_min_tokens": 2048
   },
-  "stages": ["ring", "forward", "backward"],
+  "stages": ["ring", "forward", "backward", "backward_return"],
   "ring": {
     "local": [
       {"window_tokens": 512, "contribution_windows": 8},
@@ -42,6 +42,12 @@
       {"backward.dab_stages": 3, "backward.dx_stages": 3},
       {"backward.dw1_stages": 2, "backward.dw2_stages": 2}
     ]
+  },
+  "backward_return": {
+    "axes": {
+      "backward.dx_claim_tiles": [2, 4, 8],
+      "backward.return_window_scale": [1, 2]
+    }
   },
   "seed": 123,
   "token_std_fraction": 0.1,

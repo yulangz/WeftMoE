@@ -10,6 +10,12 @@
     "dx_tile_n": [
       256
     ],
+    "dx_claim_tiles": [
+      2
+    ],
+    "return_window_scale": [
+      1
+    ],
     "dw_tile_m": [
       128
     ],

@@ -38,6 +38,12 @@
 #ifndef WEFTMOE_BWD_DX_TILE_N
 #define WEFTMOE_BWD_DX_TILE_N 256
 #endif
+#ifndef WEFTMOE_BWD_DX_CLAIM_TILES
+#define WEFTMOE_BWD_DX_CLAIM_TILES 2
+#endif
+#ifndef WEFTMOE_BWD_RETURN_WINDOW_SCALE
+#define WEFTMOE_BWD_RETURN_WINDOW_SCALE 1
+#endif
 #ifndef WEFTMOE_BWD_DW_TILE_M
 #define WEFTMOE_BWD_DW_TILE_M 128
 #endif
@@ -163,6 +169,12 @@ inline constexpr std::uint32_t kMainIntermediate =
 inline constexpr std::uint32_t kTileM = WEFTMOE_BWD_TILE_M;
 inline constexpr std::uint32_t kDabTileN = WEFTMOE_BWD_DAB_TILE_N;
 inline constexpr std::uint32_t kDxTileN = WEFTMOE_BWD_DX_TILE_N;
+// Adjacent N-cluster tiles share one bounded dAB gather. This changes only
+// task granularity, not static ownership, K accumulation, or Return credits.
+inline constexpr std::uint32_t kDxClaimTiles = WEFTMOE_BWD_DX_CLAIM_TILES;
+static_assert(kDxClaimTiles > 0U);
+inline constexpr std::uint32_t kReturnWindowScale = WEFTMOE_BWD_RETURN_WINDOW_SCALE;
+static_assert(kReturnWindowScale > 0U);
 // Pair complete M128 activation tiles along N when both projections have an
 // even number of column tiles. Both math warpgroups then do useful work and
 // the cluster reuses A. Odd column extents keep the M64 split without padding

@@ -60,6 +60,8 @@ PARAMETER_MACROS = {
     "tile_m": "WEFTMOE_BWD_TILE_M",
     "dab_tile_n": "WEFTMOE_BWD_DAB_TILE_N",
     "dx_tile_n": "WEFTMOE_BWD_DX_TILE_N",
+    "dx_claim_tiles": "WEFTMOE_BWD_DX_CLAIM_TILES",
+    "return_window_scale": "WEFTMOE_BWD_RETURN_WINDOW_SCALE",
     "dw_tile_m": "WEFTMOE_BWD_DW_TILE_M",
     "dw_tile_n": "WEFTMOE_BWD_DW_TILE_N",
     "tile_k": "WEFTMOE_BWD_TILE_K",
@@ -148,6 +150,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
             "the activation dependency block is fixed at M128")
     require_choice(config, "dab_tile_n", (128, 256))
     require_choice(config, "dx_tile_n", (128, 256))
+    require_choice(config, "dx_claim_tiles", (1, 2, 4, 8, 16))
+    require_choice(config, "return_window_scale", (1, 2))
     require_choice(config, "dw_tile_m", (128, 256))
     require_choice(config, "dw_tile_n", (128, 256))
     require(config["main_hidden"] % config["dw_tile_m"] == 0,
@@ -211,7 +215,9 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
     topology, jit_overrides = resolve_runtime_settings(
         model=model, system=system, repo_root=REPO_ROOT)
     space = constrain_transport_space(space, topology)
-    unified_tuning.upgrade_legacy_groups(space, search=True)
+    unified_tuning.upgrade_legacy_groups(
+        space, search=True,
+        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1})
     flat = flatten_groups(space, require_all=False)
     require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
             "hyperparameters must cover every tuning parameter and exclude model dimensions")
@@ -273,7 +279,9 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     if "schema" not in document:
         document = make_runtime_plan(document, model=model, benchmark=benchmark, system=system)
     require(document.get("schema") == 1, "Backward plan schema must be 1")
-    unified_tuning.upgrade_legacy_groups(document.setdefault("fixed", {}))
+    unified_tuning.upgrade_legacy_groups(
+        document.setdefault("fixed", {}),
+        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1})
     required_sections = {
         "jit", "benchmark", "selection", "invariants", "fixed", "candidates"
     }

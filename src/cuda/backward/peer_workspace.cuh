@@ -107,9 +107,6 @@ struct BackwardPeerWorkspace {
       const static_forward::ComputeRingLayout &forward, std::uint64_t hidden) {
     auto result = forward;
     const auto row_bytes = checked_mul(hidden, 2ULL, "Backward contribution row") + sizeof(float);
-    const auto window_bytes = checked_mul(
-        std::uint64_t(forward.shape.tokens) * forward.shape.top_k,
-        row_bytes, "Backward contribution window");
     const auto budget = return_budget(forward, hidden);
     const auto full_bytes = checked_mul(max_routes, row_bytes, "Backward full source capacity");
     const bool canonical = full_bytes <= budget;
@@ -118,6 +115,22 @@ struct BackwardPeerWorkspace {
       result.shape.sources = result.shape.world;
       result.contribution_depth = 1U;
     } else {
+      // Coarsen only the dX regrouping window within the same byte budget.
+      // Larger windows reduce expert tails without growing Forward X/S/C or
+      // replacing the bounded Return protocol with a full-context allocation.
+      // A bounded wire packet can join rows from distant expert M-blocks.
+      // Keep the whole worst-case window in dX slots so packing that packet
+      // never awaits a future block that needs to recycle its first row.
+      const auto slot_tokens =
+          std::uint64_t(forward.depth - owned_experts) * forward.shape.tile_m /
+          (std::uint64_t(std::min(forward.shape.sources, forward.shape.world)) *
+           forward.shape.top_k);
+      result.shape.tokens = static_cast<unsigned>(std::min(
+          std::uint64_t(forward.shape.tokens) * backward_tuning::kReturnWindowScale,
+          std::min(slot_tokens, budget / (forward.shape.top_k * row_bytes))));
+      const auto window_bytes = checked_mul(
+          std::uint64_t(result.shape.tokens) * result.shape.top_k,
+          row_bytes, "Backward contribution window");
       result.contribution_depth = static_cast<unsigned>(std::min(
           std::uint64_t(forward.contribution_depth) * 4U, budget / window_bytes));
     }

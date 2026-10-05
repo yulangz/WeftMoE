@@ -25,14 +25,15 @@ struct Schedule {
       return a.return_ring.depth && !a.return_ring.canonical
           ? a.return_ring.du_order[index] : index;
     };
-    // A bounded window can underfill the M grid even for a long invocation.
-    // Stripe N pairs as well; Return waits for every N tile of the M-block.
-    constexpr auto dx_pairs = (DxTiles + 1U) / 2U;
+    // Batch adjacent N tiles over one gathered dAB M-block. Smaller batches
+    // expose N parallelism when the bounded window underfills the M grid.
+    constexpr auto dx_tiles = backward_tuning::kDxClaimTiles;
+    constexpr auto dx_groups = (DxTiles + dx_tiles - 1U) / dx_tiles;
     if (a.return_ring.depth && !a.return_ring.canonical) {
-      if (dx < dx_blocks * dx_pairs &&
-          weftmoe_pf::backward_return::input_ready(a, dx / dx_pairs)) {
-        const auto tile = (dx % dx_pairs) * 2U;
-        task = {dx / dx_pairs, tile, TaskKind::Dx, min(2U, DxTiles - tile)};
+      if (dx < dx_blocks * dx_groups &&
+          weftmoe_pf::backward_return::input_ready(a, dx / dx_groups)) {
+        const auto tile = (dx % dx_groups) * dx_tiles;
+        task = {dx / dx_groups, tile, TaskKind::Dx, min(dx_tiles, DxTiles - tile)};
         dx += clusters;
         return true;
       }
