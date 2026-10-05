@@ -11,6 +11,12 @@
 严格先后关系；默认 dX batch 仍为 2。4、8 与后面的扩大窗口参数暂只用于
 实验，稳定性未通过前不加入默认训练搜索。
 
+同步正确性补充：定位到 BWD 两个 CTA 读到不同代的任务 mailbox，改为
+显式 cluster 级 release/acquire，并补齐 Return generic store→TMA read
+的 proxy fence。Flash 三轮双机长回放（每 rank 共3072次训练调用）、
+两模型 EP8/EP16 的数值与小模型生命周期回归通过；没有新增 buffer。
+这是正确性里程碑，尚未完成其性能配对，不把它登记为性能收益。
+
 ### 已确认的规模相关问题
 
 1. 每卡权重体积增大远快于每 token 的 GEMM 工作量。由
@@ -217,7 +223,9 @@ mailbox acquire 后、每个 TMA issuer 的首次读取前执行
 `fence.proxy.async.global`，尚在消融验证，不提前声称解释或修复了上述
 数值偏差、或此前 batch8 的等待。跨 proxy 顺序依据
 [PTX fence.proxy 语义](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-membar)。
-新增窗口参数、dX batch 参数和该 fence 均尚未提交或导出为最优配置。
+新增窗口参数、dX batch 参数尚未提交或导出为最优配置。该 fence 后续与
+下节的 cluster 内存顺序修正一并完成正确性回归，独立于参数搜索提交；
+仍不把早先一次数值失败全部归因于缺少这一条 fence。
 
 fence 候选的双机 20K、12 步共同五项校验通过，但随后 256 步 trace
 长回放完成 8K 后，在 20K 再次持续等待（`stress_window2_proxy_ep16`，
@@ -230,6 +238,55 @@ window3），它们 `input_rows == rows`、对应 slot credit 为零且都是首
 条件，等待缩小到本地 source-window reservation，尚需追溯缺失的
 Return/Reduce credit。rank0 的 dX/dW 完成计数也已取得，不能把此现场
 解释为 GEMM 计算时间长。status 指针读取失败仍不作为计数器证据。
+
+### 等待继续定位：跨 CTA 任务 mailbox 分歧
+
+后续只对冻结的 window2 + batch2 + proxy-fence 库重放，不改变 CUDA 实现。
+`credit2_window2_proxy_ep16` 中，rank0/1/8/9 缺少的 contribution 全部指向
+rank1；rank1 的 1438 个 dX 块中，1331 个退休、62 个计算完成待 Return、
+45 个只完成 6/8 个 N-pair。首个未完成块 input rows 已齐、无本地 source
+依赖，且仍为无需回收 credit 的首代槽位。`credit3` 类似，但计算积压在
+rank15。因而先前看到的 source-window 等待是下游症状，不能登记为根因。
+两次都由 420 秒超时收尾；`credit4` 完成，不能用这一成功抹掉前面的失败。
+
+`credit5` 再次失败，按未完成块的静态 owner 自动抓取，定位到 rank4 的
+cluster44（CTA88/89）：CTA88 mailbox 为 `NoTask`，CTA89 为
+`Dx(owner=1232, tile=0, count=2)`。块1232 已经完成并退休；CTA89 却再次进入
+该任务，math 等 TMA full，producer 在耗尽可用 stage 后等 empty，CTA88
+则等下一次 mailbox join。间隔一次 detach/attach 的第二份快照仍完全相同。
+其后9个 dX 块各缺少2个 N-pair；这与该 cluster 的静态 residue 一致。
+这是 CTA 对任务不一致的直接证据，不再只是任意线程停在 barrier 的采样。
+
+检查本地 CUTLASS 头文件发现，此处 `ClusterBarrier::arrive/wait` 发出的
+PTX 没有显式 `.scope`，默认是 CTA，而非 cluster；`.shared::cluster` 只
+说明 barrier 地址空间，不会自动把内存顺序扩大到 cluster。跨 CTA 的
+DSM mailbox 需要 cluster 级发布/读取顺序，参见
+[PTX mbarrier.arrive](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-arrive)
+及 [mbarrier wait](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-mbarrier-try-wait)。
+据此增加显式 release.cluster / acquire.cluster 的最小候选，并保留
+双 arrival、原 phase 规则、原计算线程域及 mailbox-copy acknowledgement。
+候选已通过 EP16、256/8K/20K、各两步五项 Torch oracle，以及三轮
+每档512次连续调用的长回放（每 rank 共3072次完整训练调用）；第三轮
+没有并发编译，三轮均无调试器 attach。local/network 的 REG168/SHARED2048、STACK
+0/72 B 不变；static network 入口 HGMMA/DEPBAR 仍为48/12，额外的内存
+顺序指令已在 SASS 中确认。**没有用诊断期间的耗时更新性能表。**冻结库 SHA256 为
+`2698c99e26e3c1b6b23710511d687c411175f19003e5d2b048a7596e59054e88`。
+
+随后完成原窗口（scale1）与扩大窗口（scale2）的 Flash EP8/EP16、
+256/8K/20K、各两步五项共同 Torch oracle；小尺寸 H2048/I512/E64/K4 的
+EP8/EP16、1/64/8K/20K、各两步也通过。小尺寸 B16/D1、实际 T256/容量
+40K 的热点/空 rank、peer payload 复用、CUDA Graph 销毁/offload 检查
+均通过。未新增单元测试或生产诊断分支。
+本次代码里程碑只包含 cluster 内存顺序和 Return proxy fence，不包含
+实验中的 batch/window 参数化，也不修改默认调优表。性能配对另行完成；
+原窗口对照库 `registers/frozen/reg208_88` 已有相同 Return fence，能独立
+消融 cluster 修正；小尺寸旧 vector 库没有此 fence，需按两项合并修正
+报告，不能冒充单因素消融。
+
+证据为 `candidates/credit{2,3,5}_window2_proxy_ep16/` 下的 CB0、ReturnBlock、
+ready/route dumps；最后一轮另有 `compute_gdb_rank4.log`、
+`mailbox_gdb_rank4.log` 和两次 shared-memory 快照。所有调试运行均不计入
+性能评分；新候选独立保存在 `build/pf_flash_diagnosis/mailbox/`。
 
 ### V3 历史结果的口径
 

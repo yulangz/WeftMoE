@@ -77,13 +77,27 @@ template <bool MathRole> struct UnifiedComputeSynchronization {
     // data that a compute task awaits and must never participate here.
     cta_sync();
     if (MathRole && threadIdx.x == 0U) {
-      auto &barrier = *reinterpret_cast<cutlass::arch::ClusterBarrier *>(
-          &state.cluster_join);
       // Two arrivals (local and peer) are essential: a fast CTA cannot flip
       // the next phase before the peer has observed and left this phase.
-      barrier.arrive();
-      barrier.arrive(cute::block_rank_in_cluster() ^ 1U);
-      barrier.wait(phase);
+      // DSM mailbox stores/loads require cluster scope. CUTLASS's unqualified
+      // mbarrier arrive/wait defaults to CTA scope, even for a remote address.
+      const auto local = cute::cast_smem_ptr_to_uint(&state.cluster_join);
+      const auto peer = cute::block_rank_in_cluster() ^ 1U;
+      asm volatile(
+          "{\n"
+          ".reg .b32 remote;\n"
+          ".reg .pred ready;\n"
+          "mapa.shared::cluster.u32 remote, %0, %1;\n"
+          "mbarrier.arrive.release.cluster.shared::cta.b64 _, [%0];\n"
+          "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote];\n"
+          "wait_phase:\n"
+          "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+          "ready, [%0], %2;\n"
+          "@!ready bra wait_phase;\n"
+          "}\n"
+          :
+          : "r"(local), "r"(peer), "r"(phase)
+          : "memory");
       phase ^= 1U;
     }
     cta_sync();

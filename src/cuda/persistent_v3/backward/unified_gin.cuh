@@ -85,6 +85,10 @@ __device__ __forceinline__ void pack_return(const BackwardKernelArgs &a,
   const auto *dx = a.dx_rows;
   const auto *dgate = a.dgate_rows;
   if (lane == 0U) {
+    // Ring dX is written by generic vector stores. The queue/mailbox acquire
+    // orders those writes, but TMA reads use the async proxy. Import the
+    // acquired payload before loading a recycled dX slot into NIC TX.
+    asm volatile("fence.proxy.async.global;" ::: "memory");
     forward_unified_transport::RowPrefetchPipeline<Storage> prefetch(s, warp);
     for (unsigned item = warp; item < task.rows; item += Storage::kCopyWarps) {
       const auto entry = entries[task.first + item];
