@@ -130,20 +130,23 @@ __global__ void interleave_forward_w1_kernel(
     const transport::BFloat16 *source, transport::BFloat16 *destination,
     std::uint64_t elements, std::uint64_t hidden,
     std::uint64_t intermediate) {
-  const auto stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
-  const auto expert_stride = 2ULL * intermediate * hidden;
-  for (std::uint64_t index =
-           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       index < elements; index += stride) {
-    const auto within = index % expert_stride;
-    const auto row = within / hidden;
-    const auto column = within % hidden;
+  // TMA-compatible weight rows are 16-byte aligned. A CTA owns complete rows,
+  // so the gate/up permutation is computed once per row, not per BF16 value.
+  const auto vectors = hidden / 8U;
+  const auto rows = elements / hidden;
+  const auto *input = reinterpret_cast<const uint4 *>(source);
+  auto *output = reinterpret_cast<uint4 *>(destination);
+  for (std::uint64_t index = blockIdx.x; index < rows; index += gridDim.x) {
+    const auto expert = index / (2ULL * intermediate);
+    const auto row = index % (2ULL * intermediate);
     const auto projection = row / intermediate;
     const auto channel = row % intermediate;
     const auto packed_row =
         (channel / 8ULL) * 16ULL + projection * 8ULL + channel % 8ULL;
-    destination[(index / expert_stride) * expert_stride +
-                packed_row * hidden + column] = source[index];
+    const auto target = (expert * 2ULL * intermediate + packed_row) * vectors;
+    for (auto column = std::uint64_t(threadIdx.x); column < vectors;
+         column += blockDim.x)
+      output[target + column] = input[index * vectors + column];
   }
 }
 

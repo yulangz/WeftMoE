@@ -1,5 +1,123 @@
 # V4 ring 训练对接记录
 
+## 2026-10-05：Flash 回退定位与通用优化（进行中）
+
+优化摘要：W1 gate/up 重排改为按行的 16B vector copy，避免逐 BF16 的
+64-bit 除法/取模；bounded BWD 的相邻 dX N-cluster tile 批量大小从固定 2
+变成 `backward.dx_claim_tiles`，一次 gather 可供多个 N tile 复用。
+同一 Flash EP8 动态 trace 的两轮完整 FWD+BWD，前者降低约 2.4 ms；
+后者在 20K 再降低约 4.5 ms。**尚未达到超过 Megatron 的目标**。
+这些改动不缓存权重值，不改变 GEMM K 累加次序、ring credit 或 dX→dW
+严格先后关系；默认 dX batch 仍为 2，训练搜索配置增加 4、8 两个候选。
+
+### 已确认的规模相关问题
+
+1. 每卡权重体积增大远快于每 token 的 GEMM 工作量。由
+   H2048/I512/E64/K4 切到 H4096/I2048/E256/K6，EP8 的 W1 从
+   32 MiB 增至 1024 MiB、W1+W2 从 48 MiB 增至 1536 MiB，均为 32 倍；
+   useful GEMM FLOPs/token 只增至 12 倍。原逐元素重排不再是可忽略的
+   开销。单步 rank0 Kineto 中旧重排为 2.835 ms；下面的整轮消融更能
+   代表最终收益，不能把单步 profile 的耗时当作 rank-max p50。
+2. BWD source Return 容量预算与 FWD B/D 耦合：
+   `B * D * top_k * (2 * H + 4) + 448 MiB`。小尺寸 20K trace 的完整
+   贡献区约 403.83 MiB，能放入 512.06 MiB 预算；Flash EP8 20K 约
+   1210.90 MiB，超过 B2048/D2 的 640.09 MiB 预算，进入 bounded 分窗
+   dX。后者额外重新聚行、增加尾块并受 source credit 约束。
+   这是容量启发式不够通用，不是按模型名称写了专用 CUDA 分支。
+3. bounded dX 原来每个静态任务只算两个 N-cluster tile，却每次 gather
+   完整 M128×2I 的 dAB。Flash 的 H4096/N256/cluster-N2 一共有 8 个
+   N-cluster tile，同一输入最多重复 gather 四次。批量设为 8 后只做一次；
+   对窗口较小的场景仍保留更小 batch 的 N 方向并行度，由搜索决定。
+
+容量放大消融也支持第 2 点：同一 32 步 EP8 trace 上，D2 的 20K 完整周期
+80.270 ms，D8 为 69.192 ms，CUDA stream BWD 区间从 51.964 降到
+40.996 ms；8K 两者约 31.5 ms、没有收益。但 D8 同时增加 FWD 缓冲，
+native 持久区额外约 1211.62 MiB/rank，且使该 20K case 不再需要 bounded
+dX，**没有作为 ring 路径已经优化好的证据，也没有据此修改默认容量**。
+
+对实际同一条随机路由 trace 逐步精确计数，20K 的
+`sum(padded M rows) / sum(real rows)` 的 median 如下。这里只算几何量，
+不是重新执行 GEMM 得到的速度预测；canonical 列合并全部 source/window。
+
+| 拓扑 | 当前 window B | 当前分窗 padding 倍数 | B×2 | B×4 | canonical |
+|---|---:|---:|---:|---:|---:|
+| EP8 | 2048 | 1.2205 | 1.1045 | 1.0500 | 1.0165 |
+| EP16 | 3072 | 1.1446 | 1.0687 | 1.0338 | 1.0082 |
+
+随机路由不是全部原因：改成均衡路由但保留变长 tokens，旧 PF 的 EP8
+8K/20K 为 25.288/66.338 ms，Megatron 为 19.205/43.342 ms，差距仍在。
+Megatron `deterministic_mode=True` 的随机结果 23.183/52.955 ms，与默认
+23.208/52.858 ms 接近。没有通过关闭 Megatron 快路径来制造 PF 优势。
+当前 BWD static 入口的 SASS 中 WGMMA/ARRIVE/DEPBAR 为 48/12/12，
+未发现逐条 WGMMA 串行化；不能把 legacy 入口的编译警告当作当前入口
+的回退证据。dW 已按专家实际 padded rows 加权划分，也不是简单均分专家。
+
+### 第一组实际改动的消融
+
+全部为 H4096/I2048/E256/K6、EP8 单机、B2048/D2。使用相同 32 步
+变长热点 trace，完整 untimed replay 后 8 warmup + 24 measured，先测
+旧库→vector-only→vector+batch8，再反序测一轮；下表分别列每轮 rank-max
+wall p50，单位 ms，不把它与上一节 80 步 trace 直接混算。
+
+| 配置 | 8K：第一轮 / 第二轮 | 20K：第一轮 / 第二轮 |
+|---|---:|---:|
+| 原调优库 | 31.345 / 31.886 | 79.794 / 79.667 |
+| 仅 vector W1，dX batch2 | 29.054 / 29.063 | 77.241 / 77.457 |
+| vector W1 + dX batch8 | 28.718 / 29.251 | 72.983 / 72.740 |
+
+vector-only 的 CUDA stream FWD 区间由约 13.45/28.12 ms 降至
+11.10/25.73 ms；batch8 的 20K BWD 区间由约 51.59 降至 46.78 ms。
+stream 区间包含 host enqueue 间隙，不是裸 kernel 时间，两个 phase 的
+median 也不能直接相加当作整轮 median。8K 已使用 canonical dX，batch
+参数不作用于它，约 0.3 ms 的波动不登记为这项优化的收益。
+
+另用原有设备时间戳诊断 20K：每步先取 rank-max 再取 median，dX 全部
+完成前的区间从 33.731 降至 29.045 ms；其后 dW 完成区间为
+17.133/17.121 ms，基本不变。前一阶段包括 dU、SwiGLU、dX、通信等待，
+不能解释成纯 dX GEMM 时间；诊断模式的 host polling 不用于正式评分。
+
+Flash EP8/EP16、256/8K/20K、每档两步随机路由的 output/dX/dGate/dW1/dW2
+均通过共同 Torch 参考，两个候选分别校验。**但双机性能反序确认暴露持续
+等待，batch8 尚不能验收**：第一轮旧/vector-only/batch8 的 8K 为
+38.140/36.800/36.927 ms，20K 为 94.036/93.631/87.228 ms；第二轮 batch8
+完成 8K（36.758 ms）后，20K 长时间无进展。两节点 GPU 100% 占用、约
+110–125 W，CUDA-GDB 看到 rank8 活跃的是 static unified BWD，采样线程
+停在 cluster barrier；这不是单凭一个线程就定位了根因。已终止该候选的
+两个 torchrun 进程，两节点显存均回到 0 MiB，失败日志原样保留。
+正开启逐 rank BWD status/scheduler 诊断复现，不将第一轮成功成绩导出为
+最优 profile，也不先归因于新 batch 参数或此前 B2304/D2 的等待问题。
+开启原生进度轮询后的三轮诊断均完成，但轮询改变 host 等待方式，不能
+据此抹掉正常路径的失败。下一步使用冻结库的 address-only 诊断，保留原
+`cudaEventSynchronize`，继续定位。
+
+小尺寸 H2048/I512/E64/K4 已通过 EP8/EP16、1/64/8K/20K、每档两步的
+完整五项数值校验；B16/D1、实际 T256/prepared capacity 40K 的热点/空
+rank、peer payload 复用及 CUDA Graph 销毁/offload 检查也通过。小尺寸
+性能复测尚待补齐。**本轮第一个代码里程碑只合入 vector W1 重排**；
+dX batch 参数化暂留为未验收候选，未导出新最优表。
+没有新增细粒度单测。已有 backward/static-forward/unified autotune 测试
+29 项、13 subtests 通过；更大集合 57 项通过、7 项失败，失败都在旧
+`test_forward_autotune.py` 的宏清单/网格/SMEM 精确断言，参见此前
+[autotune 记录](autotune.md)的已知失败，不能宣称完整测试集通过。
+
+### V3 历史结果的口径
+
+V3 确实在该 Flash 形状领先过。9 月 13 日固定均衡负载、1980 MHz 的
+FWD/BWD 独立阶段 p50 相加：EP8/8K 为 18.864 vs Megatron 21.151 ms，
+EP16/8K 为 21.741 vs 23.967 ms，见
+[历史报告](../benchmarks/performance_20260913.md)。1620 MHz 的 9 月 14 日
+记录也有优势：EP8/8K 的阶段 wall **均值**为 7.885+10.847 vs
+9.230+14.698 ms，EP16 为 11.203+10.774 vs 10.316+15.974 ms，见
+[全 CTA 报告](../benchmarks/full_cta_all_worker_20260914.md)。
+但这些是固定均衡路由、权重预备和 cached-state 独立阶段，不能冒充本轮
+随机变长、逐调用重排的完整 FWD+BWD；本轮尚未新测匹配该 trace 的原版
+Flash V3。既不能否认历史领先，也不能用历史毫秒数证明当前差距已恢复。
+
+原始证据位于 `build/pf_flash_diagnosis/`：`candidates/perf*_ep8.log`、
+`verify_*`、`clocks_*`、`geometry*`；此前分阶段/均衡/D8/Megatron 消融及
+单步 trace 也保留在该目录。候选 CUDA 库与头文件均冻结在
+`candidates/cache/`，测量期间没有并发 GPU 作业或编译。
+
 ## 2026-10-04：配置驱动的训练 autotune 与 Flash 复测
 
 优化摘要：接通按 shape/拓扑生成、编译和选优的完整训练 autotune；放大
