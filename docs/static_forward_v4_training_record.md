@@ -87,8 +87,10 @@ Flash EP8/EP16、256/8K/20K、每档两步随机路由的 output/dX/dGate/dW1/dW
 正开启逐 rank BWD status/scheduler 诊断复现，不将第一轮成功成绩导出为
 最优 profile，也不先归因于新 batch 参数或此前 B2304/D2 的等待问题。
 开启原生进度轮询后的三轮诊断均完成，但轮询改变 host 等待方式，不能
-据此抹掉正常路径的失败。下一步使用冻结库的 address-only 诊断，保留原
-`cudaEventSynchronize`，继续定位。
+据此抹掉正常路径的失败。随后冻结库的三轮 address-only 诊断也完成：
+用诊断 interposer 只保留 launch 地址日志、保留原 `cudaEventSynchronize`，
+不使用进度轮询；日志和 interposer 位于实验目录，没有进入生产代码。
+额外日志仍可能扰动时序，六轮成功不等于已修复此前的正常路径等待。
 
 小尺寸 H2048/I512/E64/K4 已通过 EP8/EP16、1/64/8K/20K、每档两步的
 完整五项数值校验；B16/D1、实际 T256/prepared capacity 40K 的热点/空
