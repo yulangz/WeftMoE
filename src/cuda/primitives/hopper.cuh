@@ -100,9 +100,12 @@ CUTLASS_DEVICE uint32_t advance_gmma_desc_lo(
     const uint32_t& base, const uint32_t& mn, const uint32_t& k,
     const uint32_t& offset = 0) {
   static_assert(Swizzle == 128);
-  constexpr auto stride_k = Mode == Major::K ? 1U : Swizzle / sizeof(T);
-  return base + (((offset + mn * K + k * stride_k) *
-                  static_cast<uint32_t>(sizeof(T))) >> 4U);
+  constexpr auto atom = Swizzle / sizeof(T);
+  // A wider K-major stage consists of contiguous [MN, atom] TMA slabs.
+  const auto elements = Mode == Major::K
+      ? (k / atom) * MN * atom + mn * atom + k % atom
+      : mn * K + k * atom;
+  return base + (((offset + elements) * static_cast<uint32_t>(sizeof(T))) >> 4U);
 }
 
 template <Major Mode, uint32_t MN, uint32_t K, uint32_t Swizzle, class T>
@@ -112,8 +115,9 @@ CUTLASS_DEVICE cute::GmmaDescriptor make_gmma_desc(
   constexpr auto atom = Swizzle / sizeof(T);
   constexpr auto layout = static_cast<int>(cute::SM90::GMMA::LayoutType::B128);
   if constexpr (Mode == Major::K) {
-    static_assert(K * sizeof(T) == Swizzle);
-    return make_smem_desc(base + mn * K + k, layout, 0, 8 * K * sizeof(T));
+    static_assert(K % atom == 0);
+    return make_smem_desc(base + (k / atom) * MN * atom + mn * atom + k % atom,
+                          layout, 0, 8 * Swizzle);
   } else {
     return make_smem_desc(base + mn * K + k * atom, layout,
                           K * atom * sizeof(T), 8 * atom * sizeof(T));

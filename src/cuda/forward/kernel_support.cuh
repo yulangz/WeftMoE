@@ -187,7 +187,8 @@ CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
 }
 
 CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
-                                 std::uint64_t outer, const char *field) {
+                                 std::uint64_t outer, const char *field,
+                                 std::uint32_t box_rows = 64U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
       outer > UINT32_MAX)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
@@ -198,8 +199,8 @@ CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
   const cuuint64_t strides[1] = {
       checked_mul(inner, sizeof(transport::BFloat16), field)};
   // MN-major WGMMA consumes a row-major [K,N] operand as 64 contiguous N
-  // columns by one 64-row K slice. Wider N tiles assemble adjacent atoms.
-  const cuuint32_t box[2] = {64U, 64U};
+  // columns by one K slice. Wider N tiles assemble adjacent atoms.
+  const cuuint32_t box[2] = {64U, box_rows};
   const cuuint32_t element_strides[2] = {1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
       &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, base, dims, strides, box,

@@ -25,6 +25,12 @@
     "tile_k": [
       64
     ],
+    "activation_tile_k": [
+      64
+    ],
+    "dw_partition_rounds": [
+      1
+    ],
     "dab_stages": [
       4
     ],

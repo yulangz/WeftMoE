@@ -8,7 +8,6 @@ constexpr std::uint32_t kMathWarpGroups = 2U;
 constexpr std::uint32_t kMathThreads = kMathWarpGroups * 128U;
 constexpr std::uint32_t kActivationMathThreads =
     backward_tuning::kActivationTileM == 128U ? kMathThreads : 128U;
-constexpr std::uint32_t kStageK = backward_tuning::kTileK;
 constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 constexpr std::uint32_t kStoreReadyBarrier = 0U;
 constexpr std::uint32_t kStoreDoneBarrier = 1U;
@@ -34,19 +33,20 @@ struct FullCtaComputeSynchronization {
 };
 
 template <std::uint32_t TileN>
-constexpr std::uint32_t stage_storage_elements() {
-  constexpr auto activation_elements =
-      (backward_tuning::kActivationTileM + TileN) * kStageK;
-  constexpr auto dw_elements =
-      (backward_tuning::kDwTileM + backward_tuning::kDwTileN) * kStageK;
-  return activation_elements > dw_elements ? activation_elements : dw_elements;
+constexpr std::uint32_t activation_stage_elements() {
+  return (backward_tuning::kActivationTileM + TileN) *
+         backward_tuning::kActivationTileK;
 }
 
+constexpr auto kDwStageElements =
+    (backward_tuning::kDwTileM + backward_tuning::kDwTileN) * backward_tuning::kTileK;
+
 template <std::uint32_t TileN> constexpr std::uint32_t shared_arena_elements() {
+  // The two phases reuse one arena but need not share a stage stride.
   constexpr auto activation_elements =
-      kActivationStages * stage_storage_elements<TileN>();
+      kActivationStages * activation_stage_elements<TileN>();
   constexpr auto dw_elements =
-      kDwStages * stage_storage_elements<TileN>() +
+      kDwStages * kDwStageElements +
       backward_tuning::kDwTileM * backward_tuning::kDwTileN;
   return activation_elements > dw_elements ? activation_elements : dw_elements;
 }
@@ -130,8 +130,8 @@ store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
                       bool wait_current, const Output &output = {}) {
   using TileMma =
       typename hopper::BF16MMASelector<TileN, cute::SM90::GMMA::Major::MN,
-                                       cute::SM90::GMMA::Major::MN, kStageK,
-                                       128U>::type;
+                                       cute::SM90::GMMA::Major::MN,
+                                       backward_tuning::kTileK, 128U>::type;
   constexpr std::uint32_t kMWaves = TileM == 64U ? 1U : TileM / kStageM;
   constexpr std::uint32_t kNAtoms = TileN / 64U;
   constexpr std::uint32_t kStoreRows = TileM == 64U ? 64U : 128U;
@@ -209,6 +209,7 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
   constexpr auto MajorA = cute::SM90::GMMA::Major::K;
   constexpr auto MajorB = cute::SM90::GMMA::Major::MN;
   constexpr auto StageCount = kActivationStages;
+  constexpr auto kStageK = backward_tuning::kActivationTileK;
   static_assert(Synchronization::kActivationWaitGroup <= 1U,
                 "Activation WGMMA supports zero or one outstanding group");
   static_assert(TileM == 64U || TileM == 128U);
@@ -223,7 +224,7 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
                                                    kStageK, 128U>::type;
   constexpr std::uint32_t kAStageElements = TileM * kStageK;
   constexpr std::uint32_t kBStageElements = TileN * kStageK;
-  constexpr auto kStageStorageElements = stage_storage_elements<StorageTileN>();
+  constexpr auto kStageStorageElements = activation_stage_elements<StorageTileN>();
   static_assert(kAStageElements + kBStageElements <= kStageStorageElements);
   auto *smem = reinterpret_cast<transport::BFloat16 *>(storage);
   auto *barriers = reinterpret_cast<ForwardBarrier *>(
@@ -304,7 +305,7 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
         for (int index = 0; index < TileMma::kNumAccum; ++index)
           cute::warpgroup_fence_operand(accum[index]);
         if constexpr (Synchronization::kActivationWaitGroup == 0U) {
-          // Complete this K64 group before releasing its operand stage. This
+          // Complete this K group before releasing its operand stage. This
           // avoids conservative WGMMA serialization in the unified entry.
           cute::warpgroup_wait<0>();
           release_stage(empty[stage]);
@@ -353,6 +354,7 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
                 std::uint32_t right_reduction_start, std::uint32_t reduction,
                 std::uint32_t output_width, std::uint32_t output_owner_row,
                 unsigned char *storage, std::uint32_t &pipeline) {
+  constexpr auto kStageK = backward_tuning::kTileK;
   using TileMma =
       typename hopper::BF16MMASelector<TileN, cute::SM90::GMMA::Major::MN,
                                        cute::SM90::GMMA::Major::MN, kStageK,
@@ -360,7 +362,7 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
   constexpr std::uint32_t kMWaves = TileM / kStageM;
   constexpr std::uint32_t kAStageElements = TileM * kStageK;
   constexpr std::uint32_t kBStageElements = TileN * kStageK;
-  constexpr auto kStageStorageElements = stage_storage_elements<StorageTileN>();
+  constexpr auto kStageStorageElements = kDwStageElements;
   static_assert(kAStageElements + kBStageElements <= kStageStorageElements);
   (void)output_width;
   const auto rank = cute::block_rank_in_cluster();
@@ -466,7 +468,7 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
         const auto n_tile = tile.n;
         if (tile.valid)
           store_tma_accumulator<
-              TileM, TileN, kDwStages * stage_storage_elements<StorageTileN>(),
+              TileM, TileN, kDwStages * kDwStageElements,
               Synchronization>(accum, output_store_map,
                                output_owner_row + m_tile * TileM,
                                n_tile * TileN, storage, true, false);

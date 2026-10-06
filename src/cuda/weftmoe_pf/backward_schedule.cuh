@@ -8,10 +8,11 @@ namespace weftmoe_pf::backward {
 struct Schedule {
   unsigned block, epilogue, dx;
   unsigned weight = 0U, weight_end = 0U;
+  unsigned weight_partition;
   bool weights_initialized = false;
 
   __device__ explicit Schedule(unsigned cluster)
-      : block(cluster), epilogue(cluster), dx(cluster) {}
+      : block(cluster), epilogue(cluster), dx(cluster), weight_partition(cluster) {}
 
   template <unsigned DuTiles, unsigned DxTiles, class Layout>
   __device__ __forceinline__ bool
@@ -97,17 +98,23 @@ struct Schedule {
       return false;
     const auto *rows = words + layout.dw_reduction_rows;
     const auto experts = a.dispatch.sizes.owned_expert_count;
-    if (!weights_initialized) {
-      std::uint64_t work = 0U;
-      for (unsigned expert = 0; expert < experts; ++expert)
-        work += rows[expert] * (kDw2Pairs + kDw1Pairs);
-      const auto cluster = blockIdx.x / 2U;
-      weight = weight_cut(rows, experts, work * cluster / clusters);
-      weight_end = weight_cut(rows, experts, work * (cluster + 1U) / clusters);
-      weights_initialized = true;
+    // Block-cyclic weighted intervals trade task length for expert locality.
+    // Adjacent intervals use identical cuts, so ownership stays disjoint even
+    // when a short interval rounds to zero tiles or spans empty experts.
+    const auto partitions = clusters * backward_tuning::kDwPartitionRounds;
+    for (; weight_partition < partitions;
+         weight_partition += clusters, weights_initialized = false) {
+      if (!weights_initialized) {
+        std::uint64_t work = 0U;
+        for (unsigned expert = 0; expert < experts; ++expert)
+          work += rows[expert] * (kDw2Pairs + kDw1Pairs);
+        weight = weight_cut(rows, experts, work * weight_partition / partitions);
+        weight_end = weight_cut(rows, experts, work * (weight_partition + 1U) / partitions);
+        weights_initialized = true;
+      }
+      if (weight_task(a, task))
+        return true;
     }
-    if (weight_task(a, task))
-      return true;
     terminal = true;
     return false;
   }

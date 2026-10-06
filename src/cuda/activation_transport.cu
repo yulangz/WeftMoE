@@ -978,11 +978,11 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        "Backward W1 MN-major");
+        "Backward W1 MN-major", backward_tuning::kActivationTileK);
     impl->backward_w2_map = make_bf16_tma_map_mn(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
-        "Backward W2 MN-major");
+        "Backward W2 MN-major", backward_tuning::kActivationTileK);
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -1119,11 +1119,11 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        "Backward W1 MN-major");
+        "Backward W1 MN-major", backward_tuning::kActivationTileK);
     impl->backward_w2_map = make_bf16_tma_map_mn(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
-        "Backward W2 MN-major");
+        "Backward W2 MN-major", backward_tuning::kActivationTileK);
   }
   return ForwardWeightLease(std::move(impl));
 }

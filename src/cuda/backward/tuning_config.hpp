@@ -53,6 +53,9 @@
 #ifndef WEFTMOE_BWD_TILE_K
 #define WEFTMOE_BWD_TILE_K 64
 #endif
+#ifndef WEFTMOE_BWD_ACTIVATION_TILE_K
+#define WEFTMOE_BWD_ACTIVATION_TILE_K 64
+#endif
 #ifndef WEFTMOE_BWD_DAB_STAGES
 #define WEFTMOE_BWD_DAB_STAGES 4
 #endif
@@ -107,6 +110,9 @@
 #endif
 #ifndef WEFTMOE_BWD_DW1_CLAIM_TILES
 #define WEFTMOE_BWD_DW1_CLAIM_TILES 4
+#endif
+#ifndef WEFTMOE_BWD_DW_PARTITION_ROUNDS
+#define WEFTMOE_BWD_DW_PARTITION_ROUNDS 1
 #endif
 #ifndef WEFTMOE_BWD_SETUP_THREADS
 #define WEFTMOE_BWD_SETUP_THREADS 256
@@ -189,6 +195,7 @@ inline constexpr std::uint32_t kActivationTileM =
 inline constexpr std::uint32_t kDwTileM = WEFTMOE_BWD_DW_TILE_M;
 inline constexpr std::uint32_t kDwTileN = WEFTMOE_BWD_DW_TILE_N;
 inline constexpr std::uint32_t kTileK = WEFTMOE_BWD_TILE_K;
+inline constexpr std::uint32_t kActivationTileK = WEFTMOE_BWD_ACTIVATION_TILE_K;
 inline constexpr std::uint32_t kDabStages = WEFTMOE_BWD_DAB_STAGES;
 inline constexpr std::uint32_t kDxStages = WEFTMOE_BWD_DX_STAGES;
 inline constexpr std::uint32_t kDw1Stages = WEFTMOE_BWD_DW1_STAGES;
@@ -219,6 +226,7 @@ inline constexpr std::uint32_t kDw2ClaimTiles =
     WEFTMOE_BWD_DW2_CLAIM_TILES;
 inline constexpr std::uint32_t kDw1ClaimTiles =
     WEFTMOE_BWD_DW1_CLAIM_TILES;
+inline constexpr std::uint32_t kDwPartitionRounds = WEFTMOE_BWD_DW_PARTITION_ROUNDS;
 inline constexpr std::uint32_t kSetupThreads = WEFTMOE_BWD_SETUP_THREADS;
 inline constexpr std::uint32_t kSetupIdleNanosleep =
     WEFTMOE_BWD_SETUP_IDLE_NANOSLEEP;
@@ -243,6 +251,7 @@ static_assert(kMainIntermediate % kDwTileN == 0U);
 static_assert((2U * kMainIntermediate) % kDwTileM == 0U);
 static_assert(kMainHidden % kDwTileN == 0U);
 static_assert(kTileK == 64U);
+static_assert(kActivationTileK == 64U || kActivationTileK == 128U);
 static_assert(kDabStages >= 2U && kDabStages <= 4U);
 static_assert(kDxStages >= 2U && kDxStages <= 4U);
 static_assert(kDw1Stages >= 2U && kDw1Stages <= 4U);
@@ -267,6 +276,7 @@ static_assert(kDw2ClaimTiles == 1U || kDw2ClaimTiles == 4U ||
               kDw2ClaimTiles == 8U || kDw2ClaimTiles == 16U);
 static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 4U ||
               kDw1ClaimTiles == 8U || kDw1ClaimTiles == 16U);
+static_assert(kDwPartitionRounds >= 1U && kDwPartitionRounds <= 128U);
 static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
               kSetupThreads % 32U == 0U);
 static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&

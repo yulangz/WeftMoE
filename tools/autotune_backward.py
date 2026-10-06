@@ -65,6 +65,7 @@ PARAMETER_MACROS = {
     "dw_tile_m": "WEFTMOE_BWD_DW_TILE_M",
     "dw_tile_n": "WEFTMOE_BWD_DW_TILE_N",
     "tile_k": "WEFTMOE_BWD_TILE_K",
+    "activation_tile_k": "WEFTMOE_BWD_ACTIVATION_TILE_K",
     "dab_stages": "WEFTMOE_BWD_DAB_STAGES",
     "dx_stages": "WEFTMOE_BWD_DX_STAGES",
     "dw1_stages": "WEFTMOE_BWD_DW1_STAGES",
@@ -85,6 +86,7 @@ PARAMETER_MACROS = {
     "epilogue_rows_per_task": "WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK",
     "dw2_claim_tiles": "WEFTMOE_BWD_DW2_CLAIM_TILES",
     "dw1_claim_tiles": "WEFTMOE_BWD_DW1_CLAIM_TILES",
+    "dw_partition_rounds": "WEFTMOE_BWD_DW_PARTITION_ROUNDS",
     "reduce_threads": "WEFTMOE_BWD_REDUCE_THREADS",
     "reduce_idle_nanosleep": "WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP",
     "unified_workers": "WEFTMOE_BWD_UNIFIED_WORKERS",
@@ -152,6 +154,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require_choice(config, "dx_tile_n", (128, 256))
     require_choice(config, "dx_claim_tiles", (1, 2, 4, 8, 16))
     require_choice(config, "return_window_scale", (1, 2))
+    require_choice(config, "dw_partition_rounds", (1, 2, 4, 8, 16, 32, 64, 128))
     require_choice(config, "dw_tile_m", (128, 256))
     require_choice(config, "dw_tile_n", (128, 256))
     require(config["main_hidden"] % config["dw_tile_m"] == 0,
@@ -163,7 +166,12 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require(config["main_hidden"] % config["dw_tile_n"] == 0,
             "dW1 N tile must divide hidden")
     require(config["tile_k"] == 64,
-            "the Hopper 128-byte-swizzle descriptor requires tile_k=64")
+            "the weight-gradient pipeline uses tile_k=64")
+    require_choice(config, "activation_tile_k", (64, 128))
+    unified_tuning.require_resources(
+        config["activation_tile_k"] == 64 or config["wgmma_n256_atom_n"] == 256 or
+        max(config["dab_tile_n"], config["dx_tile_n"]) == 128,
+        "split N256 WGMMA requires activation_tile_k=64")
     for key in ("dab_stages", "dx_stages", "dw1_stages", "dw2_stages"):
         require_choice(config, key, (2, 3, 4))
     require(config["dab_stages"] == config["dx_stages"],
@@ -217,7 +225,8 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
     space = constrain_transport_space(space, topology)
     unified_tuning.upgrade_legacy_groups(
         space, search=True,
-        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1})
+        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1,
+                        "activation_tile_k": 64, "dw_partition_rounds": 1})
     flat = flatten_groups(space, require_all=False)
     require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
             "hyperparameters must cover every tuning parameter and exclude model dimensions")
@@ -281,7 +290,8 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     require(document.get("schema") == 1, "Backward plan schema must be 1")
     unified_tuning.upgrade_legacy_groups(
         document.setdefault("fixed", {}),
-        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1})
+        extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1,
+                        "activation_tile_k": 64, "dw_partition_rounds": 1})
     required_sections = {
         "jit", "benchmark", "selection", "invariants", "fixed", "candidates"
     }
@@ -414,13 +424,12 @@ def dynamic_shared_memory(config: Mapping[str, Any]) -> int:
     pair_n = (config["main_intermediate"] % (2 * config["dab_tile_n"]) == 0
               and config["main_hidden"] % (2 * config["dx_tile_n"]) == 0)
     activation_m = config["tile_m"] if pair_n else config["tile_m"] // 2
-    activation_elements = (activation_m + storage_tile_n) * config["tile_k"]
+    activation_elements = (activation_m + storage_tile_n) * config["activation_tile_k"]
     dw_elements = (
         config["dw_tile_m"] + config["dw_tile_n"]
     ) * config["tile_k"]
-    stage_elements = max(activation_elements, dw_elements)
-    activation_arena = config["dab_stages"] * stage_elements
-    dw_arena = (config["dw1_stages"] * stage_elements +
+    activation_arena = config["dab_stages"] * activation_elements
+    dw_arena = (config["dw1_stages"] * dw_elements +
                 config["dw_tile_m"] * config["dw_tile_n"])
     barriers = 2 * (config["dab_stages"] + config["dw1_stages"])
     return 2 * max(activation_arena, dw_arena) + 8 * barriers
