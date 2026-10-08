@@ -3,6 +3,11 @@
 这是独立 CUDA 诊断，不改变正式 PF。问题是：为什么在 FC1 已加载的 A-stage
 上保存 X，vector 比 C7/C8 的 TMA 集成更快？不是测通用 memcpy 峰值。
 
+**术语澄清：本文件原来的 `copy` 是带 producer/ring 同步的 GM→SM→GM
+流程，不是裸 shared→global 吞吐。后文新增的独立 store 对照表明：去掉
+ring/input refill 后，多数配置 vector/TMA 持平，部分配置 TMA 更快。不能
+把原来的约 10% 差距解读成 vector 的裸拷贝能力更强。**
+
 ## 运行
 
 在仓库根目录，依赖 CUDA 和 CUTLASS headers，不依赖 Python、Weft runtime、
@@ -184,3 +189,79 @@ WGMMA 的跨 warp 等待解释参见
 C7/C8 在 cache-off 下也有回退，涉及完整 kernel 代码生成/物理行序等因素。
 实验发现 peeling loop 也不等于实际重复发送了 32 份数据；活跃 issuer
 只有一个线程，不能据静态反汇编夸大事务数量。
+
+## 2026-10-08 补充：独立 shared→global store
+
+新增 [tma_store_repro.cu](tma_store_repro.cu)，只依赖 CUDA/CUTLASS headers。
+没有 GEMM、GM→SM load、ring、source 覆盖、跨 CTA credit 或 multicast。
+每个 CTA 一次性准备不可变的 128 B-swizzled shared tile，随后写到互不重叠
+的 global tile。三种写法在同一个 kernel binary 内切换：
+
+- vector：256 threads 合作，真实 `LDS.128 → STG.128`；用 volatile inline
+  LDS 防止编译器把恒定源提升到寄存器、变成 register→global 测试。
+- TMA serial：一次 tensor store 对应一个 tile，每个 tile commit + full
+  wait。一次 election 包围整个循环，避免 peeling，并保持 issuer 一致。
+- TMA queued：每个 tile commit + `wait_group 7`，允许最多八组在途，
+  最后 full wait。源始终不变，因此没有逐 tile 源复用的等待需求。
+
+shape 编译期固定，避免运行时整数除法影响地址计算；无 spill。两者都包含
+相同的一次 shared 初始化、proxy fence 和同步，分配/数值检查在计时外。
+`none` 测出的准备及 launch 开销约 5–9 us，下表没有人为扣除它。
+所有模式都计到 kernel 完成，不能拿 TMA 发起耗时与 vector 完成耗时比较。
+
+```bash
+mkdir -p build/tma_store_repro_20261008
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -lineinfo \
+  -gencode arch=compute_90a,code=sm_90a --expt-relaxed-constexpr \
+  -I/opt/cutlass/include benchmarks/tma_store_repro.cu \
+  -lcuda -o build/tma_store_repro_20261008/repro
+
+# 参数：tile_rows global_width output_MiB grid_multiplier samples device [mode]
+# 64 rows × K64 × BF16 = 每 tile 8 KiB；width64 连续，width4096 为 PF 跨行布局。
+build/tma_store_repro_20261008/repro 64 64 512 1 40 0
+build/tma_store_repro_20261008/repro 64 4096 512 1 40 0
+build/tma_store_repro_20261008/repro 64 4096 512 4 40 0
+```
+
+L20X GPU0/132 SM，SM 设定 1620 MHz，memory 3201 MHz，写出 512 MiB。
+8 warmup、40 measured、2 ms 计时外间隔；配置正反序两轮，各轮内部 mode
+顺序交替。下表为两轮 median 的均值，单位 **us**：
+
+| tile | global 布局 | grid CTAs | vector | TMA serial | TMA queued |
+|---|---|---:|---:|---:|---:|
+| 4 KiB | 连续 | 132 | 126.376 | 126.776 | 126.872 |
+| 4 KiB | 连续 | 528 | 128.568 | 128.648 | 128.800 |
+| 4 KiB | PF 跨行 | 132 | 132.608 | 130.776 | 132.344 |
+| 4 KiB | PF 跨行 | 528 | 138.608 | 133.688 | 134.432 |
+| 8 KiB | 连续 | 132 | 131.216 | 131.904 | 130.872 |
+| 8 KiB | 连续 | 528 | 133.776 | 131.792 | 132.240 |
+| 8 KiB | PF 跨行 | 132 | 133.408 | 133.232 | 133.344 |
+| 8 KiB | PF 跨行 | 528 | 151.600 | 134.176 | 136.536 |
+| 32 KiB | 连续 | 132 | 131.528 | 131.320 | 131.544 |
+| 32 KiB | 连续 | 528 | 132.200 | 131.560 | 132.608 |
+| 32 KiB | PF 跨行 | 132 | 136.280 | 136.400 | 136.104 |
+| 32 KiB | PF 跨行 | 528 | 148.888 | 135.728 | 138.264 |
+
+多数配置差异约 0–2%，视为基本持平，而不是 vector 或 TMA 的稳定优势。
+PF 跨行/grid528 时，TMA serial 的 8/32 KiB 耗时比 vector 低
+**11.49% / 8.84%**，两轮方向一致。8 KiB/grid132 的有效写出带宽两者
+都约 **4.0 TB/s**。这是持续写出的有效吞吐，不是一次小块拷贝的指令延迟，
+也不是 GM→GM memcpy 或 GM→SM load 的比较。更多 TMA group 在途不保证
+更快；本例 grid 级并发已很高，queued 没有稳定胜过 serial。
+
+grid multiplier 只是 launch CTAs / SM 数，不强制逐 SM 均匀驻留。
+PF 本身还有约 226 KiB shared 预留；这里 grid528 的结果不能直接移植为
+PF 的驻留配置。新旧样例也不是只改变一项的实验：去掉了 input refill、
+ring credit 和大 shared 预留，所以不能把两张表的差值归到某一条 wait。
+
+全部 96 条记录逐 word 校验通过；定向 memcheck/racecheck 零错误。
+100 ms NVML 采样均为 1620 MHz、无 SW power cap。另行 NCU application
+replay 下，8 KiB/PF 布局的 vector/TMA、grid132/528 有效频率约
+1579–1582 MHz，差异不到 0.2%；DRAM 写出均约 534.6–534.7 MB。
+依然应区分设定时钟和 kernel 窗口内的有效频率，profiler 时间不混入上表。
+
+最终源码 SHA256 为 `eedb764e32ce664ee0b9259172b607b38ef59aa375f8e222cd7e0e61a534d1f5`。
+原始样本、时钟、NCU、检查和反汇编均在 `build/tma_store_repro_20261008/`：
+`matrix_r{0,1}.log`、`clocks.csv`、`ncu_*.{csv,log}`、`memcheck.log`、
+`racecheck.log`、`repro.sass`。早期 `probe_*.log` 使用了运行时 shape，
+不属于最终结果，不与静态地址计算的上述数据混用。

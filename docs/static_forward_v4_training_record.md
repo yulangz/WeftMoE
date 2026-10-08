@@ -1,5 +1,21 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：澄清 ring copy 与裸 store 的性能
+
+补充 [独立 shared→global store 对照](../benchmarks/pf_saved_x_repro.md)，
+移除 GM→SM input refill、ring/credit、GEMM，源 shared tile 保持不变。
+1620 MHz 时钟设置、512 MiB 写出、两轮正反序；8 KiB tile/grid132 下，
+连续布局 vector/TMA 为 **131.216 / 131.904 us**，PF 跨行布局为
+**133.408 / 133.232 us**，基本持平。PF 跨行/grid528 下为
+**151.600 / 134.176 us**，TMA 快 11.49%；32 KiB 同配置快 8.84%。
+这里 TMA 指逐 tile full wait，增加到八组在途并未稳定更快。
+
+因此下节约 10% 的差距只能称为 **ring copy 工作流差距**，不能解释为
+vector 的裸拷贝能力更强。持续吞吐不等于单次指令延迟；新旧样例并非
+只改一个因素，不能据此把差距精确归到某条 wait。正式 PF 未改动。
+全部 96 条记录数值校验通过，定向 memcheck/racecheck 零错误；时钟的
+NVML/NCU 区别、布局/并发边界及复现命令见上述说明。
+
 ## 2026-10-08：Saved-X vector/TMA 最小复现与归因
 
 新增独立 [CUDA 样例与实验说明](../benchmarks/pf_saved_x_repro.md)，不修改正式
