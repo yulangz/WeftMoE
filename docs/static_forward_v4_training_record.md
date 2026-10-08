@@ -1,5 +1,111 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：当前 PF 的 FC1 S / FC2 contribution 写回消融
+
+结论：**保留 FC1 完整 S tile 的 TMA、FC2 contribution 的 vector**。
+新候选没有形成稳定的端到端收益；只保留实验 patch 与数据，不增加生产开关。
+这是当前 C5/Flash 流水的完整 FWD 实验，不是下面的 Saved-X、ring-copy 或
+裸 store 样例；历史 FT 的小模型收益也不能代替此次验证。
+
+### 单因素与布局对照
+
+| 候选 | 唯一目标及实现差异 |
+|---|---|
+| C5 | 当前生产：FC1 S 为 swizzled shared → tensor TMA，FC2 为 swizzled shared → 16B vector |
+| S-vector | 仅关闭 FC1 S 的 TMA，复用已有 shared → 16B vector helper；每个写线程 fence、math join 后发布 `fc1_done`，尾块不变 |
+| C-linear-vector | FC2 改为线性 row-major shared staging，再按原目标地址逐行 vector 写出；为下一项提供相同布局的对照 |
+| C-linear-TMA | 在上一项相同 staging 上，每 warp 的 lane0 按静态行号发 512B bulk TMA；每 tile 等源读取完成，全部 FC2 结束后、combine barrier 前再 full wait |
+
+FC1 的完整 S 输出为 M128×N128 BF16，共 32 KiB，两个 N64 tensor TMA
+issuer 在发布 S-ready 前都必须完成。FC2 contribution 的不同物理行对应
+不同 source GPU/token，不能直接套用这个规则二维 tensor store；本候选测的是
+**每行 512B 的 bulk TMA**。既有 swizzle 不能直接按整行 raw bulk copy，所以
+额外测线性 staging 的 vector 对照，不把它的代价全归给 TMA 指令。
+
+C-linear-TMA 每 tile 只执行 `cp.async.bulk.wait_group.read 0` 加 math join，
+保护 shared 源复用；最终执行 `cp.async.bulk.wait_group 0`，然后走原来的
+跨 rank publication/combine barrier。后续 FC1 S 的同 issuer full wait 也可能
+提前 drain 已提交的 contribution，因此不声称所有 FC2 写入都一直延后到末尾。
+没有强加逐 FC2 tile 的远端完成等待，没有新增 GM/shared buffer、Return
+relay、额外 kernel 或改变 contribution 地址/字节数。`fc2_done` 仍仅为 S 的
+读退休 credit。Saved X/GU、数值舍入、GEMM 和路由均不改。
+
+### 正式结果
+
+单机 EP8，8×L20X，SM 设置 1620 MHz、memory 3201 MHz；
+H4096/I2048/E256/top-k6，BF16，M128/N256/K64、3 stages、cluster2，
+B128/D2。tokens/rank 按 nominal 附近 10% 标准差随机波动，route bias std=0.5，
+seed=123；全部候选逐 rank 的 token trace、route/gate hash 一致。
+
+每组完整 prime 32-step trace，再 8 warmup + 24 measured；先
+C5 off/on → S-vector off/on → C-linear-vector off/on → C-linear-TMA off/on，
+再完全反序。表中为两次 **rank-max FWD wall p50 的均值**，单位 ms。
+计时包含输入 staging、同步与 tape 释放；缓存开启还包含 mini-notify、当次
+缓存空间准备和写出。不可变权重只准备一次，不含 BWD，也不是纯 GEMM/store。
+全部编译和正确性检查结束后才开始正式计时。
+
+| 写回方案 | inference 8K | inference 20K | 缓存 X/GU 8K | 缓存 X/GU 20K |
+|---|---:|---:|---:|---:|
+| C5：FC1 TMA + FC2 vector | 6.838 | 16.659 | 7.776 | 17.953 |
+| 仅 FC1 改 vector | 6.891 | 16.782 | 7.828 | 17.912 |
+| FC2 线性 staging + vector | 6.955 | 17.002 | 7.844 | 18.124 |
+| FC2 线性 staging + bulk TMA | 6.887 | 16.913 | 7.822 | 18.029 |
+
+- FC1 改 vector：inference 慢 **0.77% / 0.74%**，缓存开启为
+  **+0.67% / −0.23%**。没有足够收益支持替换已有 S-TMA；小于 1% 的差距
+  应视为接近，不宣称 TMA 有显著、普适的优势。
+- FC2 改线性 staging + vector：inference 慢 **1.70% / 2.05%**。
+  这里改变了 accumulator→shared staging 及取数地址计算，不是仅改 GM 地址。
+- 在相同线性 staging 下，bulk TMA 平均比 vector 快 **0.97% / 0.52%**
+  （缓存开启为 **0.28% / 0.53%**）；反序 20K 两者几乎持平，不能称稳定
+  的明显收益。它没有补回相对生产 swizzled/vector 的全部代价：最终 inference
+  比 C5 慢 **0.71% / 1.52%**，缓存开启慢 **0.58% / 0.42%**。
+
+所以这次支持保留当前集成方式，不支持“vector 裸拷贝天然更快”，也没有穷尽
+所有 tensor-map/scatter TMA 实现。进一步优化需要同时处理 epilogue staging、
+发起粒度与完成条件，不能只替换 store 指令并忽略配套成本。
+
+### 门禁、产物与复现
+
+三个候选均通过 T256/8K/20K 普通缓存 FWD、20K 强热点（route bias std=8）、
+8K/20K inference 的 PyTorch 对照，共 288 个 rank/sample 比较；最大 relative
+L2 为 3.1043e-4，最大绝对误差 6.1036e-5。C-linear-TMA 另通过定向 local-main
+memcheck/racecheck：8 ranks 均 0 errors / 0 hazards。这不是完整 BWD 的门禁，
+本轮没有修改或重新验收 BWD 性能。四个产物均 REG168/STACK0/静态 shared1024/
+LOCAL0，动态 shared226304 bytes；同一缓存模式下 workspace 容量逐项一致。
+
+UTC 12:06:13–12:11:46 的 500 ms NVML 轮询共 5320 个 GPU 样本（454 个
+util≥80%），SM 全部 1620、memory 全部 3201 MHz。这是采样与设置，不代表
+逐周期有效频率测量。结束后 8 卡均空闲，无残留 benchmark/monitor。
+
+原始 rank-max samples、每轮 p50、trace/hash、校验、时钟摘要及 library SHA256
+见 [`pf_epilogue_store_20261008.json`](../benchmarks/pf_epilogue_store_20261008.json)。
+候选保存在 [`pf_epilogue_store.patch`](../benchmarks/pf_epilogue_store.patch)，基于
+`8606637` 的 C5 源码；当前生产源码已恢复，冻结产物未删除。
+本机产物为 `build/pf_megamoe_20261008/cache_{c5,svec,cvec,ctma}/f47b1119685a/`，
+正式日志为同目录 `epilogue_{候选}_{off,on}_{0,1}_ep8.log`。
+
+复现时先应用 patch，构建模式 0/1/2/3 分别对应表中四行，所有模式使用同一
+`configs/pf_inference_flash_20261008/` profile。例如模式 3：
+
+```bash
+git apply benchmarks/pf_epilogue_store.patch
+NVCCFLAGS="-lineinfo -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I$PWD/configs/pf_inference_flash_20261008 -DWEFTMOE_PF_EPILOGUE_ABLATION=3" \
+  python build_native.py lib --jobs 4 --output build/pf_epilogue_mode3/libweftmoe.so
+python tools/build_tensor_runtime.py --library build/pf_epilogue_mode3/libweftmoe.so
+OMP_NUM_THREADS=1 WEFTMOE_AUTOTUNE_TABLE="" \
+WEFTMOE_TENSOR_EXTENSION="$PWD/build/pf_epilogue_mode3/_runtime.cpython-312-x86_64-linux-gnu.so" \
+  python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  benchmarks/torchrun_megamoe_prefill.py --backend pf \
+  --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --ring-tokens 128 --ring-depth 2 --prepared-weights \
+  --tokens 8192 20480 --forward-cache off --warmups 8 --samples 24
+```
+
+缓存对照改 `--forward-cache on`；数值检查加 `--verify --warmups 0 --samples 2`。
+按本机 CUDA/NCCL 环境设置库路径及网卡，保持八卡空闲和相同时钟。全部构建
+完成后再按上述正反序计时；实验结束用 `git apply -R` 撤回该候选 patch。
+
 ## 2026-10-08：更正独立 store 样例，补测连续地址高 CTA 数
 
 初版独立样例的 vector LDS 实际被 ptxas 外提，之前称为逐 tile 的

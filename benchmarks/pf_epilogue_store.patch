@@ -1,0 +1,121 @@
+diff --git a/src/cuda/weftmoe_pf/local_compute.cuh b/src/cuda/weftmoe_pf/local_compute.cuh
+index 9964097..e6032bf 100644
+--- a/src/cuda/weftmoe_pf/local_compute.cuh
++++ b/src/cuda/weftmoe_pf/local_compute.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+
+ #include "cuda/weftmoe_pf/local_schedule.cuh"
++#include "cuda/weftmoe_pf/epilogue_ablation.cuh"
+
+ namespace weftmoe_pf::local {
+ #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+@@ -135,8 +136,12 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
+         s.empty[retirement].arrive(lane);
+     }
+     if (t.fc2) {
++#if WEFTMOE_PF_EPILOGUE_ABLATION >= 2
++      ablate_fc2_store<WEFTMOE_PF_EPILOGUE_ABLATION == 3>(a, s, accum, t);
++#else
+       static_v4_push_fc2_tile<Mma, false, kN, true, kM, kMathThreads, true>(
+           a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
++#endif
+       // This is an S read-retirement credit, not contribution publication.
+       // All TMA/WGMMA reads and the math join have finished. The terminal
+       // rank barrier publishes remote stores once, without draining them at
+@@ -152,13 +157,14 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
+       if (a.saved_ab)
+         static_v4_save_fc1_tile<kN>(a, accum, t.rows, t.column * kN / 2U,
+                                   t.block);
+-      static_v4_store_fc1_tile<kN, kM * kN, false, true, true,
++      static_v4_store_fc1_tile<kN, kM * kN, false,
++                              WEFTMOE_PF_EPILOGUE_ABLATION != 1, true,
+                               forward_tuning::kLocalPrefillFastMath>(
+           a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
+           t.block, &output_map);
+       // Full tiles use a single TMA issuer which has already waited for
+       // global completion. Compact tails use stores from every math thread.
+-      if (t.rows != kM) {
++      if (WEFTMOE_PF_EPILOGUE_ABLATION == 1 || t.rows != kM) {
+         __threadfence();
+         collective_scope_sync<kMathThreads, 7U>();
+       } else if constexpr (kN > 128U) {
+@@ -171,6 +177,13 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
+       collective_scope_sync<kMathThreads, 7U>();
+     }
+   }
++#if WEFTMOE_PF_EPILOGUE_ABLATION == 3
++  // Source-read completion recycles shared output per tile; destination
++  // completion is needed only before the terminal contribution barrier.
++  if ((threadIdx.x & 31U) == 0U)
++    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
++  collective_scope_sync<kMathThreads, 7U>();
++#endif
+   if (threadIdx.x == 0U) {
+     const auto now = device_globaltimer_ns();
+     if (started_fc1 && !previous_fc2)
+diff --git a/src/cuda/weftmoe_pf/epilogue_ablation.cuh b/src/cuda/weftmoe_pf/epilogue_ablation.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/cuda/weftmoe_pf/epilogue_ablation.cuh
+@@ -0,0 +1,60 @@
++#pragma once
++
++// Temporary experiment, exported as a patch rather than a production option.
++// 0: production; 1: FC1 vector; 2: FC2 linear/vector; 3: FC2 linear/bulk TMA.
++#ifndef WEFTMOE_PF_EPILOGUE_ABLATION
++#define WEFTMOE_PF_EPILOGUE_ABLATION 0
++#endif
++
++#if WEFTMOE_PF_EPILOGUE_ABLATION >= 2
++namespace weftmoe_pf::local {
++#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
++template <bool Tma>
++__device__ __forceinline__ void ablate_fc2_store(
++    const ForwardKernelArgs &a, Shared &s, const float *accum, const Task &t) {
++  const auto lane = threadIdx.x & 31U;
++  const auto warp = threadIdx.x / 32U;
++  const auto row0 = warp * 16U + lane / 4U;
++#pragma unroll
++  for (unsigned index = 0; index < Mma::kNumAccum / 4U; ++index) {
++    const auto column = index * 8U + (lane % 4U) * 2U;
++    *reinterpret_cast<__nv_bfloat162 *>(s.output + row0 * kN + column) =
++        __float22bfloat162_rn(make_float2(accum[index * 4U], accum[index * 4U + 1U]));
++    *reinterpret_cast<__nv_bfloat162 *>(s.output + (row0 + 8U) * kN + column) =
++        __float22bfloat162_rn(make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U]));
++  }
++  if constexpr (Tma)
++    cute::tma_store_fence();
++  collective_scope_sync<kMathThreads, 7U>();
++  if constexpr (Tma) {
++    if (lane == 0U) {
++#pragma unroll
++      for (unsigned row = warp; row < kM; row += kMathThreads / 32U) {
++        if (row < t.rows) {
++          auto *destination = static_cast<transport::BFloat16 *>(
++              a.ring.rows[t.block * kM + row].output) + t.column * kN;
++          cute::SM90_BULK_COPY_S2G::copy(s.output + row * kN, destination, kN * 2U);
++        }
++      }
++      cute::tma_store_arrive();
++      asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
++    }
++  } else {
++    constexpr auto row_lanes = kN / 8U;
++#pragma unroll
++    for (unsigned row = threadIdx.x / row_lanes; row < kM;
++         row += kMathThreads / row_lanes) {
++      if (row < t.rows) {
++        const auto column = (threadIdx.x % row_lanes) * 8U;
++        auto *destination = static_cast<transport::BFloat16 *>(
++            a.ring.rows[t.block * kM + row].output) + t.column * kN;
++        *reinterpret_cast<uint4 *>(destination + column) =
++            *reinterpret_cast<const uint4 *>(s.output + row * kN + column);
++      }
++    }
++  }
++  collective_scope_sync<kMathThreads, 7U>();
++}
++#endif
++} // namespace weftmoe_pf::local
++#endif
