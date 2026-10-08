@@ -14,7 +14,8 @@ static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
 }
 
 template <unsigned Fc1TileN, unsigned ScratchElements,
-          bool RetainBackwardState = false, bool TmaStore = false, class Args>
+          bool RetainBackwardState = false, bool TmaStore = false,
+          bool PrivateScratch = false, class Args>
 __device__ __forceinline__ void static_v4_store_fc1_tile(
     const Args &a, transport::BFloat16 *tile, const float *accum,
     transport::BFloat16 *output, const float *gates, std::uint64_t row,
@@ -38,8 +39,9 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     // original direct epilogue rather than staging a partial atom.
     // Training packs G/U into two additional retired B planes for vector
     // checkpoint writeback in canonical row order.
-    cutlass::arch::NamedBarrier::sync(
-        kMathThreads, physical_barrier<true>(kMathReadyBarrier));
+    if constexpr (!PrivateScratch)
+      cutlass::arch::NamedBarrier::sync(
+          kMathThreads, physical_barrier<true>(kMathReadyBarrier));
 #pragma unroll
     for (unsigned index = 0; index < kOutputN / 8U; ++index) {
       const auto *g = accum + index * 8U;

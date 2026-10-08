@@ -7,6 +7,7 @@ namespace weftmoe_pf {
 // source route id into the owning rank's symmetric table. X and gates are
 // staged once into source-local symmetric storage, then destination control
 // warps pull the routed rows.
+template <bool MaterializeGeometry = true>
 __device__ __noinline__ void
 route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   constexpr auto kMathThreads = forward_tuning::kMathWarpgroups * 128U;
@@ -124,7 +125,10 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   }
   rank_barrier<kMathThreads, kControlThreads, false, false>(a);
 
-  build_geometry<kMathThreads, kControlThreads>(a);
+  if constexpr (MaterializeGeometry)
+    build_geometry<kMathThreads, kControlThreads>(a);
+  else
+    grid_sync<kMathThreads, kControlThreads>(a);
   collective_scope_sync<forward_tuning::kUnifiedThreads,
                         kCollectiveJoinBarrier>();
 }

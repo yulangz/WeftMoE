@@ -5,6 +5,7 @@
 #include <weftmoe/cuda/backward.hpp>
 #include <cstdlib>
 #include <map>
+#include <optional>
 
 namespace py = pybind11;
 using namespace weftmoe;
@@ -169,19 +170,21 @@ class Runtime {
   }
 
   py::object eager_inference(py::object x, py::object routes, py::object gates,
-                             py::object w1, py::object w2, std::uintptr_t caller_stream) {
+                             py::object w1, py::object w2, std::uintptr_t caller_stream,
+                             std::optional<unsigned> layer = std::nullopt) {
     if (training_) throw std::invalid_argument("eager_inference is inference-only");
     drain_eager_inference();
     auto caller = reinterpret_cast<cudaStream_t>(caller_stream);
     check_cuda(cudaEventRecord(input_ready_, caller));
     check_cuda(cudaStreamWaitEvent(stream_, input_ready_));
-    return forward(x, routes, gates, w1, w2)->output;
+    return execute_forward(x, routes, gates, w1, w2, true, layer)->output;
   }
 
   py::object eager_inference_async(py::object x, py::object routes,
                                    py::object gates, py::object w1,
                                    py::object w2,
-                                   std::uintptr_t caller_stream) {
+                                   std::uintptr_t caller_stream,
+                                   std::optional<unsigned> layer = std::nullopt) {
     if (training_)
       throw std::invalid_argument("eager_inference_async is inference-only");
     // There is one persistent transport workspace.  Reclaim the preceding
@@ -191,7 +194,7 @@ class Runtime {
     auto caller = reinterpret_cast<cudaStream_t>(caller_stream);
     check_cuda(cudaEventRecord(input_ready_, caller));
     check_cuda(cudaStreamWaitEvent(stream_, input_ready_));
-    auto tape = execute_forward(x, routes, gates, w1, w2, false);
+    auto tape = execute_forward(x, routes, gates, w1, w2, false, layer);
     // Preserve ordinary PyTorch stream semantics without completing the work
     // on the host: consumers on caller wait for the output-ready CUDA event.
     tape->forward.wait_workspace_on(caller);
@@ -202,14 +205,15 @@ class Runtime {
 
   py::dict profile_inference(py::object x, py::object routes,
                              py::object gates, py::object w1, py::object w2,
-                             std::uintptr_t caller_stream) {
+                             std::uintptr_t caller_stream,
+                             std::optional<unsigned> layer = std::nullopt) {
     if (training_)
       throw std::invalid_argument("profile_inference is inference-only");
     drain_eager_inference();
     auto caller = reinterpret_cast<cudaStream_t>(caller_stream);
     check_cuda(cudaEventRecord(input_ready_, caller));
     check_cuda(cudaStreamWaitEvent(stream_, input_ready_));
-    auto tape = execute_forward(x, routes, gates, w1, w2, true);
+    auto tape = execute_forward(x, routes, gates, w1, w2, true, layer);
     const auto &timings = tape->forward.timings();
     py::dict result;
     result["output"] = tape->output;
@@ -237,7 +241,8 @@ class Runtime {
 
   std::shared_ptr<Tape> execute_forward(py::object x, py::object routes,
                                         py::object gates, py::object w1,
-                                        py::object w2, bool synchronize) {
+                                        py::object w2, bool synchronize,
+                                        std::optional<unsigned> layer = std::nullopt) {
     cudaStreamCaptureStatus status;
     if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone)
       throw std::runtime_error("dynamic forward requires preparation before CUDA Graph capture");
@@ -263,13 +268,17 @@ class Runtime {
       input = producer.publish_activations(
           static_cast<const transport::BFloat16 *>(pointer(x)),
           elements(x), tokens, hidden_, owner(x));
-      auto packed_w1 = empty({elements(w1)}, "bfloat16");
-      weights = producer.publish_weights(
-          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
-          config_.num_experts / config_.topology.world_size,
-          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_,
-          binding(packed_w1));
+      if (layer) {
+        weights = prepared_inference_weights(*layer, producer, w1, w2);
+      } else {
+        auto packed_w1 = empty({elements(w1)}, "bfloat16");
+        weights = producer.publish_weights(
+            static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
+            static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+            config_.num_experts / config_.topology.world_size,
+            rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_,
+            binding(packed_w1));
+      }
       // Mini Notify already supplies the exact tape size. Prepare inputs and
       // saved tensors under one allocation agreement before entering main.
       tape->output = empty({tokens, hidden_}, "bfloat16");
@@ -415,6 +424,33 @@ class Runtime {
   }
 
  private:
+  const ForwardWeightLease &prepared_inference_weights(
+      unsigned layer, ExternalCudaProducer &producer,
+      const py::object &w1, const py::object &w2) {
+    const auto w1_address = reinterpret_cast<std::uintptr_t>(pointer(w1));
+    const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
+    auto entry = inference_weights_.find(layer);
+    if (entry == inference_weights_.end()) {
+      // The immutable packed copy belongs to a resident layer, not a token
+      // bucket or invocation. Eager and graph inference share its lifetime.
+      auto weight_producer = make_external_cuda_producer(
+          producer.context(), execution_.device_ordinal(), stream_,
+          owner(w1), "inference-weights");
+      auto weights = weight_producer.publish_weights(
+          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
+          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+          config_.num_experts / config_.topology.world_size,
+          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
+      entry = inference_weights_.emplace(
+          layer, InferenceWeights{std::move(weights), w1_address, w2_address}).first;
+    } else if (entry->second.w1 != w1_address || entry->second.w2 != w2_address) {
+      throw std::runtime_error(
+          "Expert addresses changed: discard outer graphs and call "
+          "invalidate_inference_layer(layer) before re-preparation");
+    }
+    return entry->second.lease;
+  }
+
   void prepare_bucket(std::uint64_t tokens) {
     if (tokens > max_tokens_) throw std::invalid_argument("inference token capacity exceeded");
     auto bucket = std::make_unique<InferenceBucket>();
@@ -456,24 +492,7 @@ class Runtime {
         key.second, hidden_, owner(x));
     const auto w1_address = reinterpret_cast<std::uintptr_t>(pointer(w1));
     const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
-    auto weight_entry = inference_weights_.find(key.first);
-    if (weight_entry == inference_weights_.end()) {
-      // Packed W1 is immutable for the layer's residency, not specific to a
-      // token bucket. Its lease is session-scoped and can serve all buckets.
-      auto weights = producer.publish_weights(
-          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
-          config_.num_experts / config_.topology.world_size,
-          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
-      weight_entry = inference_weights_.emplace(
-          key.first, InferenceWeights{std::move(weights), w1_address, w2_address}).first;
-    } else if (weight_entry->second.w1 != w1_address ||
-               weight_entry->second.w2 != w2_address) {
-      throw std::runtime_error(
-          "Expert addresses changed: discard outer graphs and call "
-          "invalidate_inference_layer(layer) before re-preparation");
-    }
-    const auto &weights = weight_entry->second.lease;
+    const auto &weights = prepared_inference_weights(key.first, producer, w1, w2);
     auto plan = std::make_unique<InferencePlan>();
     plan->output = empty({key.second, hidden_}, "bfloat16");
     plan->x = x;
@@ -570,9 +589,15 @@ PYBIND11_MODULE(_runtime, m) {
       .def("backward", &Runtime::backward)
       .def("graph_forward", &Runtime::graph_forward)
       .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)
-      .def("eager_inference", &Runtime::eager_inference)
-      .def("eager_inference_async", &Runtime::eager_inference_async)
-      .def("profile_inference", &Runtime::profile_inference)
+      .def("eager_inference", &Runtime::eager_inference,
+           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("caller_stream"), py::arg("layer") = std::nullopt)
+      .def("eager_inference_async", &Runtime::eager_inference_async,
+           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("caller_stream"), py::arg("layer") = std::nullopt)
+      .def("profile_inference", &Runtime::profile_inference,
+           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("caller_stream"), py::arg("layer") = std::nullopt)
       .def("drain_eager_inference", &Runtime::drain_eager_inference)
       .def("retire_peer_mappings", &Runtime::retire_peer_mappings)
       .def("usage", &Runtime::usage);

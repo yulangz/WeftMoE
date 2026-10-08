@@ -68,6 +68,7 @@ namespace {
 #include "cuda/forward/device_kernels.cuh"
 
 #include "cuda/weftmoe_dt/kernel.cuh"
+#include "cuda/weftmoe_pf/local_kernel.cuh"
 
 #include "cuda/backward/device_kernels.cuh"
 
@@ -5292,6 +5293,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           const bool decode = args.fused_inference_routes &&
               weftmoe_dt::eligible(state->config, layout.static_ring);
+          const bool local_prefill = args.fused_inference_routes &&
+              local_prefill_streaming(state->config);
+          if (local_prefill)
+            kStaticUnified = weftmoe_pf::local::kernel;
           // Arithmetic variants share the same physical blocks and rank
           // protocol, so unequal sources can select different M shapes.
           const bool wide_decode =
@@ -5319,11 +5324,18 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               decode
                   ? (wide_decode ? sizeof(weftmoe_dt::Shared<64U>)
                                  : sizeof(weftmoe_dt::Shared<16U>))
-                  : forward_unified_detail::shared_bytes<true>(id.world_size);
+                  : (local_prefill ? sizeof(weftmoe_pf::local::Shared)
+                                   : forward_unified_detail::shared_bytes<true>(id.world_size));
           const bool pdl = programmatic_launch::enabled();
           const auto error =
               decode ? backend->prepare_unified_launch<>(
                            reinterpret_cast<const void *>(decode_kernel), smem,
+                           forward_main_compute_ctas, threads,
+                           forward_tuning::kClusterSize, pdl, false,
+                           &max_active_clusters)
+                     : local_prefill ? backend->prepare_unified_launch<
+                           weftmoe_pf::local::Resources>(
+                           reinterpret_cast<const void *>(kStaticUnified), smem,
                            forward_main_compute_ctas, threads,
                            forward_tuning::kClusterSize, pdl, false,
                            &max_active_clusters)

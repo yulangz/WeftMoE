@@ -1,5 +1,71 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：PF 单机 inference 对齐 MegaMoE（进行中）
+
+已切回 `refactor/static-forward-v4`；V3 恢复分支及容量消融分支保留。
+本轮目标为 EP8、H4096/I2048/E256/top-k6、8K/20K，无训练激活缓存。
+新入口先显式 opt-in，不以尚未追平的候选替换已验收训练或跨机 profile。
+
+本轮步骤及当前结论：
+
+- M1：完整 source contribution、expert-global M128、三个 Pull warp、
+  producer/math 独立静态任务流、独立 epilogue scratch、统一连续 TMA stages。
+  大 expert 按 activation ring 深度切 wave，保留有界 X/S 复用。功能通过，
+  但初版 20K 比旧 PF 慢，不能把架构迁移本身登记为性能收益。
+- M2：Hoist WGMMA descriptor，移除 private scratch 不需要的 FC1 前置 join，
+  完整 TMA tile 不再执行全 math 的冗余 threadfence/join；math/control
+  register 配额改为 208/80，并使用匹配的 host quota audit。
+  相邻 screening 的 kernel 耗时下降约 3%。
+- M3：最终 Reduce 改为 warp/token、每 lane 16B 向量传输，top-k order 放在
+  warp registers；FP32 求和次序不变。20K rank0 Reduce 中位数从
+  2.253 ms 降至 1.012 ms，rank-max kernel 从 25.864 ms 降至 24.001 ms。
+- M4：contribution 改为 MegaMoE 同样的 `[top_k,Tmax,H]`；单独消融未获得
+  稳定收益，不能将“热点 expert 地址跨度更小”当作已证实的主要性能原因。
+  同时 eager 可显式按 layer 复用不可变权重，沿用 graph 的 invalidate/close
+  机制，不缓存 X、route、gate/up 或其它计算结果。训练仍每次发布新权重。
+
+以下是定位用单轮 screening，不是最终验收表。32 步相同正态变长/热点随机
+trace（token std=10%、route bias std=0.5），完整 prime，8 warmup + 24 measured，
+1620 MHz；表为每步 rank-max 的 p50，单位 ms。不是模型采集 trace。
+M1–M3 kernel 数字不包含每次 W1 repack；M4 为预准备权重后的 kernel 数字。
+
+| 版本 | 8K kernel | 20K kernel | 备注 |
+|---|---:|---:|---|
+| 旧 PF（冻结已验收库） | 9.201 | 23.197 | 原 source-window 工作流 |
+| M1 | 9.230 | 26.762 | 功能迁移，20K 回退 |
+| M2 | 8.939 | 25.864 | 同步/descriptor/register 精简 |
+| M3 | 8.443 | 24.001 | 向量化 Reduce |
+| M3，预准备权重复测 | 8.448 | 24.286 | 和 M4 相同 host 权重策略 |
+| M4 | 8.420 | 24.514 | K-major contribution，无稳定收益 |
+| MegaMoE | 6.894 | 16.557 | CUDA event 含外部输入 staging 及 enqueue gaps |
+
+PF 的 `profile_inference.total_us` 为 native fused-kernel clock，含 kernel 内
+输入 staging/route plan，但不含 host prepare；MegaMoE 这里为 CUDA event 区间，
+含输入 staging 和多个 enqueue 间隙。最终报告还需给出两者都预准备权重的
+完整调用耗时，不能将此表直接称为完全相同计时边界。
+
+M1–M4 都通过 T256/8192/20480 每档两步 Torch 对照，以及 B128、route bias
+std=8 的 8K/20K ring-wrap 对照。M4 另通过 Flash 三档训练
+output/dX/dGate/dW1/dW2 对照。单独的 Flash inference 生命周期校验覆盖
+变长/变路由、prepared 与 fresh 逐位对照、async、原址改权重前 invalidate、
+graph 与 eager 交替、输入 weakref 释放及 close 后显存释放；8 ranks 全通过。
+临时 CTA0 时钟探针显示 20K 热点 rank 的 FC2
+epilogue 增长显著，producer ready 等待不是最大的部分；探针有扰动，仅用于
+定位，未用于上表，也不保留在正式 kernel 中。数值门禁未放宽。
+
+原始 runner、日志、编译产物保存在 `build/pf_megamoe_20261008/`；
+`cache{,_m2,_m3,_m4}/a7a38001e7a7/` 分别对应各步骤。宏/profile 相同而
+源码不同，因此目录区分源码版本，不能仅用 tuning digest 识别实验。
+旧库使用 `return_frozen/batch4_window2`，MegaMoE 使用前节冻结 Torch 2.9.1 包。
+
+原 `torchrun_tensor_runtime.py` 的 2048/512 小形状训练 fixture 直接扩到
+4096/2048 时，dX 对照出现少量绝对误差 2.29e-5/3.05e-5 超过原 2e-5 阈值；
+没有放宽阈值或将该 run 算作通过。Flash 的规范训练 reference 对照与上述
+独立 inference 生命周期分别验证；还需在冻结旧库上复现此 fixture 差异。
+
+待办：继续消融 WGMMA 在途组与 FC2 epilogue；完整调用正反序确认；
+导出验收 profile 后再关闭性能门禁。
+
 ## 2026-10-06：MegaMoE 缩容与 PF 工作流对齐诊断
 
 本轮在独立分支 `experiment/pf-megamoe-alignment` 上进行，保留 V3 恢复分支。

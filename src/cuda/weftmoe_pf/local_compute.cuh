@@ -1,0 +1,135 @@
+#pragma once
+
+#include "cuda/weftmoe_pf/local_schedule.cuh"
+
+namespace weftmoe_pf::local {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+
+__device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
+                                        const CUtensorMap &x_map,
+                                        const CUtensorMap &s_map,
+                                        const CUtensorMap &w1_map,
+                                        const CUtensorMap &w2_map) {
+  Schedule schedule(a);
+  Task t;
+  unsigned stage = 0U, phase = 0U;
+  while (schedule.next(t)) {
+    auto &slot = a.ring.slots[t.block % a.ring.depth];
+    if (cute::elect_one_sync()) {
+      const auto &ready = t.fc2 ? slot.fc1_done : slot.x_full;
+      const auto target =
+          std::uint64_t(t.generation) * (t.fc2 ? kFc1Tiles : kM);
+      while (ring::acquire(ready) < target) {
+      }
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+    }
+    __syncwarp();
+    const auto reduction =
+        t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
+    const auto columns = t.fc2 ? forward_tuning::kMainHidden
+                               : 2U * forward_tuning::kMainIntermediate;
+    for (unsigned k = 0; k < reduction; k += kK) {
+      s.empty[stage].wait(phase ^ 1U);
+      if (cute::elect_one_sync()) {
+        hopper::tma_load<kK, kM, 128U>(t.fc2 ? &s_map : &x_map, &s.full[stage],
+                                       s.a[stage], k, t.row, 2U);
+        hopper::tma_load<kK, kN, 128U>(t.fc2 ? &w2_map : &w1_map,
+                                       &s.full[stage], s.b[stage], k,
+                                       t.expert * columns + t.column * kN);
+        s.full[stage].arrive_and_expect_tx((kM + kN) * kK * 2U);
+      }
+      stage = (stage + 1U) % kStages;
+      phase ^= stage == 0U;
+    }
+  }
+}
+
+__device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
+                                        const CUtensorMap &output_map) {
+  using namespace forward_compute_detail;
+  Schedule schedule(a);
+  Task t;
+  unsigned stage = 0U, phase = 0U;
+  bool started_fc1 = false, started_fc2 = false;
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+  auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
+  auto *output = peer_at<transport::BFloat16>(a.local_base, a.forward_s_offset);
+  auto da = hopper::make_gmma_desc<hopper::Major::K, kM, kK, 128U>(
+      s.a[0], (threadIdx.x / 128U) * 64U, 0U);
+  auto db =
+      hopper::make_gmma_desc<hopper::Major::K, kN, kK, 128U>(s.b[0], 0U, 0U);
+  const auto abase = da.reg32_[0], bbase = db.reg32_[0];
+  bool previous_fc2 = false;
+  while (schedule.next(t)) {
+    auto &slot = a.ring.slots[t.block % a.ring.depth];
+    auto &started = t.fc2 ? started_fc2 : started_fc1;
+    if (!started && threadIdx.x == 0U)
+      atomicMin(t.fc2 ? &status->dispatch_blocks_done
+                      : &status->fc1_start_clock,
+                device_globaltimer_ns());
+    started = true;
+    if (threadIdx.x == 0U && t.fc2 && !previous_fc2)
+      atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
+    previous_fc2 = t.fc2;
+    float accum[Mma::kNumAccum] = {};
+    const auto reduction =
+        t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
+    for (unsigned k = 0; k < reduction; k += kK) {
+      s.full[stage].wait(phase);
+#pragma unroll
+      for (auto &value : accum)
+        cute::warpgroup_fence_operand(value);
+      cute::warpgroup_arrive();
+#pragma unroll
+      for (unsigned atom = 0; atom < kK; atom += Mma::K) {
+        da.reg32_[0] = abase + (stage * kM * kK + atom) * 2U / 16U;
+        db.reg32_[0] = bbase + (stage * kN * kK + atom) * 2U / 16U;
+        Mma::wgmma(da, db, accum, k != 0U || atom != 0U);
+      }
+      cute::warpgroup_commit_batch();
+#pragma unroll
+      for (auto &value : accum)
+        cute::warpgroup_fence_operand(value);
+      cute::warpgroup_wait<0>();
+      const auto lane = threadIdx.x & 31U;
+      if (lane < 2U)
+        s.empty[stage].arrive(lane);
+      stage = (stage + 1U) % kStages;
+      phase ^= stage == 0U;
+    }
+    if (t.fc2) {
+      static_v4_push_fc2_tile<Mma, false, kN, true>(
+          a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
+      if (threadIdx.x == 0U)
+        arrive(slot.fc2_done, 1U);
+    } else {
+      // X and S have independent lifetimes. Pull can recycle X as soon as
+      // all FC1 tiles retire, but the new S must wait for the previous FC2.
+      while (ring::acquire(slot.fc2_done) <
+             std::uint64_t(t.generation - 1U) * kFc2Tiles) {
+      }
+      static_v4_store_fc1_tile<kN, kM * kN, false, true, true>(
+          a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
+          t.block, &output_map);
+      // Full tiles use a single TMA issuer which has already waited for
+      // global completion. Compact tails use stores from every math thread.
+      if (t.rows != kM) {
+        __threadfence();
+        collective_scope_sync<kMathThreads, 7U>();
+      }
+      if (threadIdx.x == 0U)
+        arrive(slot.fc1_done, 1U);
+      collective_scope_sync<kMathThreads, 7U>();
+    }
+  }
+  if (threadIdx.x == 0U) {
+    const auto now = device_globaltimer_ns();
+    if (started_fc1 && !previous_fc2)
+      atomicMax(&status->fc1_complete_clock, now);
+    if (started_fc2)
+      atomicMax(&status->fc2_complete_clock, now);
+  }
+}
+
+#endif
+} // namespace weftmoe_pf::local

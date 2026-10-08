@@ -637,6 +637,17 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 }
 #endif
 
+bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
+  return forward_tuning::kLocalPrefillStreaming &&
+         forward_tuning::kFc1TileN == 128U && forward_tuning::kFc2TileN == 128U &&
+         forward_tuning::kStaticV4TileK == 64U &&
+         !forward_tuning::kStaticV4PrefillEnabled &&
+         config.max_hidden_size == forward_tuning::kMainHidden &&
+         config.max_intermediate_size == forward_tuning::kMainIntermediate &&
+         config.max_nodes == 1U && !config.enable_backward_state &&
+         config.static_forward_window_tokens && config.max_tokens_per_rank > 64U;
+}
+
 static_forward::WindowShape
 static_ring_shape(const ActivationTransportPoolConfig &config) {
   const auto local_world = config.max_world_size / config.max_nodes;
@@ -1111,7 +1122,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       append(cursor, activation_rows, sizeof(float),
              "canonical route gates");
   const auto route_elements =
-      checked_mul(ring.depth ? std::uint64_t(ring.contribution_depth) *
+      checked_mul(ring.depth && !local_prefill_streaming(config)
+                                ? std::uint64_t(ring.contribution_depth) *
                                   ring.shape.tokens * config.max_top_k : routes,
                   config.max_hidden_size, "route elements");
   if (!ring.depth || !config.enable_gin_rdma)

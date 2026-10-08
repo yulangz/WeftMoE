@@ -1,5 +1,50 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-08：单机 PF inference 的 expert-global 静态流水
+
+目标为 Flash H4096/I2048/E256/top-k6、EP8、8K/20K、1620 MHz，关闭
+训练中间结果缓存。此项通过 `WEFTMOE_FWD_LOCAL_PREFILL_STREAMING` 选择；
+训练、跨机和 DT 继续使用原入口，不将未验证的新 row order 带入 Backward。
+性能门禁以相同变长、热点随机路由和预准备权重的 MegaMoE 为准。
+
+- 在同一个主 kernel 内发布 source X、gate 和每个 expert 的 route index/count。
+  按完整 expert 的实际接收量构造 M128 块，取消 source-token window 带来的
+  重复 padding。三条 Pull warp 静态分摊 routed rows，一条 producer warp
+  发 TMA，两个 math warpgroup 做 FC1/FC2。
+- Producer 与 math 独立重放同一个 `(expert, wave, FC1/FC2, M, N)` 任务流，
+  CTA 按 `blockIdx + j * gridDim` 取自己的 residue，无动态任务队列。
+  每个 wave 先 FC1 后 FC2；专家大于 activation ring 时按 ring 深度分 wave，
+  不要求 ring 容纳整个热点 expert，也不丢 token。wave 间没有全 grid barrier。
+- 共享 A/B stage ring 跨 FC1/FC2 连续推进，保留 cluster2 multicast A。
+  Epilogue 有独立 scratch，不复用 B stage，因此下一任务的 TMA 可与当前
+  epilogue 重叠，不再逐 GEMM tile 做 producer/math 任务交接。
+- X 与 S 仍使用有界 ring；逻辑 block、逆向 route metadata 不取模。
+  `slot = block % depth`，`g = block / depth + 1`。以下计数每次调用开始清零，
+  在一次调用内累计，不把旧代的 ready 误当成新代。
+
+| 字段 | 发布条件 | 等待条件 |
+|---|---|---|
+| `x_full` | 每行 Pull 的本地 TMA store 完成；尾行补 padding credit | FC1 producer 等待 `g × 128` |
+| `fc1_done` | FC1 N tile 的 SwiGLU 写入 S 完成 | FC2 等待 `g × FC1_N_tiles`；下一代 Pull 等待旧代同一目标 |
+| `fc2_done` | FC2 N tile 计算及 contribution stores 发出 | 下一代 FC1 epilogue 等待 `(g−1) × FC2_N_tiles` 再覆盖 S |
+
+- Source 预留完整 BF16 contribution `[top_k, max_tokens_per_rank, H]`，
+  FC2 直接写 `(slot, source_token, H_tile)`，不再等待 source window credit。
+  它是本次推理的临时通信结果，不是跨调用缓存的激活。全部 FC2 store 经
+  rank release/acquire barrier 发布后，math warps 做 FP32 top-k Reduce；
+  保留 Weft 的 expert-sorted 求和次序及 BF16 gate/up 舍入规则。
+- 下一调用的 route/count 发布 barrier 确保所有 peer 已退出上一调用的
+  Reduce，之后才允许新 FC2 覆盖 contribution。X/S 的逐 slot 生命周期与
+  完整 contribution 的跨调用生命周期分开，不需要为 contribution 逐行 ACK。
+- Eager 可显式传 `layer`，复用已有的不可变权重 lease/重排结果；与 graph
+  共用 `invalidate_inference_layer`、close/offload 生命周期。每次调用仍处理
+  新 X、token 数和 route。训练不使用这个缓存；更新权重（包括原址更新）前
+  必须显式 invalidate，不以地址未变推断权重未变。
+
+GEMM 参数和 shared-memory 预算由 profile 校验：当前入口为 N128/K64、
+cluster2、FC1/FC2 共用 2–5 stages，独立 epilogue 与三份 Pull scratch。
+迭代性能、未采用候选和验收范围见训练记录顶部的单机 inference 对齐章节。
+
 ## 2026-10-03：Backward peer 地址按容量复用（M7e）
 
 调用 generation 标识一次 FWD/对应 BWD 的执行，不是通信内存的地址版本。

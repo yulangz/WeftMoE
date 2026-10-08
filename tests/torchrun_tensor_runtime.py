@@ -33,7 +33,8 @@ def main():
     max_rows = int(os.environ.get(
         "TEST_MAX_ROWS", max(2048, 2 * tokens * top_k + (experts // world) * 128)
     ))
-    hidden, intermediate = 2048, 512
+    hidden = int(os.environ.get("TEST_HIDDEN", 2048))
+    intermediate = int(os.environ.get("TEST_INTERMEDIATE", 512))
     generator = torch.Generator(device="cuda").manual_seed(123)
 
     def rand(*shape):
@@ -265,6 +266,14 @@ def main():
         probe = x.detach().clone()
         probe_ref = weakref.ref(probe)
         inference.inference_eager(probe, ids, g, w1, w2)
+        prepared = inference.inference_eager(probe, ids, g, w1, w2, layer=2)
+        fresh = inference.inference_eager(probe, ids, g, w1, w2)
+        torch.testing.assert_close(prepared, fresh, rtol=0, atol=0)
+        inference.invalidate_inference_layer(2)
+        prepared = inference.inference_eager(probe[:3], ids[:3], g[:3], w1, w2, layer=2)
+        fresh = inference.inference_eager(probe[:3], ids[:3], g[:3], w1, w2)
+        torch.testing.assert_close(prepared, fresh, rtol=0, atol=0)
+        del prepared, fresh
         del probe
         gc.collect()
         assert probe_ref() is None, "External CUDA producer retained its input"

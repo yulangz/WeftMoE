@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from autotune_common import candidate_digest, require
+import unified_tuning
 
 
 # Runtime capacities are kept in the candidate digest but not in CUDA headers.
@@ -22,8 +23,10 @@ DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
                 return_packet_rows=32, network_min_depth=8,
                 network_max_workers=32, source_group=0,
                 network_prefill_min_tokens=0,
-                window_tokens=256, contribution_windows=2)
+                window_tokens=256, contribution_windows=2,
+                local_prefill_streaming=0)
 MACROS = {
+    "local_prefill_streaming": "WEFTMOE_FWD_LOCAL_PREFILL_STREAMING",
     "decode_math_m": "WEFTMOE_FWD_LOCAL_DECODE_M",
     "decode_stages": "WEFTMOE_FWD_LOCAL_DECODE_STAGES",
     "decode_cta_multiplier": "WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER",
@@ -43,7 +46,8 @@ def validate(config):
     require(set(v) == set(DEFAULTS), "incomplete V4 candidate")
     require(all(type(x) is int and x >= 0 for x in v.values()),
             "V4 parameters must be nonnegative integers")
-    choices = dict(decode_math_m=(0, 16, 64), decode_stages=(2, 3),
+    choices = dict(local_prefill_streaming=(0, 1),
+                   decode_math_m=(0, 16, 64), decode_stages=(2, 3),
                    decode_cta_multiplier=(0, 1, 2, 3),
                    network_lanes=(1, 2, 4, 8, 16, 32), packet_rows=(8, 16, 32, 64, 128),
                    return_packet_rows=(16, 32, 64, 128),
@@ -59,6 +63,19 @@ def validate(config):
             (config["unified_threads"], config["unified_comm_base"],
              config["unified_comm_threads"]) == (384, 288, 96),
             "V4 ring requires physical M128 and the 256/32/96 partition")
+    if v["local_prefill_streaming"]:
+        require((config["fc1_tile_n"], config["fc2_tile_n"], config["tile_k"],
+                 config["cluster_size"]) == (128, 128, 64, 2) and
+                config["static_v4_prefill_min_tokens"] == 0 and
+                v["network_prefill_min_tokens"] == 0,
+                "local streaming requires N128/K64/cluster2 without a companion entry")
+        require(config["static_v4_fc1_stages"] == config["static_v4_fc2_stages"],
+                "local streaming FC1/FC2 share one stage ring")
+        # Two 16 KiB operands per stage, 32 KiB private epilogue, 12 KiB
+        # pull scratch and aligned barrier/compiler storage.
+        unified_tuning.require_resources(
+            config["static_v4_fc1_stages"] * 32768 + 32768 + 12288 + 2048 <= 227 * 1024,
+            "local streaming shared memory exceeds the SM90 CTA budget")
     if v["decode_math_m"] or v["network_prefill_min_tokens"]:
         require((config["fc1_tile_n"], config["fc2_tile_n"], config["tile_k"],
                  config["static_v4_fc1_stages"], config["static_v4_fc2_stages"],

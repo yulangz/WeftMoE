@@ -2,7 +2,8 @@
 """Single-node PF/V3/MegaMoE inference on the training benchmark's dynamic trace.
 
 Measures eager forward + device synchronize, including MegaMoE input staging.
-Weights are immutable: MegaMoE packs once; PF eager still packs on each call.
+MegaMoE packs immutable weights once. PF eager packs on each call by default;
+--prepared-weights reuses its layer weight cache for a matched comparison.
 No saved training activations, backward, or optimizer are included.
 """
 
@@ -103,6 +104,10 @@ def main():
     parser.add_argument("--token-std-fraction", type=float, default=0.1)
     parser.add_argument("--route-bias-std", type=float, default=0.5)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--profile-device", action="store_true",
+                        help="Also report PF's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
+    parser.add_argument("--prepared-weights", action="store_true",
+                        help="Reuse PF's immutable layer weights across changing token counts/routes")
     args = parser.parse_args()
     if args.backend == "pf":
         os.environ.pop("WEFTMOE_DISABLE_STATIC_FORWARD_V4", None)
@@ -157,7 +162,9 @@ def main():
         else:
             buffer = megamoe_buffer(deep_gemm, args, capacity)
         output_storage = torch.empty(capacity, args.hidden, device="cuda", dtype=torch.bfloat16)
-        samples, errors = [], []
+        samples, device_samples, device_phases, errors = [], [], [], []
+        if args.profile_device and args.backend == "megamoe":
+            device_begin, device_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         rng_state = generator.get_state()
         priming = 0 if args.verify else len(batches)
         for step, (cpu_routes, cpu_gates) in enumerate(batches * (1 if args.verify else 2)):
@@ -170,13 +177,25 @@ def main():
             torch.cuda.synchronize()
             started = time.perf_counter_ns()
             if args.backend != "megamoe":
-                output = runtime.inference_eager(x, routes, gates, w1, w2)
+                if args.profile_device:
+                    profile = runtime.native.profile_inference(
+                        x, routes, gates, w1, w2, torch.cuda.current_stream().cuda_stream,
+                        *((0,) if args.prepared_weights else ()))
+                    output, device_us = profile["output"], profile["total_us"]
+                else:
+                    output = runtime.inference_eager(
+                        x, routes, gates, w1, w2,
+                        **({"layer": 0} if args.prepared_weights else {}))
             else:
+                if args.profile_device:
+                    device_begin.record()
                 buffer.x[:x.shape[0]].copy_(x)
                 buffer.topk_idx[:x.shape[0]].copy_(routes)
                 buffer.topk_weights[:x.shape[0]].copy_(gates)
                 deep_gemm.bf16_mega_moe(output, packed_w1, packed_w2, buffer,
                                        activation_clamp=None, fast_math=True)
+                if args.profile_device:
+                    device_end.record()
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - started) / 1000
             if args.verify:
@@ -189,8 +208,17 @@ def main():
                 errors.append(error)
             elif step >= priming + args.warmups:
                 samples.append(elapsed)
+                if args.profile_device:
+                    if args.backend == "megamoe":
+                        device_us = device_begin.elapsed_time(device_end) * 1000
+                    device_samples.append(device_us)
+                    if args.backend != "megamoe":
+                        device_phases.append({key: value for key, value in profile.items()
+                                              if key != "output"})
         records = [None] * world
-        dist.all_gather_object(records, dict(samples_us=samples, errors=errors))
+        dist.all_gather_object(records, dict(samples_us=samples,
+                                            device_samples_us=device_samples,
+                                            device_phases=device_phases, errors=errors))
         workspace = (runtime.native.usage() if args.backend != "megamoe"
                      else dict(symm_bytes=buffer.buffer.nbytes, ring_tokens=buffer.num_ring_tokens))
         if rank == 0:
@@ -203,7 +231,12 @@ def main():
                 wall_slowest_rank_p50_us=None if args.verify else statistics.median(
                     map(max, zip(*(r["samples_us"] for r in records)))),
                 scope="eager inference + synchronize; includes input staging; no training cache",
-                weights_prepared_once=args.backend != "pf",
+                weights_prepared_once=args.backend == "megamoe" or args.prepared_weights,
+                device_slowest_rank_p50_us=(statistics.median(
+                    map(max, zip(*(r["device_samples_us"] for r in records))))
+                    if device_samples else None),
+                device_scope=("PF: native fused-kernel clock; MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
+                              if args.profile_device else None),
                 megamoe_buffer_mib=args.megamoe_buffer_mib,
                 megamoe_minimum_ring=args.megamoe_minimum_ring,
                 workspace_rank0=workspace, per_rank=records,
