@@ -1,5 +1,148 @@
 # V4 ring 训练对接记录
 
+## 2026-10-06：MegaMoE 缩容与 PF 工作流对齐诊断
+
+本轮在独立分支 `experiment/pf-megamoe-alignment` 上进行，保留 V3 恢复分支。
+首先只改变 MegaMoE 的对称区容量，不改变其 kernel 或调度。结论是：
+**本次负载下，MegaMoE 的大额默认分配不是领先的主要解释**。
+8K 压到 PF 同级预算后耗时变化 +0.71%，再降到最小合法容量为 −0.21%；
+20K 降到最小合法容量变化 −0.11%。不能将这些小差异登记为稳定收益，
+也不能据此排除两种算法的 credit 粒度、分块与流水组织差异。
+另外固定 PF 工作流，把 GEMM 改成 MegaMoE 同样的 N128/K64，3→5
+stages 确实降低耗时 8.85%/7.77%，但仍比现有 PF N256/K128、2 stages
+慢约 9.4%。这两个候选均未采用，不能把局部 stages 收益算成现有版本的收益。
+
+### 对称区容量消融
+
+单机 EP8，H4096/I2048/E256/top-k6，BF16，设置 SM clock 1620 MHz。
+沿用上一节的冻结 MegaMoE 包和推理计时范围：不可变权重在计时外转换，
+包含输入 staging、eager 调用与 device synchronize，不保存训练激活。
+每个配置完整预热同一条 32 步 trace，之后 8 warmup + 24 measured；
+配置顺序及反序各跑一次，报告两轮 rank-max p50 的算术平均。
+所有性能配置的全部 rank 的 token 长度和 route/gate hash 相同。
+仍是正态变长、每步重采样的热点随机路由，**不是模型采集的真实 trace**。
+
+PF 预算用已验收 `return_frozen/batch4_window2` 的单机推理 native
+持久区 `compute_bytes + gin_bytes + notify_bytes`：8K/20K 分别为
+2.725/3.021 GiB。该次 PF eager 耗时含每次 W1 repack，因此没有把它
+与 MegaMoE 的预重排权重耗时作为纯 kernel 对照。
+“同级预算”指两者的 native workspace 总量，不表示内部区域划分相同，
+也不包括模型权重、用户输入或训练 tape 的整卡峰值。
+
+| 名义 tokens/rank | MegaMoE 配置 | 对称区 GiB/rank | L1/L2 ring 行数 | 第 1 / 2 轮 ms | 均值 ms | 相对默认耗时 |
+|---|---|---:|---:|---:|---:|---:|
+| 8192 | 默认 | 6.478 | 509952 | 6.889 / 6.880 | 6.885 | — |
+| 8192 | PF 同级预算 | 2.723 | 182016 | 7.011 / 6.856 | 6.933 | +0.71% |
+| 8192 | 最小合法 ring | 1.589 | 82944 | 6.878 / 6.862 | 6.870 | −0.21% |
+| 20480 | 默认 | 10.614 | 786432 | 16.549 / 16.625 | 16.587 | — |
+| 20480 | 最小合法 ring | 4.001 | 208896 | 16.565 / 16.573 | 16.569 | −0.11% |
+
+20K **无法在现有 MegaMoE 合同下压到 PF 的 3.021 GiB**：它按完整
+expert wave 调度，最小 ring 必须能容纳任一 expert 接收全部 source
+tokens 的情况。该 trace 的对齐 `max_tokens` 是 26112，最小行数为
+`26112 × 8 = 208896`。没有绕过 `_C.get_ring_limit_for_mega_moe` 或
+修改其最坏路由检查；这里报告的是最接近 PF 的合法配置，而非等容量结果。
+8K 对齐容量为 10368，最小 ring 为 82944 行。
+
+最小 ring 并不等于每步都被容量卡住：按同 trace 的 expert-global M128
+几何统计，8K 的 24 个 measured step 中只有 4 步存在 rank 总 padded
+行数超过 82944，最大为 89728；20K measured steps 最大为 208256，
+仍低于最小合法 ring。因此，本轮主要排除了“默认大分配本身”的解释，
+没有证明极端拥塞下缩容也完全无代价。
+
+缩容配置通过 Torch 输出对照；最小 ring 另外在 route bias std=0.5/8.0、
+8K/20K、各 4 次变长连续调用上校验，最大 relative L2 为 9.36e-5，
+未放宽 rtol=0.02、atol=1e-4。强偏置是额外压力校验，不混入性能样本。
+
+复现入口为 `benchmarks/torchrun_megamoe_prefill.py` 的互斥选项
+`--megamoe-buffer-mib` / `--megamoe-minimum-ring`。前者按总字节预算
+搜索合法、对齐的 ring 行数，预算低于合法下界则报错；默认调用不变。
+原始日志、编译产物及串行 runner 在
+`build/pf_megamoe_alignment_20261006/`。
+
+### PF pipeline 参数对照
+
+复用已有 `tools/autotune_training.py` 的 profile 展开、资源校验和 native
+编译器，独立生成三个库，不修改 CUDA 源码。均以
+`return_frozen/batch4_window2` header 为起点，物理 M128、B2048/D2、
+静态任务分配和 Pull/Return/Reduce 分工不变，关闭额外 decode/prefill
+入口选择。只改变 FC1/FC2 的 N、K 和 stages；基础库与候选从同一源码
+重新构建。三个库并行编译耗时约 235–278 秒，正式 GPU 计时期间没有编译。
+候选的 legacy GEMM stages 均为 3，实际 PF static stages 如下表所列。
+
+计时是 **PF eager inference + synchronize**，均包含每次 W1 repack；
+因此这张表只做 PF 内部消融，不与上表作“预重排权重的纯 kernel”对照。
+同一 32 步动态 trace、8 warmup + 24 measured，三个配置正序/反序各一轮，
+全 rank trace hash 与容量实验一致。单位 ms，仍报告两轮 rank-max p50
+的算术平均，不是 FWD+BWD 耗时。
+
+| FC1 / FC2 N | K | PF FC1 / FC2 stages | 8K | 20K |
+|---|---:|---|---:|---:|
+| 256 / 256（当前参数） | 128 | 2 / 2 | 9.977 | 24.064 |
+| 128 / 128 | 64 | 3 / 3 | 11.975 | 28.547 |
+| 128 / 128（MegaMoE 几何） | 64 | 5 / 5 | 10.915 | 26.329 |
+
+固定 N128/K64，增加 stages 的改善是 **8.85%/7.77%**；但 5-stage
+组合仍比当前 PF 慢 **9.40%/9.42%**，保留现有配置。本次只是针对
+MegaMoE 几何的有界消融，不是对其它 N/K/stages 组合的全局最优证明。
+
+参数之外还存在明确的任务间 pipeline 区别：PF 的 producer 每个 GEMM
+tile 经过 `kTaskDoneBarrier` 等待 math/epilogue，FC1↔FC2 切换还通过
+`retire_multicast_operands` 等待共享 A stage 的 cluster 读者退休；
+MegaMoE producer 沿同一静态任务流及统一 stage 环推进，没有同样的
+逐 tile producer/math 交接。PF 的 epilogue 复用已退休的 B staging，
+MegaMoE 则有独立 `smem_d`。因此不能只删等待或增加 stage 数：要使
+下一 tile 的 TMA 与本 tile epilogue 重叠，还需解决输入/输出 scratch
+别名和 cluster 生命周期。这里是代码可确认的机制差异，尚未分离测出
+它占总差距的百分比，也没有把所有空转归因为静态任务划分。
+
+三个配置均通过单机 T256/8192/20480、各两步、全 rank 的
+output/dX/dGate/dW1/dW2 对照，最大 relative L2 为 6.57e-4（dX）。
+这些校验只覆盖本次参数变体，不是尚未实现的 expert-global planner
+或 deferred-combine 的验收。未新增细粒度单测。
+
+编译/配置记录为 `pipeline_builds.json`，复现脚本为 `pipeline.py`，
+profile artifact ID 分别为 `2b4d3c8b8f65`、`2e313548a2d1`、
+`a1229db7a985`，日志为 `pipeline_{performance,verify}_*_ep8.log`。
+500 ms 时钟日志覆盖容量、pipeline 实验及数值校验；GPU-util ≥90%
+的 404 个样本中，400 个为 1620 MHz，最低 1545 MHz。
+未按频率修正结果，不能声称全程完全没有降频。实验结束后停止本轮
+监控进程，单机 8 张 GPU 均为 0 MiB，保留 1620 MHz 设置。
+
+### 工作流对齐的边界（待实现，不是已取得的收益）
+
+- **M128 对齐**：PF 现在按 `(source window, expert)` 分别向上取整，
+  MegaMoE 按 expert 全部路由行取整。同一 EP8 trace，PF 比 expert-global
+  多约 18.4%/20.0% 的 padded 行工作量（8K/20K）；不是已归因的耗时。
+  应解耦逻辑 expert 行目录与物理 slot，把通信 packet/window 当 transport
+  单元，不再天然当 GEMM 尾块边界。
+- **BWD 稳定性**：保留 `build_training_rows` 的 expert/source/route
+  canonical 行号和 `route_dst_row`，physical ring row 通过 checkpoint
+  rows 映射到 saved X/G/U。只重排 FWD 物理任务不必重排 BWD 输入，也
+  不必改变 dW 的归约顺序。仍需校验输出和四项梯度、slot 重用与热点迁移；
+  “数学等价”不是并发正确性或逐位相同的证明。
+- **先不折叠 Return/Reduce**：可先保留 FC2 epilogue 的远端 contribution
+  写回，在所有写入完成并 system-scope 同步后，用 math warps 做 Reduce，
+  同时释放原 Return/Reduce 控制 warp 给 Pull。若将全部 Return 也移到
+  FC2 之后，则必须另存完整 FC2 输出，不能无成本照搬。
+- **容量约束仍存在**：整次调用末尾才 Reduce，source contribution 区
+  就必须覆盖整次调用；固定深度的 source ring 不能继续在中途复用。
+  有界长文需要按批次 drain，或在足够容量时选择整次合并。尤其不能把
+  “完整 expert 先 FC1 再 FC2”直接套在原 D=2 source-window credit 上：
+  后续窗口可能等前面的 Reduce 退役，而该 expert 的 FC1 又在等后续窗口，
+  会形成等待环。先解耦／重建准入合同，再改变遍历顺序。
+- **Pull 与任务顺序**：当前 PF 单机为一 warp Pull、一 warp Return、
+  一 warp Reduce（CTA0 用于 admission）；MegaMoE 三 warp Pull。
+  PF 当前 window 内先耗尽自有 FC1，再做 FC2；下一 FC1 未 ready 时
+  不尝试 FC2。可借鉴 MegaMoE 的 expert wave、独立 L1/L2 slot 退休和
+  集中末尾 Combine，但它并不是一个现成的跨节点训练协议。
+
+后续顺序：先验证不折叠 Combine 的通信分工，再解决 expert-global 分块
+与有界准入，最后在新工作流上联合搜索 GEMM N/K/stages 与通信 prefetch。
+本轮容量实验没有修改 PF/DT/BWD kernel，也未宣称已解决上述结构问题。
+
+
+
 ## 2026-10-05：Flash 回退定位与通用优化（进行中）
 
 优化摘要：W1 gate/up 重排改为按行的 16B vector copy，避免逐 BF16 的
