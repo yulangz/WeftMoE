@@ -71,6 +71,25 @@ C5 off 为 6.887 / 16.769 ms。主入口 REG168/STACK0/SHARED1024/LOCAL0，
 逐 rank 相同。产物 `cache_c5/f47b1119685a/`，日志 `c4_c5_*_ep8.log`。
 目前恢复到原 C2 附近；最终还需与 C2 同窗口复测，不能跨轮次直接算总收益。
 
+### C6：训练物理行使用 canonical source 顺序（单独无稳定收益）
+
+Pull 的静态行号递增，因此用本次调用的 source-prefix 游标确定 source/ordinal。
+`saved_row = linear`，直接写 logical→saved 映射；删除 route exchange 中
+不再需要的 source saved-row 发布与 Pull 的远端逐行读取。没有新增全局表、
+kernel 或 barrier，也不缓存跨调用路由。推理仍使用原 round-robin 顺序；
+保存给 BWD 的 canonical tape 完全不变。此步仍用 C5 的 vector X 写出。
+
+| tokens/rank | C5 on ms（两轮） | C6 on ms（两轮） | C6 耗时变化 |
+|---|---:|---:|---:|
+| 8192 | 7.687（7.701 / 7.673） | 7.827（7.978 / 7.675） | +1.82% |
+| 20480 | 17.830（17.826 / 17.835） | 17.813（17.744 / 17.881） | −0.10% |
+
+8K 两轮波动较大，不删除较慢的一轮；目前不能认定行序本身有收益。
+C6 off 为 6.907 / 16.698 ms，主入口 REG168/STACK0/SHARED1024/LOCAL0。
+普通/强热点 FWD、完整梯度及双 tape/空接收/回绕、inference/Graph 生命周期
+通过。六组全部 rank workload 相同。产物 `cache_c6/f47b1119685a/`，日志
+`c5_c6_*_ep8.log`。后续单独启用连续段 TMA，再决定是否保留此行序。
+
 ## 2026-10-08：新 PF 的训练缓存分步接入
 
 已完成两步接入：先只做准备，再在同一个 local main 内保存 X/GU。
