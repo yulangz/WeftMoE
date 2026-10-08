@@ -4525,6 +4525,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       (!use_gin || fused_inference_routes || training_ring) &&
       (!config.retain_backward_state || training_ring) &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
+  const bool local_prefill = static_v4_candidate &&
+      local_prefill_streaming(state->config);
   if (state->layout.static_ring.depth &&
       (!static_v4_candidate || (!fused_inference_routes && !training_ring)))
     throw std::invalid_argument("ring workspace requires static Forward");
@@ -4760,7 +4762,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("generation_init_enqueued");
 #endif
   ForwardKernelArgs args{};
-  if (fused_inference_routes) {
+  if (fused_inference_routes || local_prefill) {
     view.runtime = at<const DeviceDispatchRuntime>(
         slot.device, layout.fused_dispatch_runtime);
     view.expert_id =
@@ -4807,11 +4809,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                  : ActivationTransportBridge::route_pointer(dispatch))
           : nullptr;
   args.fused_local_expert_count =
-      fused_inference_routes
+      fused_inference_routes || local_prefill
           ? at<std::uint64_t>(slot.device, layout.fused_local_expert_count)
           : nullptr;
   args.fused_source_routes =
-      fused_inference_routes
+      fused_inference_routes || local_prefill
           ? at<std::uint32_t>(slot.device, layout.fused_source_routes)
           : nullptr;
   args.max_routes_per_rank =
@@ -5293,8 +5295,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
           }
           const bool decode = args.fused_inference_routes &&
               weftmoe_dt::eligible(state->config, layout.static_ring);
-          const bool local_prefill = args.fused_inference_routes &&
-              local_prefill_streaming(state->config);
           if (local_prefill)
             kStaticUnified = weftmoe_pf::local::kernel;
           // Arithmetic variants share the same physical blocks and rank
@@ -5737,6 +5737,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->identity = {id.generation, id.calling_rank, id.world_size,
                       id.num_tokens, config.hidden_size};
   result->retained_backward_state = config.retain_backward_state;
+  // Allocation-only milestone: the new local entry has not populated a
+  // training tape yet. Never expose its uninitialized storage to Backward.
+  if (local_prefill)
+    result->retained_backward_state = false;
   result->serialized_graph_replay = serialized_graph_replay;
   result->compact_return = args.forward_compact_return;
   result->incoming_rows = view.sizes.incoming_row_count;

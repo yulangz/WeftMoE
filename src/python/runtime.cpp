@@ -235,8 +235,9 @@ class Runtime {
   }
 
   std::shared_ptr<Tape> forward(py::object x, py::object routes, py::object gates,
-                                py::object w1, py::object w2) {
-    return execute_forward(x, routes, gates, w1, w2, true);
+                                py::object w1, py::object w2,
+                                std::optional<unsigned> layer = std::nullopt) {
+    return execute_forward(x, routes, gates, w1, w2, true, layer);
   }
 
   std::shared_ptr<Tape> execute_forward(py::object x, py::object routes,
@@ -585,7 +586,9 @@ PYBIND11_MODULE(_runtime, m) {
                     unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())
       .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
                     unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned, py::dict>())
-      .def("forward", &Runtime::forward)
+      .def("forward", &Runtime::forward,
+           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("layer") = std::nullopt)
       .def("backward", &Runtime::backward)
       .def("graph_forward", &Runtime::graph_forward)
       .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)

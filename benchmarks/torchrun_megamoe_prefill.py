@@ -108,7 +108,11 @@ def main():
                         help="Also report PF's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
     parser.add_argument("--prepared-weights", action="store_true",
                         help="Reuse PF's immutable layer weights across changing token counts/routes")
+    parser.add_argument("--forward-cache", choices=("off", "on"),
+                        help="PF forward-only cache experiment; both modes use the same native tape API")
     args = parser.parse_args()
+    if args.forward_cache and (args.backend != "pf" or args.profile_device):
+        parser.error("--forward-cache requires PF without --profile-device")
     if args.backend == "pf":
         os.environ.pop("WEFTMOE_DISABLE_STATIC_FORWARD_V4", None)
         os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
@@ -158,7 +162,9 @@ def main():
             runtime = TensorRuntime(group=dist.group.WORLD, experts=args.experts,
                                     top_k=args.top_k, hidden=args.hidden,
                                     intermediate=args.intermediate, max_tokens=capacity,
-                                    max_rows=max_rows, training=False)
+                                    max_rows=max_rows, training=args.forward_cache == "on",
+                                    **({"stream": torch.cuda.current_stream()}
+                                       if args.forward_cache else {}))
         else:
             buffer = megamoe_buffer(deep_gemm, args, capacity)
         output_storage = torch.empty(capacity, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -177,7 +183,12 @@ def main():
             torch.cuda.synchronize()
             started = time.perf_counter_ns()
             if args.backend != "megamoe":
-                if args.profile_device:
+                if args.forward_cache:
+                    tape = runtime.native.forward(x, routes, gates, w1, w2,
+                        **({"layer": 0} if args.prepared_weights else {}))
+                    output = tape.output
+                    del tape
+                elif args.profile_device:
                     profile = runtime.native.profile_inference(
                         x, routes, gates, w1, w2, torch.cuda.current_stream().cuda_stream,
                         *((0,) if args.prepared_weights else ()))
@@ -230,7 +241,10 @@ def main():
                 route_bias_std=args.route_bias_std, workload=workloads,
                 wall_slowest_rank_p50_us=None if args.verify else statistics.median(
                     map(max, zip(*(r["samples_us"] for r in records)))),
-                scope="eager inference + synchronize; includes input staging; no training cache",
+                scope=("eager forward + tape release + synchronize; includes input staging and per-call cache preparation"
+                       if args.forward_cache else
+                       "eager inference + synchronize; includes input staging; no training cache"),
+                forward_cache=args.forward_cache,
                 weights_prepared_once=args.backend == "megamoe" or args.prepared_weights,
                 device_slowest_rank_p50_us=(statistics.median(
                     map(max, zip(*(r["device_samples_us"] for r in records))))

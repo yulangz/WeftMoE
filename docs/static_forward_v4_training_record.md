@@ -1,5 +1,38 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：新 PF 的训练缓存分步接入
+
+### C1：只做 mini-notify 与实际容量申请
+
+在已验收的 M11/B128 单机入口上接入现有 training count notify，根据
+每 rank 的实际 received rows `R` 申请 X `[R,H]`、G/U `[2,R,I]` BF16
+及 gate/header。此阶段尚未写入缓存，显式禁止该入口的 tape 用于 BWD。
+不缓存上一调用的路由或激活，也不按最坏情况申请 X/GU。
+
+EP8，H4096/I2048/E256/top-k6，SM 设置 1620 MHz。沿用上一节 seed=123
+的 32 步随机变长/热点路由 trace；完整 prime、8 warmup、24 measured，
+每步 rank-max 后取 p50。off→on 与 on→off 各一轮，所有 rank 的 token
+长度及 route/gate hash 完全一致。两模式均走 native forward/tape API，
+显式使用当前 stream，并在计时内释放 tape、最终 synchronize；不可变
+W1/W2 都在计时外准备。常规训练不传 layer，仍每调用发布当前权重；
+显式传 layer 的实验调用必须遵守已有 invalidate 的不可变权重契约。
+
+| tokens/rank | 不缓存 ms（两轮） | 只 notify + 申请 ms（两轮） | 增量 |
+|---|---:|---:|---:|
+| 8192 | 6.850（6.853 / 6.846） | 7.149（7.102 / 7.196） | +0.299 ms / +4.36% |
+| 20480 | 16.698（16.700 / 16.696） | 17.260（17.261 / 17.258） | +0.561 ms / +3.36% |
+
+这些增量包含 mini-notify、host 取得 R、allocation agreement、缓存申请与
+释放，并非单独 notify kernel 时间。C1 与 M11 的 local main kernel 规范化
+SASS 指令相同，均 REG168/STACK8，无 local spill，主计算未变。
+普通路由及 route-bias-std=8、B128 回绕的 Torch 输出校验通过。
+固定训练 metadata workspace 沿用现有实现（20K notify 约 2.54 GiB/rank），
+不是本轮按实际 R 申请的激活；两者不应混为一项。
+
+冻结产物 `build/pf_megamoe_20261008/cache_c1/f47b1119685a/`；日志
+`c1_cache_{off,on}_{0,1}_ep8.log`。公开 benchmark 增加
+`--forward-cache off|on`，与 `--prepared-weights` 配合进行上述消融。
+
 ## 2026-10-08：PF 单机 inference 对齐 MegaMoE
 
 已切回 `refactor/static-forward-v4`；V3 恢复分支及容量消融分支保留。

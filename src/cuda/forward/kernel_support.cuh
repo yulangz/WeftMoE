@@ -645,7 +645,7 @@ bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
          !forward_tuning::kStaticV4PrefillEnabled &&
          config.max_hidden_size == forward_tuning::kMainHidden &&
          config.max_intermediate_size == forward_tuning::kMainIntermediate &&
-         config.max_nodes == 1U && !config.enable_backward_state &&
+         config.max_nodes == 1U &&
          config.static_forward_window_tokens && config.max_tokens_per_rank > 64U;
 }
 
