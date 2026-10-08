@@ -1,5 +1,42 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：计算侧 Saved X 分步消融（C3 起）
+
+延续 C2 的 EP8 Flash H4096/I2048/E256/top-k6、M128/N256/K64、3 stages、
+B128/D2、1620 MHz。每个候选与冻结前一候选正反序复测，同一 seed=123
+随机变长/热点路由 trace，完整 prime、8 warmup、24 measured，rank-max wall
+p50；包含 notify/分配/释放，不计一次性不可变权重准备。保留无收益候选的
+结果，不将旧小模型上 FM/FO/FZ 的收益直接套用到此流水。
+
+### C3a：只迁移 Saved X 到 FC1 A stage（负向候选）
+
+Pull 仅写 X ring；每个 M-block 的 FC1 Ntile0 在 WGMMA commit 后，从已 ready
+的 A stage 保存 X，再按原流程等待 WGMMA、归还 stage。复用
+`StaticV4XCheckpoint<K64,false>`，保持物理行序、G/U、planner、缓存容量不变。
+此步仍在每次 K 迭代计算目的地址，地址外提与轮转 pair 留作独立候选。
+
+最初 C3 产物触发非法地址；定向 memcheck 定位为 `local_compute.cuh` 中
+`auto &started = fc2 ? started_fc2 : started_fc1` 的局部 bool 写出（SASS
+`STL.U8`），不是 saved X 地址越界。C3a 改为值判断及两个显式 bool 更新。
+该项也属于本候选差异，不把 C3a−C2 全部归因于纯复制指令。失败产物及
+诊断日志保留在 `cache_c3/`、`c3_debug_blocking_ep8.log`、
+`c3_memcheck_device_ep8.log`，未用于计时。
+
+| tokens/rank | C2 缓存开启 ms（两轮） | C3a 缓存开启 ms（两轮） | C3a 耗时变化 |
+|---|---:|---:|---:|
+| 8192 | 7.737（7.652 / 7.821） | 8.268（8.288 / 8.248） | +6.87% |
+| 20480 | 18.021（17.991 / 18.052） | 18.892（18.935 / 18.848） | +4.83% |
+
+C3a 关闭缓存为 6.913 / 17.045 ms。本轮六组全部 rank 的 workload hash/长度
+一致。主入口 REG168/STACK24/SHARED1024/LOCAL0，动态 shared 不变；不是
+“完全没有资源代价”。仅改变复制位置没有收益，后续需检查地址计算和静态
+分担；不能按历史 FM 结论直接采用。
+
+C3a 已通过 local main 定向 memcheck（8 rank 均 0 error）、普通及强热点
+Forward、T256/8K/20K 全部梯度、双 live tape/空接收/回绕及 inference/Graph
+生命周期。冻结产物 `build/pf_megamoe_20261008/cache_c3a/f47b1119685a/`，
+正反序日志 `c2_c3a_{c2,c3a}_{on,off}_{0,1}_ep8.log`（仅 C3a 测 off）。
+
 ## 2026-10-08：新 PF 的训练缓存分步接入
 
 已完成两步接入：先只做准备，再在同一个 local main 内保存 X/GU。

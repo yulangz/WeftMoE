@@ -70,9 +70,9 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
       const auto token = route / a.dispatch.identity.top_k;
       const auto gate = peer_at<float>(a.peer_bases[source],
                                        a.fused_source_gates_offset)[route];
-      std::uint64_t saved = 0U;
       if (a.saved_x) {
-        saved = ring::source_metadata(a, source, a.checkpoint.source_rows)[route];
+        const auto saved =
+            ring::source_metadata(a, source, a.checkpoint.source_rows)[route];
         a.checkpoint.rows[logical] = saved;
         a.checkpoint.gates[saved] = gate;
         a.checkpoint.headers[saved] = {
@@ -105,11 +105,6 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
         s.pull_full[warp].wait(phase);
         phase ^= 1U;
         cute::SM90_BULK_COPY_S2G::copy(s.pull[warp], output + offset, bytes);
-        if (a.saved_x)
-          cute::SM90_BULK_COPY_S2G::copy(
-              s.pull[warp], reinterpret_cast<char *>(a.saved_x) +
-                                saved * a.hidden * 2U + offset,
-              bytes);
         cute::tma_store_arrive();
         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
       }

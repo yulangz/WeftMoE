@@ -63,12 +63,13 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
   bool previous_fc2 = false;
   while (schedule.next(t)) {
     auto &slot = a.ring.slots[t.block % a.ring.depth];
-    auto &started = t.fc2 ? started_fc2 : started_fc1;
+    const bool started = t.fc2 ? started_fc2 : started_fc1;
     if (!started && threadIdx.x == 0U)
       atomicMin(t.fc2 ? &status->dispatch_blocks_done
                       : &status->fc1_start_clock,
                 device_globaltimer_ns());
-    started = true;
+    started_fc1 |= !t.fc2;
+    started_fc2 |= t.fc2;
     if (threadIdx.x == 0U && t.fc2 && !previous_fc2)
       atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
     previous_fc2 = t.fc2;
@@ -76,6 +77,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
     const auto reduction =
         t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
     unsigned retirement = stage;
+    const bool checkpoint_owner = a.saved_x && !t.fc2 && t.column == 0U;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.full[stage].wait(phase);
       const auto astart = abase + stage * (kM * kK / 8U);
@@ -94,6 +96,13 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
 #pragma unroll
       for (auto &value : accum)
         cute::warpgroup_fence_operand(value);
+      if (checkpoint_owner) {
+        // The A-ready acquire also publishes Pull's logical-to-saved rows.
+        // Reuse this GEMM load; do not add another global read of X.
+        StaticV4XCheckpoint<kK, false> checkpoint;
+        checkpoint.prepare(a, t.block, t.rows);
+        checkpoint.save(s.a[stage], t.rows, k, a.hidden, a.saved_x_map);
+      }
       const auto lane = threadIdx.x & 31U;
       if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
         if (k != 0U) {
