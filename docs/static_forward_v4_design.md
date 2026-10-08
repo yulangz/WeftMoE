@@ -65,7 +65,7 @@ expert wave 回绕，保证不丢 token。使用与边界说明见
 `configs/pf_inference_flash_20261008/` 及 `configs/README.md`。
 迭代性能、未采用候选和验收范围见训练记录顶部的单机 inference 对齐章节。
 
-### 同一 local main 的可选 checkpoint（C1/C2）
+### 同一 local main 的可选 checkpoint（C1/C2，C5 优化）
 
 - 主 kernel 前复用计数 mini-notify，只交换 source/expert 数量并取得实际
   `R`，在现有 allocation agreement 内申请本次 tape：BF16 X `[R,H]`、
@@ -74,9 +74,14 @@ expert wave 回绕，保证不丢 token。使用与边界说明见
   恢复稳定的 expert/source/route 行号，并生成旧 BWD 所需的不可变 route
   表。训练的 route exchange 发布这些稳定 ordinal；推理仍用原直方图路径。
 - 三个 Pull warp 每次确定逻辑 ring 行时，同时记录 `logical_row → saved_row`
-  及该行 gate/header。G2S 到达后，从同一 shared-memory 分段双写物理 X ring
-  与 saved X，等待两次 S2G 完成后发布 `x_full`。元数据工作在本入口随 Pull
-  逐行完成；这区别于旧 window planner 预先批量填充 header 的实现。
+  及该行 gate/header。物理行保持 round-robin，saved row 仍通过 source
+  发布的稳定映射读取。G2S 到达后仅写物理 X ring，S2G 完成后发布 `x_full`。
+  元数据工作随 Pull 逐行完成；不同于旧 window planner 预先批量填充 header。
+- C5 将 saved X 写出移至 FC1：每个 M-block 选择轮转的静态 N-tile pair，
+  两个 CTA 各保存 M64，复用 multicast A，不增加全局 X 读取。第一个 A-ready
+  acquire 之后准备目的地址，跨 K 分块复用；不能提前读取尚未由 Pull 发布的
+  映射。WGMMA commit 后以 vector 复制，shared 读取在原 empty credit 前
+  完成，不增加 stage、计数器或 barrier。C2 的 Pull 双写只作为冻结对照。
 - FC1 从 accumulator 将舍入后的 BF16 G/U 保存到规范平面，同时保留 S 的
   原 TMA epilogue。直接寄存器写出复用现有 helper，不扩充接近上限的 shared
   arena，也不让三平面 staging 将 S 降级为 vector store。producer 的下一
@@ -86,7 +91,9 @@ expert wave 回绕，保证不丢 token。使用与边界说明见
   推理的保存指针为空，同一 main 跳过训练规划和全部缓存写出。
 
 C1 仅测 mini-notify/申请，未初始化的 tape 明确禁止 BWD；C2 才启用缓存
-消费。冻结产物及分步耗时、梯度和生命周期验证范围见训练记录顶部。
+消费。C5 保持同一个 main 与原 tape 布局；canonical 物理行序及 M32 TMA
+候选没有稳定收益，已撤回。最终 Flash EP8 缓存 FWD 相对 C2：8K 持平、
+20K 约快 0.94%。冻结产物及分步耗时、梯度和生命周期验证范围见训练记录顶部。
 
 ## 2026-10-03：Backward peer 地址按容量复用（M7e）
 

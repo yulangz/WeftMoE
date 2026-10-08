@@ -2,9 +2,9 @@
 
 // Included inside forward_compute_detail. One static FC1 pair owns each X
 // checkpoint, with each CTA copying half of M from its ready multicast A.
-// Single-node training orders canonical rows within each block:
-// store contiguous M32 runs with TMA and scatter only the remainder. Network
-// training retains round-robin geometry and vector copies.
+// Source-major profiles store contiguous M32 runs with TMA and scatter only
+// the remainder. Round-robin profiles (including expert-global local PF and
+// network training) use vector copies.
 // Both readers must retire before either CTA can recycle its ready A stage.
 template <unsigned TileK, bool Contiguous,
           unsigned Rows = forward_tuning::kTileM>

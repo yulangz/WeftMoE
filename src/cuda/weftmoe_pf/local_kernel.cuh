@@ -49,30 +49,14 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
   const auto lane = threadIdx.x & 31U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned expert = 0U, begin = 0U, phase = 0U, peer_rows = 0U;
-  unsigned next_source = 0U, source_begin = 0U, source_end = 0U;
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   for (unsigned linear = blockIdx.x * 3U + warp;; linear += gridDim.x * 3U) {
-    while (expert < owned && linear >= begin + a.ring.expert_rows[expert]) {
+    while (expert < owned && linear >= begin + a.ring.expert_rows[expert])
       begin += a.ring.expert_rows[expert++];
-      next_source = 0U;
-      source_end = begin;
-    }
     if (expert == owned)
       break;
     unsigned source, ordinal;
-    if (a.saved_x) {
-      // Pull visits increasing rows. A source-prefix cursor gives training
-      // canonical expert/source/ordinal order without a remote row lookup.
-      while (linear >= source_end) {
-        source_begin = source_end;
-        source_end += a.fused_local_expert_count[
-            std::uint64_t(next_source++) * owned + expert];
-      }
-      source = next_source - 1U;
-      ordinal = linear - source_begin;
-    } else {
-      decode_source_row(a, expert, linear - begin, source, ordinal);
-    }
+    decode_source_row(a, expert, linear - begin, source, ordinal);
     if (lane == 0U) {
       const auto logical =
           unsigned(a.ring.expert_blocks[expert]) * kM + linear - begin;
@@ -87,7 +71,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
       const auto gate = peer_at<float>(a.peer_bases[source],
                                        a.fused_source_gates_offset)[route];
       if (a.saved_x) {
-        const auto saved = linear;
+        const auto saved =
+            ring::source_metadata(a, source, a.checkpoint.source_rows)[route];
         a.checkpoint.rows[logical] = saved;
         a.checkpoint.gates[saved] = gate;
         a.checkpoint.headers[saved] = {

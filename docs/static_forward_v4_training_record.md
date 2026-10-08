@@ -1,5 +1,47 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：本轮缓存优化结论（保留 C5）
+
+最终保留 **FC1 A-stage 保存 X + 目的地址外提 + 轮转 CTA pair 各复制 M64**。
+Pull 只写物理 X ring，复制复用 GEMM 已加载的 A，不重新读取全局 X；仍用
+vector 写 canonical saved X。物理行继续 round-robin，G/U 保持原 accumulator
+写出。C6 的 source-major 行序及 C7 的 TMA 候选已撤回，不新增模式开关。
+
+EP8 Flash H4096/I2048/E256/top-k6、随机变长/热点路由、1620 MHz，最终
+同窗口正反序复测的完整 FWD wall p50（两轮均值）：
+
+| tokens/rank | 原 C2 缓存开启 ms | 最终 C5 缓存开启 ms | 耗时变化 | C2 / C5 缓存关闭 ms |
+|---|---:|---:|---:|---:|
+| 8192 | 7.703 | 7.683 | −0.26%，视为持平 | 6.825 / 6.851 |
+| 20480 | 18.008 | 17.839 | −0.94%，小幅改善 | 16.689 / 16.756 |
+
+关闭缓存的变化为 +0.37% / +0.40%，幅度小，但不能据此声称严格零回退。
+缓存 on−off 的完整调用增量由 0.878 / 1.320 ms 变为 0.832 / 1.083 ms；
+包含 notify、缓存申请/释放与 main，不是纯 Saved X store 时间。权重在计时
+外预准备，各调用的新 X/route/tape 不复用。不能将历史小模型上的 FM/FZ
+收益直接套到 Flash 新流水，也不把各轮相邻收益简单相乘。
+
+简要消融结论（相对各自同轮前项，完整数据见下文）：
+
+- C3a：只把 Saved X 从 Pull 移到 FC1，8K/20K **慢 6.87% / 4.83%**。
+- C4：地址计算移出 K 循环，较 C3a **快 2.45% / 3.08%**。
+- C5：轮转 pair 分摊 M64，较 C4 **快 3.27% / 2.48%**，最终保留。
+- C6：canonical source 游标/行序，单独无稳定收益，撤回。
+- C7：在 C6 上启用连续 M32 TMA，最终同轮 **慢 1.99% / 3.04%**，撤回。
+
+最终代码未增加持久或临时缓冲：C2/C5 的 compute/notify workspace 逐项相同，
+saved X/GU 仍按实际 R 分配。主入口 REG168/STACK0/静态 shared1024/LOCAL0，
+动态 shared 226304 bytes 不变。复用现有 checkpoint helper，不增加公开单测。
+C5 已通过普通/强热点 FWD、完整 output/dX/dGate/dW1/dW2、双 live tape、
+空接收与 ring 回绕、inference/Graph 生命周期；定向 local-main memcheck 和
+racecheck 均为 8 ranks 零错误/零 hazard，后者不代表完整 BWD racecheck。
+现有 CPU 检查 6 passed、4 subtests passed。本轮只验收 FWD 性能，未重测
+BWD 吞吐，也未改变旧训练 profile、多机或 DT 的入口选择。
+
+选中产物：`build/pf_megamoe_20261008/cache_c5/f47b1119685a/`。
+源码 milestone：C3a `27df922`、C4 `62cc114`、C5 `53d5a92`、
+C6 `6709583`、C7 `d8cc33a`；最终撤回 C6/C7，保留消融日志与结论。
+
 ## 2026-10-08：计算侧 Saved X 分步消融（C3 起）
 
 延续 C2 的 EP8 Flash H4096/I2048/E256/top-k6、M128/N256/K64、3 stages、
