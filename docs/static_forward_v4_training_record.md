@@ -1,5 +1,29 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：Saved-X vector/TMA 最小复现与归因
+
+新增独立 [CUDA 样例与实验说明](../benchmarks/pf_saved_x_repro.md)，不修改正式
+PF，仍保留 C5。保留 FC1 M128/N256/K64、3 stages、cluster2、轮转 owner
+pair，去掉路由/通信/FC2；各复制模式在同一个 kernel binary 内切换。
+
+- 8K / 20K 等效工作量分别为 49152 / 122880 routed rows，不是随机路由
+  的完整 FWD。两轮正反序、每模式 40 samples：copy-only 的 vector 为
+  **0.246 / 0.603 ms**，TMA 为 **0.269 / 0.661 ms**（慢 9.63% / 9.77%）；
+  保留 FC1 GEMM 后为 **2.510 / 6.152 ms** 对 **2.545 / 6.282 ms**
+  （TMA 慢 1.37% / 2.11%）。这些不是新的端到端 PF 性能记录。
+- 源读/full wait 拆分、elect 消除 peeling loop、M32×2 合为 M64、删除
+  此路径多余的 source fence，都未逆转结论。延后一个 K 释放 A credit
+  的两组在途方案反而更慢，不移植到 PF。
+- NCU 中写出字节数基本相同；TMA 的 GMMA arrive wait 增加，Tensor
+  active 下降，并伴随 DRAM 读取变化。证据支持 A-stage 生命周期与
+  GEMM 推进/L2 复用的耦合，不支持“TMA 峰值带宽天然不如 vector”。
+- 时钟设定 1620 MHz；计时外 2 ms 间隔消除了 NVML 采样中的持续功率
+  限制，但 NCU 的 GEMM 有效频率仍约 1440–1454 MHz，copy 约
+  1614–1619 MHz。不能将锁频设置/瞬时采样等同于 kernel 全程恒频。
+- 全部 176 条记录数值校验通过；定向 memcheck/racecheck 零错误。
+  原始数据、SASS、时钟限制和复现命令见上述说明。本实验不能解释全部
+  C7/C8 端到端回退，特别是 cache-off 下的代码生成/行序差异。
+
 ## 2026-10-08：C8 拆分 TMA 读退休与完整写出（未采用）
 
 结论：相对 C7 的逐 K 完整等待，拆分等待没有稳定收益；最终仍保留 C5
