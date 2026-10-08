@@ -85,16 +85,11 @@ struct StaticV4XCheckpoint {
     }
   }
 
-  template <bool ReadOnly = false>
   __device__ __forceinline__ void finish() const {
     if (Contiguous && threadIdx.x < 32U && tma_mask) {
-      if (threadIdx.x == 0U) {
-        if constexpr (ReadOnly)
-          asm volatile("cp.async.bulk.wait_group.read 0;" : : : "memory");
-        else
-          // Full completion is still required before publishing the tape.
-          asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
-      }
+      if (threadIdx.x == 0U)
+        // Full global completion also precedes FC1's checkpoint publication.
+        asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
       // Hand completion to both CTA empty arrivals (lanes 0/1), without
       // relying on implicit warp convergence after the issuer-only wait.
       __syncwarp();

@@ -85,7 +85,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                      : 0U;
     const bool checkpoint_owner =
         a.saved_x && !t.fc2 && t.column / 2U == t.block % (kFc1Tiles / 2U);
-    StaticV4XCheckpoint<kK, true, kCheckpointRows> checkpoint;
+    StaticV4XCheckpoint<kK, false, kCheckpointRows> checkpoint;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.full[stage].wait(phase);
       const auto astart = abase + stage * (kM * kK / 8U);
@@ -111,9 +111,6 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
           checkpoint.prepare(a, t.block, checkpoint_rows, checkpoint_begin);
         checkpoint.save(s.a[stage] + checkpoint_begin * kK, checkpoint_rows,
                         k, a.hidden, a.saved_x_map);
-        // Recycle shared A after both TMA and WGMMA readers retire; the
-        // checkpoint's global writes may continue through later K stages.
-        checkpoint.finish<true>();
       }
       const auto lane = threadIdx.x & 31U;
       if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
@@ -159,8 +156,6 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                               forward_tuning::kLocalPrefillFastMath>(
           a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
           t.block, &output_map);
-      if (checkpoint_owner)
-        checkpoint.finish();
       // Full tiles use a single TMA issuer which has already waited for
       // global completion. Compact tails use stores from every math thread.
       if (t.rows != kM) {

@@ -3,7 +3,8 @@
 ## 2026-10-08：C8 拆分 TMA 读退休与完整写出（未采用）
 
 结论：相对 C7 的逐 K 完整等待，拆分等待没有稳定收益；最终仍保留 C5
-pair/vector，不新增运行模式。C8 的候选实现与冻结产物保留用于复现。
+pair/vector，不新增运行模式。C8 的候选实现保存在 `20ab38d`，冻结产物
+也保留用于复现；正式 native 源码已恢复为此前验收的 C5。
 
 Saved X 不是由固定 Ntile0 保存。每个全局 M-block 选取
 `Ntile/2 == Mblock % (FC1_Ntiles/2)` 的相邻 CTA pair；偶数 N tile 保存
