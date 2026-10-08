@@ -78,6 +78,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
     unsigned retirement = stage;
     const bool checkpoint_owner = a.saved_x && !t.fc2 && t.column == 0U;
+    StaticV4XCheckpoint<kK, false> checkpoint;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.full[stage].wait(phase);
       const auto astart = abase + stage * (kM * kK / 8U);
@@ -99,8 +100,8 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       if (checkpoint_owner) {
         // The A-ready acquire also publishes Pull's logical-to-saved rows.
         // Reuse this GEMM load; do not add another global read of X.
-        StaticV4XCheckpoint<kK, false> checkpoint;
-        checkpoint.prepare(a, t.block, t.rows);
+        if (k == 0U)
+          checkpoint.prepare(a, t.block, t.rows);
         checkpoint.save(s.a[stage], t.rows, k, a.hidden, a.saved_x_map);
       }
       const auto lane = threadIdx.x & 31U;

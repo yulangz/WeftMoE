@@ -37,6 +37,23 @@ Forward、T256/8K/20K 全部梯度、双 live tape/空接收/回绕及 inference
 生命周期。冻结产物 `build/pf_megamoe_20261008/cache_c3a/f47b1119685a/`，
 正反序日志 `c2_c3a_{c2,c3a}_{on,off}_{0,1}_ep8.log`（仅 C3a 测 off）。
 
+### C4：目的地址外提（相对 C3a 有收益，尚未超过 C2）
+
+`StaticV4XCheckpoint::prepare` 从每个 K 分块一次改为每个 FC1 任务一次。
+仍在第一个 A-ready acquire 之后读取行映射：映射由 Pull 动态发布，不能
+直接移到首次等待之前。没有新增 barrier，也没有增加 X 的全局读取。
+
+| tokens/rank | C3a on ms（两轮） | C4 on ms（两轮） | C4 耗时变化 |
+|---|---:|---:|---:|
+| 8192 | 8.244（8.221 / 8.268） | 8.042（8.058 / 8.027） | −2.45% |
+| 20480 | 18.973（18.915 / 19.032） | 18.389（18.396 / 18.382） | −3.08% |
+
+C4 off 为 6.947 / 16.882 ms，主入口仍 REG168/STACK24/SHARED1024/LOCAL0。
+定向 memcheck、普通/强热点 FWD、完整梯度与双 tape/空接收/回绕、
+inference/Graph 生命周期全部通过。六组全部 rank 的 workload hash 相同。
+产物 `cache_c4/f47b1119685a/`，日志 `c3a_c4_*_ep8.log`。
+这是相对 C3a 的改善，不能说已经优于原先 C2 Pull 写出。
+
 ## 2026-10-08：新 PF 的训练缓存分步接入
 
 已完成两步接入：先只做准备，再在同一个 local main 内保存 X/GU。
