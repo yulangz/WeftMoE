@@ -54,6 +54,23 @@ inference/Graph 生命周期全部通过。六组全部 rank 的 workload hash �
 产物 `cache_c4/f47b1119685a/`，日志 `c3a_c4_*_ep8.log`。
 这是相对 C3a 的改善，不能说已经优于原先 C2 Pull 写出。
 
+### C5：轮转 CTA pair 各保存半个 M
+
+每个 M-block 选择 `Ntile/2 == Mblock % (FC1_Ntiles/2)` 的 pair，两个
+CTA 各负责 M64；总复制量不变，复用 multicast A，不增加 buffer/credit。
+每 CTA 的 saved-row 目的指针减半；沿用 C4 的首次 A-ready 后准备。
+
+| tokens/rank | C4 on ms（两轮） | C5 on ms（两轮） | C5 耗时变化 |
+|---|---:|---:|---:|
+| 8192 | 7.963（7.971 / 7.956） | 7.703（7.670 / 7.736） | −3.27% |
+| 20480 | 18.306（18.379 / 18.233） | 17.852（17.909 / 17.795） | −2.48% |
+
+C5 off 为 6.887 / 16.769 ms。主入口 REG168/STACK0/SHARED1024/LOCAL0，
+相对 C4 去掉 24-byte stack。定向 memcheck、普通/强热点 FWD、完整梯度、
+双 tape/空接收/回绕及 inference/Graph 生命周期全通过；六组 workload
+逐 rank 相同。产物 `cache_c5/f47b1119685a/`，日志 `c4_c5_*_ep8.log`。
+目前恢复到原 C2 附近；最终还需与 C2 同窗口复测，不能跨轮次直接算总收益。
+
 ## 2026-10-08：新 PF 的训练缓存分步接入
 
 已完成两步接入：先只做准备，再在同一个 local main 内保存 X/GU。
