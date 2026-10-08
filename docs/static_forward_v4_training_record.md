@@ -23,6 +23,50 @@
   稳定收益，不能将“热点 expert 地址跨度更小”当作已证实的主要性能原因。
   同时 eager 可显式按 layer 复用不可变权重，沿用 graph 的 invalidate/close
   机制，不缓存 X、route、gate/up 或其它计算结果。训练仍每次发布新权重。
+- M5：WGMMA descriptor 低位先 warp-uniform，再按 stage/atom 做简单加法，
+  stage 游标使用条件回绕；沿用现有 `wgmma_wait_group` 轴比较 0/1。
+  0 在途额外组的 8K/20K kernel 为 8.214/24.059 ms，1 为
+  8.314/24.144 ms，未发现多一组在途的收益，保留 0。wait=1 也通过
+  普通及强热点小 ring 的输出对照。
+- M6：FC2 的 `fc2_done` 仅作为 S 读退休计数，改用 relaxed atomic；
+  contribution 仍由最终 system release/acquire barrier 发布。SASS 确认
+  移除了该计数前的 GPU fence，8K/20K kernel 为 8.053/23.804 ms，
+  相对 M5 小幅改善 1.96%/1.06%，不是剩余差距的主要解释。
+- M7：只对新 inference 入口的完整 N tile，展开 FC2 向量写回并移除
+  不需要的列边界判断，N128 时采用 16 lanes/row。8K/20K kernel 为
+  8.055/23.698 ms，未显示显著额外收益。M6、M7 均通过普通及
+  B128/强热点 ring-wrap 输出对照。
+- M8：将新入口的 N 接回已有 GEMM tuning 参数，比较 N128/5 stages 与
+  N256/3 stages（均 K64）。N256 增加 FC1 两个 N64 TMA issuer 的 completion
+  join，未改变 BF16 舍入与 FP32 算术。8K/20K kernel 降至
+  7.254/18.355 ms，相对 M7 改善 **9.95%/22.55%**；完整调用
+  7.413/18.529 ms。普通及强热点小 ring 校验通过。N256 的旧 fallback
+  stages 配为 2/2 以满足原入口资源限制，新入口实际为 3/3。
+- M9：增加显式 `local_prefill_fast_math` inference 消融，使用与 MegaMoE
+  fast-math 相同的 SFU exponential/reciprocal；仍保留 gate/up 和 FC2 input
+  的 BF16 舍入，不调整训练/其它入口的算术。N256 kernel 为
+  6.982/17.636 ms，相对严格算术再改善 3.74%/3.92%；N128 则为
+  7.723/23.225 ms，说明 fast-math 不能代替 tile 粒度优化。两种 N 都
+  通过普通及强热点小 ring 原容差校验。默认关闭，只由显式 inference
+  profile 选择；其语义不是与严格除法逐位一致。
+- M10：最终 Reduce 每 lane 同时处理四个独立 16B 向量，提高 GM load 的
+  在途并行度；每个元素仍按相同专家顺序做 FP32 逐项相加。N256/wait0
+  的 8K/20K kernel 为 6.748/17.095 ms；wait1 为 6.784/17.103 ms，
+  没有显示额外在途 WGMMA group 的收益。两者都通过原容差普通及热点
+  小 ring 校验，继续选 wait0。
+- M11：producer/math scheduler 将本次调用内不变的当前 expert 行数和
+  block 边界留在 warp-uniform registers，避免逐 tile GM 重读；没有
+  跨调用保留 route/count。FC2 的固定展开也单独隔离，原训练/跨机
+  epilogue 保留原来的动态行循环策略。8K/20K kernel 为
+  6.624/16.943 ms，完整调用为 6.796/17.179 ms；普通及热点小 ring
+  输出对照通过。随后 Flash T256/8192/20480 的训练
+  output/dX/dGate/dW1/dW2，以及独立 inference 生命周期校验均通过。
+- M12（未采用）：Pull G2S 改为 MegaMoE 的 `EVICT_FIRST`，普通及
+  热点小 ring 校验通过，但 kernel 为 6.668/17.007 ms，未优于 M11。
+  已去掉该改动，不将缓存优先级对齐当作性能收益。
+- M13（未采用）：N256 的 N-group 从 16 降为 8，使每组覆盖的权重
+  列宽与 MegaMoE N128/group16 一致。kernel 回退至 7.331/20.587 ms，
+  已撤回；不能据“相同列宽”推断相同复用或更好的流水，保留 M11。
 
 以下是定位用单轮 screening，不是最终验收表。32 步相同正态变长/热点随机
 trace（token std=10%、route bias std=0.5），完整 prime，8 warmup + 24 measured，
@@ -61,9 +105,16 @@ epilogue 增长显著，producer ready 等待不是最大的部分；探针有�
 原 `torchrun_tensor_runtime.py` 的 2048/512 小形状训练 fixture 直接扩到
 4096/2048 时，dX 对照出现少量绝对误差 2.29e-5/3.05e-5 超过原 2e-5 阈值；
 没有放宽阈值或将该 run 算作通过。Flash 的规范训练 reference 对照与上述
-独立 inference 生命周期分别验证；还需在冻结旧库上复现此 fixture 差异。
+独立 inference 生命周期分别验证。冻结旧 PF 原样复现了 top-k4 case 的相同
+rank、元素位置和 2.29e-5 最大绝对误差（`old_lifecycle_fixture_ep8.log`），
+因此不是本轮 CUDA 改动引入的回退；没有改动这个 fixture 的容差。
 
-待办：继续消融 WGMMA 在途组与 FC2 epilogue；完整调用正反序确认；
+CPU 的 `test_static_forward_autotune.py`、`test_autotune_defaults.py`、
+`test_forward_autotune.py` 合计 33 passed、7 failed；在改动前的 `7aaaded`
+独立 worktree 上同样是这 7 项失败（旧宏枚举、候选数量、shared-memory
+固定值断言），不把它们列为本轮通过，也未增加或放宽微观断言。
+
+待办：完整调用正反序确认；
 导出验收 profile 后再关闭性能门禁。
 
 ## 2026-10-06：MegaMoE 缩容与 PF 工作流对齐诊断

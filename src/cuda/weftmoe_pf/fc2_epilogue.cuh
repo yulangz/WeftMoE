@@ -5,7 +5,7 @@
 // avoids carrying static peer addressing through the dynamic V3 epilogue.
 template <bool Network = false, unsigned TileN = forward_tuning::kFc2TileN,
           bool RingSchedule = false, unsigned TileRows = 128U,
-          unsigned MathThreads = kMathThreads>
+          unsigned MathThreads = kMathThreads, bool FullColumns = false>
 __device__ __forceinline__ void
 static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
                         std::uint64_t canonical_row, std::uint32_t valid_rows,
@@ -17,11 +17,10 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
   // Neighboring lanes write neighboring vectors of one contribution row.
   // Assigning one lane per row scatters every warp across H-strided peer
   // addresses and turns each 16-byte store into its own NVLink transaction.
-  constexpr auto kRowLanes = 8U;
   constexpr auto kElements = sizeof(uint4) / sizeof(transport::BFloat16);
+  constexpr auto kRowLanes = FullColumns ? TileN / kElements : 8U;
   const auto column_lane = threadIdx.x % kRowLanes;
-  for (auto row = threadIdx.x / kRowLanes; row < valid_rows;
-       row += MathThreads / kRowLanes) {
+  const auto copy_row = [&](unsigned row) {
     transport::BFloat16 *destination;
     if constexpr (RingSchedule) {
       const auto identity =
@@ -40,9 +39,11 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
     destination += column_base;
     for (std::uint32_t column = column_lane * kElements; column < TileN;
          column += kRowLanes * kElements) {
-      if (column_base + column >= a.hidden)
-        break;
-      const auto remaining = a.hidden - column_base - column;
+      if constexpr (!FullColumns)
+        if (column_base + column >= a.hidden)
+          break;
+      const auto remaining =
+          FullColumns ? kElements : a.hidden - column_base - column;
       const auto elements = remaining < kElements ? remaining : kElements;
       const auto *source =
           tile + m_fragment_vector_offset<TileRows>(row, column);
@@ -54,6 +55,19 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
           destination[column + element] = source[element];
       }
     }
+  };
+  if constexpr (FullColumns) {
+    // Shape-specialized inference owns complete N tiles. Expose independent
+    // peer stores without imposing unroll policy on the existing epilogues.
+#pragma unroll
+    for (unsigned row = threadIdx.x / kRowLanes; row < TileRows;
+         row += MathThreads / kRowLanes)
+      if (row < valid_rows)
+        copy_row(row);
+  } else {
+    for (auto row = threadIdx.x / kRowLanes; row < valid_rows;
+         row += MathThreads / kRowLanes)
+      copy_row(row);
   }
   cutlass::arch::NamedBarrier::sync(MathThreads,
                                     physical_barrier<true>(kMathDoneBarrier));
@@ -61,7 +75,8 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
 
 template <class TileMma, bool Network = false,
           unsigned TileN = forward_tuning::kFc2TileN, bool RingSchedule = false,
-          unsigned TileRows = 128U, unsigned MathThreads = kMathThreads>
+          unsigned TileRows = 128U, unsigned MathThreads = kMathThreads,
+          bool FullColumns = false>
 __device__ __forceinline__ void
 static_v4_push_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
                         float *accum, std::uint64_t canonical_row,
@@ -76,6 +91,7 @@ static_v4_push_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
         __float22bfloat162_rn(
             make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])));
   }
-  static_v4_copy_fc2_tile<Network, TileN, RingSchedule, TileRows, MathThreads>(
+  static_v4_copy_fc2_tile<Network, TileN, RingSchedule, TileRows, MathThreads,
+                          FullColumns>(
       a, tile, canonical_row, valid_rows, column_base, mblock, row_offset);
 }

@@ -28,6 +28,10 @@
 | `fc1_done` | FC1 N tile 的 SwiGLU 写入 S 完成 | FC2 等待 `g × FC1_N_tiles`；下一代 Pull 等待旧代同一目标 |
 | `fc2_done` | FC2 N tile 计算及 contribution stores 发出 | 下一代 FC1 epilogue 等待 `(g−1) × FC2_N_tiles` 再覆盖 S |
 
+- `fc2_done` 是 S 的读退休 credit，使用 relaxed atomic；它不承担
+  contribution 的发布语义。`x_full`、`fc1_done` 仍使用 release 发布
+  当前数据。N256 的 FC1 tile 有两个 N64 TMA store issuer，必须先 join
+  两者的全局完成，再由 leader 更新 `fc1_done`。
 - Source 预留完整 BF16 contribution `[top_k, max_tokens_per_rank, H]`，
   FC2 直接写 `(slot, source_token, H_tile)`，不再等待 source window credit。
   它是本次推理的临时通信结果，不是跨调用缓存的激活。全部 FC2 store 经
@@ -41,8 +45,14 @@
   新 X、token 数和 route。训练不使用这个缓存；更新权重（包括原址更新）前
   必须显式 invalidate，不以地址未变推断权重未变。
 
-GEMM 参数和 shared-memory 预算由 profile 校验：当前入口为 N128/K64、
-cluster2、FC1/FC2 共用 2–5 stages，独立 epilogue 与三份 Pull scratch。
+GEMM 参数和 shared-memory 预算由 profile 校验：当前入口支持共同 N128
+或 N256、K64、cluster2，FC1/FC2 使用相同 stage 数；N128 最多 5 stages，
+N256 最多 3 stages，独立 epilogue 与三份 Pull scratch 均计入预算。
+当前 expert 的行数/边界只在本次 kernel 的 warp registers 内复用，不缓存
+跨调用路由。Reduce 同时读取四个独立向量，保留逐元素 FP32 累加次序。
+`WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH` 默认关闭；显式 inference profile
+可选择 MegaMoE 式 SFU exponential/reciprocal。它保留 BF16 投影舍入，
+但不保证与严格除法逐位相同；训练、DT 和跨机入口不使用该开关。
 迭代性能、未采用候选和验收范围见训练记录顶部的单机 inference 对齐章节。
 
 ## 2026-10-03：Backward peer 地址按容量复用（M7e）

@@ -673,6 +673,9 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
     )
     if "v4" in config and config["static_v4_prefill_min_tokens"]:
         kernel_names += ("weftmoe_dt6kernel",)
+    local_streaming = config.get("v4", {}).get("local_prefill_streaming", 0)
+    if local_streaming:
+        kernel_names += ("weftmoe_pf5local6kernel",)
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
     for index, line in enumerate(lines[:-1]):
@@ -701,6 +704,8 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
         "compiled_split_kernel_count": 0 if unified else len(functions),
         "compiled_unified_kernel_count": len(functions) if unified else 0,
         "kernels": functions,
+        "local_streaming_dynamic_shared_bytes": (
+            v4_tuning.local_streaming_shared_bytes(config) if local_streaming else None),
         "dynamic_shared_memory_world16": dynamic_shared_memory(config, 16),
         "unified_total_shared_memory_upper_bound_world16": (
             unified_tuning.shared_memory_upper_bound(

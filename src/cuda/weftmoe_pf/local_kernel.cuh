@@ -120,35 +120,50 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
   auto *output = reinterpret_cast<uint4 *>(a.output);
   constexpr unsigned vectors = forward_tuning::kMainHidden / 8U;
   constexpr unsigned warps = kMathThreads / 32U;
+  constexpr unsigned batch = 4U;
   const auto lane = threadIdx.x % 32U;
   const auto top_k = a.dispatch.identity.top_k;
   for (auto token = std::uint64_t(blockIdx.x) * warps + threadIdx.x / 32U;
        token < a.dispatch.identity.num_tokens; token += gridDim.x * warps) {
-    // Keep the usual top-k directory in warp registers, and transfer eight
-    // BF16 values per lane. The FP32 summation order remains expert-sorted.
+    // Keep the usual top-k directory in warp registers. Four independent
+    // 16B vectors overlap global loads without changing each element's
+    // expert-sorted FP32 summation order.
     const auto order =
         lane < top_k ? a.dispatch.combine_order[token * top_k + lane] : 0U;
-    for (unsigned column = lane; column < vectors; column += 32U) {
-      float2 sum[4] = {};
+    for (unsigned column = lane; column < vectors; column += batch * 32U) {
+      float2 sum[batch][4] = {};
       for (unsigned position = 0; position < top_k; ++position) {
         const auto slot =
             position < 32U ? __shfl_sync(0xffffffffU, order, position)
                            : a.dispatch.combine_order[token * top_k + position];
-        const auto packed =
-            input[(slot * a.max_tokens_per_rank + token) * vectors + column];
-        const unsigned bits[4] = {packed.x, packed.y, packed.z, packed.w};
+        uint4 packed[batch];
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) {
-          const auto value = bf16x2_bits_to_float2(bits[i]);
-          sum[i].x = __fadd_rn(sum[i].x, value.x);
-          sum[i].y = __fadd_rn(sum[i].y, value.y);
+        for (unsigned vector = 0; vector < batch; ++vector)
+          if (column + vector * 32U < vectors)
+            packed[vector] = input[(slot * a.max_tokens_per_rank + token) *
+                                       vectors + column + vector * 32U];
+#pragma unroll
+        for (unsigned vector = 0; vector < batch; ++vector) {
+          if (column + vector * 32U >= vectors)
+            continue;
+          const unsigned bits[4] = {packed[vector].x, packed[vector].y,
+                                    packed[vector].z, packed[vector].w};
+#pragma unroll
+          for (unsigned i = 0; i < 4U; ++i) {
+            const auto value = bf16x2_bits_to_float2(bits[i]);
+            sum[vector][i].x = __fadd_rn(sum[vector][i].x, value.x);
+            sum[vector][i].y = __fadd_rn(sum[vector][i].y, value.y);
+          }
         }
       }
-      output[token * vectors + column] = {
-          float2_to_bf16x2_bits(sum[0].x, sum[0].y),
-          float2_to_bf16x2_bits(sum[1].x, sum[1].y),
-          float2_to_bf16x2_bits(sum[2].x, sum[2].y),
-          float2_to_bf16x2_bits(sum[3].x, sum[3].y)};
+#pragma unroll
+      for (unsigned vector = 0; vector < batch; ++vector)
+        if (column + vector * 32U < vectors)
+          output[token * vectors + column + vector * 32U] = {
+              float2_to_bf16x2_bits(sum[vector][0].x, sum[vector][0].y),
+              float2_to_bf16x2_bits(sum[vector][1].x, sum[vector][1].y),
+              float2_to_bf16x2_bits(sum[vector][2].x, sum[vector][2].y),
+              float2_to_bf16x2_bits(sum[vector][3].x, sum[vector][3].y)};
     }
   }
   collective_scope_sync<kMathThreads, 7U>();

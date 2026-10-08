@@ -2,7 +2,7 @@
 
 namespace weftmoe_pf::local {
 
-constexpr unsigned kM = 128U, kN = 128U, kK = 64U;
+constexpr unsigned kM = 128U, kN = forward_tuning::kFc1TileN, kK = 64U;
 constexpr unsigned kThreads = 384U, kMathThreads = 256U;
 constexpr unsigned kStages = forward_tuning::kStaticV4Fc1Stages;
 constexpr unsigned kFc1Tiles = 2U * forward_tuning::kMainIntermediate / kN;
@@ -33,6 +33,7 @@ struct Task {
 struct Schedule {
   const ForwardKernelArgs &a;
   unsigned expert = 0U, begin = 0U, end = 0U, index;
+  unsigned cached_expert = ~0U, expert_begin = 0U, expert_end = 0U, rows = 0U;
 
   __device__ explicit Schedule(const ForwardKernelArgs &args)
       : a(args), index(blockIdx.x) {}
@@ -40,8 +41,16 @@ struct Schedule {
   __device__ __forceinline__ bool next(Task &t) {
     const auto owned = a.dispatch.sizes.owned_expert_count;
     while (expert < owned) {
-      const auto expert_begin = unsigned(a.ring.expert_blocks[expert]);
-      const auto expert_end = unsigned(a.ring.expert_blocks[expert + 1U]);
+      if (cached_expert != expert) {
+        // Geometry is immutable within this invocation. Keep the current
+        // expert in warp-uniform registers across all its FC1/FC2 tiles.
+        expert_begin = __shfl_sync(
+            0xffffffffU, unsigned(a.ring.expert_blocks[expert]), 0);
+        expert_end = __shfl_sync(
+            0xffffffffU, unsigned(a.ring.expert_blocks[expert + 1U]), 0);
+        rows = __shfl_sync(0xffffffffU, unsigned(a.ring.expert_rows[expert]), 0);
+        cached_expert = expert;
+      }
       if (end == begin)
         end = min(expert_end, begin + a.ring.depth);
       const auto blocks = end - begin;
@@ -59,8 +68,7 @@ struct Schedule {
         t = {expert,
              block,
              group * Group + within % width,
-             min(kM, unsigned(a.ring.expert_rows[expert]) -
-                         (block - expert_begin) * kM),
+             min(kM, rows - (block - expert_begin) * kM),
              block % a.ring.depth * kM,
              block / a.ring.depth + 1U,
              fc2};

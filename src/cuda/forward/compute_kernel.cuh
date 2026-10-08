@@ -55,17 +55,31 @@ enum ForwardComputePairOperand : std::uint32_t {
 // in BF16. Forward must consume those exact checkpoint values as well, or a
 // later SwiGLU recomputation would silently use different operands. FC2 then
 // consumes the separately rounded BF16 U = gate*S.
+template <bool FastMath = false>
 __device__ __forceinline__ float gated_swiglu_fc2_input(float a, float b,
                                                         float gate) {
-  const auto sigmoid = 1.0F / (1.0F + __expf(-a));
+  float sigmoid;
+  if constexpr (FastMath) {
+    // The optional inference profile matches MegaMoE's fast SFU path.
+    // Projection/output BF16 rounding and multiplication order stay intact;
+    // training and all existing callers retain the rounded FP32 division.
+    float exponent;
+    const auto scaled = -a * 1.4426950408889634F;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponent) : "f"(scaled));
+    const auto denominator = 1.0F + exponent;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sigmoid) : "f"(denominator));
+  } else {
+    sigmoid = 1.0F / (1.0F + __expf(-a));
+  }
   return __fmul_rn((a * sigmoid) * b, gate);
 }
 
+template <bool FastMath = false>
 __device__ __forceinline__ float
 gated_swiglu_fc2_input_from_bf16(std::uint16_t a_bits, std::uint16_t b_bits,
                                  float gate) {
-  return gated_swiglu_fc2_input(bf16_bits_to_float(a_bits),
-                                bf16_bits_to_float(b_bits), gate);
+  return gated_swiglu_fc2_input<FastMath>(bf16_bits_to_float(a_bits),
+                                          bf16_bits_to_float(b_bits), gate);
 }
 
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)

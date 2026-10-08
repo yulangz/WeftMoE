@@ -38,7 +38,7 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
                                        t.expert * columns + t.column * kN);
         s.full[stage].arrive_and_expect_tx((kM + kN) * kK * 2U);
       }
-      stage = (stage + 1U) % kStages;
+      stage = stage + 1U == kStages ? 0U : stage + 1U;
       phase ^= stage == 0U;
     }
   }
@@ -58,7 +58,8 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       s.a[0], (threadIdx.x / 128U) * 64U, 0U);
   auto db =
       hopper::make_gmma_desc<hopper::Major::K, kN, kK, 128U>(s.b[0], 0U, 0U);
-  const auto abase = da.reg32_[0], bbase = db.reg32_[0];
+  const auto abase = __shfl_sync(0xffffffffU, da.reg32_[0], 0);
+  const auto bbase = __shfl_sync(0xffffffffU, db.reg32_[0], 0);
   bool previous_fc2 = false;
   while (schedule.next(t)) {
     auto &slot = a.ring.slots[t.block % a.ring.depth];
@@ -74,47 +75,74 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
     float accum[Mma::kNumAccum] = {};
     const auto reduction =
         t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
+    unsigned retirement = stage;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.full[stage].wait(phase);
+      const auto astart = abase + stage * (kM * kK / 8U);
+      const auto bstart = bbase + stage * (kN * kK / 8U);
 #pragma unroll
       for (auto &value : accum)
         cute::warpgroup_fence_operand(value);
       cute::warpgroup_arrive();
 #pragma unroll
       for (unsigned atom = 0; atom < kK; atom += Mma::K) {
-        da.reg32_[0] = abase + (stage * kM * kK + atom) * 2U / 16U;
-        db.reg32_[0] = bbase + (stage * kN * kK + atom) * 2U / 16U;
+        da.reg32_[0] = astart + atom / 8U;
+        db.reg32_[0] = bstart + atom / 8U;
         Mma::wgmma(da, db, accum, k != 0U || atom != 0U);
       }
       cute::warpgroup_commit_batch();
 #pragma unroll
       for (auto &value : accum)
         cute::warpgroup_fence_operand(value);
+      const auto lane = threadIdx.x & 31U;
+      if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
+        if (k != 0U) {
+          cute::warpgroup_wait<1>();
+          if (lane < 2U)
+            s.empty[retirement].arrive(lane);
+          retirement = retirement + 1U == kStages ? 0U : retirement + 1U;
+        }
+      } else {
+        cute::warpgroup_wait<0>();
+        if (lane < 2U)
+          s.empty[stage].arrive(lane);
+      }
+      stage = stage + 1U == kStages ? 0U : stage + 1U;
+      phase ^= stage == 0U;
+    }
+    if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
       cute::warpgroup_wait<0>();
       const auto lane = threadIdx.x & 31U;
       if (lane < 2U)
-        s.empty[stage].arrive(lane);
-      stage = (stage + 1U) % kStages;
-      phase ^= stage == 0U;
+        s.empty[retirement].arrive(lane);
     }
     if (t.fc2) {
-      static_v4_push_fc2_tile<Mma, false, kN, true>(
+      static_v4_push_fc2_tile<Mma, false, kN, true, kM, kMathThreads, true>(
           a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
+      // This is an S read-retirement credit, not contribution publication.
+      // All TMA/WGMMA reads and the math join have finished. The terminal
+      // rank barrier publishes remote stores once, without draining them at
+      // every FC2 tile just to recycle the unrelated S input slot.
       if (threadIdx.x == 0U)
-        arrive(slot.fc2_done, 1U);
+        atomicAdd(reinterpret_cast<unsigned long long *>(&slot.fc2_done), 1ULL);
     } else {
       // X and S have independent lifetimes. Pull can recycle X as soon as
       // all FC1 tiles retire, but the new S must wait for the previous FC2.
       while (ring::acquire(slot.fc2_done) <
              std::uint64_t(t.generation - 1U) * kFc2Tiles) {
       }
-      static_v4_store_fc1_tile<kN, kM * kN, false, true, true>(
+      static_v4_store_fc1_tile<kN, kM * kN, false, true, true,
+                              forward_tuning::kLocalPrefillFastMath>(
           a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
           t.block, &output_map);
       // Full tiles use a single TMA issuer which has already waited for
       // global completion. Compact tails use stores from every math thread.
       if (t.rows != kM) {
         __threadfence();
+        collective_scope_sync<kMathThreads, 7U>();
+      } else if constexpr (kN > 128U) {
+        // Wider SwiGLU tiles have multiple N64 TMA issuers. Join their
+        // global completions before the leader publishes S readiness.
         collective_scope_sync<kMathThreads, 7U>();
       }
       if (threadIdx.x == 0U)

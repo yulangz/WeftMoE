@@ -639,7 +639,8 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 
 bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
   return forward_tuning::kLocalPrefillStreaming &&
-         forward_tuning::kFc1TileN == 128U && forward_tuning::kFc2TileN == 128U &&
+         (forward_tuning::kFc1TileN == 128U || forward_tuning::kFc1TileN == 256U) &&
+         forward_tuning::kFc2TileN == forward_tuning::kFc1TileN &&
          forward_tuning::kStaticV4TileK == 64U &&
          !forward_tuning::kStaticV4PrefillEnabled &&
          config.max_hidden_size == forward_tuning::kMainHidden &&

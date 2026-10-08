@@ -271,7 +271,11 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_LOCAL_PREFILL_STREAMING
 #define WEFTMOE_FWD_LOCAL_PREFILL_STREAMING 0
 #endif
+#ifndef WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH
+#define WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH 0
+#endif
 inline constexpr bool kLocalPrefillStreaming = WEFTMOE_FWD_LOCAL_PREFILL_STREAMING;
+inline constexpr bool kLocalPrefillFastMath = WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH;
 inline constexpr unsigned kStaticV4CtaCount = WEFTMOE_FWD_STATIC_V4_CTA_COUNT;
 static_assert(kStaticV4CtaCount % 2U == 0U);
 #ifndef WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS

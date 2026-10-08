@@ -3,19 +3,20 @@
 // Included inside forward_compute_detail, alongside the shared M128 fragment
 // layout helpers. W1's packed [gate8, up8] accumulator becomes an N/2 SwiGLU
 // tile; the BF16 projection rounding remains identical to the V3 contract.
+template <bool FastMath = false>
 __device__ __forceinline__ float2
 static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
   const auto g = __bfloat1622float2(
       __float22bfloat162_rn(make_float2(gate[0], gate[1])));
   const auto u = __bfloat1622float2(
       __float22bfloat162_rn(make_float2(up[0], up[1])));
-  return make_float2(gated_swiglu_fc2_input(g.x, u.x, route_weight),
-                    gated_swiglu_fc2_input(g.y, u.y, route_weight));
+  return make_float2(gated_swiglu_fc2_input<FastMath>(g.x, u.x, route_weight),
+                    gated_swiglu_fc2_input<FastMath>(g.y, u.y, route_weight));
 }
 
 template <unsigned Fc1TileN, unsigned ScratchElements,
           bool RetainBackwardState = false, bool TmaStore = false,
-          bool PrivateScratch = false, class Args>
+          bool PrivateScratch = false, bool FastMath = false, class Args>
 __device__ __forceinline__ void static_v4_store_fc1_tile(
     const Args &a, transport::BFloat16 *tile, const float *accum,
     transport::BFloat16 *output, const float *gates, std::uint64_t row,
@@ -48,8 +49,8 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
       const auto *u = g + 4U;
       store_m_fragment(
           tile, index,
-          __float22bfloat162_rn(static_v4_swiglu_pair(g, u, gate0)),
-          __float22bfloat162_rn(static_v4_swiglu_pair(g + 2U, u + 2U, gate1)));
+          __float22bfloat162_rn(static_v4_swiglu_pair<FastMath>(g, u, gate0)),
+          __float22bfloat162_rn(static_v4_swiglu_pair<FastMath>(g + 2U, u + 2U, gate1)));
       if constexpr (RetainBackwardState) {
         store_m_fragment(
             tile + kOutputElements, index,
@@ -136,9 +137,9 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     const auto column = column_base + index * 8U + (lane % 4U) * 2U;
     if (row0 < valid_rows) {
       const auto value = make_float2(
-          gated_swiglu_fc2_input_from_bf16(
+          gated_swiglu_fc2_input_from_bf16<FastMath>(
               float_to_bf16_bits(g[0]), float_to_bf16_bits(u[0]), gate0),
-          gated_swiglu_fc2_input_from_bf16(
+          gated_swiglu_fc2_input_from_bf16<FastMath>(
               float_to_bf16_bits(g[1]), float_to_bf16_bits(u[1]), gate0));
       *reinterpret_cast<std::uint32_t *>(
           output + (row + row0) * a.intermediate + column) =
@@ -146,9 +147,9 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     }
     if (row1 < valid_rows) {
       const auto value = make_float2(
-          gated_swiglu_fc2_input_from_bf16(
+          gated_swiglu_fc2_input_from_bf16<FastMath>(
               float_to_bf16_bits(g[2]), float_to_bf16_bits(u[2]), gate1),
-          gated_swiglu_fc2_input_from_bf16(
+          gated_swiglu_fc2_input_from_bf16<FastMath>(
               float_to_bf16_bits(g[3]), float_to_bf16_bits(u[3]), gate1));
       *reinterpret_cast<std::uint32_t *>(
           output + (row + row1) * a.intermediate + column) =
