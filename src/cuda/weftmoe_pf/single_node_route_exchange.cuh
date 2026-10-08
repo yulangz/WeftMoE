@@ -65,7 +65,6 @@ __device__ __noinline__ void route_exchange(const ForwardKernelArgs &a,
     for (auto route = tid; route < routes; route += stride) {
       peer_at<float>(a.local_base, a.fused_source_gates_offset)[route] =
           a.gates[route];
-      a.checkpoint.source_rows[route] = a.dispatch.route_dst_row[route];
       const auto expert = unsigned(a.selected_experts[route]);
       source_routes(a, expert / owned, a.rank,
                     expert % owned)[a.dispatch.local_offset[route]] = route;

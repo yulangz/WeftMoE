@@ -1,5 +1,64 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：C8 拆分 TMA 读退休与完整写出（未采用）
+
+结论：相对 C7 的逐 K 完整等待，拆分等待没有稳定收益；最终仍保留 C5
+pair/vector，不新增运行模式。C8 的候选实现与冻结产物保留用于复现。
+
+Saved X 不是由固定 Ntile0 保存。每个全局 M-block 选取
+`Ntile/2 == Mblock % (FC1_Ntiles/2)` 的相邻 CTA pair；偶数 N tile 保存
+前 M64，奇数保存后 M64，其余 N tile 不重复写 X。本轮 FC1 有 16 个
+N tile，即在 8 对之间轮转。C5/C7/C8 的 owner 分配完全相同。
+
+C8 恢复 C7 的 canonical 物理行序、M32 TMA/尾行 vector，唯一执行策略
+差异为完成条件的位置：
+
+- 每个 K64 分块 WGMMA commit、checkpoint TMA commit 后，执行
+  `cp.async.bulk.wait_group.read 0`。第 0 warp 的 join 保证 lane0/1 发出的
+  两个 multicast empty credit 不早于 TMA 源读取完成；WGMMA 读退休条件
+  也保留。因此 A stage 可以回收，而目标写出允许继续推进。
+- FC1 epilogue 后、现有 math join 和 `fc1_done` 发布前，再执行完整
+  `cp.async.bulk.wait_group 0`。完整 M tile 的 S epilogue 已有同 issuer 的
+  full wait；显式任务末尾等待也覆盖不走 S-TMA 的尾块。不依赖 kernel
+  退出代替显式完成，不新增 buffer、计数器或 GEMM 参数。
+- 复用 checkpoint helper，以默认完整等待保持旧入口语义。SASS 确认
+  K 循环的 `DEPBAR` 仍存在、其后的 `CCTL.IVALL` 被移除，任务末尾仍有
+  完整等待。C7/C8 都是 REG168/STACK32/静态 shared1024/LOCAL0，动态
+  shared 226304 bytes 不变，不能把这一步称为降低了寄存器或 stack。
+
+同一轮 EP8 Flash、1620 MHz、随机变长/热点路由，32-step prime、8 warmup、
+24 measured。C5/C7/C8 都测缓存 on/off，先正序再反序；以下为两轮完整
+FWD wall p50 的均值，括号内是各轮值，单位 ms：
+
+| tokens/rank | C5 vector on | C7 逐 K full wait on | C8 分离等待 on |
+|---|---:|---:|---:|
+| 8192 | 7.741（7.748 / 7.735） | 8.044（7.967 / 8.122） | 8.006（8.044 / 7.967） |
+| 20480 | 17.874（17.875 / 17.872） | 18.394（18.412 / 18.375） | 18.472（18.485 / 18.458） |
+
+C8−C7 为 −0.48% / +0.42%；8K 两轮方向相反，不宣称有稳定提升。
+C8 比最终 C5 慢 3.42% / 3.35%，因此不采用。缓存关闭的结果也完整保留：
+
+| tokens/rank | C5 off ms | C7 off ms | C8 off ms |
+|---|---:|---:|---:|
+| 8192 | 6.881（6.829 / 6.934） | 6.966（6.939 / 6.994） | 6.916（6.898 / 6.934） |
+| 20480 | 16.767（16.722 / 16.812） | 17.054（17.067 / 17.041） | 17.075（17.123 / 17.026） |
+
+C8 off 相比 C5 为 +0.50% / +1.84%。本实验没有证实逐 K full wait 是
+C7 回退的主要可优化来源，也不能据此判定 TMA 的独立带宽更低；这里测的
+仍是具体集成方式的完整 FWD，不是独立 copy microbenchmark。
+
+全部 12 组、24 条记录的逐 rank workload hash、token trace、计时设置与
+workspace 容量一致；包括 notify、按实际 R 申请/释放 tape，不计一次性
+不可变权重准备。UTC 08:58:19.280–09:02:42.163 的计时区间，500 ms 轮询
+4200 个 GPU 样本全为 1620 MHz，其中 util≥80% 的 324 个。
+
+C8 已通过 T256/8K/20K 普通 FWD、8K/20K 强热点、完整
+output/dX/dGate/dW1/dW2、双 tape/空接收/回绕、inference/Graph 生命周期。
+定向 local-main memcheck 与 racecheck 均为 8 ranks 零错误/零 hazard；
+不代表完整 BWD racecheck。CPU 检查 6 passed、4 subtests passed。
+冻结产物 `build/pf_megamoe_20261008/cache_c8/f47b1119685a/`，性能日志
+`c8_split_wait_{c5,c7,c8}_{on,off}_{0,1}_ep8.log`，验证日志 `c8_*_ep8.log`。
+
 ## 2026-10-08：本轮缓存优化结论（保留 C5）
 
 最终保留 **FC1 A-stage 保存 X + 目的地址外提 + 轮转 CTA pair 各复制 M64**。
