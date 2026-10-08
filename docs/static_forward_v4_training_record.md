@@ -1,6 +1,25 @@
 # V4 ring 训练对接记录
 
+## 2026-10-08：更正独立 store 样例，补测连续地址高 CTA 数
+
+初版独立样例的 vector LDS 实际被 ptxas 外提，之前称为逐 tile 的
+shared→global 拷贝不准确。已改为 PTX `ld.volatile.shared`，反汇编和
+NCU 确认每轮读取 shared；只改 benchmark，正式 PF/C5 不变。
+
+1620 MHz 时钟设置、8 KiB tile、总写出始终 512 MiB，连续布局从
+132 扫到 **8448 CTA**：vector/TMA serial 的差距均在约 2% 以内。
+1056 CTA 为 **133.176 / 131.376 us**，8448 CTA 为
+**125.728 / 124.792 us**。并非 CTA 越多 TMA 优势越大；launch CTA 数
+也不等于同时驻留数。修正后的 PF 跨行/grid528 为
+**152.344 / 134.032 us**，TMA 耗时低 **12.02%**，跨行下的优势仍存在。
+
+两轮正反序、每模式 40 samples；复制模式全部逐 word 校验通过，定向
+memcheck/racecheck 零错误。完整 CTA 扫描、旧数据更正、计时边界和
+复现命令见 [样例记录末节](../benchmarks/pf_saved_x_repro.md)。
+
 ## 2026-10-08：澄清 ring copy 与裸 store 的性能
+
+本节为初版历史记录；vector 的 shared load 外提问题及修正结果见上节。
 
 补充 [独立 shared→global store 对照](../benchmarks/pf_saved_x_repro.md)，
 移除 GM→SM input refill、ring/credit、GEMM，源 shared tile 保持不变。

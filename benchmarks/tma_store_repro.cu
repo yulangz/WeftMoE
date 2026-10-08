@@ -57,9 +57,9 @@ __launch_bounds__(Threads) void store_repro(const __grid_constant__ CUtensorMap 
         const auto address = cute::cast_smem_ptr_to_uint(source + r * (K / 2) +
                                                          ((c / 2) ^ ((r % 8U) * 4U)));
         uint4 value;
-        // Keep a real LDS for every copy, rather than hoisting an immutable
-        // source into registers and accidentally benchmarking register stores.
-        asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
+        // PTX volatile is required too: asm volatile alone still lets ptxas
+        // hoist these immutable shared loads out of the task loop.
+        asm volatile("ld.volatile.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
                      : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
                      : "r"(address)
                      : "memory");

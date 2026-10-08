@@ -192,13 +192,18 @@ C7/C8 在 cache-off 下也有回退，涉及完整 kernel 代码生成/物理行
 
 ## 2026-10-08 补充：独立 shared→global store
 
+更正：本节保留初版 `4ff76fa` 的历史数据。进一步检查循环边界发现，
+vector 的 LDS 被 ptxas 提升到循环外，实际循环是 register→global store；
+仅有 `asm volatile` 并不足以阻止这一优化。因此本节不能作为严格的
+逐 tile shared→global 对比。修正后的样例及更多 CTA 数据见下一节。
+
 新增 [tma_store_repro.cu](tma_store_repro.cu)，只依赖 CUDA/CUTLASS headers。
 没有 GEMM、GM→SM load、ring、source 覆盖、跨 CTA credit 或 multicast。
 每个 CTA 一次性准备不可变的 128 B-swizzled shared tile，随后写到互不重叠
 的 global tile。三种写法在同一个 kernel binary 内切换：
 
-- vector：256 threads 合作，真实 `LDS.128 → STG.128`；用 volatile inline
-  LDS 防止编译器把恒定源提升到寄存器、变成 register→global 测试。
+- vector：256 threads 合作；初版源代码意图逐 tile 执行 LDS，但生成的
+  SASS 实际在循环外读取 shared，随后反复从寄存器写出。
 - TMA serial：一次 tensor store 对应一个 tile，每个 tile commit + full
   wait。一次 election 包围整个循环，避免 peeling，并保持 issuer 一致。
 - TMA queued：每个 tile commit + `wait_group 7`，允许最多八组在途，
@@ -208,6 +213,8 @@ shape 编译期固定，避免运行时整数除法影响地址计算；无 spil
 相同的一次 shared 初始化、proxy fence 和同步，分配/数值检查在计时外。
 `none` 测出的准备及 launch 开销约 5–9 us，下表没有人为扣除它。
 所有模式都计到 kernel 完成，不能拿 TMA 发起耗时与 vector 完成耗时比较。
+以下构建命令使用工作区源码；历史表来自初版 `4ff76fa`，不能用修正后的
+当前源码复现其 binary。旧 binary/反汇编保留在本节末尾的产物目录中。
 
 ```bash
 mkdir -p build/tma_store_repro_20261008
@@ -260,8 +267,81 @@ replay 下，8 KiB/PF 布局的 vector/TMA、grid132/528 有效频率约
 1579–1582 MHz，差异不到 0.2%；DRAM 写出均约 534.6–534.7 MB。
 依然应区分设定时钟和 kernel 窗口内的有效频率，profiler 时间不混入上表。
 
-最终源码 SHA256 为 `eedb764e32ce664ee0b9259172b607b38ef59aa375f8e222cd7e0e61a534d1f5`。
+初版源码 SHA256 为 `eedb764e32ce664ee0b9259172b607b38ef59aa375f8e222cd7e0e61a534d1f5`。
 原始样本、时钟、NCU、检查和反汇编均在 `build/tma_store_repro_20261008/`：
 `matrix_r{0,1}.log`、`clocks.csv`、`ncu_*.{csv,log}`、`memcheck.log`、
 `racecheck.log`、`repro.sass`。早期 `probe_*.log` 使用了运行时 shape，
 不属于最终结果，不与静态地址计算的上述数据混用。
+
+## 2026-10-08：修正 LDS 外提，补充连续地址与更多 CTA
+
+将 vector 的 PTX 改为 `ld.volatile.shared.v4.b32`，只改诊断样例，不改
+正式 PF。原来的 C++ `asm volatile` 没有阻止 ptxas 外提不可变源的 LDS。
+修正后，8 KiB/连续布局的 SASS 回边为 `BRA 0x410`，两条 LDS 位于
+`0x410/0x430`；PF 跨行布局回到 `0x420`，两条 LDS 位于 `0x420/0x460`。
+两者均在循环内实际读取 shared。NCU 在连续布局/grid1056 下测到
+**4,194,304 个 shared-load wavefront**，对应完整 512 MiB 的读取，
+shared-load bank conflict 为零，不再是每个 CTA 只读一次 shared。
+
+连续布局为 width64 BF16：每行 128 B、每 tile 64 行共 8 KiB，整个 tile
+连续，warp 每条 vector store 的 512 B 也连续；tile 按 grid-stride 分配。
+仍固定写出 **512 MiB**，256 threads/CTA，GPU0/L20X/132 SM，SM 时钟
+设置 1620 MHz、memory 3201 MHz。分配/逐 word 校验不计时；每配置
+8 warmup + 40 samples、mode 正反序交替、计时外间隔 2 ms；配置顺序
+正反各测一轮，下表为两轮 median 的均值，单位 **us**。
+
+| launch CTAs | grid / SM 数 | vector | TMA serial | TMA queued |
+|---:|---:|---:|---:|---:|
+| 132 | 1 | 131.208 | 132.184 | 130.768 |
+| 264 | 2 | 131.288 | 131.432 | 131.112 |
+| 528 | 4 | 134.456 | 134.192 | 133.496 |
+| 1056 | 8 | 133.176 | 131.376 | 131.432 |
+| 2112 | 16 | 131.864 | 129.744 | 130.944 |
+| 4224 | 32 | 128.280 | 128.112 | 128.456 |
+| 8448 | 64 | 125.728 | 124.792 | 125.112 |
+
+结论：连续布局下基本持平，TMA serial 相对 vector 的耗时变化为
+**+0.74% 至 −1.61%**，没有跨行布局约 12% 的优势。更多在途 group
+也没有稳定改善。增加 launch CTA 不等于同比增加同时驻留 CTA，超出
+硬件驻留容量后分多批执行；表中第二列不是实测 occupancy。更多 CTA
+仍只处理同一份 512 MiB，不是按 CTA 数增加数据量。一次性的 shared
+初始化随 CTA 数增加，已包含在表中；`none` 为 5.176–21.672 us，未扣除。
+
+同轮补测修正后的 PF 跨行布局：
+
+| launch CTAs | vector us | TMA serial us | TMA queued us |
+|---:|---:|---:|---:|
+| 132 | 134.888 | 135.192 | 134.504 |
+| 528 | 152.344 | 134.032 | 136.640 |
+
+grid528 下 TMA serial 耗时低 **12.02%**，说明原先的性能方向并非由
+LDS 外提造成，但旧版“逐 tile shared→global”的描述仍须撤回。
+不能将本例的独立 store 吞吐推广为 PF 中的 stage 释放/流水线性能。
+
+共 72 条计时记录，其中 54 条复制模式记录逐 word 校验通过，另外
+18 条为 `none`。定向 memcheck（连续/grid8448）、racecheck
+（连续/grid1056）均零错误/零 hazard，检查数据量为 2 MiB。
+连续/PF 布局分别 REG26/27、LOCAL0、shared8192，模式共享同一 binary。
+100 ms NVML 采样均为 1620 MHz、无 SW power cap；独立 NCU 的
+grid1056 vector/TMA serial 有效频率为 1548.5/1581.1 MHz，因此仍只称
+1620 MHz 设置下的测量，不宣称 kernel 窗口严格恒频。NCU 时间不混入
+上表；约 1–2% 的差异不解读为稳定优势。
+
+复现连续地址扫描（再逆序执行一轮）：
+
+```bash
+mkdir -p build/tma_store_repro_20261008/contiguous_volatile
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -lineinfo \
+  -gencode arch=compute_90a,code=sm_90a --expt-relaxed-constexpr \
+  -I/opt/cutlass/include benchmarks/tma_store_repro.cu \
+  -lcuda -o build/tma_store_repro_20261008/contiguous_volatile/repro
+for grid_multiplier in 1 2 4 8 16 32 64; do
+  build/tma_store_repro_20261008/contiguous_volatile/repro \
+    64 64 512 "$grid_multiplier" 40 0
+done
+```
+
+新产物单独保存于 `build/tma_store_repro_20261008/contiguous_volatile/`，
+包括 `matrix_r{0,1}.log`、`repro.sass`、`ncu_8_*.{csv,log}`、
+`clocks.csv`、`memcheck.log`、`racecheck.log`，没有覆盖初版数据。
+源码 SHA256：`ca08ce96cdb69a8c7ae9580c04a04a05530fa551a860363c59b5ff6f56f96af4`。
