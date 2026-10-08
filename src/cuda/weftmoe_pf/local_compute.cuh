@@ -85,7 +85,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                      : 0U;
     const bool checkpoint_owner =
         a.saved_x && !t.fc2 && t.column / 2U == t.block % (kFc1Tiles / 2U);
-    StaticV4XCheckpoint<kK, false, kCheckpointRows> checkpoint;
+    StaticV4XCheckpoint<kK, true, kCheckpointRows> checkpoint;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.full[stage].wait(phase);
       const auto astart = abase + stage * (kM * kK / 8U);
@@ -111,6 +111,9 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
           checkpoint.prepare(a, t.block, checkpoint_rows, checkpoint_begin);
         checkpoint.save(s.a[stage] + checkpoint_begin * kK, checkpoint_rows,
                         k, a.hidden, a.saved_x_map);
+        // The checkpoint TMA reader must retire before either multicast
+        // consumer can return this A stage to the producer.
+        checkpoint.finish();
       }
       const auto lane = threadIdx.x & 31U;
       if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
