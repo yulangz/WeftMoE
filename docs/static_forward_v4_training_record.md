@@ -2,6 +2,21 @@
 
 ## 2026-10-08：新 PF 的训练缓存分步接入
 
+已完成两步接入：先只做准备，再在同一个 local main 内保存 X/GU。
+EP8 Flash、1620 MHz 设置、随机变长/热点路由、完整 eager FWD 的结果：
+
+| 阶段 | 8K ms | 20K ms | 相比上一阶段增量（8K / 20K） |
+|---|---:|---:|---:|
+| C1 不缓存对照 | 6.850 | 16.698 | — |
+| C1 mini-notify + 实际 R 的缓存申请/释放 | 7.149 | 17.260 | +0.299 / +0.561 ms |
+| C2 main 内规范行映射 + X/GU 写出 | 7.703 | 17.972 | +0.554 / +0.712 ms |
+
+第二步相对第一步增加 7.75% / 4.13%；相对最初无缓存对照，总增量
+12.46% / 7.63%。C2 自身关闭缓存为 6.832 / 16.776 ms，较 C1 无缓存
+为 −0.26% / +0.47%，未观察到明显 inference 回退。相对 C2 自身关闭
+缓存，打开缓存的增量为 12.74% / 7.13%；不要混用两个对照的分母。
+所有四组的全部 rank workload 长度/hash 逐项相同。
+
 ### C1：只做 mini-notify 与实际容量申请
 
 在已验收的 M11/B128 单机入口上接入现有 training count notify，根据
@@ -32,6 +47,65 @@ SASS 指令相同，均 REG168/STACK8，无 local spill，主计算未变。
 冻结产物 `build/pf_megamoe_20261008/cache_c1/f47b1119685a/`；日志
 `c1_cache_{off,on}_{0,1}_ep8.log`。公开 benchmark 增加
 `--forward-cache off|on`，与 `--prepared-weights` 配合进行上述消融。
+
+### C2：在同一个 main 内写出缓存
+
+复用旧训练的稳定行号 planner，在 main 内恢复 canonical expert/source/route
+顺序，给现有 BWD 保留其原 route 表与缓存布局；物理计算仍是 expert-global
+M128/wave 静态划分，不切回 source-token window。训练 route exchange 复用
+mini-notify 的 counts/ordinal，不再用 inference 的原子预留顺序作为 saved row。
+
+- X：Pull 从 peer X 读取到已有 4 KiB shared 分段后，同时写入物理 X ring
+  与本次 saved X；两次 store 完成才发布 `x_full`。没有额外 GM 重读或拷贝
+  kernel，其它 CTA 的 FC1/FC2 与 Pull 可以继续推进。
+- G/U：FC1 从 accumulator 直接写 BF16 分离平面，复用旧 epilogue 的 vector
+  helper；保留原 S-only TMA epilogue，而不是增加三平面 shared staging。
+  producer 仍能预取下一 tile。这个选择避免 shared 超预算与 S 写回降级，
+  不宣称写出本身完全没有计算/带宽成本。
+- 不改变 activation ring 的逐 slot credit。saved row 不取模；每份 tape
+  独占实际 R 的 X/GU 与元数据，main 完成后才可 BWD。推理保存指针为 NULL，
+  跳过训练规划及写出。C1 的临时 BWD 禁用保护在 C2 删除。
+- X+GU 为 `2*R*(H+2I)` 字节，本形状为每 row 16 KiB；平均路由下 8K/20K
+  每 rank 约 0.75/1.875 GiB，热点按实际 R 增长，不截断 token。此项随 tape
+  释放，与持久通信 ring、prepared W1 及 allocator reserved 分开。
+
+与 C1 完全相同的计时设置，off→on / on→off 正反序各一次：
+
+| tokens/rank | C2 off ms（两轮） | C2 on ms（两轮） | on−off |
+|---|---:|---:|---:|
+| 8192 | 6.832（6.829 / 6.836） | 7.703（7.740 / 7.666） | +0.871 ms / +12.74% |
+| 20480 | 16.776（16.769 / 16.783） | 17.972（17.897 / 18.047） | +1.196 ms / +7.13% |
+
+C2−C1 on 包含必要的规范行映射与写出，不是单独 memory-store kernel 时间。
+未增加第三个 activation-copy kernel；训练为 mini-notify + 一个 main。
+两步的主 kernel 均 REG168/STACK8/静态 shared 1024、LOCAL0，动态 shared
+仍为 226304 bytes，无新增 spill。计时阶段没有并发 GPU workload 或编译。
+覆盖计时的 UTC 06:38–06:40、06:48:30–06:50:30 监测区间，500 ms 轮询
+全部 3832 个 GPU 样本均为 1620 MHz，其中 GPU-util≥80% 的样本 225 个。
+
+验证范围：
+
+- EP8 T256/8K/20K 普通路由，以及 8K/20K route-bias-std=8、B128 回绕，
+  Forward 对照 Torch 全通过。
+- T256/8K/20K 完整 output/dX/dGate/dW1/dW2 对照现有 training reference
+  全通过，未放宽 tolerance。两档长序列最坏 relative L2 分别不超过
+  1.16e−4 / 1.08e−4（均为 dX）；最大绝对误差不超过 6.11e−5。
+- 两份不同路由 tape 交错，先反传新 tape 再消费旧 tape；全部 token 命中
+  一个 rank、其余 rank 零接收，T1/1024、小 ring 回绕，梯度通过；close 后
+  native workspace 成功释放。现有 inference prepared/fresh、失效后更新、
+  eager/Graph 交错与 close 检查通过。
+- 现有 static-forward autotune/defaults 检查 6 passed、4 subtests passed。
+
+本轮没有测完整 FWD+BWD 性能，也没有重新验证双机性能；不能由这些 FWD
+数字推定训练总吞吐。旧训练、多机和 DT profile 未替换。正常训练仍每调用
+发布当前权重，本次 forward-only 消融在两边一致地准备不可变权重。
+
+C1 commit `ae53d69`；C2 冻结产物 `cache_c2/f47b1119685a/`，日志
+`c2_cache_{off,on}_{0,1}_ep8.log`、`c2_training_ep8.log` 及
+`c2_{checkpoint_lifecycle,lifecycle}_ep8.log`，均在
+`build/pf_megamoe_20261008/`。时钟记录为
+`build/pf_checkpoint_20261008/clocks_node0.csv`。源码及使用边界同步到
+设计文档顶部与 `configs/README.md`。
 
 ## 2026-10-08：PF 单机 inference 对齐 MegaMoE
 

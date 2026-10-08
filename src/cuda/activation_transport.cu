@@ -4762,7 +4762,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   debug_forward_host_phase("generation_init_enqueued");
 #endif
   ForwardKernelArgs args{};
-  if (fused_inference_routes || local_prefill) {
+  if (fused_inference_routes) {
     view.runtime = at<const DeviceDispatchRuntime>(
         slot.device, layout.fused_dispatch_runtime);
     view.expert_id =
@@ -5737,10 +5737,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   result->identity = {id.generation, id.calling_rank, id.world_size,
                       id.num_tokens, config.hidden_size};
   result->retained_backward_state = config.retain_backward_state;
-  // Allocation-only milestone: the new local entry has not populated a
-  // training tape yet. Never expose its uninitialized storage to Backward.
-  if (local_prefill)
-    result->retained_backward_state = false;
   result->serialized_graph_replay = serialized_graph_replay;
   result->compact_return = args.forward_compact_return;
   result->incoming_rows = view.sizes.incoming_row_count;

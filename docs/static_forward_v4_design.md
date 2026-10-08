@@ -4,7 +4,8 @@
 
 目标为 Flash H4096/I2048/E256/top-k6、EP8、8K/20K、1620 MHz，关闭
 训练中间结果缓存。此项通过 `WEFTMOE_FWD_LOCAL_PREFILL_STREAMING` 选择；
-训练、跨机和 DT 继续使用原入口，不将未验证的新 row order 带入 Backward。
+随后 C1/C2 在此入口接入可选训练缓存，见下文；原训练 profile、跨机与 DT
+的入口选择保持不变。物理 row order 不作为 Backward 的 checkpoint 布局。
 性能门禁以相同变长、热点随机路由和预准备权重的 MegaMoE 为准。
 
 - 在同一个主 kernel 内发布 source X、gate 和每个 expert 的 route index/count。
@@ -42,8 +43,9 @@
   完整 contribution 的跨调用生命周期分开，不需要为 contribution 逐行 ACK。
 - Eager 可显式传 `layer`，复用已有的不可变权重 lease/重排结果；与 graph
   共用 `invalidate_inference_layer`、close/offload 生命周期。每次调用仍处理
-  新 X、token 数和 route。训练不使用这个缓存；更新权重（包括原址更新）前
-  必须显式 invalidate，不以地址未变推断权重未变。
+  新 X、token 数和 route。常规训练每调用重新发布权重；仅 forward 缓存消融
+  可显式复用不可变权重。更新权重（包括原址更新）前必须显式 invalidate，
+  不以地址未变推断权重未变。
 
 GEMM 参数和 shared-memory 预算由 profile 校验：当前入口支持共同 N128
 或 N256、K64、cluster2，FC1/FC2 使用相同 stage 数；N128 最多 5 stages，
@@ -52,7 +54,8 @@ N256 最多 3 stages，独立 epilogue 与三份 Pull scratch 均计入预算。
 跨调用路由。Reduce 同时读取四个独立向量，保留逐元素 FP32 累加次序。
 `WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH` 默认关闭；显式 inference profile
 可选择 MegaMoE 式 SFU exponential/reciprocal。它保留 BF16 投影舍入，
-但不保证与严格除法逐位相同；训练、DT 和跨机入口不使用该开关。
+但不保证与严格除法逐位相同；C1/C2 缓存消融保持相同算术参数。原训练、
+DT 和跨机入口不使用该开关，不能由 FWD 快路径直接推定 BWD 数值或性能。
 Flash 的已测 inference profile 选择 N256/K64、3 stages、wait0、N-group16，
 开启上述 fast math，B128/D2。这里 B 只影响复用原 allocator 得到的 X/S
 物理容量和元数据上界，不再把计算切回 source-token windows。
@@ -61,6 +64,29 @@ EP8/E256/top-k6 下为 160 个 M128 slot（20480 行），X/S 合计 240 MiB。
 expert wave 回绕，保证不丢 token。使用与边界说明见
 `configs/pf_inference_flash_20261008/` 及 `configs/README.md`。
 迭代性能、未采用候选和验收范围见训练记录顶部的单机 inference 对齐章节。
+
+### 同一 local main 的可选 checkpoint（C1/C2）
+
+- 主 kernel 前复用计数 mini-notify，只交换 source/expert 数量并取得实际
+  `R`，在现有 allocation agreement 内申请本次 tape：BF16 X `[R,H]`、
+  G/U `[2,R,I]` 以及 gate/header。不新增 activation copy kernel。
+- main 内复用 `build_training_rows`，利用 count notify 的 chunk prefix
+  恢复稳定的 expert/source/route 行号，并生成旧 BWD 所需的不可变 route
+  表。训练的 route exchange 发布这些稳定 ordinal；推理仍用原直方图路径。
+- 三个 Pull warp 每次确定逻辑 ring 行时，同时记录 `logical_row → saved_row`
+  及该行 gate/header。G2S 到达后，从同一 shared-memory 分段双写物理 X ring
+  与 saved X，等待两次 S2G 完成后发布 `x_full`。元数据工作在本入口随 Pull
+  逐行完成；这区别于旧 window planner 预先批量填充 header 的实现。
+- FC1 从 accumulator 将舍入后的 BF16 G/U 保存到规范平面，同时保留 S 的
+  原 TMA epilogue。直接寄存器写出复用现有 helper，不扩充接近上限的 shared
+  arena，也不让三平面 staging 将 S 降级为 vector store。producer 的下一
+  tile 预取、其它 CTA 的通信/计算可以继续；写出并不意味着零额外带宽成本。
+- saved row 不取模，物理 X/S slot 仍按原 credit 回绕。saved X/GU 由每份
+  tape 独立持有，BWD 不读取 transient ring；Forward 完成后才能消费缓存。
+  推理的保存指针为空，同一 main 跳过训练规划和全部缓存写出。
+
+C1 仅测 mini-notify/申请，未初始化的 tape 明确禁止 BWD；C2 才启用缓存
+消费。冻结产物及分步耗时、梯度和生命周期验证范围见训练记录顶部。
 
 ## 2026-10-03：Backward peer 地址按容量复用（M7e）
 

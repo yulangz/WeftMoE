@@ -16,9 +16,12 @@ The single-node Flash **inference-only** profile is in
 [`pf_inference_flash_20261008`](pf_inference_flash_20261008/weftmoe_forward_tuning_generated.hpp).
 It enables the expert-global PF pipeline for BF16 H4096/I2048/E256/top-k6,
 using M128/N256/K64, three shared input stages, two-CTA multicast, and
-inference-only fast SwiGLU. It retains bounded X/S rings but reserves full
-source contributions. No training activations or routes are cached between
-calls. Training, multi-node and DT profiles are not replaced by this profile.
+optional fast SwiGLU. It retains bounded X/S rings but reserves full source
+contributions. In inference no activations or routes are cached between calls.
+The same local main also supports a training tape: count-only mini-notify and
+exact-size allocation precede main, which saves X and BF16 gate/up in the
+existing Backward layout. The existing training, multi-node and DT profiles
+are not replaced by this profile.
 The accompanying lookup table has `training=false`, EP8, NVIDIA L20X entries
 at exact prepared token capacities 10055 and 25820; these are measured trace
 maxima, not bucket sizes or maximum supported lengths.
@@ -43,6 +46,16 @@ The benchmark option `--prepared-weights` exercises this path. Its wall timing
 includes input staging, routing, communication, both GEMMs, reduce, and device
 synchronization. Measurements and negative ablations are in the
 [PF report](../docs/static_forward_v4_training_record.md).
+
+To measure the cost of retaining activations on this local profile, use
+`benchmarks/torchrun_megamoe_prefill.py --backend pf --forward-cache off|on`
+with the same dimensions, `--ring-tokens 128 --ring-depth 2`, and
+`--prepared-weights`. Both modes use the same native forward/tape API and
+include tape release in wall timing. Omit the inference-only lookup table
+when constructing a training runtime. The explicit layer option assumes
+immutable weights; normal `TensorRuntime.forward` does not pass it and still
+publishes the current training weights on every call. Forward-only cache
+overhead does not establish end-to-end FWD+BWD performance.
 
 In the independent phase grids, each parameter contains a nonempty array of candidate values. The first values
 form the incumbent configuration and the defaults used when autotuning is

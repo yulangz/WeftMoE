@@ -14,6 +14,34 @@ static_v4_swiglu_pair(const float *gate, const float *up, float route_weight) {
                     gated_swiglu_fc2_input<FastMath>(g.y, u.y, route_weight));
 }
 
+// Save directly from WGMMA registers when the shared epilogue arena cannot
+// hold three planes. In particular, local PF keeps its S-only TMA fast path.
+template <unsigned Fc1TileN, class Args>
+__device__ __forceinline__ void static_v4_save_fc1_tile(
+    const Args &a, const float *accum, std::uint32_t valid_rows,
+    std::uint32_t column_base, std::uint64_t mblock) {
+  const auto lane = threadIdx.x % 32U;
+  const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
+  for (unsigned item = 0U; item < 2U; ++item) {
+    const auto m = row0 + item * 8U;
+    if (m >= valid_rows)
+      continue;
+    const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
+#pragma unroll
+    for (unsigned index = 0U; index < Fc1TileN / 16U; ++index) {
+      const auto *g = accum + index * 8U + item * 2U;
+      const auto *u = g + 4U;
+      const auto column = column_base + index * 8U + (lane % 4U) * 2U;
+      auto *gate = a.saved_ab + saved * a.intermediate + column;
+      auto *up = gate + a.saved_rows * a.intermediate;
+      *reinterpret_cast<__nv_bfloat162 *>(gate) =
+          __float22bfloat162_rn(make_float2(g[0], g[1]));
+      *reinterpret_cast<__nv_bfloat162 *>(up) =
+          __float22bfloat162_rn(make_float2(u[0], u[1]));
+    }
+  }
+}
+
 template <unsigned Fc1TileN, unsigned ScratchElements,
           bool RetainBackwardState = false, bool TmaStore = false,
           bool PrivateScratch = false, bool FastMath = false, class Args>
@@ -106,28 +134,8 @@ __device__ __forceinline__ void static_v4_store_fc1_tile(
     return;
   }
 
-  if constexpr (RetainBackwardState) {
-    // Ring order is physical only. Save rounded gate/up projections in the
-    // canonical separated planes consumed by the unchanged Backward GEMMs.
-    for (unsigned item = 0U; item < 2U; ++item) {
-      const auto m = item ? row1 : row0;
-      if (m >= valid_rows)
-        continue;
-      const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
-#pragma unroll
-      for (unsigned index = 0U; index < kOutputN / 8U; ++index) {
-        const auto *g = accum + index * 8U + item * 2U;
-        const auto *u = g + 4U;
-        const auto column = column_base + index * 8U + (lane % 4U) * 2U;
-        auto *gate = a.saved_ab + saved * a.intermediate + column;
-        auto *up = gate + a.saved_rows * a.intermediate;
-        *reinterpret_cast<__nv_bfloat162 *>(gate) =
-            __float22bfloat162_rn(make_float2(g[0], g[1]));
-        *reinterpret_cast<__nv_bfloat162 *>(up) =
-            __float22bfloat162_rn(make_float2(u[0], u[1]));
-      }
-    }
-  }
+  if constexpr (RetainBackwardState)
+    static_v4_save_fc1_tile<Fc1TileN>(a, accum, valid_rows, column_base, mblock);
 
   // Decode and compact expert tails avoid staging and its extra CTA barriers.
 #pragma unroll

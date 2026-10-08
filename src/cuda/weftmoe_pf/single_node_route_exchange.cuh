@@ -7,9 +7,9 @@ namespace weftmoe_pf {
 // source route id into the owning rank's symmetric table. X and gates are
 // staged once into source-local symmetric storage, then destination control
 // warps pull the routed rows.
-template <bool MaterializeGeometry = true>
-__device__ __noinline__ void
-route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
+template <bool MaterializeGeometry = true, bool Training = false>
+__device__ __noinline__ void route_exchange(const ForwardKernelArgs &a,
+                                            unsigned char *scratch) {
   constexpr auto kMathThreads = forward_tuning::kMathWarpgroups * 128U;
   constexpr auto kControlThreads =
       forward_tuning::kUnifiedThreads - kMathThreads;
@@ -18,19 +18,18 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   const auto experts = a.dispatch.identity.num_experts;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   auto *send_counts =
-      const_cast<std::uint64_t *>(a.dispatch.source_expert_count);
+      const_cast<std::uint64_t *>(a.dispatch.source_expert_count) +
+      (Training ? std::uint64_t(a.rank) * experts : 0U);
   auto *runtime = const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime);
   auto *cta_expert_count = reinterpret_cast<std::uint32_t *>(scratch);
 
   if (threadIdx.x < kMathThreads) {
-    const auto tid = static_cast<std::uint64_t>(blockIdx.x) * kMathThreads +
-                     threadIdx.x;
-    const auto stride =
-        static_cast<std::uint64_t>(gridDim.x) * kMathThreads;
-    auto *source_input = peer_at<transport::BFloat16>(
-        a.local_base, a.source_input_offset);
-    const auto input_vectors =
-        a.dispatch.identity.num_tokens * a.hidden / 8ULL;
+    const auto tid =
+        static_cast<std::uint64_t>(blockIdx.x) * kMathThreads + threadIdx.x;
+    const auto stride = static_cast<std::uint64_t>(gridDim.x) * kMathThreads;
+    auto *source_input =
+        peer_at<transport::BFloat16>(a.local_base, a.source_input_offset);
+    const auto input_vectors = a.dispatch.identity.num_tokens * a.hidden / 8ULL;
     for (auto vector = tid; vector < input_vectors; vector += stride)
       reinterpret_cast<uint4 *>(source_input)[vector] =
           reinterpret_cast<const uint4 *>(a.input)[vector];
@@ -48,10 +47,9 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
   }
 
   const auto control_thread = threadIdx.x - kMathThreads;
-  const auto tid = static_cast<std::uint64_t>(blockIdx.x) * kControlThreads +
-                   control_thread;
-  const auto stride =
-      static_cast<std::uint64_t>(gridDim.x) * kControlThreads;
+  const auto tid =
+      static_cast<std::uint64_t>(blockIdx.x) * kControlThreads + control_thread;
+  const auto stride = static_cast<std::uint64_t>(gridDim.x) * kControlThreads;
   if (tid == 0ULL) {
     runtime->sizes.route_count = routes;
     runtime->sizes.owned_expert_count = owned;
@@ -61,50 +59,62 @@ route_exchange(const ForwardKernelArgs &a, unsigned char *scratch) {
     runtime->sizes.incoming_signal_count = 0U;
     runtime->wave_count = 0ULL;
   }
-  for (auto expert = static_cast<std::uint64_t>(control_thread);
-       expert < experts; expert += kControlThreads)
-    cta_expert_count[expert] = 0U;
-  collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
+  if constexpr (Training) {
+    // The count-only notify and in-kernel training planner already assigned
+    // stable expert/source ordinals. Publish those same ordinals to Pull.
+    for (auto route = tid; route < routes; route += stride) {
+      peer_at<float>(a.local_base, a.fused_source_gates_offset)[route] =
+          a.gates[route];
+      a.checkpoint.source_rows[route] = a.dispatch.route_dst_row[route];
+      const auto expert = unsigned(a.selected_experts[route]);
+      source_routes(a, expert / owned, a.rank,
+                    expert % owned)[a.dispatch.local_offset[route]] = route;
+    }
+  } else {
+    for (auto expert = static_cast<std::uint64_t>(control_thread);
+         expert < experts; expert += kControlThreads)
+      cta_expert_count[expert] = 0U;
+    collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
 
-  // Pass one forms a CTA-local histogram. One global atomic per
-  // (CTA,expert) reserves a disjoint source slot interval; pass two then
-  // reproduces the route enumeration to assign exact offsets.
-  for (auto route = tid; route < routes; route += stride) {
-    peer_at<float>(a.local_base, a.fused_source_gates_offset)[route] =
-        a.gates[route];
-    const auto raw = a.selected_experts[route];
-    const auto invalid =
-        raw < 0 || static_cast<std::uint32_t>(raw) >= experts;
-    if (invalid)
-      atomicExch(reinterpret_cast<unsigned long long *>(&runtime->error),
-                 1ULL);
-    const auto expert = invalid ? 0U : static_cast<std::uint32_t>(raw);
-    atomicAdd(cta_expert_count + expert, 1U);
-  }
+    // Pass one forms a CTA-local histogram. One global atomic per
+    // (CTA,expert) reserves a disjoint source slot interval; pass two then
+    // reproduces the route enumeration to assign exact offsets.
+    for (auto route = tid; route < routes; route += stride) {
+      peer_at<float>(a.local_base, a.fused_source_gates_offset)[route] =
+          a.gates[route];
+      const auto raw = a.selected_experts[route];
+      const auto invalid =
+          raw < 0 || static_cast<std::uint32_t>(raw) >= experts;
+      if (invalid)
+        atomicExch(reinterpret_cast<unsigned long long *>(&runtime->error),
+                   1ULL);
+      const auto expert = invalid ? 0U : static_cast<std::uint32_t>(raw);
+      atomicAdd(cta_expert_count + expert, 1U);
+    }
 
-  collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
+    collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
 
-  for (auto expert = static_cast<std::uint64_t>(control_thread);
-       expert < experts; expert += kControlThreads) {
-    const auto count = cta_expert_count[expert];
-    if (count)
-      cta_expert_count[expert] = static_cast<std::uint32_t>(atomicAdd(
-          reinterpret_cast<unsigned long long *>(send_counts + expert),
-          static_cast<unsigned long long>(count)));
-  }
-  collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
+    for (auto expert = static_cast<std::uint64_t>(control_thread);
+         expert < experts; expert += kControlThreads) {
+      const auto count = cta_expert_count[expert];
+      if (count)
+        cta_expert_count[expert] = static_cast<std::uint32_t>(atomicAdd(
+            reinterpret_cast<unsigned long long *>(send_counts + expert),
+            static_cast<unsigned long long>(count)));
+    }
+    collective_scope_sync<kControlThreads, kCollectiveScopeBarrier>();
 
-  for (auto route = tid; route < routes; route += stride) {
-    const auto raw = a.selected_experts[route];
-    const auto expert =
-        raw < 0 || static_cast<std::uint32_t>(raw) >= experts
-            ? 0U
-            : static_cast<std::uint32_t>(raw);
-    const auto source_slot = atomicAdd(cta_expert_count + expert, 1U);
-    const auto destination = expert / owned;
-    const auto local_expert = expert % owned;
-    source_routes(a, destination, a.rank, local_expert)[source_slot] =
-        static_cast<std::uint32_t>(route);
+    for (auto route = tid; route < routes; route += stride) {
+      const auto raw = a.selected_experts[route];
+      const auto expert = raw < 0 || static_cast<std::uint32_t>(raw) >= experts
+                              ? 0U
+                              : static_cast<std::uint32_t>(raw);
+      const auto source_slot = atomicAdd(cta_expert_count + expert, 1U);
+      const auto destination = expert / owned;
+      const auto local_expert = expert % owned;
+      source_routes(a, destination, a.rank, local_expert)[source_slot] =
+          static_cast<std::uint32_t>(route);
+    }
   }
 
   collective_scope_sync<forward_tuning::kUnifiedThreads,

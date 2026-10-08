@@ -131,6 +131,9 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       while (ring::acquire(slot.fc2_done) <
              std::uint64_t(t.generation - 1U) * kFc2Tiles) {
       }
+      if (a.saved_ab)
+        static_v4_save_fc1_tile<kN>(a, accum, t.rows, t.column * kN / 2U,
+                                  t.block);
       static_v4_store_fc1_tile<kN, kM * kN, false, true, true,
                               forward_tuning::kLocalPrefillFastMath>(
           a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,

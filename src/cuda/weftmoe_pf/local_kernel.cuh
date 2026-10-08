@@ -70,6 +70,17 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
       const auto token = route / a.dispatch.identity.top_k;
       const auto gate = peer_at<float>(a.peer_bases[source],
                                        a.fused_source_gates_offset)[route];
+      std::uint64_t saved = 0U;
+      if (a.saved_x) {
+        saved = ring::source_metadata(a, source, a.checkpoint.source_rows)[route];
+        a.checkpoint.rows[logical] = saved;
+        a.checkpoint.gates[saved] = gate;
+        a.checkpoint.headers[saved] = {
+            transport::kActivationTransportSchemaVersion, source, a.rank, 0U,
+            a.dispatch.identity.generation, execution_epoch(a), route, route,
+            token, saved, a.rank * owned + expert,
+            unsigned(route % a.dispatch.identity.top_k)};
+      }
       a.ring.rows[logical] = {
           route, source, gate, token,
           peer_at<transport::BFloat16>(a.peer_bases[source],
@@ -94,6 +105,11 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
         s.pull_full[warp].wait(phase);
         phase ^= 1U;
         cute::SM90_BULK_COPY_S2G::copy(s.pull[warp], output + offset, bytes);
+        if (a.saved_x)
+          cute::SM90_BULK_COPY_S2G::copy(
+              s.pull[warp], reinterpret_cast<char *>(a.saved_x) +
+                                saved * a.hidden * 2U + offset,
+              bytes);
         cute::tma_store_arrive();
         asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
       }
@@ -205,11 +221,17 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   const auto stride = std::uint64_t(gridDim.x) * kThreads;
   for (auto slot = tid; slot < a.ring.depth; slot += stride)
     a.ring.slots[slot] = {};
-  for (auto expert = tid; expert < a.dispatch.identity.num_experts;
-       expert += stride)
-    const_cast<std::uint64_t *>(a.dispatch.source_expert_count)[expert] = 0U;
+  if (!a.retain_backward_state)
+    for (auto expert = tid; expert < a.dispatch.identity.num_experts;
+         expert += stride)
+      const_cast<std::uint64_t *>(a.dispatch.source_expert_count)[expert] = 0U;
   grid_sync(a);
-  route_exchange<false>(a, storage);
+  if (a.retain_backward_state) {
+    ring::build_training_rows(a, storage);
+    route_exchange<false, true>(a, storage);
+  } else {
+    route_exchange<false>(a, storage);
+  }
   geometry(a);
   if (threadIdx.x == kMathThreads) {
     for (unsigned stage = 0; stage < kStages; ++stage) {
