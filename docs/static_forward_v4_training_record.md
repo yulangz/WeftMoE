@@ -1,12 +1,86 @@
 # V4 ring 训练对接记录
 
-## 2026-10-08：PF 单机 inference 对齐 MegaMoE（进行中）
+## 2026-10-08：PF 单机 inference 对齐 MegaMoE
 
 已切回 `refactor/static-forward-v4`；V3 恢复分支及容量消融分支保留。
 本轮目标为 EP8、H4096/I2048/E256/top-k6、8K/20K，无训练激活缓存。
-新入口先显式 opt-in，不以尚未追平的候选替换已验收训练或跨机 profile。
+选定 M11 kernel + M14/B128 容量配置。完整调用正反序复测中，8K 比
+MegaMoE 快 1.59%，20K 慢 0.77%；相比旧 PF，两档耗时下降约 28%。
+这是接近持平，不是“两档都领先”。新入口由独立 inference profile
+显式选择，不替换已验收训练、跨机或 DT profile。
 
-本轮步骤及当前结论：
+### 最终完整调用对照
+
+单机 EP8，BF16 H4096/I2048/E256/top-k6。两者都在计时外准备不可变
+权重，不缓存 X、route、gate/up 或其它跨调用计算结果。使用普通 eager，
+关闭 `--profile-device`；计时包括输入 staging、路由、通信、FC1/FC2、
+Reduce、host enqueue 与最终 device synchronize。固定通信 buffer/IPC
+bootstrap 不在稳态计时内。旧 PF 使用冻结的已验收 native 库和相同的
+prepared-weight Python adapter，保持其原 B2048/D2，不强迫它使用新容量。
+
+同一条 32 步正态变长、热点随机路由 trace，seed=123，token std=10%、
+route bias std=0.5；完整 prime 后 8 warmup + 24 measured。每步取最慢
+rank 耗时，再取 p50。按旧 PF→新 PF→MegaMoE 及反序各跑一轮，表中
+为两轮 p50 的平均，括号内为原始两轮。所有 backend 的所有 rank 的
+token 长度与 route/gate hash 完全一致。不是模型采集的真实 trace。
+
+| 名义 tokens/rank | 旧 PF ms | 新 PF ms | MegaMoE ms | 新 PF 比旧 PF 耗时降低 | 新 PF / MegaMoE 耗时差 |
+|---|---:|---:|---:|---:|---:|
+| 8192 | 9.420（9.308 / 9.533） | 6.767（6.773 / 6.762） | 6.877（6.872 / 6.882） | 28.16% | −1.59% |
+| 20480 | 23.401（23.439 / 23.362） | 16.750（16.716 / 16.784） | 16.622（16.584 / 16.660） | 28.42% | +0.77% |
+
+设置 GPU SM 锁频 1620 MHz；确认区间 UTC 05:55:08–05:57:43，500 ms
+轮询的 175 个 GPU-util≥80% 样本中，173 个为 1620，1590/1605 各一个。
+没有 1980 MHz 样本，也不将锁频设置说成“每个周期绝无短暂降频”。
+比较正式运行期间没有并发 GPU workload 或 native 编译。
+
+新配置 B128 对应 160 个 M128 slot，即 X/S 各可容纳 20480 个 routed
+rows，合计 240 MiB；超出容量就回绕，不按平均专家负载截断。
+完整 source contribution 是 `[6,Tmax,4096]` BF16，本 trace 的
+`Tmax=10055/25820`，分别约 471/1210 MiB。此项是一次调用内的通信
+workspace，不是训练激活缓存。总 native 持久区如下，不含模型权重、
+prepared W1（另 1 GiB/layer）、用户输入输出或 allocator reserved：
+
+| 名义 tokens/rank | 旧 PF GiB/rank | 新 PF GiB/rank | MegaMoE 默认对称区 GiB/rank |
+|---|---:|---:|---:|
+| 8192 | 2.725 | 0.895 | 6.478 |
+| 20480 | 3.021 | 1.922 | 10.614 |
+
+新 PF native 区包含 compute + notify，GIN 在单机为零；MegaMoE 内部区域
+划分不同。完整 contribution 增加了容量，但更紧凑的 X/S 环抵消了该增量。
+未更改训练/BWD 的 row order、缓存协议或多机 wire protocol。
+
+选定 header/table 位于 `configs/pf_inference_flash_20261008/`，compiled
+digest `f47b1119685a`，B128/D2 config digest `bc1f3bdd59aa`。table 是
+`training=false` 的精确容量查表，不是自动覆盖其它 token bucket。
+构建与加载见 `configs/README.md`。公开复测入口：
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_megamoe_prefill.py \
+  --backend pf --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --tokens 8192 20480 --ring-tokens 128 --ring-depth 2 --prepared-weights
+```
+
+冻结旧 PF adapter 为 `build/pf_megamoe_20261008/baseline_prepared/`；
+新库为 `cache_m11/f47b1119685a/`，正反序日志为 `final_b128_*_ep8.log`。
+源码 milestone：`a07e18d`（工作流和权重生命周期），`d616eaa`
+（GEMM/epilogue/Reduce 优化）。M14 仅改变现有 runtime 容量参数，未重编译。
+
+未参与选参的独立 seed=456，保持同一 N256/3-stage/B128 配置，不重新调参，
+新 PF→MegaMoE 及反序各一轮，普通 eager、相同 prime/warmup/sample 口径：
+
+| 名义 tokens/rank | 新 PF 两轮 ms | MegaMoE 两轮 ms | 新 PF / MegaMoE 均值 ms | 耗时差 |
+|---|---:|---:|---:|---:|
+| 8192 | 6.495 / 6.354 | 6.578 / 6.393 | 6.425 / 6.485 | −0.94% |
+| 20480 | 15.786 / 15.978 | 15.998 / 16.158 | 15.882 / 16.078 | −1.22% |
+
+对应实际容量 10355/24937，不强行映射到 seed=123 的查表项；直接使用
+相同 header 和 B128/D2。所有 rank 的 workload hash/长度再次逐项一致。
+时钟采样区间 UTC 05:57:43–05:59:58，高利用率样本 97 个为 1620 MHz，
+1545/1560 各一个。两组负载结果支持“目标形状接近 MegaMoE”，不证明
+其它模型、拓扑或路由分布下均领先。记录为 `holdout_*_ep8.log`。
+
+### 本轮优化与消融
 
 - M1：完整 source contribution、expert-global M128、三个 Pull warp、
   producer/math 独立静态任务流、独立 epilogue scratch、统一连续 TMA stages。
@@ -67,6 +141,13 @@
 - M13（未采用）：N256 的 N-group 从 16 降为 8，使每组覆盖的权重
   列宽与 MegaMoE N128/group16 一致。kernel 回退至 7.331/20.587 ms，
   已撤回；不能据“相同列宽”推断相同复用或更好的流水，保留 M11。
+- M14：同一 M11 binary，单独将 X/S ring 的 `window_tokens` 从 2048
+  比较到 128/512/1024，完整 contribution 不变。三者 8K/20K kernel
+  分别为 6.636/16.421、6.641/16.574、6.641/16.827 ms。B128 的
+  完整调用为 6.889/16.605 ms；20K kernel 相对 M11/B2048 下降约
+  3.08%，8K 没有稳定差别。较小 X/S 地址工作集有收益，但这里没有
+  L2/TLB 硬件计数证据，不把具体缓存原因当作已确认结论。大专家仍按
+  ring 深度切 wave，不截断路由，不缩小完整 source contribution。
 
 以下是定位用单轮 screening，不是最终验收表。32 步相同正态变长/热点随机
 trace（token std=10%、route bias std=0.5），完整 prime，8 warmup + 24 measured，
@@ -114,8 +195,12 @@ CPU 的 `test_static_forward_autotune.py`、`test_autotune_defaults.py`、
 独立 worktree 上同样是这 7 项失败（旧宏枚举、候选数量、shared-memory
 固定值断言），不把它们列为本轮通过，也未增加或放宽微观断言。
 
-待办：完整调用正反序确认；
-导出验收 profile 后再关闭性能门禁。
+M14/B128 再次通过普通 T256/8192/20480 × 2 次以及强热点 8K/20K × 2 次
+Torch 对照，共 80 个 rank-step；最大 relative L2 为 3.11e-4，最大绝对
+误差 6.10e-5，没有放宽原容差。B128 的独立生命周期复测也在 8 ranks
+全通过（`m14_lifecycle_ep8.log`），包括 prepared/fresh 逐位对照、变长与
+变路由、async、改权重前 invalidate、graph/eager 交替、旧 X weakref
+释放和 close 释放持久区。没有增加冗余微观单测。
 
 ## 2026-10-06：MegaMoE 缩容与 PF 工作流对齐诊断
 

@@ -12,6 +12,38 @@ model dimensions and local/multi-node topologies through
 `tools/autotune_training.py`; see [training autotune](../docs/autotune.md).
 Its search candidates are not a claim of measured optimal parameters.
 
+The single-node Flash **inference-only** profile is in
+[`pf_inference_flash_20261008`](pf_inference_flash_20261008/weftmoe_forward_tuning_generated.hpp).
+It enables the expert-global PF pipeline for BF16 H4096/I2048/E256/top-k6,
+using M128/N256/K64, three shared input stages, two-CTA multicast, and
+inference-only fast SwiGLU. It retains bounded X/S rings but reserves full
+source contributions. No training activations or routes are cached between
+calls. Training, multi-node and DT profiles are not replaced by this profile.
+The accompanying lookup table has `training=false`, EP8, NVIDIA L20X entries
+at exact prepared token capacities 10055 and 25820; these are measured trace
+maxima, not bucket sizes or maximum supported lengths.
+
+Build with the existing CUDA/CUTLASS/NCCL environment:
+
+```bash
+export NVCCFLAGS="-lineinfo -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I${PWD}/configs/pf_inference_flash_20261008"
+python build_native.py lib --output build/flash_pf_inference/libweftmoe.so --jobs 4
+python tools/build_tensor_runtime.py --library build/flash_pf_inference/libweftmoe.so
+```
+
+Select the printed extension with `WEFTMOE_TENSOR_EXTENSION`. The optional
+`WEFTMOE_AUTOTUNE_TABLE=configs/pf_inference_flash_20261008/table.json` performs
+exact-capacity lookup, not runtime tuning or compilation. Without that table,
+set `WEFTMOE_STATIC_RING_TOKENS=128` and
+`WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS=2` before preparing the runtime.
+Eager inference may pass `layer=...` to prepare immutable weights once; call
+`invalidate_inference_layer(layer)` before changing those weights, including
+in-place updates. This is weight preparation, not saved intermediate results.
+The benchmark option `--prepared-weights` exercises this path. Its wall timing
+includes input staging, routing, communication, both GEMMs, reduce, and device
+synchronization. Measurements and negative ablations are in the
+[PF report](../docs/static_forward_v4_training_record.md).
+
 In the independent phase grids, each parameter contains a nonempty array of candidate values. The first values
 form the incumbent configuration and the defaults used when autotuning is
 disabled; the Cartesian product defines the search space. A single value fixes a parameter for that search. Supported values and

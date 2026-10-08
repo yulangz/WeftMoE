@@ -53,6 +53,13 @@ N256 最多 3 stages，独立 epilogue 与三份 Pull scratch 均计入预算。
 `WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH` 默认关闭；显式 inference profile
 可选择 MegaMoE 式 SFU exponential/reciprocal。它保留 BF16 投影舍入，
 但不保证与严格除法逐位相同；训练、DT 和跨机入口不使用该开关。
+Flash 的已测 inference profile 选择 N256/K64、3 stages、wait0、N-group16，
+开启上述 fast math，B128/D2。这里 B 只影响复用原 allocator 得到的 X/S
+物理容量和元数据上界，不再把计算切回 source-token windows。
+EP8/E256/top-k6 下为 160 个 M128 slot（20480 行），X/S 合计 240 MiB。
+完整 source contribution 不受 B 限制；极端热点通过逐 slot credit 和
+expert wave 回绕，保证不丢 token。使用与边界说明见
+`configs/pf_inference_flash_20261008/` 及 `configs/README.md`。
 迭代性能、未采用候选和验收范围见训练记录顶部的单机 inference 对齐章节。
 
 ## 2026-10-03：Backward peer 地址按容量复用（M7e）
