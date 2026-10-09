@@ -1,0 +1,32 @@
+diff --git a/src/cuda/weftmoe_pf/local_compute.cuh b/src/cuda/weftmoe_pf/local_compute.cuh
+index 9964097..261130a 100644
+--- a/src/cuda/weftmoe_pf/local_compute.cuh
++++ b/src/cuda/weftmoe_pf/local_compute.cuh
+@@ -152,20 +152,16 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
+       if (a.saved_ab)
+         static_v4_save_fc1_tile<kN>(a, accum, t.rows, t.column * kN / 2U,
+                                   t.block);
+-      static_v4_store_fc1_tile<kN, kM * kN, false, true, true,
++      // A zero scratch budget selects the existing BF16x2 register-to-global
++      // epilogue for complete tiles as well as tails; no shared staging.
++      static_v4_store_fc1_tile<kN, 0U, false, false, true,
+                               forward_tuning::kLocalPrefillFastMath>(
+           a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
+           t.block, &output_map);
+-      // Full tiles use a single TMA issuer which has already waited for
+-      // global completion. Compact tails use stores from every math thread.
+-      if (t.rows != kM) {
+-        __threadfence();
+-        collective_scope_sync<kMathThreads, 7U>();
+-      } else if constexpr (kN > 128U) {
+-        // Wider SwiGLU tiles have multiple N64 TMA issuers. Join their
+-        // global completions before the leader publishes S readiness.
+-        collective_scope_sync<kMathThreads, 7U>();
+-      }
++      // Every math thread writes S. Publish only after all stores are
++      // visible, keeping FC2's ready and the X ring's retirement contract.
++      __threadfence();
++      collective_scope_sync<kMathThreads, 7U>();
+       if (threadIdx.x == 0U)
+         arrive(slot.fc1_done, 1U);
+       collective_scope_sync<kMathThreads, 7U>();

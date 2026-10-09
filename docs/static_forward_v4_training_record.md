@@ -1,5 +1,99 @@
 # V4 ring 训练对接记录
 
+## 2026-10-09：FC1 寄存器直接写 S（无收益，保留原 TMA）
+
+补测完整 FC1 tile 跳过 shared staging 的方案。**没有取得端到端收益，
+生产源码保持 C5 不变**；三份实验 patch 和原始数据单独保留，不增加运行模式。
+这里写出的是 SwiGLU/route weight 之后的 S，即 FC2 input，不是 saved G/U。
+GEMM 的 A/B shared 输入、FC2 epilogue 和 Saved X/GU 路径均不改。
+
+### 逐步实现与代码生成
+
+| 候选 | 实际改动 | 主入口资源 |
+|---|---|---|
+| C5 | 原完整 tile：寄存器 → swizzled shared → tensor TMA → GM | REG168 / STACK0 |
+| S-vector | 上轮冻结对照：相同 shared staging → 16B vector → GM | REG168 / STACK0 |
+| R1 (`rvec`) | 将 scratch 模板预算设为 0，完整 tile 也复用原尾块的 BF16×2 寄存器直写；保留其整数 BF16 舍入 | REG168 / STACK0 |
+| R2 (`rpack`) | 完整 tile 使用原来的 packed BF16 转换/SwiGLU helper，再以 BF16×2 直写；尾块保留旧路径 | REG168 / STACK120 |
+| R3 (`rpair`) | 合并成一个带行边界检查的 packed 转换/直写循环，完整 tile 和尾块都使用该循环 | REG168 / STACK0 |
+
+三种寄存器直写都只有 **4B/线程/store**，没有用 shared 重排，也没有用 warp
+shuffle 拼成 16B。每个写线程先执行 device fence，再 math join，由 leader
+发布 `fc1_done`；不能省掉这个 S-ready/X-retirement 合同。FC1 的 output
+staging 不再使用，但 FC2 仍需要同一 output arena，因此没有削减 shared
+分配、增加 stages 或改变 occupancy。
+
+R2 保持完整 tile 原来的转换实现，是为了区分“省 shared”和“改转换指令”
+两个因素；但 full/tail 分支引出了额外 120B stack，SASS 有新增局部访存。
+R3 合并路径后恢复 STACK0，同时尾块也统一为 packed 转换。R2→R3 的整体
+改善不能全归因于 stack，不能忽略其代码布局和尾块实现也发生了改变。
+所有候选的静态 shared1024、动态 shared226304 bytes 均不变；同一缓存模式
+下 workspace 容量逐项一致。SASS 中 FC1 的 STSM 和二维 TMA store 确已消失，
+没有仅改参数却仍执行原 staging。
+
+### 正反序实测
+
+单机 EP8，8×L20X，1620 MHz 设置；Flash H4096/I2048/E256/top-k6、BF16，
+M128/N256/K64、3 stages、cluster2、B128/D2，与上一节配置相同。重新计时
+C5 和 S-vector，未使用昨日的时延作为本轮分母。各 rank 的随机 token trace、
+route/gate hash 与上一节相同：token std=10%、route bias std=0.5、seed123。
+
+每组 prime32 + warmup8 + measured24；先按表中顺序各测缓存 off/on，再
+完全反序。以下为两次 rank-max FWD wall p50 的均值，单位 ms。计时包含
+input staging、synchronize、tape 释放；缓存开启还包含 mini-notify、按本次
+实际 R 准备缓存及写出。权重预准备一次，不含 BWD，不是纯 store/GEMM 时间。
+
+| 方案 | inference 8K | inference 20K | 缓存 X/GU 8K | 缓存 X/GU 20K |
+|---|---:|---:|---:|---:|
+| C5：shared → TMA | 6.788 | 16.651 | 7.673 | 17.978 |
+| S-vector：shared → 16B vector | 6.856 | 16.813 | 7.763 | 17.922 |
+| R1：复用尾块，寄存器 → 4B GM | 7.001 | 17.011 | 7.836 | 18.162 |
+| R2：packed full/tail 分支，额外 stack | 7.207 | 17.632 | 8.194 | 18.838 |
+| R3：packed 单循环，寄存器 → 4B GM | 6.860 | 16.971 | 7.907 | 18.237 |
+
+相对同轮 C5：R1 的 inference 慢 **3.14% / 2.16%**，缓存开启慢
+**2.12% / 1.02%**；R3 的 inference 慢 **1.05% / 1.92%**，缓存开启慢
+**3.05% / 1.44%**。R2 的四档分别慢 6.17% / 5.89% / 6.78% / 4.78%。
+R3 修掉额外 stack 后仍没有超过原 TMA，且开启缓存时并不优于 R1，不能将
+更少的转换/局部访存指令简单等同于完整算子更快。S-vector 与原版仍很接近，
+20K 缓存的约 0.31% 小幅优势不作为采用依据。
+
+布局上的权衡是：直接写出时，每四个相邻 lane 属于同一行，一次每 lane
+写两个 BF16，整个 warp 分散到八行，每行只有 16B；下一次指令才写该行
+后续 16B。shared 重排后的 vector 可以让更多 lane 合并写同一行，TMA 则
+按规则二维 tile 写出。因此“少一次 shared 中转”不保证更快。这是地址/指令
+层面的分析，不是实测 DRAM 流量翻倍，也没有定量分摊所有回退来源。
+本轮没有测试额外 warp-shuffle 重排后的寄存器 16B store，不能否定所有
+可能的寄存器直写实现。
+
+### 验证与复现
+
+R1/R2/R3 均通过普通缓存 T256/8K/20K、强热点 20K（route bias std=8）、
+inference 8K/20K，共 288 个 rank/sample PyTorch 对照；最大 relative L2
+3.1043e-4、最大绝对误差 6.1036e-5。三份产物均通过定向 local-main
+memcheck/racecheck，分别为 8 ranks 零 errors / 零 hazards。没有重新验收
+BWD 或多机性能；最终源码未修改这些路径，也未修改默认单机 PF。
+
+全部构建/验证结束后计时。UTC 03:51:10–03:58:13 的 500 ms NVML 轮询
+共 6768 个 GPU 样本（574 个 util≥80%），SM 全部 1620、memory 全部
+3201 MHz；这不是逐周期有效频率测量。完整 40 条性能记录、rank-max 原始
+样本、每轮 p50、workload/hash、资源、校验和 library SHA256 见
+[`pf_fc1_register_store_20261009.json`](../benchmarks/pf_fc1_register_store_20261009.json)。
+
+三个独立候选分别保存在
+[R1 patch](../benchmarks/pf_fc1_register_store.patch)、
+[R2 patch](../benchmarks/pf_fc1_register_packed_store.patch)、
+[R3 patch](../benchmarks/pf_fc1_register_packed_unified_store.patch)。
+它们都基于 `110aab4`，**分别应用，不叠加**；使用上一节的 Flash profile
+和 benchmark 命令构建/运行，不需要 `WEFTMOE_PF_EPILOGUE_ABLATION` 宏。
+完整 S-vector 对照仍按上一节 patch 的 mode1 构建。
+
+本机冻结目录为 `build/pf_megamoe_20261008/cache_{rvec,rpack,rpair}/f47b1119685a/`，
+日志为同目录下 `regwrite_{c5,svec,rvec,rpack,rpair}_{off,on}_{0,1}_ep8.log`。
+验证日志为 `regwrite_{rvec,rpack,rpair}_verify_*_ep8.log` 和
+`{rvec,rpack,rpair}_{memcheck,racecheck}_device_ep8.log`。失败方向保留记录与
+可重放 patch，不把额外 helper 或实验开关留在生产代码里。
+
 ## 2026-10-08：当前 PF 的 FC1 S / FC2 contribution 写回消融
 
 结论：**保留 FC1 完整 S tile 的 TMA、FC2 contribution 的 vector**。
