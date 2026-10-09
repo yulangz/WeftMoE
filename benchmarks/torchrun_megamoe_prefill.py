@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Single-node PF/V3/MegaMoE inference on the training benchmark's dynamic trace.
+"""Single-node PF/DT/V3/MegaMoE inference on a shared route trace.
 
 Measures eager forward + device synchronize, including MegaMoE input staging.
 MegaMoE packs immutable weights once. PF eager packs on each call by default;
 --prepared-weights reuses its layer weight cache for a matched comparison.
 No saved training activations, backward, or optimizer are included.
+Fixed-token PF/DT comparisons can use CUDA graphs; runtime capacity and kernel
+tracing are explicit so small batches cannot silently benchmark a fallback.
 """
 
 import argparse
@@ -86,7 +88,7 @@ def reference(x, routes, gates, w1, w2):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "v3", "megamoe"), required=True)
+    parser.add_argument("--backend", choices=("pf", "dt", "v3", "megamoe"), required=True)
     parser.add_argument("--deepgemm-package", type=Path)
     capacity = parser.add_mutually_exclusive_group()
     capacity.add_argument("--megamoe-buffer-mib", type=float,
@@ -98,14 +100,20 @@ def main():
     for name in ("hidden", "intermediate", "experts", "top-k"):
         parser.add_argument("--" + name, type=int, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 64, 8192, 20480])
+    parser.add_argument("--pool-tokens", type=int, default=0,
+                        help="Minimum runtime capacity, independent of the measured token count")
     parser.add_argument("--warmups", type=int, default=8)
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--token-std-fraction", type=float, default=0.1)
     parser.add_argument("--route-bias-std", type=float, default=0.5)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--verify-kernel", action="store_true",
+                        help="During verification, trace the first call and require the selected PF/DT entry")
     parser.add_argument("--profile-device", action="store_true",
                         help="Also report PF's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
+    parser.add_argument("--graph-replays", type=int, default=0,
+                        help="Measure a PF/DT CUDA graph with this many calls; requires fixed token counts")
     parser.add_argument("--prepared-weights", action="store_true",
                         help="Reuse PF's immutable layer weights across changing token counts/routes")
     parser.add_argument("--forward-cache", choices=("off", "on"),
@@ -113,7 +121,12 @@ def main():
     args = parser.parse_args()
     if args.forward_cache and (args.backend != "pf" or args.profile_device):
         parser.error("--forward-cache requires PF without --profile-device")
-    if args.backend == "pf":
+    if args.verify_kernel and (not args.verify or args.backend not in ("pf", "dt")):
+        parser.error("--verify-kernel requires --verify and --backend pf/dt")
+    if args.graph_replays and (args.backend not in ("pf", "dt") or args.token_std_fraction
+                              or args.forward_cache or args.profile_device):
+        parser.error("--graph-replays requires PF/DT, --token-std-fraction 0, no cache/profile flags")
+    if args.backend in ("pf", "dt"):
         os.environ.pop("WEFTMOE_DISABLE_STATIC_FORWARD_V4", None)
         os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
         os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
@@ -153,7 +166,7 @@ def main():
         workload = dict(tokens=[r.shape[0] for r, _ in batches], sha256=digest.hexdigest())
         workloads = [None] * world
         dist.all_gather_object(workloads, workload)
-        capacity = max(max(w["tokens"]) for w in workloads)
+        capacity = max(args.pool_tokens, max(max(w["tokens"]) for w in workloads))
         incoming = torch.stack([torch.bincount(r.flatten().long(), minlength=args.experts)
                                 for r, _ in batches]).cuda()
         dist.all_reduce(incoming)
@@ -169,6 +182,14 @@ def main():
             buffer = megamoe_buffer(deep_gemm, args, capacity)
         output_storage = torch.empty(capacity, args.hidden, device="cuda", dtype=torch.bfloat16)
         samples, device_samples, device_phases, errors = [], [], [], []
+        measurement_intervals_ns = []
+        kernel_names = []
+        graph = None
+        if args.graph_replays:
+            graph_x = torch.empty(nominal, args.hidden, device="cuda", dtype=torch.bfloat16)
+            graph_routes = torch.empty(nominal, args.top_k, device="cuda", dtype=torch.int32)
+            graph_gates = torch.empty(nominal, args.top_k, device="cuda", dtype=torch.float32)
+            device_begin, device_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         if args.profile_device and args.backend == "megamoe":
             device_begin, device_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         rng_state = generator.get_state()
@@ -179,10 +200,33 @@ def main():
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
             x = rand(routes.shape[0], args.hidden)
             output = output_storage[:x.shape[0]]
+            if args.graph_replays:
+                graph_x.copy_(x)
+                graph_routes.copy_(routes)
+                graph_gates.copy_(gates)
+                if graph is None:
+                    graph_output = runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2)
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        for _ in range(args.graph_replays):
+                            runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2)
             dist.barrier()
             torch.cuda.synchronize()
+            probe = None
+            if args.verify_kernel and step == 0:
+                probe = torch.profiler.profile(activities=[
+                    torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+                probe.start()
+            interval_start = time.time_ns()
             started = time.perf_counter_ns()
-            if args.backend != "megamoe":
+            if args.graph_replays:
+                device_begin.record()
+                graph.replay()
+                device_end.record()
+                output = graph_output
+            elif args.backend != "megamoe":
                 if args.forward_cache:
                     tape = runtime.native.forward(x, routes, gates, w1, w2,
                         **({"layer": 0} if args.prepared_weights else {}))
@@ -209,6 +253,14 @@ def main():
                     device_end.record()
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - started) / 1000
+            interval_end = time.time_ns()
+            if probe is not None:
+                probe.stop()
+                kernel_names = sorted({event.name for event in probe.events()
+                                       if event.device_type == torch.autograd.DeviceType.CUDA})
+                expected_entry = ("weftmoe_pf::local::kernel" if args.backend == "pf"
+                                  else "weftmoe_dt::kernel")
+                assert any(expected_entry in name for name in kernel_names), kernel_names
             if args.verify:
                 expected = reference(x, routes, gates, w1, w2).float()
                 delta = output.float() - expected
@@ -219,29 +271,36 @@ def main():
                 errors.append(error)
             elif step >= priming + args.warmups:
                 samples.append(elapsed)
-                if args.profile_device:
-                    if args.backend == "megamoe":
-                        device_us = device_begin.elapsed_time(device_end) * 1000
+                measurement_intervals_ns.append((interval_start, interval_end))
+                if args.profile_device or args.graph_replays:
+                    if args.backend == "megamoe" or args.graph_replays:
+                        device_us = device_begin.elapsed_time(device_end) * 1000 / (args.graph_replays or 1)
                     device_samples.append(device_us)
-                    if args.backend != "megamoe":
+                    if args.profile_device and args.backend != "megamoe":
                         device_phases.append({key: value for key, value in profile.items()
                                               if key != "output"})
         records = [None] * world
         dist.all_gather_object(records, dict(samples_us=samples,
                                             device_samples_us=device_samples,
-                                            device_phases=device_phases, errors=errors))
+                                            measurement_intervals_ns=measurement_intervals_ns,
+                                            device_phases=device_phases, errors=errors,
+                                            kernel_names=kernel_names))
         workspace = (runtime.native.usage() if args.backend != "megamoe"
                      else dict(symm_bytes=buffer.buffer.nbytes, ring_tokens=buffer.num_ring_tokens))
         if rank == 0:
             print("MEGAMOE_PREFILL_JSON " + json.dumps(dict(
                 backend=args.backend, world=world, nominal_tokens_per_rank=nominal,
+                pool_tokens=capacity,
                 hidden=args.hidden, intermediate=args.intermediate, experts=args.experts,
                 top_k=args.top_k, warmups=args.warmups, samples=args.samples,
                 priming_steps=priming, token_std_fraction=args.token_std_fraction,
+                graph_replays=args.graph_replays,
                 route_bias_std=args.route_bias_std, workload=workloads,
                 wall_slowest_rank_p50_us=None if args.verify else statistics.median(
                     map(max, zip(*(r["samples_us"] for r in records)))),
-                scope=("eager forward + tape release + synchronize; includes input staging and per-call cache preparation"
+                scope=("CUDA graph batch wall + synchronize; see device_scope for per-call kernel timing"
+                       if args.graph_replays else
+                       "eager forward + tape release + synchronize; includes input staging and per-call cache preparation"
                        if args.forward_cache else
                        "eager inference + synchronize; includes input staging; no training cache"),
                 forward_cache=args.forward_cache,
@@ -249,7 +308,9 @@ def main():
                 device_slowest_rank_p50_us=(statistics.median(
                     map(max, zip(*(r["device_samples_us"] for r in records))))
                     if device_samples else None),
-                device_scope=("PF: native fused-kernel clock; MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
+                device_scope=("CUDA graph events divided by graph_replays; includes fused source staging; excludes external input updates and preparation"
+                              if args.graph_replays else
+                              "PF/DT: native fused-kernel clock; MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
                               if args.profile_device else None),
                 megamoe_buffer_mib=args.megamoe_buffer_mib,
                 megamoe_minimum_ring=args.megamoe_minimum_ring,
@@ -257,6 +318,7 @@ def main():
                 package=deep_gemm.__file__ if args.backend == "megamoe" else
                     os.environ.get("WEFTMOE_TENSOR_EXTENSION"))), flush=True)
         if args.backend != "megamoe":
+            del graph
             runtime.close()
         else:
             buffer.destroy()

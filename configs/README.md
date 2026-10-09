@@ -57,6 +57,14 @@ immutable weights; normal `TensorRuntime.forward` does not pass it and still
 publishes the current training weights on every call. Forward-only cache
 overhead does not establish end-to-end FWD+BWD performance.
 
+The small-batch Flash DT comparison profile is in
+[`dt_flash_probe_20261009`](dt_flash_probe_20261009/weftmoe_forward_tuning_generated.hpp).
+It preserves the existing DT arithmetic and epilogue; it is not an autotuned
+replacement or a deployment lookup table. The T256 measurement additionally
+uses an isolated capacity-guard patch; production DT selection remains at
+capacity <=64. See the [DT/PF comparison](../docs/static_forward_v4_decode_record.md)
+for exact kernel traces, graph timing, and the patch needed to reproduce T256.
+
 In the independent phase grids, each parameter contains a nonempty array of candidate values. The first values
 form the incumbent configuration and the defaults used when autotuning is
 disabled; the Cartesian product defines the search space. A single value fixes a parameter for that search. Supported values and

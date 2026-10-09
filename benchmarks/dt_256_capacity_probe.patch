@@ -1,0 +1,13 @@
+diff --git a/src/cuda/weftmoe_dt/schedule.cuh b/src/cuda/weftmoe_dt/schedule.cuh
+index ee695bb..6cb1495 100644
+--- a/src/cuda/weftmoe_dt/schedule.cuh
++++ b/src/cuda/weftmoe_dt/schedule.cuh
+@@ -38,7 +38,7 @@ inline bool eligible(const ActivationTransportPoolConfig &config,
+          forward_tuning::kTileM == kBlockM && forward_tuning::kTileK == kK &&
+          forward_tuning::StaticV4Gemm<true>::kFc1N == kN &&
+          forward_tuning::kFc2TileN == kN && config.max_nodes == 1U &&
+-         !config.enable_backward_state && config.max_tokens_per_rank <= 64U &&
++         !config.enable_backward_state && config.max_tokens_per_rank <= 256U &&
+          ring.depth && ring.max_windows == 1U && config.max_world_size <= 32U &&
+          config.max_owned_experts * config.max_world_size <= kMaxExperts;
+ }

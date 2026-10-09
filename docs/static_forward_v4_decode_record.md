@@ -1,5 +1,94 @@
 # 单机 decode 专属实现与验收记录
 
+## 2026-10-09：Flash 小 batch，DT 与已采纳 128-bit 写出的 PF
+
+**PF 的 FC1 寄存器 shuffle → 16B 写出已正式采纳**（`85aac52`）。
+本次只测 inference：Flash H4096/I2048/E256/top-k6、BF16，单机 EP8，
+每 rank 精确 1/64/256 tokens；不与下文 H2048/I512/E64 的历史值混用。
+结果是 **1 token 用现有 DT 更快，64/256 则是当前 PF profile 更快**。
+新 PF 相比旧 PF 三档均改善约 1.1%，没有扩大长文测试中的微小差距。
+
+### 入口与公平口径
+
+- 新 PF：M128/N256/K64、3 stages、cluster2，FC1 寄存器 16B 直写；
+  旧 PF 是冻结 C5，完整块走 TMA、尾块走 4B store。二者其他设置相同。
+- DT **保持原有 4B FC1 epilogue**，作为独立 decode 工作流对照；本次没有
+  将 PF 的 M128 重排直接移植到 DT。trace 确认 T1/T64 为 `kernel<16u>`，
+  T256 为 `kernel<64u>`，实际 N128/K64、3 stages；没有重新 autotune。
+- 两边 pool 容量均为256，以保证小输入也实际走 PF。PF 请求 B128/D2，
+  DT 请求 B512/D8（单窗口按 pool256 截断）；保留各自缓冲布局，未强行
+  等化物理 workspace，分配量已保存到结果 JSON。
+- 生产 DT 自动入口只允许容量≤64。为了真正测 DT-256，**仅实验产物**把
+  eligibility 上限放到256，仍要求单机、inference、单窗口能装下最坏路由。
+  测完源码恢复64，不改变生产自动切换阈值。所有规模、所有 rank 都通过
+  GPU trace 核对入口，不能把通用回退 kernel 记作 DT 或 PF。
+
+固定 token 数是本次点测口径；route/gate 每个样本重新随机，route bias
+std=0.5、seed123。候选逐 rank 的完整50步 route/gate hash 一致。
+每个 runtime 的分配、IPC、权重 packing、graph capture 都只准备一次；
+先 prime50，再 warmup10 + measured40，每个 graph 含20次真实算子调用。
+每个样本在 graph 外更新 X/route/gate；核内 source staging、dispatch、
+FC1/FC2、return/combine 仍全部计入。没有 Saved X/GU、mini-notify 或 BWD。
+GPU trace 中，每次算子调用只有相应的 fused main kernel。
+
+### 正反序实测
+
+顺序 DT → 新 PF → 旧 PF，再完全反序。单位 **µs/算子调用**，为两轮
+rank-max CUDA-event p50 的均值；不是 Python eager wall，也不是纯 GEMM。
+
+| tokens/rank | DT 原写出 | PF 新 16B 写出 | PF 旧写出 |
+|---|---:|---:|---:|
+| 1 | 125.008 | 213.784 | 216.323 |
+| 64 | 685.633 | 628.422 | 635.624 |
+| 256 | 771.511 | 748.973 | 757.221 |
+
+新 PF 相对旧 PF 时延降低 **1.17% / 1.13% / 1.09%**。
+与 DT 相比，PF 在64/256降低 **8.34% / 2.92%**，但T1明显更慢。
+这只是当前 Flash profile 的点测，不据此改全模型统一的 DT/PF 分界，
+也不能认定 DT 的参数搜索已经充分。
+
+时钟目标和锁频范围均设为1620 MHz，memory3201 MHz。最初两组完整对照
+都观察到个别瞬时降频，因此没有直接选用它们，而是增加每个正式样本的
+host 时间边界重新测量。最终 UTC 04:49:13–04:51:45 的500 ms轮询共
+2424条GPU记录，其中落入正式计时窗口的136条全部为1620 MHz。
+另两条 GPU6/7 的1530/1515 MHz读数发生在首轮 DT-256 最后一个计时窗口
+结束约2.066 ms之后；没有与正式计时窗口重叠。这里仅陈述可观测采样点，
+**不保证两次轮询之间逐周期恒频**。前两组结果、原始降频和最终窗口边界
+都保留在 JSON 中，不静默删除；三组性能排序一致。
+
+### 验证与复现
+
+DT、新 PF、旧 PF 均通过 T1/T64/T256 普通路由及 T256 热点路由
+（route bias std=8），每例2个不同输入、8 ranks，共192个 PyTorch
+数值对照；同时覆盖 graph 重放时 route/gate 更新。最大 relative L2
+约1.5911e-3。PF 采纳时另做的 FWD+BWD 回归见训练记录，不混入本表。
+
+原始结果与每轮40个 rank-max样本：
+[`dt_pf_small_20261009.json`](../benchmarks/dt_pf_small_20261009.json)。
+DT 使用 [`dt_flash_probe_20261009`](../configs/dt_flash_probe_20261009/weftmoe_forward_tuning_generated.hpp)
+profile；测256时另独立应用
+[`dt_256_capacity_probe.patch`](../benchmarks/dt_256_capacity_probe.patch)，构建后恢复源码。
+PF 使用既有 `configs/pf_inference_flash_20261008/`，新源码直接构建即可。
+旧 PF 对照为 `7310228` 之前保留的 C5 frozen binary。
+
+使用现有 `benchmarks/torchrun_megamoe_prefill.py`，在单机8进程 torchrun 下
+分别加载对应 `WEFTMOE_TENSOR_EXTENSION`、清空 `WEFTMOE_AUTOTUNE_TABLE`：
+
+```sh
+# 新/旧 PF 的共同参数；DT 改 --backend dt --ring-tokens 512 --ring-depth 8
+python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  benchmarks/torchrun_megamoe_prefill.py \
+  --backend pf --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --tokens 1 64 256 --pool-tokens 256 --token-std-fraction 0 \
+  --route-bias-std 0.5 --seed 123 --prepared-weights \
+  --ring-tokens 128 --ring-depth 2 --graph-replays 20 --warmups 10 --samples 40
+```
+
+验证时改为 `--graph-replays 2 --warmups 0 --samples 2 --verify --verify-kernel`。
+冻结产物在 `build/pf_megamoe_20261008/cache_dt_small/0f4281018282/`、
+`cache_rquad/f47b1119685a/`、`cache_c5/f47b1119685a/`；正式日志前缀
+`small128_timed_{dt,pf,pfold}_{0,1}_ep8.log`，验证为 `small128_*_verify_*`。
+
 2026-09-30 阅读入口：[decode 优化历程和适用范围](static_forward_v4_decode_optimization_history.md)
 汇总通用 ring 短文优化到 HHE、TP/DP 对照、当前实现和跨模型推广边界。
 下文保留逐次实验记录；其中 HF 的双 warpgroup/multicast/三个 rank barrier
