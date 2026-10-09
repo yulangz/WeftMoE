@@ -1,5 +1,116 @@
 # Static Forward V4 多机 inference 记录
 
+## 2026-10-09：跨机逐 token 与 pack 的最小消融
+
+结论：**pack 明显降低低并发下的网络请求开销，但本例并非必须先 pack。**
+32 个通信 owner 时，逐 token 的纯通信已接近打包版；本实验把整批 pack
+串行计入后，不 pack 反而更快。不能把这个结果外推成“流式 pack 与通信折叠也无收益”，
+也不能把纯通信收益当作 PF FWD 收益。此次不修改 PF/DT/BWD 生产实现。
+
+### 测量合同
+
+- 两机各 8 张 L20X，8 对同 local rank GPU 同时双向通信，不是 2 机 EP8。
+  NCCL 2.31.2，所有 rank 实报 GDAKI（railed_gin_type=3）。
+- H=4096、BF16 等宽原始数据，一 token 8192B。8K/20K 为名义每 rank
+  传输 token 数，逐 sample 采样正态分布（标准差 10%）；正式样本均值分别
+  8453 / 20400.15，范围 6706–10158 / 16782–26038。
+- 所有变体重放相同 token 数、相同每 rank 随机行排列；每个 sample 重新打乱行。
+  这是隔离传输粒度的一对一随机行 gather，不含 MoE top-k 展开或节点去重。
+  各 rank 的 token 数相同，不将其描述为完整不均衡 MoE workload。
+- Q=1：每次 Get/Put 从原始 X 的随机 token 行搬 8KiB，直接落到连续 RX 行。
+  Q=4/16/64：先用 128-bit vector gather 到连续 TX，再按 32/128/512KiB 发请求。
+  接收布局、有效字节数完全相同，两者都不需要 unpack。
+- 固定总在途上限 2048 tokens/rank=16MiB；contexts × 每 context batch
+  分别为 4×512、16×128、32×64。各 context 独占固定任务，无动态领用。
+  Q 改变时不增加在途字节上限，也不多传 payload。GIN queue depth=1024。
+- Get 每批用 flushAsync(peer)+wait 确认本地可见；Put 每个请求绑定 weak
+  ready signal，每批 flush 确认本地读完，并等待自己的相应接收计数。
+  因此 pure network 包含真正可消费的完成确认，不是仅计 enqueue。
+- 原始 X、packed TX、RX 一次预分配/注册，计时不含分配、初始化、路由数组构造、
+  NCCL bootstrap、校验及最终销毁。Q=1 也预留相同的三个 plane，排除容量差异。
+- 单个 cooperative kernel 内分阶段记录 globaltimer。network 从 source-ready
+  rendezvous 后开始，到全部本地 owner 完成；total 包含 pack、相同的 source-ready
+  rendezvous 和 network。pack **没有**与本批通信重叠，也没有 GEMM。
+  pack_us 含其局部 grid joins（Q=1 约 2.5us 的空阶段）。
+- 每个 case 5 warmup + 20 measured，第二轮逆序 Q 和 Get/Put。下表为
+  **每 sample 先取 16 rank 最大值，再对两轮共 40 samples 求平均**，单位 ms；
+  不是早期固定负载的 p50。各 stage 的 rank-max 可能来自不同 rank，不能相加。
+- 每轮先 poison RX，通信后检查全部 32-bit words，不只比较抽样或 hash。
+  最终三种 contexts 合计 38,400 次 rank/sample 全量校验通过；每组 160、
+  共 480 次 GPU 时钟观测均为 SM1620MHz，活跃显存时钟均3201MHz。
+
+### 32 contexts：完整通信及额外 pack 代价
+
+| 名义 tokens | 方式 | Q1 network | Q16 network | Q1 total | Q16 total | pack 后 total 变化 |
+|---|---|---:|---:|---:|---:|---:|
+| 8K | Get / pull | 1.554 | 1.483 | 1.566 | 1.705 | +8.9% |
+| 8K | Put / push | 1.584 | 1.487 | 1.597 | 1.711 | +7.2% |
+| 20K | Get / pull | 3.700 | 3.505 | 3.712 | 4.014 | +8.1% |
+| 20K | Put / push | 3.756 | 3.543 | 3.769 | 4.052 | +7.5% |
+
+打包后纯通信约快 4.6%–6.1%，但额外 pack 约 0.214ms / 0.506ms，
+使 total 慢 7.2%–8.9%。Q1 的有效单向 payload 吞吐约 43.7–45.2GB/s/rank；
+Q16 约46.6–47.7GB/s/rank。这里不把双向流量乘二冒充单向带宽。
+Q16 增到 Q64 的纯通信变化在约1%以内，没有继续增加包长的明显依据；
+Q4 结果及全部逐样本数据保存在 JSON。
+
+### 并发度消融：不能只测少量 issuer 就判定必须 pack
+
+下表每格为 **Q1 total → Q16 total**，单位 ms；在途容量均为16MiB/rank。
+
+| contexts | 每 context batch tokens | 8K pull | 8K push | 20K pull | 20K push |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 512 | 4.352 → 1.776 | 4.536 → 1.811 | 9.990 → 4.203 | 10.415 → 4.283 |
+| 16 | 128 | 1.609 → 1.702 | 1.706 → 1.736 | 3.745 → 4.012 | 3.908 → 4.119 |
+| 32 | 64 | 1.566 → 1.705 | 1.597 → 1.711 | 3.712 → 4.014 | 3.769 → 4.052 |
+
+4 contexts 时，pack 的 total 加速约2.4–2.5倍；Q1 的纯通信只有约15–17GB/s。
+32 contexts 时，Q1 通过更多独立 issuer/QP 达到约44–45GB/s，省掉额外 pack 后
+反而占优。这支持“小请求的发起/进度并发是重要因素”，但不能仅凭本实验进一步
+区分 WQE 构造、doorbell、QP 执行和完成等待各自的成本。
+
+后续多机实现的决策边界：
+
+1. Dispatch 可优先试按节点去重的逐 token pull，不必预设整批 pack 是必要步骤。
+   同时必须给足通信并发；不能直接把本实验的32个owner照搬成PF的最优资源配额。
+2. 如果 FC2 本来就能直接产出连续 return TX，便没有这里约0.2/0.5ms的额外 gather，
+   聚合 Put 仍值得保留；本实验没有否定这种“生产时即排好布局”的方案。
+3. 尚未测试流式 packet pack 与网络/GEMM 的 overlap、节点内 fanout、ring 消费
+   credit、跨更多节点和真实 FWD 资源竞争。不得据此承诺 PF 的端到端收益。
+
+### 代码、数据与复现
+
+- 独立最小实现：[gin_pack.cu](../benchmarks/gin_pack.cu)。
+- 启动及聚合：[run_gin_pack.py](../benchmarks/run_gin_pack.py)，复用既有双机
+  bootstrap、SSH 和进程清理，不链接 WeftMoE 主算子。
+- [冻结数据](../benchmarks/gin_pack_20261009.json)：含每项 rank-max
+  逐样本数据、随机 token 数、所有 rank 的 backend 证据、校验/时钟统计及文件哈希。
+  完整逐 rank 日志为 build/gin_pack_final_c{4,16,32}.log。
+- 两节点实测 binary SHA256：
+  `0c924eb5ffa1aded4a72194993a5a816a56735bee631d67bfe9ac3ea079e767a`。
+  另有单对 GPU、T≈1024、C4 的快速全量校验，不用于正式性能结论。
+
+在 repo 根目录编译，并将同一 binary 放到第二节点的同一路径；两端先固定时钟。
+以下以 C32/B64 为例，改为 C16/B128 或 C4/B512 即可保持相同的总在途上限：
+
+```bash
+/usr/local/cuda/bin/nvcc -O3 -std=c++17 --expt-relaxed-constexpr \
+  -arch=sm_90a -Xcompiler=-Wall,-Wextra benchmarks/gin_pack.cu \
+  -lnccl -o build/gin_pack
+scp -P 2222 build/gin_pack \
+  root@10.10.19.233:/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/gin_pack
+
+env LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64 \
+  NCCL_IB_GID_INDEX=3 WEFTMOE_GIN_BENCH_CONTEXTS=32 WEFTMOE_GIN_BENCH_BATCH=64 \
+  /opt/.venv/bin/python benchmarks/run_gin_pack.py \
+  --binary "$PWD/build/gin_pack" --remote-binary "$PWD/build/gin_pack" \
+  --remote root@10.10.19.233 --port 2222 --gpus-per-node 8 \
+  --socket-ifname eth0 --enable-ib \
+  --nccl-lib-dir /usr/local/cuda/compat:/usr/local/cuda/lib64 --timeout 240
+```
+
+## 以下为 2026-09-22 起的历史实现与测量
+
 日期：2026-09-22；2026-09-23 补充优化分步记录与 V3 对照。协议与首版边界见
 [`static_forward_v4_design.md`](static_forward_v4_design.md#60-复审进度容量与首版实现边界)。
 
