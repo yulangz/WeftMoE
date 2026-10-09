@@ -1,0 +1,186 @@
+{
+  "communication": {
+    "library": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/wg3-slots-20261009/build/slots/diag/libweftmoe.so",
+    "library_sha256": "2593678a0cf2a9a6b444ab2ff7d7767ee47dfd0c1848c59dc4ef639d4284fa4c",
+    "ptxas_functions": {
+      "kernel": {
+        "stack_frame": 424,
+        "spill_stores": 68,
+        "spill_loads": 48
+      },
+      "admit": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "prepare": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "communication_copy": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "pack": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "pull": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "progress": {
+        "stack_frame": 0,
+        "spill_stores": 4,
+        "spill_loads": 8
+      },
+      "transfer_put": {
+        "stack_frame": 0,
+        "spill_stores": 308,
+        "spill_loads": 600
+      },
+      "transfer_get": {
+        "stack_frame": 0,
+        "spill_stores": 420,
+        "spill_loads": 844
+      }
+    },
+    "resources": {
+      "network": {
+        "registers": 128,
+        "stack_bytes": 424,
+        "static_shared_bytes": 1024,
+        "local_bytes": 0,
+        "instructions": 34920,
+        "normalized_sha256": "cc714b9a801cd590fabe70277784a3bccb4ad41bd1ed75b781f7569b4a52e1f3",
+        "hgmma": [],
+        "wait": [],
+        "local_loads": 1398,
+        "local_stores": 729
+      },
+      "local": {
+        "registers": 168,
+        "stack_bytes": 0,
+        "static_shared_bytes": 1024,
+        "local_bytes": 0,
+        "instructions": 10536,
+        "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+        "hgmma": [
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+        ],
+        "wait": [
+          "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+        ],
+        "local_loads": 54,
+        "local_stores": 6
+      }
+    }
+  },
+  "full_gemm_compile_only": {
+    "library": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/wg3-slots-20261009/build/slots/gemm_audit/libweftmoe.so",
+    "library_sha256": "1a155bffcbb54fd15e630897de2e929f16648c105c648ffd2f65d69821ebef60",
+    "ptxas_functions": {
+      "kernel": {
+        "stack_frame": 456,
+        "spill_stores": 144,
+        "spill_loads": 140
+      },
+      "admit": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "prepare": {
+        "stack_frame": 0,
+        "spill_stores": 4,
+        "spill_loads": 4
+      },
+      "pack": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "pull": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "progress": {
+        "stack_frame": 0,
+        "spill_stores": 0,
+        "spill_loads": 0
+      },
+      "transfer_put": {
+        "stack_frame": 0,
+        "spill_stores": 476,
+        "spill_loads": 804
+      },
+      "transfer_get": {
+        "stack_frame": 0,
+        "spill_stores": 560,
+        "spill_loads": 1016
+      }
+    },
+    "resources": {
+      "network": {
+        "registers": 128,
+        "stack_bytes": 456,
+        "static_shared_bytes": 1024,
+        "local_bytes": 0,
+        "instructions": 38648,
+        "normalized_sha256": "14c03ed46d3670a98337d3cb6398dc7f8166e767cf609cb64b7a42ba2350ac5a",
+        "hgmma": [
+          "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24, UP0;",
+          "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88, UP0;",
+          "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+          "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88;",
+          "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+          "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88;",
+          "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+          "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88, gsb0;"
+        ],
+        "wait": [
+          "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+        ],
+        "local_loads": 1455,
+        "local_stores": 794
+      },
+      "local": {
+        "registers": 168,
+        "stack_bytes": 0,
+        "static_shared_bytes": 1024,
+        "local_bytes": 0,
+        "instructions": 10536,
+        "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+        "hgmma": [
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+          "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+        ],
+        "wait": [
+          "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+        ],
+        "local_loads": 54,
+        "local_stores": 6
+      }
+    },
+    "hot_k_loop": {
+      "instructions": 152,
+      "LDL": 0,
+      "STL": 0,
+      "HGMMA": 8,
+      "waits": [
+        "/*42d0*/                   WARPGROUP.DEPBAR.LE gsb0, 0x0 ;"
+      ],
+      "scope": "K loop 0x3aa0..0x43b0 and out-of-line full-barrier wait 0x1c5e0..0x1c630; excludes task scheduling and epilogue"
+    }
+  }
+}
