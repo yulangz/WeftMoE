@@ -96,7 +96,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   if (!a.dispatch.runtime->error) {
     if (threadIdx.x < 256U) {
       cutlass::arch::warpgroup_reg_alloc<Resources::kUnifiedMathRegisters>();
-      local::compute<Schedule, true>(a, s, output_map);
+      local::compute<Schedule, true, Mma>(a, s, output_map);
     } else if (threadIdx.x < 288U) {
       local::produce<Schedule, true>(a, s, x_map, s_map, w1_map, w2_map);
     } else {

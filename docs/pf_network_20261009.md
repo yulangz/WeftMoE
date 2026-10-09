@@ -2,10 +2,10 @@
 
 ## 结论与测量口径
 
-第一步已完成：384-thread CTA 借用部分 pull warp 专职 RDMA，双机 EP16
-的 8K/20K kernel 比本轮重测的旧网络 PF 快 **2.03× / 2.15×**。
-不是 V3 对比，也不是单机 MegaMoE 对比。第二步将保持数据面与 GEMM 不变，
-只测试 WG3 math208/local48/network48。
+两阶段完成，**推荐保留 384-thread CTA 部分专用 warp 方案**。双机 EP16
+的 8K/20K kernel 比本轮重测的旧网络 PF 快约 **2.04× / 2.15×**。
+WG3 math208/local48/network48 能运行，但分别比 384 线程版慢
+**10.8% / 11.5%**，不作为推荐配置。不是 V3 或单机 MegaMoE 对比。
 
 Flash BF16 H4096/I2048/E256/top-k6，两机各 8 张 L20X，SM 1620 MHz，
 memory 3201 MHz。每 rank tokens 围绕 8192/20480 正态波动（std=10%），
@@ -13,11 +13,13 @@ memory 3201 MHz。每 rank tokens 围绕 8192/20480 正态波动（std=10%），
 同一 token/route hash；权重和持久 workspace 预备一次，没有训练缓存。
 先完整 prime 32 步，再 warmup 8 / measured 24；各步取最慢 rank，再取 p50。
 kernel 为主核设备时钟，eager 包含输入准备、调用与 synchronize。
+下表列各版本首轮；新版本另外各复测一轮，均值与范围见 WG3 一节。
 
 | 版本 | 8K kernel / eager（ms） | 20K kernel / eager（ms） |
 |---|---:|---:|
 | 冻结旧 PF 网络入口 | 37.017 / 37.248 | 92.137 / 92.475 |
 | 新协议，384 线程部分专用 warp | 18.211 / 18.382 | 42.841 / 43.154 |
+| 同协议，WG3 208/48/48（N256 拆为两条 N128） | 20.101 / 20.374 | 47.900 / 48.221 |
 
 这里只能将收益归于**整套重构**，不能将 2× 归因于“借用 29 个 warp”一项。
 旧版使用 L2/Q32，新版使用 L16/Q16；调度、数据面与 GEMM pipeline 也有变化。
@@ -73,10 +75,60 @@ eager 为 6.883 / 16.756 → 6.765 / 16.644 ms，未见回退。这是回归检�
 不把约 1% 的变化归因于网络重构。逐样本 rank-max 时间和路由 SHA256 保存在
 [`pf_network_20261009.json`](../benchmarks/pf_network_20261009.json)。
 
+## 第二阶段：WG3 208/48/48
+
+512 线程中，WG0/1 为 math208，WG2 为 producer + 原三条 pull（48），
+WG3 为 network（48）。每 GPU 仍然只有 16 Get / 8 Put / 4 progress /
+1 admission owner，与第一阶段相同；没有让 132 个 CTA 的全部新增 warp
+同时发 RDMA。未分配 owner 的 WG3 warp 直接进入 CTA 汇合，不轮询网络队列。
+本地 pull 从 367 恢复为 396 个。Get/Put 各有四个独立 completion handle，
+放在新增的 1 KiB shared arena，不能和仍在使用的三个 pull staging 区别名。
+
+原样 N256 编译失败（`e762a24`、CUDA 12.9），没有该版本的性能数字：
+
+```text
+C7602: Insufficient registers (128) ... Try to compile with register target of 154 or higher.
+```
+
+配额预算 `256×208 + 128×48 + 128×48 = 65536` 合法，但不能解除 ptxas
+对 512 线程入口静态 REG128 的 N256 指令分配限制。只给网络 WG3 的 Mma
+类型选择 N128 atom，把逻辑 N256 拆成两条指令，保持 M/N/K、accumulator
+布局、每个输出的 K 累加次序和通信协议。这个差异意味着本轮**不是纯粹的
+warp 数消融**；不能把全部回退定量归因于额外 WG、配额或指令拆分中的一项。
+
+| 资源 / 机器码 | 384 线程 | WG3 |
+|---|---:|---:|
+| 入口 REG / STACK（bytes） | 168 / 256 | 128 / 464 |
+| 动态 shared（bytes） | 226304 | 227328 |
+| static shared（bytes） | 1024 | 1024 |
+| 动态配额 | math208 / control80 | math208 / local48 / network48 |
+| 每 K64 的 WGMMA / wait | 4×N256 / 1 | 8×N128 / 1 |
+| 热 K loop 的 LDL/STL | 0 / 0 | 0 / 0 |
+
+WG3 热循环没有 accumulator spill，也没有逐 WGMMA 注入 wait 的串行化。
+STACK 更大、控制配额更低和额外指令是真实差异，但尚未独立归因；不能用
+“GEMM spill 导致慢”解释这次结果。单机 local kernel 的 21072 个 64-bit
+指令字在 shared/WG3 两个库中完全相同，WG3 的指令拆分没有扩散至单机。
+
+两轮结果（单位 ms；每轮都是 24 步 rank-max 的 p50）：
+
+| 版本 | 8K kernel 两轮 | 20K kernel 两轮 | 8K/20K kernel 均值 | 8K/20K eager 均值 |
+|---|---|---|---|---|
+| 部分专用 warp | 18.211 / 18.102 | 42.841 / 42.996 | **18.156 / 42.919** | **18.376 / 43.199** |
+| WG3 208/48/48 | 20.101 / 20.136 | 47.900 / 47.846 | 20.118 / 47.873 | 20.343 / 48.174 |
+
+WG3 对 PyTorch 的 1/64/256/8K/20K、每档两次验证通过；8K/20K 最大
+relative L2 9.470e-5。B128/bias8 的热点验证通过，64 组 rank/sample 输出
+SHA256 与部分专用 warp 版全部一致。两版正式测量的 workload hash、GM
+workspace 相同；四轮新版本的全部时钟采样均为 SM1620 MHz。
+
+只推荐 mode1；mode2 保留作为显式候选，不修改默认构建、其它 profile 或
+训练/BWD 的入口选择。两机以上没有硬件验证，不作扩展性能结论。
+
 ## 复现
 
 编译后使用打印出的 tensor extension；单机 profile 和默认构建不自动启用
-此入口。`WEFTMOE_PF_NETWORK_WORKERS=1` 为 384 线程，`=2` 为 WG3 候选。
+此入口。`WEFTMOE_PF_NETWORK_WORKERS=1` 为推荐的 384 线程，`=2` 为 WG3 候选。
 
 ```bash
 export NVCCFLAGS="-lineinfo -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I${PWD}/configs/pf_network_flash_20261009 -DWEFTMOE_PF_NETWORK_WORKERS=1"
@@ -99,3 +151,9 @@ python benchmarks/run_pf_network.py --artifact build/pf_network_20261009/shared 
 `eacc6335a965d0a815ca7304021f1ac838d3603cfd1e36ca39cb0cab6836811b`；新 shared 库为
 `build/pf_network_20261009/shared/libweftmoe.so`，SHA256
 `c9c6bed29287c4f873cafd7b628b4275cdeb7abd22f8ed821baa2c9948d63b7a`。
+WG3 产物为 `build/pf_network_20261009/wg3/libweftmoe.so`，SHA256
+`47126e5921d083c3cddcd37a34ac061e8beccff17733c69c92b0b33102a80bb2`。
+复测前缀 `shared_repeat_performance` / `wg3_repeat_performance`，WG3 首轮
+为 `wg3_performance_b2048_bias0.5_t8192-20480`。原样 N256 编译错误日志是
+`wg3_native_n256.build.log`。第一阶段提交 `e762a24`；后续提交保存 WG3
+兼容指令与完整两版结果。

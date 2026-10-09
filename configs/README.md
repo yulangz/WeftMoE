@@ -151,7 +151,9 @@ The experimental Flash **network inference** profile is
 [`pf_network_flash_20261009`](pf_network_flash_20261009/weftmoe_forward_tuning_generated.hpp).
 It reuses the local PF GEMM with node-deduplicated Get dispatch and direct Put
 return. Build with `WEFTMOE_PF_NETWORK_WORKERS=1` for selected dedicated warps,
-or `=2` for the WG3 208/48/48 experiment. Existing profiles/default builds and
+or `=2` for the WG3 208/48/48 experiment (about 11% slower in the measured
+8K/20K cases; mode 1 is recommended). WG3 alone splits native N256 into two
+N128 instructions to satisfy CUDA 12.9 compilation. Existing profiles/default builds and
 training selection are unchanged. See the [network report](../docs/pf_network_20261009.md)
 for commands, buffer lifetimes, measured performance and validation scope.
 

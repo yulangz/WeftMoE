@@ -48,9 +48,10 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
   }
 }
 
-template <class Scheduler = Schedule, bool Network = false>
+template <class Scheduler = Schedule, bool Network = false, class Matrix = Mma>
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                         const CUtensorMap &output_map) {
+  using Mma = Matrix;
   using namespace forward_compute_detail;
   Scheduler schedule(a);
   Task t;

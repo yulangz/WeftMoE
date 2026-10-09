@@ -30,8 +30,10 @@ static_assert(WEFTMOE_WGMMA_N256_ATOM_N == 128 ||
               WEFTMOE_WGMMA_N256_ATOM_N == 256);
 
 template <int Columns, Major MajorA = Major::K, Major MajorB = Major::K,
-          uint32_t StageK = 64, uint32_t SwizzleBytes = 128>
+          uint32_t StageK = 64, uint32_t SwizzleBytes = 128,
+          int AtomN = WEFTMOE_WGMMA_N256_ATOM_N>
 struct BF16Mma {
+  static_assert(AtomN == 128 || AtomN == 256);
   static constexpr int M = 64, N = Columns, K = 16;
   static constexpr int kNumAccum = Columns / 2;
   static constexpr auto operation() {
@@ -54,7 +56,7 @@ struct BF16Mma {
   }
   CUTLASS_DEVICE static void wgmma(uint64_t const& a, uint64_t const& b,
                                   float* d, bool accumulate) {
-    if constexpr (Columns == 256 && WEFTMOE_WGMMA_N256_ATOM_N == 128) {
+    if constexpr (Columns == 256 && AtomN == 128) {
       // CUDA 12.9 ptxas can reject a native N256 instruction at the static
       // register limit of a 512/640-thread CTA despite setmaxnreg. Keep the
       // N256 tile, all accumulators, and each output's K order; only split

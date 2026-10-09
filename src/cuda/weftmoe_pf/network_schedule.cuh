@@ -6,6 +6,10 @@ constexpr unsigned kThreads = kNetworkWorkerMode == 2U ? 512U : 384U;
 using Resources = unified_worker_tuning::Resources<
     kThreads, 96, 288, 208, kThreads == 512U ? 48U : 80U,
     kThreads == 512U ? 48U : 80U, 4096, 1>;
+// CUDA 12.9 rejects native N256 at a 512-thread entry's static REG128.
+// Split only this candidate's instruction; preserve logical N and K order.
+using Mma = hopper::BF16Mma<local::kN, hopper::Major::K, hopper::Major::K,
+    local::kK, 128U, kThreads == 512U ? 128 : WEFTMOE_WGMMA_N256_ATOM_N>;
 
 // Static residues of full M/N tiles, paired for TMA multicast. A source window
 // bounds RX/Return lifetimes; it does not split GEMM at network packet edges.

@@ -35,11 +35,12 @@ SM 固定 1620 MHz。先验证 384 线程部分专用 warp，再消融 512 线�
   warp（132 CTA 时）保留。所有 CTA 仍有两个 math WG 和一个 TMA producer。
 - 512 线程候选：原三个 pull warp 全保留，WG3 承担上述同一组 owner；配额为
   math208/local48/network48。每 GPU 的 NIC 发射 owner 数不随 CTA 数增加。
-  必须检查真实寄存器池、热 K spill、WGMMA 分组及 shared-memory 占用；配额
-  算式合法不代表编译或性能通过。暂不将候选设为默认。
+  原样 N256 被 CUDA 12.9 的 REG128 编译限制拒绝；仅此候选将指令拆为
+  两条 N128，逻辑 M/N/K 不变。检查后热 K 无 spill，八条 WGMMA 一次 wait；
+  仍比 384 版慢约 11%，不将候选设为默认。
 
-384 版本已通过正确性/重复调用/热点及 8K/20K 性能验证，较本轮旧网络 PF
-快 2.03×/2.15×。待办：WG3 编译审计及同负载性能 → milestone commit。
+两版均通过正确性/重复调用/热点及 8K/20K 性能验证。推荐 384 部分专用
+warp：两轮均值较本轮旧网络 PF 快 2.04×/2.15×；WG3 慢 10.8%/11.5%。
 结果及复现见 [跨机优化记录](pf_network_20261009.md)；保留 workload hash 和
 独立的 kernel / eager 时间，不把历史固定负载结果改名为本次变长结果。
 
