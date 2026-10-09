@@ -86,7 +86,10 @@ def summarize(path):
     if pf:
         prefix = re.sub(r"_ep\d+_node\d+\.log$", "", path.name)
         result["clocks"] = json.loads(path.with_name(prefix + ".clocks.json").read_text())
-        result["launch"] = json.loads(path.with_name(prefix + ".launch.json").read_text())
+        manifest = path.with_name(prefix + ".launch.json")
+        if not manifest.exists():
+            manifest = path.with_name(prefix + ".manifest.json")
+        result["launch"] = json.loads(manifest.read_text())
     return result
 
 

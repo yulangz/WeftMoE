@@ -1,5 +1,8 @@
 # PF 跨机 pull / direct Return：2026-10-09
 
+更新：[WG3 全 CTA 去 GEMM 通信消融](pf_wg3_communication_20261009.md)显示
+扩大owner有稳定收益；尚未测其含GEMM版本，不替代下文真实MoE的架构对比。
+
 补充：[去 GEMM 后的通信带宽实测](pf_communication_bandwidth_20261009.md)。
 区分纯 GIN 数据面上限与保留实际 ring/credit、机内转发的完整通信路径；
 测量代码位于独立 diagnostic 分支，不改变本分支的生产算子。
