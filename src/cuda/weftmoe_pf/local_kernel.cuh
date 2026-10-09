@@ -126,8 +126,11 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
   }
 }
 
+template <bool Network = false>
 __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
-  const auto *input = peer_at<const uint4>(a.local_base, a.contribution_offset);
+  const auto *input = Network
+      ? peer_at<const uint4>(a.gin_window_base, a.static_network.contribution)
+      : peer_at<const uint4>(a.local_base, a.contribution_offset);
   auto *output = reinterpret_cast<uint4 *>(a.output);
   constexpr unsigned vectors = forward_tuning::kMainHidden / 8U;
   constexpr unsigned warps = kMathThreads / 32U;
@@ -147,12 +150,18 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
         const auto slot =
             position < 32U ? __shfl_sync(0xffffffffU, order, position)
                            : a.dispatch.combine_order[token * top_k + position];
+        auto row = slot * a.max_tokens_per_rank + token;
+        if constexpr (Network) {
+          const auto sequence = a.ring.state->source_base +
+                                token / a.ring.source.shape.tokens;
+          row = sequence % a.ring.contribution_depth * a.ring.contribution_stride +
+                a.ring.contribution_rows[token * top_k + slot];
+        }
         uint4 packed[batch];
 #pragma unroll
         for (unsigned vector = 0; vector < batch; ++vector)
           if (column + vector * 32U < vectors)
-            packed[vector] = input[(slot * a.max_tokens_per_rank + token) *
-                                       vectors + column + vector * 32U];
+            packed[vector] = input[row * vectors + column + vector * 32U];
 #pragma unroll
         for (unsigned vector = 0; vector < batch; ++vector) {
           if (column + vector * 32U >= vectors)

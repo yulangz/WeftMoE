@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-node PF/DT/V3/MegaMoE inference on a shared route trace.
+"""PF/DT/V3/MegaMoE inference on a shared route trace (MegaMoE/DT: one node).
 
 Measures eager forward + device synchronize, including MegaMoE input staging.
 MegaMoE packs immutable weights once. PF eager packs on each call by default;
@@ -137,8 +137,10 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
-    if world != int(os.environ["LOCAL_WORLD_SIZE"]) or args.experts % world:
-        parser.error("requires single-node EP with an equal expert split")
+    if args.experts % world:
+        parser.error("requires an equal expert split")
+    if args.backend in ("dt", "megamoe") and world != int(os.environ["LOCAL_WORLD_SIZE"]):
+        parser.error("DT/MegaMoE require single-node EP")
     if args.backend == "megamoe":
         if args.deepgemm_package is None:
             parser.error("MegaMoE requires --deepgemm-package")
@@ -259,7 +261,8 @@ def main():
                 probe.stop()
                 kernel_names = sorted({event.name for event in probe.events()
                                        if event.device_type == torch.autograd.DeviceType.CUDA})
-                expected_entry = ("weftmoe_pf::local::kernel" if args.backend == "pf"
+                expected_entry = (("weftmoe_pf::local::kernel" if runtime.nodes == 1
+                                   else "weftmoe_pf::network::kernel") if args.backend == "pf"
                                   else "weftmoe_dt::kernel")
                 assert any(expected_entry in name for name in kernel_names), kernel_names
             if args.verify:
@@ -267,8 +270,13 @@ def main():
                 delta = output.float() - expected
                 error = dict(relative_l2=(delta.norm() / expected.norm().clamp_min(1e-30)).item(),
                              max_abs=delta.abs().max().item())
-                assert error["relative_l2"] < 0.01, error
-                torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=1e-4)
+                # Fail collectively: otherwise successful peers enter the next
+                # reference collective while a failed rank tears down NCCL.
+                failed = torch.tensor(int(error["relative_l2"] >= 0.01 or not
+                    torch.allclose(output.float(), expected, rtol=0.02, atol=1e-4)),
+                    device="cuda")
+                dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+                assert not failed.item(), {"rank": rank, **error}
                 errors.append(error)
                 output_sha256.append(hashlib.sha256(
                     output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest())

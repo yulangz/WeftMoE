@@ -16,6 +16,8 @@ struct alignas(64) ComputeSlot {
   std::uint64_t fc1_target;
   std::uint64_t fc2_target;
   std::uint64_t return_target;
+  // Unlike fc2_done (S read retirement), this publishes FC2's remote stores.
+  std::uint64_t fc2_published;
 };
 
 struct alignas(64) ContributionSlot {

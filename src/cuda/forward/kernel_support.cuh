@@ -649,6 +649,25 @@ bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
          config.static_forward_window_tokens && config.max_tokens_per_rank > 64U;
 }
 
+bool network_prefill_streaming(const ActivationTransportPoolConfig &config) {
+  return weftmoe_pf::kNetworkWorkerMode && config.max_nodes > 1U &&
+         !config.enable_backward_state && config.static_forward_window_tokens &&
+         forward_tuning::kFc1TileN == forward_tuning::kFc2TileN &&
+         forward_tuning::kStaticV4TileK == 64U &&
+         !forward_tuning::kStaticV4PrefillEnabled &&
+         config.max_hidden_size == forward_tuning::kMainHidden &&
+         config.max_intermediate_size == forward_tuning::kMainIntermediate;
+}
+
+unsigned contribution_windows(const ActivationTransportPoolConfig &config) {
+  // The pull data plane reduces after Return drains. Keep all contributions,
+  // but continue to bound Dispatch RX, X/S and Return TX independently.
+  return network_prefill_streaming(config)
+      ? static_cast<unsigned>(static_forward::ceil_div(
+            config.max_tokens_per_rank, config.static_forward_window_tokens))
+      : config.static_forward_contribution_windows;
+}
+
 static_forward::WindowShape
 static_ring_shape(const ActivationTransportPoolConfig &config) {
   const auto local_world = config.max_world_size / config.max_nodes;
@@ -755,9 +774,16 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(
         network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
+    if (network_prefill_streaming(config)) {
+      network.contexts = weftmoe_pf::kNetworkOwners - 1U;
+      network.input = append(
+          cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
+                              "registered pull input"),
+          sizeof(transport::BFloat16), "immutable pull input");
+    }
     network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
     const auto contribution_rows = checked_mul(
-        checked_mul(config.static_forward_contribution_windows,
+        checked_mul(contribution_windows(config),
                     shape.tokens, "contribution windows"),
         config.max_top_k, "contribution rows");
     network.contribution = append(
@@ -990,7 +1016,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         window_blocks > UINT32_MAX / (2ULL * ring.shape.tile_m))
       throw std::invalid_argument("static ring window exceeds device indices");
     ring.depth = static_cast<unsigned>(2U * window_blocks);
-    ring.contribution_depth = config.static_forward_contribution_windows;
+    ring.contribution_depth = contribution_windows(config);
     ring.state = append(cursor, 1, sizeof(static_forward::RingState), "ring state");
     ring.source_epochs = append(cursor, config.max_world_size,
                                   sizeof(static_forward::SourceEpoch), "source epochs");

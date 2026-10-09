@@ -1,5 +1,48 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-09：PF 跨机 Get / direct Return 重构
+
+目标为 Flash H4096/I2048/E256/top-k6、双机 EP16、变长随机路由的 8K/20K，
+SM 固定 1620 MHz。先验证 384 线程部分专用 warp，再消融 512 线程 WG3。
+两版共享协议和 GEMM；单机入口不选择网络 worker。训练暂保留原网络入口，
+不能将本轮 inference 的验证外推到 BWD。
+
+- 控制面复用 source-window planner，预计算每个实际命中节点的去重 token、
+  packet fanout、完整 M128 blocks 和 Return 连续行区间。只交换 metadata，
+  不在开算前全量发送 X；零命中节点没有 X 数据请求。
+- X 一次 staging 到本 rank 的注册区，在本 invocation 内不可变。接收节点的
+  同 rail worker 对实际 token 发单行 Get，直接落到本地 Dispatch RX ring，
+  没有 dispatch gather-pack。每个 owner 保留四个异步完成 handle；一批行
+  完成后发布 RX slot generation，节点内 pull warp 再分发到 expert X ring。
+- RX slot 的 `retire_target += planned_fanouts` 由唯一 Get owner 维护；每个
+  消费 GPU 在最后一次 bulk-copy 完成后增加 `consumed_total`。复用仅等待本地
+  RX slot 的全部实际读者，不需要远端 Dispatch ACK 或 fence。
+- 保留完整 source-token window 的准入，避免有限 RX 与 expert-global 顺序
+  形成等待环；网络 packet 不成为 GEMM 切分单位。producer/math 独立重放同一
+  静态 M/N residue，沿用单机的连续 A/B stage、cluster2 multicast A 和 epilogue。
+- FC2 vector 直接写源 rail 上预规划的 Return TX 连续行。`fc2_done` 仅释放 S；
+  独立的 `fc2_published` 在输出发布后推进，Return owner 不依赖 S credit 推断
+  NIC 可读。Return Q16 Put 直接写 source contribution，不再额外 pack/scatter。
+- Return TX 复用同时检查远端 notification-slot credit 和本地 NIC completion。
+  四个完成 handle 循环使用，暂不去掉本地 credit。两条件不能合并为未经证明的
+  “远端释放必然等价本地可复用”。
+- Contribution 按输入容量预留完整结果；不随每次实际路由重分配。RX、X/S、
+  Return TX 保持有界 ring。Return 排空后由原 math warps 做固定顺序 Reduce，
+  本轮不依赖 Return/Reduce overlap。结尾 rendezvous 保护跨调用 metadata/X
+  复用；数据面没有全节点 Dispatch-complete barrier。
+- 384 线程：16 个 Get、8 个 Put、4 个 RX/Return-publication progress、1 个
+  admission warp，分别占前 29 个 CTA 的一个原 pull warp，其余 367 个 pull
+  warp（132 CTA 时）保留。所有 CTA 仍有两个 math WG 和一个 TMA producer。
+- 512 线程候选：原三个 pull warp 全保留，WG3 承担上述同一组 owner；配额为
+  math208/local48/network48。每 GPU 的 NIC 发射 owner 数不随 CTA 数增加。
+  必须检查真实寄存器池、热 K spill、WGMMA 分组及 shared-memory 占用；配额
+  算式合法不代表编译或性能通过。暂不将候选设为默认。
+
+384 版本已通过正确性/重复调用/热点及 8K/20K 性能验证，较本轮旧网络 PF
+快 2.03×/2.15×。待办：WG3 编译审计及同负载性能 → milestone commit。
+结果及复现见 [跨机优化记录](pf_network_20261009.md)；保留 workload hash 和
+独立的 kernel / eager 时间，不把历史固定负载结果改名为本次变长结果。
+
 ## 2026-10-08：单机 PF inference 的 expert-global 静态流水
 
 目标为 Flash H4096/I2048/E256/top-k6、EP8、8K/20K、1620 MHz，关闭

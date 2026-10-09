@@ -69,6 +69,9 @@ namespace {
 
 #include "cuda/weftmoe_dt/kernel.cuh"
 #include "cuda/weftmoe_pf/local_kernel.cuh"
+#if WEFTMOE_PF_NETWORK_WORKERS
+#include "cuda/weftmoe_pf/network_kernel.cuh"
+#endif
 
 #include "cuda/backward/device_kernels.cuh"
 
@@ -4527,6 +4530,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr;
   const bool local_prefill = static_v4_candidate &&
       local_prefill_streaming(state->config);
+  const bool network_prefill = static_v4_candidate &&
+      network_prefill_streaming(state->config);
   if (state->layout.static_ring.depth &&
       (!static_v4_candidate || (!fused_inference_routes && !training_ring)))
     throw std::invalid_argument("ring workspace requires static Forward");
@@ -4822,6 +4827,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                   "single-node source route capacity");
   args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   args.source_input_offset = layout.input;
+  args.network_pull = network_prefill;
   args.fused_source_gates_offset = layout.fused_source_gates;
   args.input = activation.pointer;
   args.gates = direct_inference_routes
@@ -5297,6 +5303,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
               weftmoe_dt::eligible(state->config, layout.static_ring);
           if (local_prefill)
             kStaticUnified = weftmoe_pf::local::kernel;
+#if WEFTMOE_PF_NETWORK_WORKERS
+          if (network_prefill)
+            kStaticUnified = weftmoe_pf::network::kernel;
+#endif
           // Arithmetic variants share the same physical blocks and rank
           // protocol, so unequal sources can select different M shapes.
           const bool wide_decode =
@@ -5306,8 +5316,12 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                               id.num_experts * 16ULL));
           const auto decode_kernel = wide_decode ? weftmoe_dt::kernel<64U>
                                                  : weftmoe_dt::kernel<16U>;
-          const auto threads =
+          auto threads =
               decode ? weftmoe_dt::kThreads : forward_tuning::kUnifiedThreads;
+#if WEFTMOE_PF_NETWORK_WORKERS
+          if (network_prefill)
+            threads = weftmoe_pf::network::kThreads;
+#endif
           if (decode && (id.num_tokens >= 4U || weftmoe_dt::kCtaMultiplier)) {
             // More residency helps many-expert decode, but a small expert
             // set should not pay the grid collective cost of mostly idle CTAs.
@@ -5320,14 +5334,26 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
             args.forward_compute_cta_count = forward_main_compute_ctas;
             args.forward_reduce_cta_count = forward_main_compute_ctas;
           }
-          const auto smem =
+          auto smem =
               decode
                   ? (wide_decode ? sizeof(weftmoe_dt::Shared<64U>)
                                  : sizeof(weftmoe_dt::Shared<16U>))
                   : (local_prefill ? sizeof(weftmoe_pf::local::Shared)
                                    : forward_unified_detail::shared_bytes<true>(id.world_size));
           const bool pdl = programmatic_launch::enabled();
-          const auto error =
+#if WEFTMOE_PF_NETWORK_WORKERS
+          if (network_prefill)
+            smem = weftmoe_pf::network::kSharedBytes;
+#endif
+          auto error =
+#if WEFTMOE_PF_NETWORK_WORKERS
+              network_prefill ? backend->prepare_unified_launch<
+                           weftmoe_pf::network::Resources>(
+                           reinterpret_cast<const void *>(kStaticUnified), smem,
+                           forward_main_compute_ctas, threads,
+                           forward_tuning::kClusterSize, pdl, false,
+                           &max_active_clusters) :
+#endif
               decode ? backend->prepare_unified_launch<>(
                            reinterpret_cast<const void *>(decode_kernel), smem,
                            forward_main_compute_ctas, threads,

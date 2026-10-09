@@ -1,6 +1,19 @@
 #pragma once
 
+#ifndef WEFTMOE_PF_NETWORK_WORKERS
+#define WEFTMOE_PF_NETWORK_WORKERS 0
+#endif
+
 namespace weftmoe_pf {
+
+// 0: legacy network entry; 1: dedicated warps in the 384-thread entry;
+// 2: a separate fourth warpgroup. The two new entries share their data plane.
+inline constexpr unsigned kNetworkWorkerMode = WEFTMOE_PF_NETWORK_WORKERS;
+inline constexpr unsigned kGetWorkers = 16U, kPutWorkers = 8U;
+inline constexpr unsigned kProgressWorkers = 4U;
+inline constexpr unsigned kNetworkOwners =
+    kGetWorkers + kPutWorkers + kProgressWorkers + 1U;
+static_assert(kNetworkWorkerMode <= 2U);
 
 // Each rail holds one source replica per node. Return TX and RX must be
 // separate: simultaneous bidirectional puts may otherwise overwrite a TX

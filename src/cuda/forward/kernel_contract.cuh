@@ -76,6 +76,7 @@ struct ForwardKernelArgs {
   std::uint32_t gin_context_count = 1;
   std::uint64_t max_tokens_per_rank = 0;
   bool use_gin = false;
+  bool network_pull = false;
   bool forward_compact_return = false;
   // A one-node split launch streams CUDA-IPC/NVLink rows through dedicated
   // Relay CTAs.  Unlike the legacy StaticLocal path, compute must consume the

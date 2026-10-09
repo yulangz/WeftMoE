@@ -5,17 +5,21 @@
 namespace weftmoe_pf::local {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
 
+template <class Scheduler = Schedule, bool Network = false>
 __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
                                         const CUtensorMap &x_map,
                                         const CUtensorMap &s_map,
                                         const CUtensorMap &w1_map,
                                         const CUtensorMap &w2_map) {
-  Schedule schedule(a);
+  Scheduler schedule(a);
   Task t;
   unsigned stage = 0U, phase = 0U;
   while (schedule.next(t)) {
-    auto &slot = a.ring.slots[t.block % a.ring.depth];
+    auto &slot = a.ring.slots[t.row / kM];
     if (cute::elect_one_sync()) {
+      if constexpr (Network)
+        while (!ring::admitted(a, t.block)) {
+        }
       const auto &ready = t.fc2 ? slot.fc1_done : slot.x_full;
       const auto target =
           std::uint64_t(t.generation) * (t.fc2 ? kFc1Tiles : kM);
@@ -44,10 +48,11 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
   }
 }
 
+template <class Scheduler = Schedule, bool Network = false>
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                         const CUtensorMap &output_map) {
   using namespace forward_compute_detail;
-  Schedule schedule(a);
+  Scheduler schedule(a);
   Task t;
   unsigned stage = 0U, phase = 0U;
   bool started_fc1 = false, started_fc2 = false;
@@ -62,7 +67,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
   const auto bbase = __shfl_sync(0xffffffffU, db.reg32_[0], 0);
   bool previous_fc2 = false;
   while (schedule.next(t)) {
-    auto &slot = a.ring.slots[t.block % a.ring.depth];
+    auto &slot = a.ring.slots[t.row / kM];
     const bool started = t.fc2 ? started_fc2 : started_fc1;
     if (!started && threadIdx.x == 0U)
       atomicMin(t.fc2 ? &status->dispatch_blocks_done
@@ -143,6 +148,14 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       // every FC2 tile just to recycle the unrelated S input slot.
       if (threadIdx.x == 0U)
         atomicAdd(reinterpret_cast<unsigned long long *>(&slot.fc2_done), 1ULL);
+      if constexpr (Network) {
+        // Publish NIC-readable output separately from the S input credit.
+        __threadfence_system();
+        collective_scope_sync<kMathThreads, 7U>();
+        if (threadIdx.x == 0U)
+          arrive(slot.fc2_published, 1U);
+        collective_scope_sync<kMathThreads, 7U>();
+      }
     } else {
       // X and S have independent lifetimes. Pull can recycle X as soon as
       // all FC1 tiles retire, but the new S must wait for the previous FC2.

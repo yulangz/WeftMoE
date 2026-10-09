@@ -97,7 +97,9 @@ __device__ __forceinline__ void build_pull_packet(const ForwardKernelArgs &a,
 __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
                                             std::uint64_t tid,
                                             std::uint64_t stride) {
-  auto *input = peer_at<uint4>(a.local_base, a.source_input_offset);
+  auto *input = a.network_pull
+      ? peer_at<uint4>(a.gin_window_base, a.static_network.input)
+      : peer_at<uint4>(a.local_base, a.source_input_offset);
   for (auto v = tid; v < a.ring.source.tokens * a.hidden / 8U; v += stride)
     input[v] = reinterpret_cast<const uint4 *>(a.input)[v];
 }
@@ -188,10 +190,10 @@ __device__ __forceinline__ void build_small_window_rows(
   }
 }
 
-template <bool Network, bool Training = false>
+template <bool Network, bool Training = false, unsigned Threads = 384U>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
-  constexpr unsigned Math = 256U, SourceThreads = 128U, Threads = 384U;
+  constexpr unsigned Math = 256U, SourceThreads = Threads - Math;
   constexpr bool Canonical = Training && !Network;
   const auto &r = a.ring;
   const auto &p = r.source;
@@ -213,7 +215,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     if (blockIdx.x == 0U)
       collective_scope_sync<Threads, kCollectiveScopeBarrier>();
   } else {
-    grid_sync(a);
+    grid_sync<0U, Threads>(a);
   }
   if constexpr (Training)
     if (a.checkpoint.counts.runtime) {
