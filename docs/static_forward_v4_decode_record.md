@@ -1,9 +1,20 @@
 # 单机 decode 专属实现与验收记录
 
-## 2026-10-09：补测8/32 tokens，当前 DT 均领先 PF
+## 2026-10-09：DT 恢复原实现，后续优化重心转向 PF
+
+按用户要求，撤回 `d158eb9` 中 DT 的 FC1 128-bit写出改动，M16/M64均恢复
+原有 BF16x2（4B）寄存器直写。DT源码与实验前 `af3a821` 完全一致；
+PF的寄存器16B写出优化、共享helper、训练/跨机路径及自动入口策略均不变。
+本次仅恢复已验证版本，不重新编译或重跑性能测试。
+
+下方128-bit DT的实现、8/32及1/64/256数据保留为历史实验记录，
+**不再代表当前 DT实现**；原始结果JSON保留测量时的状态，不改写历史结果。
+后续优化重心放在PF，不继续扩展本轮DT写出实验。
+
+## 2026-10-09：补测8/32 tokens，16B DT 实验版均领先 PF
 
 沿用下节 Flash H4096/I2048/E256/top-k6、BF16、单机 EP8、纯 inference
-口径；DT/PF均为已采纳的寄存器16B写出版本。本次不改生产代码、不重新编译，
+口径；测量时DT/PF均为寄存器16B写出版本（DT后来已回退）。本次未改生产代码、未重新编译，
 直接复用下节相同二进制，SHA256已核对。每 rank精确8或32 tokens，
 route/gate逐样本随机、bias std=0.5、seed123，两候选使用相同完整输入trace。
 
@@ -12,7 +23,7 @@ route/gate逐样本随机、bias std=0.5、seed123，两候选使用相同完整
 CUDA-event p50的均值，单位 **µs/调用**，包含 staging、dispatch、
 FC1/FC2、return/combine，不含初始化和外部输入更新。
 
-| tokens/rank | 当前 DT | 当前 PF | DT 相对 PF 时延降低 |
+| tokens/rank | DT 16B 实验版 | PF 16B | DT 相对 PF 时延降低 |
 |---|---:|---:|---:|
 | 8 | 298.261 | 458.952 | **35.01%** |
 | 32 | 476.502 | 590.589 | **19.32%** |
@@ -33,13 +44,14 @@ pool仍统一为256；DT沿用容量探针产物，生产eligibility上限64未�
 
 原始数据、每轮40个样本、入口验证、配置/二进制哈希与时钟统计见
 [`dt_pf_8_32_20261009.json`](../benchmarks/dt_pf_8_32_20261009.json)。
-复现使用下文相同benchmark命令，将 `--tokens` 改为 `8 32`；
+复现16B DT须使用 `d158eb9` 的源码或下列冻结产物；使用下文相同benchmark命令，
+将 `--tokens` 改为 `8 32`；
 产物为 `cache_dt_vector/0f4281018282/` 与 `cache_rquad/f47b1119685a/`，
 日志前缀 `build/pf_megamoe_20261008/dtpf_8_32_*`。
 
-## 2026-10-09：DT 的 FC1 也改为寄存器 128-bit 直写
+## 2026-10-09：DT 的 FC1 寄存器 128-bit 直写消融（已回退）
 
-**已实现并保留，但没有解决 DT 在64 tokens落后 PF 的问题。**
+**曾实现并采纳，后按用户要求回退；没有解决 DT 在64 tokens落后 PF 的问题。**
 1/64 tokens没有稳定收益；256 tokens四轮时延降低约 **0.23%–0.86%**。
 这一改动只作用于 DT；PF、训练、跨机路径及自动入口阈值均未修改。
 
@@ -98,7 +110,7 @@ trace确认 DT为 `kernel<16u>` / `kernel<64u>`，PF为其独立 local kernel。
 本次沿用下一节的命令与冻结 profile。256仍需单独应用
 [`dt_256_capacity_probe.patch`](../benchmarks/dt_256_capacity_probe.patch)构建实验产物，
 生产 eligibility上限保持64。旧 DT基线是本次修改前的 `af3a821`；
-新 DT直接使用本次源码，没有引入新 tuning参数。
+16B实验DT源码位于 `d158eb9`，没有引入新 tuning参数；当前DT已恢复4B写出。
 
 完整数据、产物/配置哈希、逐位验证与SASS资源统计见
 [`dt_fc1_register_vector_20261009.json`](../benchmarks/dt_fc1_register_vector_20261009.json)。
