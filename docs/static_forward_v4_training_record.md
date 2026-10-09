@@ -1,5 +1,82 @@
 # V4 ring 训练对接记录
 
+## 2026-10-09：FC1 寄存器 shuffle → 128-bit vector store
+
+补上每线程一条指令写 16B 的寄存器直写方案。**相比上一轮 4B 直写，
+完整 FWD 快约 0.9%–1.5%；与原 TMA 接近、互有胜负，默认仍保留 TMA。**
+只保存实验 patch 和测量记录，不增加生产 helper 或运行开关。
+
+### 实现与代码生成
+
+R4 (`rquad`) 保留 BF16 projection rounding、SwiGLU 和 route weight 计算。
+每四个相邻 lane 将各自的四个 BF16×2 字重排成连续八个 BF16，使用两级
+butterfly、每线程四次 32-bit shuffle 完成一次 4×4 寄存器转置，然后执行
+`uint4` store。它与 `float4` 一样是 **128 bit / 16B**，只是按整数位保存
+BF16，并没有转成四个 FP32。整个 S 写出不经过 shared memory。
+
+当前 M128/N256 的完整 S tile 为 128×128 BF16，每线程的总写出量仍是
+128B，store 从 32 次 4B 降为 8 次 16B。四个 lane 对应同一输出行，
+尾块行有效性在组内一致；shuffle mask 只包含该四个 lane。每个写线程
+仍执行 device fence 和 math join，之后 leader 才发布 `fc1_done`。
+Saved X/GU、FC2、ring 布局和任务调度均不改，shared arena 仍由 FC2 使用。
+
+反汇编确认新路径生成 `STG.E.128`、`SHFL.BFLY`，FC1 的 STSM/TMA 消失。
+主入口仍为 REG168 / STACK0、静态 shared1024 / 动态 shared226304 bytes，
+没有新增 LDL/STL 指令。这里是编译资源报告和静态指令检查，不是动态
+指令计数或“所有局部访存均为零”。
+
+### 同轮正反序结果
+
+单机 EP8，8×L20X，SM1620 / memory3201 MHz；Flash H4096/I2048/E256/
+top-k6，BF16，M128/N256/K64、3 stages、cluster2、B128/D2。继续使用
+token std=10%、route bias std=0.5、seed123；逐 rank token trace 和 route/gate
+hash 与前两轮完全相同，同缓存模式下 workspace 容量也一致。
+
+每组 prime32 + warmup8 + measured24，四个方案各测缓存 off/on，再完全
+反序。下表为两轮 **rank-max 完整 FWD wall p50 的均值**，单位 ms。
+权重只预准备一次；包含输入 staging、同步、tape 释放，缓存开启还包含
+mini-notify、当次缓存准备及写出。不是纯 epilogue 时间，也不含 BWD。
+
+| 方案 | inference 8K | inference 20K | 缓存 X/GU 8K | 缓存 X/GU 20K |
+|---|---:|---:|---:|---:|
+| C5：shared → TMA | 6.844 | 16.696 | 7.796 | 17.781 |
+| S-vector：shared → 16B vector | 6.987 | 16.788 | 7.837 | 17.975 |
+| R3：寄存器 → 4B GM | 6.897 | 16.908 | 7.825 | 18.116 |
+| R4：寄存器 shuffle → 16B GM | 6.792 | 16.668 | 7.709 | 17.946 |
+
+R4 相对 R3 时延降低 **1.52% / 1.42% / 1.48% / 0.94%**；相对 C5
+则是 **−0.75% / −0.17% / −1.12% / +0.93%**。128-bit 直写确实补回
+了 4B 版本的损失，但没有形成四档一致、明显领先 TMA 的结果。
+
+启示：上一轮的 4B 结果不能代表全部寄存器直写。寄存器转置可以改善
+写出粒度和地址合并，但同时引入 shuffle/select、改变指令调度；本轮没有
+单独定量分解这些成本，不能将全部差值都归因于 store 宽度。也不能从这组
+结果推断独立连续 copy 的 TMA/vector 优劣。
+
+### 验证、限制与复现
+
+普通缓存 T256/8K/20K、强热点缓存 20K（route bias std=8）、inference
+8K/20K 共 96 个 rank/sample PyTorch 对照通过；最大 relative L2
+3.1043e-4、最大绝对误差 6.1036e-5。定向 local-main memcheck/racecheck
+各 8 ranks 零 errors / 零 hazards。
+
+额外 synccheck **未通过**：R4 与未修改 C5 都在 FC1 前的 route-exchange
+`collective_scope_sync<384,13>`（`initialize.cuh:12`）报告 divergent block
+barrier，调用栈涉及 `build_combine_order`。这不是新 shuffle 的通过证明；
+本轮仅确认原版同样复现，未进一步区分已有实现问题与检查器限制，也未
+修改这个公共协议。没有重新验收 BWD、多机或其他 GEMM shape。
+
+正式测量 UTC 04:24:15–04:29:54，500 ms NVML 轮询共 5424 个 GPU 样本，
+SM 全部1620、memory 全部3201 MHz；不是逐周期有效频率测量。
+完整 32 条记录、原始 rank-max 样本、资源、输入 hash 和上述验证限制见
+[`pf_fc1_register_vector_store_20261009.json`](../benchmarks/pf_fc1_register_vector_store_20261009.json)。
+[R4 patch](../benchmarks/pf_fc1_register_vector_store.patch) 基于 `bcf466c` 独立
+应用，不能与 R1/R2/R3 patch 叠加；沿用下节 Flash profile 和 benchmark 命令。
+冻结产物为 `build/pf_megamoe_20261008/cache_rquad/f47b1119685a/`；
+日志前缀 `reg128_{c5,svec,rpair,rquad}_{off,on}_{0,1}_ep8.log`，验证前缀
+`reg128_rquad_verify_*` 和 `rquad_{memcheck,racecheck,synccheck}_device_ep8.log`，
+原版同步对照为 `c5_synccheck_device_ep8.log`。实验结束后生产源码已恢复原样。
+
 ## 2026-10-09：FC1 寄存器直接写 S（无收益，保留原 TMA）
 
 补测完整 FC1 tile 跳过 shared staging 的方案。**没有取得端到端收益，
