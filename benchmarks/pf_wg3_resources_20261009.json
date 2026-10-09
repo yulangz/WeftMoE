@@ -60,7 +60,9 @@
         "hgmma": [],
         "wait": [],
         "local_loads": 1398,
-        "local_stores": 729
+        "local_stores": 729,
+        "dynamic_shared_bytes": 231424,
+        "total_shared_bytes": 232448
       },
       "local": {
         "registers": 168,
@@ -150,7 +152,9 @@
           "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
         ],
         "local_loads": 1455,
-        "local_stores": 794
+        "local_stores": 794,
+        "dynamic_shared_bytes": 231424,
+        "total_shared_bytes": 232448
       },
       "local": {
         "registers": 168,
@@ -182,5 +186,10 @@
       ],
       "scope": "K loop 0x3aa0..0x43b0 and out-of-line full-barrier wait 0x1c5e0..0x1c630; excludes task scheduling and epilogue"
     }
+  },
+  "device_attributes": {
+    "SM_count": 132,
+    "shared_per_SM": 233472,
+    "shared_per_CTA_optin": 232448
   }
 }
