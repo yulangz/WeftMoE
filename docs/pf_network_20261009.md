@@ -1,11 +1,80 @@
 # PF 跨机 pull / direct Return：2026-10-09
 
+## 更新：两条独立探索与同协议交叉验证
+
+先后使用两个全新上下文的 agent，从 `7c57005` 分出独立分支，串行独占双机。
+两者分别冻结、完成验证后，主线程才交换通用优化，另外建立交叉验证分支。
+**目前仍优先部分专用 warp，但不能用下面旧的起点差距否定 WG3 潜力。**
+
+共同测量口径仍为本页的 Flash、EP16、SM1620、随机 tokens/routes、无训练缓存，
+prime32/warm8/sample24；表中为 kernel p50，单位 ms。独立方案取两轮 p50 均值。
+
+| 方向 | 起点复测 8K / 20K | 独立优化后 8K / 20K | 主要配置 |
+|---|---:|---:|---|
+| 部分专用 warp，384 threads | 18.069 / 43.046 | **12.719 / 27.888** | B4096，D32/R128，credit×2，ready 去重，提前 pack Get |
+| WG3，512 threads | 20.103 / 47.982 | **14.909 / 33.580** | 192/64/64，B4096，D32/R64，预计算发布元数据，额外 pull |
+
+两行的优化覆盖不同，**不是公平的 warp 架构消融**。因此给 WG3 补齐 Return
+Q128、credit×2、连续同 `(rank, slot, generation)` ready acquire 去重；双方都用
+不 pack 的 token Get、B4096、pending4。保留各自的 warp 划分/GEMM 和 WG3 的
+publication/extra-pull 优化，并在两个 WG3 正式重复之间穿插复测部分专用 warp。
+
+| 同协议交叉验证 | 8K kernel / eager | 20K kernel / eager |
+|---|---:|---:|
+| WG3，第 1 轮 | 13.272 / 13.436 | 29.732 / 30.046 |
+| 部分专用 warp，穿插复测 | 13.170 / 13.418 | 28.155 / 28.741 |
+| WG3，第 2 轮 | 13.386 / 13.678 | 29.519 / 29.904 |
+
+WG3 kernel 均值 **13.329 / 29.626 ms**，比穿插复测慢约 **1.2% / 5.2%**。
+两者 rank0 compute、GIN、notify 容量逐字节一致：compute+GIN **5.968 / 7.141
+GiB**，另有 notify **16.4 / 40.8 MiB**。全部正式 workload SHA 与独立实验完全
+一致。这个结果比独立最优表更接近实际方向差距，但仍不是纯线程数消融：WG3
+使用 N128 atom 和不同寄存器配额，并保留额外 pull / planner publication 优化。
+
+有收益的机制与边界：
+
+- **Return 粒度和控制开销是主要收益来源。** Q16→Q64/Q128 减少反复 ready
+  检查、issue/flush 和退休频率；credit×2 让后续窗口更少被 TX reservation
+  阻塞。去重只在一次 packet 检查中复用相邻同 slot/generation 的成功 acquire，
+  不跨轮询；仍保留 NIC completion、远端 credit 和 FC2 可见性发布。
+- **M-padding 是真实额外 GEMM。** 每个 source-window/expert 分别向 M128 取整，
+  因而窗口过碎会制造许多尾块。B2048→B4096 将 `extra / valid` 从约
+  **23.4% / 21.8%** 降到 **14.3% / 10.8%**。这是减少，不是完全消除。
+  更大 B 或跨节点 G16 虽继续减少 padding，却增加容量、推迟数据就绪/Return，
+  两方向都测到负收益。下一步应考虑细粒度 tail 合并及独立 source credit，
+  不能简单合并整个跨节点 window，也不能让局部计算等待整批远端数据。
+- **WG3 的控制寄存器和空闲 warp 有利用空间。** 208/48/48→192/64/64，
+  将发布目的地在 planner 中预计算，以及补上 116 条 local/RX pull warp 有收益。
+  最终 shared 已到每 CTA opt-in 上限；不是增加 warp 就能无成本加深 pipeline。
+- **Push 和 pack 都实际实现并消融。** 部分专用 warp 覆盖 token Get、提前 pack
+  Get、ring pack Push、提前 pack Push；WG3 实现独立 pack/NIC owner 的有限环
+  Push 流水。Push 本轮均未胜出。部分专用 warp 的提前 pack Get 只再省约
+  3% / 1%，却多预留 **576 / 1344 MiB**；token Get 是合理的低显存选择。
+- **没有证据把最终差距归于热 K spill。** 部分专用 warp 保持 4×N256 / 1 wait，
+  WG3 保持 8×N128 / 1 wait，热 K 都无 LDL/STL。控制/GIN 路径仍有 local-memory
+  访问；不能声称整个 kernel 无寄存器压力。wait-group1 的独立 WG3 消融为负。
+
+两条独立分支均通过常规、热点连续回绕、单机及训练/BWD 回归；交叉库另通过
+64/8K/20K、B128 热点连续回绕、EP8 和 EP16 训练/BWD 回归。只实测了两台机器。
+这些是 inference 数据，没有新跑 Megatron；不能与历史 cached-training FWD
+混成公平 A/B，也没有将候选直接合入生产默认配置。
+
+保留的里程碑与完整证据：
+
+- `experiment/pf-network-partial-20261009`，`82e502f`：
+  `docs/partial_warps_20261009.md`、`benchmarks/partial_warps_20261009.json`。
+- `experiment/pf-network-wg3-20261009`，`4726b66`：
+  `docs/pf_wg3_20261009.md`、`benchmarks/pf_wg3_20261009.json`。
+- `experiment/pf-network-aligned-20261009`：在 WG3 冻结结果上移植通用控制优化，
+  源码提交 `8eacade`；交叉测试原始日志/manifest 在该 worktree 的 `build/aligned/`。
+  该分支文末说明及 `benchmarks/pf_network_aligned_20261009.json` 保存交叉证据。
+
 ## 结论与测量口径
 
-两阶段完成，**推荐保留 384-thread CTA 部分专用 warp 方案**。双机 EP16
+以下为最初两阶段的历史结果，不代替上面的独立优化与交叉验证。双机 EP16
 的 8K/20K kernel 比本轮重测的旧网络 PF 快约 **2.04× / 2.15×**。
 WG3 math208/local48/network48 能运行，但分别比 384 线程版慢
-**10.8% / 11.5%**，不作为推荐配置。不是 V3 或单机 MegaMoE 对比。
+**10.8% / 11.5%**；这是未经独立优化的起点差距。不是 V3 或单机 MegaMoE 对比。
 
 Flash BF16 H4096/I2048/E256/top-k6，两机各 8 张 L20X，SM 1620 MHz，
 memory 3201 MHz。每 rank tokens 围绕 8192/20480 正态波动（std=10%），
