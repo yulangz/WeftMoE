@@ -1,5 +1,78 @@
 # V4 ring 训练对接记录
 
+## 2026-10-09：FC2 寄存器 128-bit 直写消融，不采纳
+
+**当前 FC2 已是 shared → 128-bit vector 写出。** 本轮只测试单机 PF
+能否进一步绕过 shared、由 WGMMA 寄存器重排后直接写 contribution。
+只测8K/20K：推理分别慢 **0.84% / 2.87%**，缓存开启分别慢
+**0.54% / 0.24%**；没有收益，已恢复原实现，只保留补丁和测量记录。
+FC1已采纳的寄存器16B写出、DT、多机和BWD代码均不改。
+
+### 当前路径与候选的区别
+
+现实现：WGMMA FP32 accumulator → BF16 rounding → `stmatrix` 写入
+swizzled shared → math ready barrier → `uint4` 读取/写入 contribution。
+每条向量store是16B，即8个BF16，不是4个FP32。
+source GPU的contribution地址已由Pull写入 `a.ring.rows[logical_row].output`，
+FC2不重新规划目标；同卡写本地GM，异卡写peer GM。单机布局为
+`[top-k slot][token capacity][hidden]`，不同逻辑行的目的GPU/行地址不必连续。
+
+候选复用FC1的四-lane转置，将FC2的BF16x2寄存器片段重排成16B向量，
+直接写同一目标地址，去掉shared读写及其ready barrier。末尾math join、
+`fc2_done` 的S读退休语义、terminal rank barrier统一发布contribution
+均保留，不增加逐tile远端完成等待。GEMM、ring、Saved X/GU及BF16舍入不变。
+为隔离写回本身，shared预留量保持不变，没有混入stage数或容量调参。
+
+### 性能
+
+Flash H4096/I2048/E256/top-k6，BF16，单机EP8，SM锁频1620 MHz，
+memory3201 MHz；M128/N256/K64、3 stages、cluster2、B128/D2。
+tokens/rank围绕8192/20480按10%标准差波动，route/gate每次随机，
+bias std=0.5、seed123。与此前长文实验的完整32步token/route trace一致，
+两个候选的物理workspace也相同。
+
+基线是已采纳FC1 16B直写的当前PF（冻结 `rquad`），不是更早的C5。
+正序基线off/on → 候选off/on，再完全反序；每例prime32、warmup8、
+measured24，权重与持久buffer只准备一次。单位 **ms**，两轮rank-max
+FWD wall p50的均值，包含输入staging、同步、tape释放；缓存开启还包含
+mini-notify、当次缓存空间准备及写出。**不是纯kernel计时，也不包含BWD。**
+
+| 场景 | 当前 shared → 16B | 候选寄存器 → 16B | 时延变化 |
+|---|---:|---:|---:|
+| 推理 8K | 6.778 | 6.835 | +0.84% |
+| 推理 20K | 16.631 | 17.108 | +2.87% |
+| 缓存 X/GU 8K | 7.725 | 7.767 | +0.54% |
+| 缓存 X/GU 20K | 17.903 | 17.946 | +0.24% |
+
+两轮各自均未出现候选领先；缓存开启的差距很小，应看作接近，而非显著回退。
+UTC 07:18:18–07:21:09的500 ms轮询共2744条GPU记录，全部为1620/3201 MHz；
+正式计时窗口内64条也一致，无异常样本剔除。采样不代表逐周期恒频保证。
+
+### 机制与验证
+
+省shared不等于省store：两者都已经是16B global store。当前N256路径
+同warp的32个lane共同写一行，共512B；四-lane寄存器方案则一个warp
+同时写8行，每行4个lane、64B。后者对peer GM的访问更分散，还多了shuffle。
+这是代码可确认的取舍；本轮未做计数器级归因，不能定量拆分通信与shuffle开销。
+
+两者编译资源均为REG168、STACK0、LOCAL0，动态shared226304 bytes。
+整个main的静态SASS计数：STSM从32降至0，LDS.128从28降至12，
+SHFL.BFLY从64增至192；STG.E.128保持24，既有LDL/STL数量也不变。
+这些是静态指令数，不是逐调用动态执行数；本轮不否定其他寄存器重排方案。
+
+8K/20K的缓存开关两模式及20K热点路由（bias std=8）共160个rank/sample
+PyTorch对照通过，80组新旧输出SHA256全部一致，最大relative L2约9.353e-5。
+trace确认实际使用local PF main。另做8K缓存开启的main定向memcheck，
+8 ranks均为0 errors；未新增BWD测试。实验结束后生产 `src/` 与 `f0d7b3e`
+完全一致，没有遗留候选helper、开关或无用shared布局改动。
+
+结果：[`pf_fc2_register_vector_store_20261009.json`](../benchmarks/pf_fc2_register_vector_store_20261009.json)；
+补丁：[`pf_fc2_register_vector_store.patch`](../benchmarks/pf_fc2_register_vector_store.patch)，
+基于 `f0d7b3e`，使用 `configs/pf_inference_flash_20261008/` 的同一profile构建。
+冻结产物为 `build/pf_megamoe_20261008/cache_{rquad,fc2reg}/f47b1119685a/`，
+日志前缀 `fc2reg_*`。复现沿用下文长文写回消融命令，仅tokens为8192/20480，
+分别设 `--forward-cache off/on --prepared-weights`，清空autotune table。
+
 ## 2026-10-09：采纳 FC1 寄存器 128-bit 写出
 
 按用户决定，**将下文实验的 R4 接入单机 PF 默认路径**，推理与缓存开启
