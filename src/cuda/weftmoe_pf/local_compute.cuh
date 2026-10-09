@@ -152,20 +152,12 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       if (a.saved_ab)
         static_v4_save_fc1_tile<kN>(a, accum, t.rows, t.column * kN / 2U,
                                   t.block);
-      static_v4_store_fc1_tile<kN, kM * kN, false, true, true,
-                              forward_tuning::kLocalPrefillFastMath>(
-          a, s.output, accum, output, gates, t.row, t.rows, t.column * kN / 2U,
-          t.block, &output_map);
-      // Full tiles use a single TMA issuer which has already waited for
-      // global completion. Compact tails use stores from every math thread.
-      if (t.rows != kM) {
-        __threadfence();
-        collective_scope_sync<kMathThreads, 7U>();
-      } else if constexpr (kN > 128U) {
-        // Wider SwiGLU tiles have multiple N64 TMA issuers. Join their
-        // global completions before the leader publishes S readiness.
-        collective_scope_sync<kMathThreads, 7U>();
-      }
+      static_v4_store_fc1_register_vector_tile<
+          kN, forward_tuning::kLocalPrefillFastMath>(
+          a, accum, output, gates, t.row, t.rows, t.column * kN / 2U);
+      // All writers complete their vector stores before S-ready publication.
+      __threadfence();
+      collective_scope_sync<kMathThreads, 7U>();
       if (threadIdx.x == 0U)
         arrive(slot.fc1_done, 1U);
       collective_scope_sync<kMathThreads, 7U>();

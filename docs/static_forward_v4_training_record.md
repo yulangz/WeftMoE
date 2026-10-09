@@ -1,5 +1,23 @@
 # V4 ring 训练对接记录
 
+## 2026-10-09：采纳 FC1 寄存器 128-bit 写出
+
+按用户决定，**将上一节实验的 R4 接入单机 PF 默认路径**，推理与缓存开启
+共用该实现。此前“保留 TMA”的保守选择不再作为当前实现结论：四档里三档
+改善，仅缓存开启 20K 慢约 0.93%；接受这一权衡。测量值与误差范围保持
+原记录，不把不到 1% 的差距扩大成显著或普适收益。
+
+生产改动与已验证 R4 patch 完全一致：FC1 S 经四-lane 寄存器转置后用
+128-bit store 写出；保留 device fence、math join 与 `fc1_done` 发布。
+shared 输出 arena 仍供 FC2 使用；不改 DT、多机、Saved X/GU 或 BWD 算法。
+旧 TMA helper 仍有其他入口使用，不删除，也不增加运行时选择开关。
+
+另补 Flash EP8、T≈256 的 FWD+BWD PyTorch 对照：8 ranks 的 output、dX、
+dGate、dW1、dW2 全部通过，最大 relative L2 分别为 3.1043e-4、6.5619e-4、
+1.2708e-4、2.0857e-4、1.2449e-4。日志为
+`build/pf_megamoe_20261008/reg128_training_adoption_ep8.log`。
+这是数值回归，不是新的 BWD 性能报告。下节保留原实验过程与同步检查限制。
+
 ## 2026-10-09：FC1 寄存器 shuffle → 128-bit vector store
 
 补上每线程一条指令写 16B 的寄存器直写方案。**相比上一轮 4B 直写，

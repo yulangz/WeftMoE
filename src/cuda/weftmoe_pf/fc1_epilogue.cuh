@@ -42,6 +42,58 @@ __device__ __forceinline__ void static_v4_save_fc1_tile(
   }
 }
 
+// Transpose four BF16x2 words across four lanes. Each lane then owns eight
+// consecutive columns, without staging the WGMMA fragment through shared.
+__device__ __forceinline__ uint4 static_v4_transpose_fc1_vector(uint4 v) {
+  const auto lane = threadIdx.x % 4U;
+  const auto mask = 0xfU << (threadIdx.x % 32U / 4U * 4U);
+  auto t = __shfl_xor_sync(mask, (lane & 1U) ? v.x : v.y, 1, 4);
+  v.x = (lane & 1U) ? t : v.x;
+  v.y = (lane & 1U) ? v.y : t;
+  t = __shfl_xor_sync(mask, (lane & 1U) ? v.z : v.w, 1, 4);
+  v.z = (lane & 1U) ? t : v.z;
+  v.w = (lane & 1U) ? v.w : t;
+  t = __shfl_xor_sync(mask, (lane & 2U) ? v.x : v.z, 2, 4);
+  v.x = (lane & 2U) ? t : v.x;
+  v.z = (lane & 2U) ? v.z : t;
+  t = __shfl_xor_sync(mask, (lane & 2U) ? v.y : v.w, 2, 4);
+  v.y = (lane & 2U) ? t : v.y;
+  v.w = (lane & 2U) ? v.w : t;
+  return v;
+}
+
+template <unsigned Fc1TileN, bool FastMath = false, class Args>
+__device__ __forceinline__ void static_v4_store_fc1_register_vector_tile(
+    const Args &a, const float *accum, transport::BFloat16 *output,
+    const float *gates, std::uint64_t row, std::uint32_t valid_rows,
+    std::uint32_t column_base) {
+  static_assert(Fc1TileN % 64U == 0U);
+  const auto lane = threadIdx.x % 32U;
+  const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
+#pragma unroll
+  for (unsigned item = 0; item < 2U; ++item) {
+    const auto m = row0 + item * 8U;
+    if (m >= valid_rows)
+      continue;
+    const auto gate = gates[row + m];
+#pragma unroll
+    for (unsigned index = 0; index < Fc1TileN / 16U; index += 4U) {
+      std::uint32_t words[4];
+#pragma unroll
+      for (unsigned j = 0; j < 4U; ++j) {
+        const auto *g = accum + (index + j) * 8U + item * 2U;
+        const auto value = static_v4_swiglu_pair<FastMath>(g, g + 4U, gate);
+        words[j] = float2_to_bf16x2_bits(value.x, value.y);
+      }
+      const auto vector = static_v4_transpose_fc1_vector(
+          make_uint4(words[0], words[1], words[2], words[3]));
+      const auto column = column_base + index * 8U + (lane % 4U) * 8U;
+      *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate + column) =
+          vector;
+    }
+  }
+}
+
 template <unsigned Fc1TileN, unsigned ScratchElements,
           bool RetainBackwardState = false, bool TmaStore = false,
           bool PrivateScratch = false, bool FastMath = false, class Args>
