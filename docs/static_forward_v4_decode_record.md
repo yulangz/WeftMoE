@@ -1,5 +1,42 @@
 # 单机 decode 专属实现与验收记录
 
+## 2026-10-09：补测8/32 tokens，当前 DT 均领先 PF
+
+沿用下节 Flash H4096/I2048/E256/top-k6、BF16、单机 EP8、纯 inference
+口径；DT/PF均为已采纳的寄存器16B写出版本。本次不改生产代码、不重新编译，
+直接复用下节相同二进制，SHA256已核对。每 rank精确8或32 tokens，
+route/gate逐样本随机、bias std=0.5、seed123，两候选使用相同完整输入trace。
+
+先 DT → PF，再 PF → DT；每个 runtime准备一次、prime50、warmup10，
+计时40个样本，每个 graph含20次真实算子调用。下表为两轮 rank-max
+CUDA-event p50的均值，单位 **µs/调用**，包含 staging、dispatch、
+FC1/FC2、return/combine，不含初始化和外部输入更新。
+
+| tokens/rank | 当前 DT | 当前 PF | DT 相对 PF 时延降低 |
+|---|---:|---:|---:|
+| 8 | 298.261 | 458.952 | **35.01%** |
+| 32 | 476.502 | 590.589 | **19.32%** |
+
+两轮分别为：DT-8 297.483/299.038、PF-8 459.094/458.809；
+DT-32 476.758/476.247、PF-32 591.250/589.929 µs，排序稳定。
+结合下节64 tokens时PF领先的结果，这个shape的**已测点**中，DT到32仍更快，
+64则PF更快；不能据此推导所有shape或任意路由下的统一切换阈值。
+
+时钟锁定目标1620 MHz、memory3201 MHz。UTC 06:49:52–06:51:15的
+500 ms轮询共1336条GPU记录，全部为1620/3201 MHz，正式窗口内56条
+也全部一致；这仍是采样验证，不代表逐周期保证。本次两轮均纳入统计。
+
+8/32普通路由及32热点路由（bias std=8）通过96个rank/sample数值对照，
+最大relative L2为1.1144e-3以内。GPU trace确认两档 DT均为
+`weftmoe_dt::kernel<16u>`，PF为独立local kernel，未测到回退入口。
+pool仍统一为256；DT沿用容量探针产物，生产eligibility上限64未改。
+
+原始数据、每轮40个样本、入口验证、配置/二进制哈希与时钟统计见
+[`dt_pf_8_32_20261009.json`](../benchmarks/dt_pf_8_32_20261009.json)。
+复现使用下文相同benchmark命令，将 `--tokens` 改为 `8 32`；
+产物为 `cache_dt_vector/0f4281018282/` 与 `cache_rquad/f47b1119685a/`，
+日志前缀 `build/pf_megamoe_20261008/dtpf_8_32_*`。
+
 ## 2026-10-09：DT 的 FC1 也改为寄存器 128-bit 直写
 
 **已实现并保留，但没有解决 DT 在64 tokens落后 PF 的问题。**
