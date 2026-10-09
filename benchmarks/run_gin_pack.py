@@ -52,10 +52,11 @@ def main():
         raise RuntimeError("incomplete GIN benchmark output")
     cases = {}
     for record in records:
-        key = (record["nominal_tokens"], record["operation"], record["packet_tokens"], record["repeat"])
+        key = (record["nominal_tokens"], record["operation"], record.get("mode", "burst"),
+               record.get("depth", 1), record["packet_tokens"], record["repeat"])
         cases.setdefault(key, []).append(record)
     summaries = []
-    for (nominal, operation, packet, repeat), ranks in sorted(cases.items()):
+    for (nominal, operation, mode, depth, packet, repeat), ranks in sorted(cases.items()):
         if len(ranks) != len(runtime):
             raise RuntimeError("missing rank in case")
         counts = [sample["tokens"] for sample in ranks[0]["samples"]]
@@ -64,10 +65,13 @@ def main():
         summary = {
             "nominal_tokens": nominal, "operation": operation,
             "packet_tokens": packet, "repeat": repeat,
+            "mode": mode, "depth": depth,
             "contexts": ranks[0]["contexts"], "batch_tokens": ranks[0]["batch_tokens"],
             "mean_tokens": statistics.fmean(counts),
         }
-        for metric in ("network_us", "pack_us", "ready_us", "total_us"):
+        for metric in ("network_us", "pack_us", "ready_us", "total_us", "pack_tail_after_issue_us"):
+            if metric not in ranks[0]["samples"][0]:
+                continue
             values = [max(r["samples"][i][metric] for r in ranks) for i in range(len(counts))]
             summary[metric] = sample_stats(values)
             if metric in ("network_us", "total_us"):
@@ -75,13 +79,14 @@ def main():
                     count * ranks[0]["row_bytes"] / elapsed / 1000
                     for count, elapsed in zip(counts, values)])
         summaries.append(summary)
-        print(f"GIN_PACK_SUMMARY T={nominal} {operation} Q={packet} repeat={repeat} "
+        print(f"GIN_PACK_SUMMARY T={nominal} {operation} mode={mode} D={depth} Q={packet} repeat={repeat} "
               f"net_us={summary['network_us']['p50']:.3f} "
               f"total_us={summary['total_us']['p50']:.3f} "
               f"net_GBps={summary['network_GBps_per_rank']['p50']:.3f}", flush=True)
     print("GIN_PACK_JSON " + json.dumps({
-        "schema": 1, "world": len(runtime), "runtime": runtime, "clocks": clocks,
-        "scope": "bidirectional same-rail; common dense RX; pack+source-ready+network; no GEMM",
+        "schema": 2, "world": len(runtime), "runtime": runtime, "clocks": clocks,
+        "scope": "bidirectional same-rail; full dense RX/TX; bounded request window; no GEMM; "
+                 "stream network_us includes concurrent pack; pack_tail refers to owner/producer 0",
         "summaries": summaries, "records": records,
     }, sort_keys=True))
 

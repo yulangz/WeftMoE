@@ -2,6 +2,7 @@
 // Build: nvcc -O3 -std=c++17 --expt-relaxed-constexpr -arch=sm_90a
 //        benchmarks/gin_pack.cu -lnccl -o build/gin_pack
 #include <cooperative_groups.h>
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -81,11 +82,72 @@ __device__ unsigned long long timer() {
 
 struct Shape {
   int capacity, row_bytes, iterations, contexts, batch_tokens, packet_tokens;
+  int depth;
 };
 
 struct Sample {
   unsigned long long begin, copied, network, end;
+  unsigned long long first_issue, producer_end;
 };
+
+enum class Mode { Burst, Window, Staged, Stream };
+
+const char *mode_name(Mode mode) {
+  switch (mode) {
+  case Mode::Burst:
+    return "burst";
+  case Mode::Window:
+    return "window";
+  case Mode::Staged:
+    return "staged";
+  case Mode::Stream:
+    return "stream";
+  }
+  return "";
+}
+
+using Ready = cuda::atomic_ref<unsigned, cuda::thread_scope_device>;
+
+__device__ int first_row(int group, int context, Shape shape) {
+  // Subdivide the original owner's batch, without redistributing its tokens.
+  // Otherwise a deeper window also improves tail load balance, confounding
+  // the asynchronous-issue ablation.
+  return (group / shape.depth * shape.contexts + context) * shape.batch_tokens +
+         (group & (shape.depth - 1)) * (shape.batch_tokens / shape.depth);
+}
+
+// One producer CTA owns an ordered stripe. The full TX plane is immutable
+// until the sample ends; this experiment pipelines requests, not RX/TX reuse.
+__device__ void produce(const uint4 *input, uint4 *packed,
+                        const unsigned *order, unsigned *pack_ready,
+                        Shape shape, int rows, int context, unsigned base,
+                        Sample *sample) {
+  const int chunk = shape.batch_tokens / shape.depth;
+  const int row_vectors = shape.row_bytes / sizeof(uint4);
+  for (int group = 0;; ++group) {
+    const int first = first_row(group, context, shape);
+    if (first >= rows)
+      break;
+    const int end = min(rows, first + chunk);
+    // Keep row-address calculation outside the vector loop. A flattened
+    // index otherwise performs runtime 64-bit division for every uint4.
+    for (int row = first; row < end; ++row) {
+      const auto *source = input + size_t(order[row]) * row_vectors;
+      auto *destination = packed + size_t(row) * row_vectors;
+      for (int v = threadIdx.x; v < row_vectors; v += blockDim.x)
+        destination[v] = source[v];
+    }
+    // Every writer releases its NIC-readable stores before the CTA leader
+    // publishes the contiguous ready prefix to its communication owner.
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0)
+      Ready(pack_ready[context]).store(++base, cuda::memory_order_release);
+    __syncthreads();
+  }
+  if (context == 0 && threadIdx.x == 0)
+    sample->producer_end = timer();
+}
 
 __global__ void initialize(unsigned *input, int capacity, int row_words,
                            int rank) {
@@ -99,13 +161,15 @@ __global__ void reset(ncclDevComm_t dev, int contexts) {
   const ncclGin gin(dev, blockIdx.x, NCCL_GIN_RESOURCE_SHARING_THREAD);
   gin.resetSignal(blockIdx.x);
   gin.resetSignal(contexts + blockIdx.x);
+  gin.resetSignal(2 * contexts + blockIdx.x);
 }
 
-template <bool Pull>
-__global__ void
-transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer, Shape shape,
-         int peer, const int *tokens, const unsigned *local_order,
-         const unsigned *peer_order, Sample *samples, unsigned *errors) {
+template <bool Pull, Mode Pipeline>
+__global__ void transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer,
+                         Shape shape, int peer, const int *tokens,
+                         const unsigned *local_order,
+                         const unsigned *peer_order, Sample *samples,
+                         unsigned *errors, unsigned *pack_ready) {
   const auto grid = cooperative_groups::this_grid();
   const auto tid = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto stride = size_t(gridDim.x) * blockDim.x;
@@ -120,6 +184,10 @@ transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer, Shape shape,
                     NCCL_GIN_RESOURCE_SHARING_THREAD);
   const auto team = ncclTeamWorld(dev);
   uint64_t epoch = 0, ready = 0;
+  unsigned pack_base = 0, published = 0;
+  // Only the owner lane uses these handles. Waiting the oldest prefix leaves
+  // the other sub-batches in flight, then the vacated slot is refilled.
+  __shared__ ncclGinRequest_t requests[4];
 
   for (int iteration = 0; iteration < shape.iterations; ++iteration) {
     const int rows = tokens[iteration];
@@ -144,20 +212,28 @@ transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer, Shape shape,
       samples[iteration].begin = timer();
     grid.sync();
 
-    if (shape.packet_tokens > 1) {
-      for (auto i = tid; i < vectors; i += stride) {
-        const auto row = i / row_vectors;
-        packed[i] =
-            input[size_t(send_order[row]) * row_vectors + i % row_vectors];
+    if constexpr (Pipeline == Mode::Burst || Pipeline == Mode::Window) {
+      if (shape.packet_tokens > 1) {
+        for (auto i = tid; i < vectors; i += stride) {
+          const auto row = i / row_vectors;
+          packed[i] =
+              input[size_t(send_order[row]) * row_vectors + i % row_vectors];
+        }
+        __threadfence_system();
       }
-      // The pack writers, not just the issuing lane, publish the NIC source.
-      __threadfence_system();
+    } else if constexpr (Pipeline == Mode::Staged) {
+      if (context >= shape.contexts && context < 2 * shape.contexts)
+        produce(input, packed, send_order, pack_ready, shape, rows,
+                context - shape.contexts, pack_base, samples + iteration);
     }
     grid.sync();
-    if (tid == 0)
+    if (tid == 0) {
       samples[iteration].copied = timer();
-    // Both variants pay the same source-ready rendezvous. Pull must not read
-    // the peer's packed plane until all its pack writers have finished.
+      if constexpr (Pipeline != Mode::Stream)
+        samples[iteration].producer_end = samples[iteration].copied;
+    }
+    // A common rendezvous follows the serial pack phase (empty for Stream).
+    // Stream publishes packed readiness per owner below, not through this join.
     if (owner) {
       gin.signal(team, peer, ncclGin_WeakSignalInc{context}, ncclCoopThread{},
                  ncclGin_None{}, cuda::thread_scope_system,
@@ -169,36 +245,112 @@ transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer, Shape shape,
       samples[iteration].network = timer();
     grid.sync();
 
+    if constexpr (Pipeline == Mode::Stream) {
+      if (context >= shape.contexts && context < 2 * shape.contexts)
+        produce(input, packed, send_order, pack_ready, shape, rows,
+                context - shape.contexts, pack_base, samples + iteration);
+    }
     if (owner) {
-      // Keep bytes in flight constant, not requests in flight. Each context
-      // retires a batch_tokens-row prefix before issuing its next disjoint
-      // batch.
-      for (int first = context * shape.batch_tokens; first < rows;
-           first += shape.contexts * shape.batch_tokens) {
-        const int end = min(rows, first + shape.batch_tokens);
-        for (int row = first; row < end; row += shape.packet_tokens) {
-          const auto count = min(shape.packet_tokens, end - row);
-          const auto source =
-              shape.packet_tokens == 1
-                  ? size_t((Pull ? recv_order : send_order)[row]) *
-                        shape.row_bytes
-                  : plane + size_t(row) * shape.row_bytes;
-          const auto destination = 2 * plane + size_t(row) * shape.row_bytes;
-          if constexpr (Pull) {
-            gin.get(team, peer, window, source, window, destination,
-                    size_t(count) * shape.row_bytes);
-          } else {
-            gin.put(team, peer, window, destination, window, source,
-                    size_t(count) * shape.row_bytes,
-                    ncclGin_WeakSignalInc{unsigned(shape.contexts) + context},
-                    ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-                    cuda::thread_scope_system, cuda::thread_scope_system);
-            ++ready;
+      if constexpr (Pipeline == Mode::Burst) {
+        // Keep bytes in flight constant, not requests in flight. Each context
+        // retires a batch_tokens-row prefix before issuing its next disjoint
+        // batch.
+        for (int first = context * shape.batch_tokens; first < rows;
+             first += shape.contexts * shape.batch_tokens) {
+          const int end = min(rows, first + shape.batch_tokens);
+          if (context == 0 && first == 0)
+            samples[iteration].first_issue = timer();
+          for (int row = first; row < end; row += shape.packet_tokens) {
+            const auto count = min(shape.packet_tokens, end - row);
+            const auto source =
+                shape.packet_tokens == 1
+                    ? size_t((Pull ? recv_order : send_order)[row]) *
+                          shape.row_bytes
+                    : plane + size_t(row) * shape.row_bytes;
+            const auto destination = 2 * plane + size_t(row) * shape.row_bytes;
+            if constexpr (Pull) {
+              gin.get(team, peer, window, source, window, destination,
+                      size_t(count) * shape.row_bytes);
+            } else {
+              gin.put(team, peer, window, destination, window, source,
+                      size_t(count) * shape.row_bytes,
+                      ncclGin_WeakSignalInc{unsigned(shape.contexts) + context},
+                      ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                      cuda::thread_scope_system, cuda::thread_scope_system);
+              ++ready;
+            }
           }
+          ncclGinRequest_t completion;
+          gin.flushAsync(team, peer, &completion);
+          gin.wait(completion);
+          if constexpr (!Pull)
+            gin.waitSignal(ncclCoopThread{}, shape.contexts + context, ready);
         }
-        ncclGinRequest_t completion;
-        gin.flushAsync(team, peer, &completion);
-        gin.wait(completion);
+      } else {
+        const int chunk = shape.batch_tokens / shape.depth;
+        int issued = 0;
+        for (;; ++issued) {
+          const int first = first_row(issued, context, shape);
+          if (first >= rows)
+            break;
+          const int slot = issued & (shape.depth - 1);
+          if (issued >= shape.depth)
+            gin.wait(requests[slot]);
+
+          if constexpr (Pipeline == Mode::Stream) {
+            unsigned head;
+            do {
+              head =
+                  Ready(pack_ready[context]).load(cuda::memory_order_acquire);
+            } while (head < pack_base + issued + 1);
+            if constexpr (Pull) {
+              // Publish before waiting for the peer, so symmetric pull cannot
+              // deadlock. One ordered producer makes this a true ready prefix.
+              if (head > published) {
+                gin.signal(team, peer,
+                           ncclGin_WeakSignalAdd{2 * unsigned(shape.contexts) +
+                                                     context,
+                                                 head - published},
+                           ncclCoopThread{}, ncclGin_None{},
+                           cuda::thread_scope_system,
+                           cuda::thread_scope_system);
+                published = head;
+              }
+              gin.waitSignal(ncclCoopThread{}, 2 * shape.contexts + context,
+                             pack_base + issued + 1);
+            }
+          }
+          if (context == 0 && issued == 0)
+            samples[iteration].first_issue = timer();
+          const int end = min(rows, first + chunk);
+          for (int row = first; row < end; row += shape.packet_tokens) {
+            const auto count = min(shape.packet_tokens, end - row);
+            const auto source =
+                shape.packet_tokens == 1
+                    ? size_t((Pull ? recv_order : send_order)[row]) *
+                          shape.row_bytes
+                    : plane + size_t(row) * shape.row_bytes;
+            const auto destination = 2 * plane + size_t(row) * shape.row_bytes;
+            if constexpr (Pull) {
+              gin.get(team, peer, window, source, window, destination,
+                      size_t(count) * shape.row_bytes);
+            } else {
+              gin.put(team, peer, window, destination, window, source,
+                      size_t(count) * shape.row_bytes,
+                      ncclGin_WeakSignalInc{unsigned(shape.contexts) + context},
+                      ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                      cuda::thread_scope_system, cuda::thread_scope_system);
+              ++ready;
+            }
+          }
+          gin.flushAsync(team, peer, &requests[slot]);
+        }
+        for (int pending = max(0, issued - shape.depth); pending < issued;
+             ++pending)
+          gin.wait(requests[pending & (shape.depth - 1)]);
+        // Full RX does not wrap within a sample. Only the final aggregate
+        // signal proves every inbound Put arrived; no prefix inference from
+        // out-of-order weak completions and no premature RX reuse.
         if constexpr (!Pull)
           gin.waitSignal(ncclCoopThread{}, shape.contexts + context, ready);
       }
@@ -217,6 +369,12 @@ transfer(ncclDevComm_t dev, ncclWindow_t window, char *buffer, Shape shape,
     if (mismatch)
       atomicOr(errors + iteration, 1U);
     grid.sync();
+    const int chunk = shape.batch_tokens / shape.depth;
+    const int wave = shape.contexts * shape.batch_tokens;
+    const int tail = max(
+        0, min(shape.batch_tokens, rows % wave - int(context % shape.contexts) *
+                                                     shape.batch_tokens));
+    pack_base += rows / wave * shape.depth + (tail + chunk - 1) / chunk;
   }
 }
 
@@ -253,8 +411,14 @@ void run(const std::map<std::string, std::string> &args) {
   const int measured = setting("WEFTMOE_GIN_BENCH_MEASURED", 20);
   const int batch = setting("WEFTMOE_GIN_BENCH_BATCH", 128);
   const int hidden = setting("WEFTMOE_BENCH_HIDDEN", 4096);
+  const auto *suite_env = std::getenv("WEFTMOE_GIN_BENCH_MODE");
+  const std::string suite = suite_env ? suite_env : "burst";
+  if (suite != "burst" && suite != "pipeline")
+    throw std::runtime_error(
+        "WEFTMOE_GIN_BENCH_MODE must be burst or pipeline");
   if (contexts < 1 || contexts > 128 || batch < 64 || batch % 64 ||
-      hidden < 8 || hidden % 8 || warmup < 0 || measured < 1)
+      hidden < 8 || hidden % 8 || warmup < 0 || measured < 1 ||
+      (suite == "pipeline" && contexts > 64))
     throw std::runtime_error("invalid contexts/batch/hidden/sample settings");
   CUDA(cudaSetDevice(local));
   ncclUniqueId id;
@@ -278,7 +442,7 @@ void run(const std::map<std::string, std::string> &args) {
   requirements.ginContextCount = contexts;
   requirements.ginExclusiveContexts = true;
   requirements.ginQueueDepth = 1024;
-  requirements.ginSignalCount = 2 * contexts;
+  requirements.ginSignalCount = 3 * contexts;
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
   ncclDevComm_t dev;
   NCCL(ncclDevCommCreate(comm, &requirements, &dev));
@@ -315,20 +479,41 @@ void run(const std::map<std::string, std::string> &args) {
     auto *peer_order =
         upload(orders(capacity, iterations, seed + nominal + peer * 7919U));
     Sample *device_samples;
-    unsigned *device_errors;
+    unsigned *device_errors, *pack_ready;
     CUDA(cudaMalloc(&device_samples, iterations * sizeof(Sample)));
     CUDA(cudaMalloc(&device_errors, iterations * sizeof(unsigned)));
+    CUDA(cudaMalloc(&pack_ready, contexts * sizeof(unsigned)));
     std::vector<Sample> samples(iterations);
     std::vector<unsigned> errors(iterations);
     for (int repeat = 0; repeat < 2; ++repeat) {
-      std::vector<int> packets{1, 4, 16, 64};
+      struct Case {
+        Mode mode;
+        int depth, packet;
+      };
+      std::vector<Case> cases;
+      if (suite == "burst") {
+        for (const int packet : {1, 4, 16, 64})
+          cases.push_back({Mode::Burst, 1, packet});
+      } else {
+        for (const int packet : {1, 16}) {
+          cases.push_back({Mode::Burst, 1, packet});
+          for (const int depth : {1, 2, 4})
+            cases.push_back({Mode::Window, depth, packet});
+          if (packet > 1) {
+            cases.push_back({Mode::Staged, 4, packet});
+            cases.push_back({Mode::Stream, 4, packet});
+          }
+        }
+      }
       if (repeat)
-        std::reverse(packets.begin(), packets.end());
-      for (const int packet : packets) {
+        std::reverse(cases.begin(), cases.end());
+      for (const auto test : cases) {
+        const auto packet = test.packet;
         for (int variant = 0; variant < 2; ++variant) {
           const bool pull = bool(variant ^ repeat);
           reset<<<contexts, 1>>>(dev, contexts);
           CUDA(cudaMemset(device_errors, 0, iterations * sizeof(unsigned)));
+          CUDA(cudaMemset(pack_ready, 0, contexts * sizeof(unsigned)));
           auto *sync = buffer + 3 * plane;
           NCCL(
               ncclAllReduce(sync, sync, 1, ncclUint64, ncclSum, comm, nullptr));
@@ -340,12 +525,29 @@ void run(const std::map<std::string, std::string> &args) {
           launch.blockDim = dim3(128);
           launch.attrs = &attribute;
           launch.numAttrs = 1;
-          const Shape shape{capacity, hidden * 2, iterations,
-                            contexts, batch,      packet};
-          CUDA(cudaLaunchKernelEx(
-              &launch, pull ? transfer<true> : transfer<false>, dev, window,
-              buffer, shape, peer, device_tokens, local_order, peer_order,
-              device_samples, device_errors));
+          const Shape shape{capacity, hidden * 2, iterations, contexts,
+                            batch,    packet,     test.depth};
+          auto kernel =
+              pull ? transfer<true, Mode::Burst> : transfer<false, Mode::Burst>;
+          switch (test.mode) {
+          case Mode::Burst:
+            break;
+          case Mode::Window:
+            kernel = pull ? transfer<true, Mode::Window>
+                          : transfer<false, Mode::Window>;
+            break;
+          case Mode::Staged:
+            kernel = pull ? transfer<true, Mode::Staged>
+                          : transfer<false, Mode::Staged>;
+            break;
+          case Mode::Stream:
+            kernel = pull ? transfer<true, Mode::Stream>
+                          : transfer<false, Mode::Stream>;
+            break;
+          }
+          CUDA(cudaLaunchKernelEx(&launch, kernel, dev, window, buffer, shape,
+                                  peer, device_tokens, local_order, peer_order,
+                                  device_samples, device_errors, pack_ready));
           CUDA(cudaDeviceSynchronize());
           CUDA(cudaMemcpy(samples.data(), device_samples,
                           iterations * sizeof(Sample), cudaMemcpyDeviceToHost));
@@ -358,8 +560,10 @@ void run(const std::map<std::string, std::string> &args) {
           std::cout << "GIN_PACK_CASE {\"rank\":" << rank
                     << ",\"nominal_tokens\":" << nominal << ",\"operation\":\""
                     << (pull ? "pull" : "push")
-                    << "\",\"packet_tokens\":" << packet
-                    << ",\"repeat\":" << repeat << ",\"contexts\":" << contexts
+                    << "\",\"packet_tokens\":" << packet << ",\"mode\":\""
+                    << mode_name(test.mode) << "\""
+                    << ",\"depth\":" << test.depth << ",\"repeat\":" << repeat
+                    << ",\"contexts\":" << contexts
                     << ",\"batch_tokens\":" << batch
                     << ",\"row_bytes\":" << hidden * 2
                     << ",\"registered_bytes\":" << bytes
@@ -374,12 +578,17 @@ void run(const std::map<std::string, std::string> &args) {
                       << ",\"network_us\":" << (s.end - s.network) / 1000.0
                       << ",\"pack_us\":" << (s.copied - s.begin) / 1000.0
                       << ",\"ready_us\":" << (s.network - s.copied) / 1000.0
+                      << ",\"pack_tail_after_issue_us\":"
+                      << (s.producer_end > s.first_issue
+                              ? (s.producer_end - s.first_issue) / 1000.0
+                              : 0.0)
                       << ",\"total_us\":" << (s.end - s.begin) / 1000.0 << '}';
           }
           std::cout << "]}" << std::endl;
         }
       }
     }
+    CUDA(cudaFree(pack_ready));
     CUDA(cudaFree(device_errors));
     CUDA(cudaFree(device_samples));
     CUDA(cudaFree(peer_order));

@@ -1,5 +1,134 @@
 # Static Forward V4 多机 inference 记录
 
+## 2026-10-09 补充：滚动窗口与流式 pack
+
+结论：**连续发射之后，足够并发的逐 token 通信与流式 pack 已非常接近；
+不能再把上一轮串行 pack 的额外耗时直接算到流水实现上。**
+32 owner 下，逐 token 的滚动窗口比相同实现的单段窗口快约3.5%–4.5%；
+流式 pack 相比逐 token，pull 的8K慢1.5%、20K基本持平，push 快0.9%–1.8%。
+这些都是独立通信实验，不是 PF FWD 加速；此次仍未修改生产算子。
+
+### 主结果：32 owner，单位 ms
+
+下表均为 **16 rank 的逐 sample 最大 total，再对两轮40次测量求平均**。
+total 包含 pack、ready 和实际通信完成，不是仅计 enqueue，也不扣掉流式 pack。
+两机各8 GPU、SM1620MHz、H4096/BF16、每 rank 在途请求上限16MiB，
+沿用上轮相同的20组随机 token 数和随机行排列。
+
+| 名义 tokens | 方式 | Q1 分批等完 | Q1 四段滚动 | Q16 整批 pack 后通信 | Q16 流式 pack + 四段滚动 |
+|---|---|---:|---:|---:|---:|
+| 8K | pull | 1.572 | 1.499 | 1.695 | 1.522 |
+| 8K | push | 1.600 | 1.539 | 1.703 | 1.525 |
+| 20K | pull | 3.700 | 3.544 | 4.022 | 3.545 |
+| 20K | push | 3.796 | 3.636 | 4.040 | 3.572 |
+
+与同轮整批 pack 的 total 相比，流式 pack 改善约10%–12%。
+Q1 滚动窗口的有效单向吞吐约45.0–47.1GB/s/rank，已经接近大包传输。
+20K pull 的0.014%差别不视为确定收益；8K push 的不足1%也不作强结论。
+
+### 具体改动与同步
+
+保留 `WEFTMOE_GIN_BENCH_MODE=burst` 复现旧实验；`pipeline` 增加以下对照。
+所有候选仍是同一个 cooperative kernel 内的独立实验，没有 CPU 逐段调度。
+
+| mode | 发射与完成确认 | pack 工作分配 |
+|---|---|---|
+| burst | 原版：发完一批，flush/wait，Put 再等本批入站计数 | 全128 CTA 先完成整批 pack |
+| window，D=1/2/4 | 同一容量拆成 D 段，等最老一段完成后立即补发；其余段仍在队列内 | 与 burst 相同，整批 pack 串行 |
+| staged，D=4 | 与 window 相同 | 每个 owner 对应一个独立 producer CTA，仍先 pack 完再通信 |
+| stream，D=4 | 与 window 相同，增加分段 source-ready | 与 staged 完全相同的 producer 布局，与网络 owner 并行 |
+
+- `C × B = 2048 tokens`，C/B 分别为4/512、16/128、32/64。
+  每段 B/D tokens，每个 owner 最多保留 D 个完成句柄。
+  Q1 每个请求8KiB；Q16 每个请求128KiB，尾包按实际行数。
+  改 D **不改变每个 owner 分到的 token 集合**，只拆开其原来的 B 行批次。
+- Get 用 `flushAsync + wait` 获取一个子批的完成/本地可见性。
+  填满 D 段后，只等最老句柄，再立刻填入新段，不等整个窗口清空。
+  NCCL 2.31.2 当前公开 Get 接口没有 local-counter 参数；本实验没有虚构一个
+  Get completion counter，也没有依赖私有的非阻塞 request poll。
+- Put 每个实际请求绑定 weak ready increment；滚动窗口用本地 flush 完成回收
+  发射额度，最后等待全部入站请求的累计计数。这里的 RX 是完整数组，只有最后的
+  总计数才证明全部 payload 到齐；**不能用部分累计计数推断某个 RX slot 已到齐**。
+  `window D1` 单独控制了 Put 从“逐批等入站”变为“末尾等入站”的差异。
+- stream 的 producer 按静态顺序 gather 一段，所有写线程完成 system release，
+  CTA leader 再用本地 release store 发布 `pack_ready[owner]` 前缀。
+  通信 owner acquire 后，Push 直接发 Put；Pull 则先把已生产前缀通过 GIN signal
+  发给 peer，再等待 peer 的相应前缀，才发 Get。先发布后等待，避免双向 pull 互等。
+  一个前缀只有一个顺序 producer，没有动态任务领用或跨 producer done_count。
+- ready 发布和数据请求共用该 owner 的独占 GIN context；producer CTA 不调用 GIN，
+  不存在两个线程并发操作同一独占 context。前缀和信号跨 sample 单调推进，
+  每个 case 初始化一次；source/X、packed TX、RX 在 sample 内不覆盖。
+- staged 与 stream 都只用 C 个 pack CTA。保留 staged 很重要：不能把 pack 从
+  128 CTA 改成32 CTA 后的性能变化，全部归因于是否 overlap。
+
+这是真正的 **pack/network 阶段并行 + 子批连续补发**，但仍不是生产版 ring：
+X、packed TX、RX 均按本次最大实际 token 数预分配完整 plane；16MiB 是请求窗口，
+不是总 buffer 大小。没有 RX slot wrap、消费 credit、GEMM、机内 fanout 或 reduce。
+每轮开始的双向 rendezvous 和计时外全量校验，保护跨 sample 的 buffer 复用。
+stream 的 `network_us` 包含并行 pack 的等待，不能叫“剔除 pack 的纯网络时间”。
+
+### 分步收益与排除的混杂因素
+
+1. **只改窗口深度**：C32 的 `window D1 → D4`，pull 的8K/20K为
+   1.567→1.499 / 3.713→3.544ms；push 为1.594→1.539 / 3.779→3.636ms。
+   D2 与 D4 的 total 差别均小于0.1%，本组不需要继续加深窗口。
+   C4 的 Q1 仍受小请求发起并发限制，单纯增加流水深度没有明显收益。
+2. **同一 pack 布局，串行改并行**：C32 的 staged→stream，8K pull/push 为
+   2.070→1.522 / 2.073→1.525ms；20K为4.838→3.545 / 4.875→3.572ms，
+   total 降低约26%–27%。owner 0 的首个网络请求发出后，producer 0 仍继续 pack
+   约0.56–0.57ms / 1.33–1.36ms，证明 pack 并非提前做完后移出计时。
+   这是该 producer 的时间戳诊断，不是全体 producer 的完成时间。
+3. **pack 遍历小优化**：探索版把扁平 vector 下标改成 row/vector 两层循环，
+   将每次 uint4 拷贝的运行时64位行号除法移出内层循环。在同一细条带布局的
+   C32 相邻消融中，串行 producer pack 从约0.672/1.587ms降到0.553/1.294ms，
+   改善约18%–19%；stream total 仅从1.526/3.549ms到1.517/3.543ms（pull），
+   大部分拷贝成本本来就在重叠区间。这组是相邻构建证据，不分摊成正式 PF 收益。
+4. **固定 owner 分工再复测**：初版按更细子批重新分条带，同时改变了尾批负载均衡。
+   最终改为拆分原 owner 的批次、保持其 token 集合不变；上面所有主表均来自
+   这轮重新测试。探索版单列保存，不把其全部差值当作流水收益。
+
+### 少量 owner 的边界
+
+下面三列都是 total，单位 ms；`window` 均为 D4。Q16 window 仍使用128 CTA
+先 pack，Q16 stream 则只有 C 个 producer CTA。
+
+| owners | 规模 / 方向 | Q1 window | Q16 window | Q16 stream |
+|---:|---|---:|---:|---:|
+| 4 | 8K pull | 4.438 | 1.707 | 4.348 |
+| 4 | 8K push | 4.523 | 1.741 | 4.349 |
+| 4 | 20K pull | 10.190 | 4.007 | 9.865 |
+| 4 | 20K push | 10.376 | 4.095 | 9.866 |
+| 16 | 8K pull | 1.502 | 1.692 | 1.541 |
+| 16 | 8K push | 1.651 | 1.727 | 1.584 |
+| 16 | 20K pull | 3.541 | 3.993 | 3.555 |
+| 16 | 20K push | 3.787 | 4.073 | 3.639 |
+
+C4 时 pack 仍很有价值：即使先 pack 再传，total 也比 Q1 快约2.5倍。
+但只有4个 producer CTA 的流式版本，其串行 pack 本身就需4.24/9.74ms，
+生产速度成了瓶颈，不能靠 overlap 消掉。这说明 **pack 并行度不能机械地等于
+通信 owner 数**，不是“异步 pack 天生更慢”；尚未扩展多个 producer 服务一个 owner。
+C16 pull 不 pack 已接近最优，而 push 的流式 pack 约快4%。
+
+对 PF 的当前建议：dispatch 可以先保留“不额外 pack 的逐 token pull + 滚动窗口”
+作为简单候选；如果可用通信 owner 很少，必须同时考虑聚合包。
+return 若 FC2 能直接产出连续 TX，可用 Q16 network 阶段估计不付 gather 的通信潜力。
+最终还要在真实 kernel 中比较通信/pack 占用的 SM 与 GEMM 竞争，本实验不能决定
+最优 CTA 配额，也不能代替按节点去重、非均衡 fanout 和有消费 credit 的 ring 验证。
+
+### 验证、冻结数据与复现
+
+- 正式 C4/C16/C32 共 **96,000 次 rank/sample 全量 payload 校验通过**，含随机
+  尾包；另有两 GPU、T≈1/65/1024 的720次校验，覆盖空 owner 和不足一窗。
+- 正式三轮共672次 GPU 时钟观测全部 SM1620MHz，活跃显存时钟全部3201MHz；
+  所有 rank 为 NCCL 2.31.2 GDAKI。source、RX 初始化、分配/注册和校验均在计时外。
+- [流水消融冻结数据](../benchmarks/gin_pack_pipeline_20261009.json) 保存正式
+  逐样本 rank-max、探索版汇总、时钟/校验统计和源代码/binary/log SHA256。
+  完整逐 rank 日志为 `build/gin_pack_pipeline_final_c{4,16,32}.log`。
+- 两节点相同 binary SHA256：
+  `60919d30de1c6b8fa1bb495fa51be87b589a94678cf61e64b2e596c2ac310669`。
+- 使用下节同一编译/启动命令，增加 `WEFTMOE_GIN_BENCH_MODE=pipeline`；
+  C/B 仍分别设4/512、16/128、32/64。默认 burst 模式保留旧 Q1/4/16/64 矩阵。
+
 ## 2026-10-09：跨机逐 token 与 pack 的最小消融
 
 结论：**pack 明显降低低并发下的网络请求开销，但本例并非必须先 pack。**
