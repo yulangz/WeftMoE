@@ -184,6 +184,7 @@ def main():
         samples, device_samples, device_phases, errors = [], [], [], []
         measurement_intervals_ns = []
         kernel_names = []
+        output_sha256 = []
         graph = None
         if args.graph_replays:
             graph_x = torch.empty(nominal, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -269,6 +270,8 @@ def main():
                 assert error["relative_l2"] < 0.01, error
                 torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=1e-4)
                 errors.append(error)
+                output_sha256.append(hashlib.sha256(
+                    output.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
             elif step >= priming + args.warmups:
                 samples.append(elapsed)
                 measurement_intervals_ns.append((interval_start, interval_end))
@@ -284,7 +287,8 @@ def main():
                                             device_samples_us=device_samples,
                                             measurement_intervals_ns=measurement_intervals_ns,
                                             device_phases=device_phases, errors=errors,
-                                            kernel_names=kernel_names))
+                                            kernel_names=kernel_names,
+                                            output_sha256=output_sha256))
         workspace = (runtime.native.usage() if args.backend != "megamoe"
                      else dict(symm_bytes=buffer.buffer.nbytes, ring_tokens=buffer.num_ring_tokens))
         if rank == 0:

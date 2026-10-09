@@ -1,5 +1,74 @@
 # 单机 decode 专属实现与验收记录
 
+## 2026-10-09：DT 的 FC1 也改为寄存器 128-bit 直写
+
+**已实现并保留，但没有解决 DT 在64 tokens落后 PF 的问题。**
+1/64 tokens没有稳定收益；256 tokens四轮时延降低约 **0.23%–0.86%**。
+这一改动只作用于 DT；PF、训练、跨机路径及自动入口阈值均未修改。
+
+### 改了什么
+
+- DT 原本就是寄存器直接写 GM，每次写 BF16x2（4B），并没有先写 shared。
+  本次增加 lane 间重排，改为每条 store 写8个 BF16（16B / 128-bit）；
+  不是用 FP32 存储，也不改变 SwiGLU 或 BF16 rounding。
+- M16 的每个四线程组在一行上只有16个输出列：四个线程都参与 shuffle，
+  其中两个线程各写16B。M64 直接复用 PF 的四线程 transpose helper，
+  四个线程各写16B。尾行判断对整个四线程组一致。
+- `__threadfence()`、128个 math threads 的 join 和 `s_ready` 发布原样保留。
+  GEMM、buffer、任务划分、stage 数均不变，没有新增运行时开关。
+- 反汇编确认新增 `STG.E.128`。M16/M64 的寄存器仍为80/128，
+  stack/local memory均为0，未增加 shared memory 或 spill。
+
+### 性能
+
+口径与下一节一致：Flash H4096/I2048/E256/top-k6、BF16、单机 EP8、
+每 rank精确1/64/256 tokens、纯 inference；route/gate逐样本随机。
+旧 DT 与新 DT 使用完全相同的 profile，PF 为已采纳的16B写出版本。
+仍是准备一次、prime50、warmup10、40个样本，每个 CUDA graph含20次调用。
+下表为 **µs/调用，rank-max CUDA-event p50**，包括通信、FC1/FC2与combine。
+
+| tokens/rank | 旧 DT：4B | 新 DT：16B | DT 时延变化 | 当前 PF |
+|---|---:|---:|---:|---:|
+| 1 | 125.070 | 125.564 | +0.39% | 213.682 |
+| 64 | 685.200 | 685.544 | +0.05% | 629.458 |
+| 256 | 774.205 | 767.533 | -0.86% | 748.416 |
+
+64 tokens时新 DT仍比 PF慢 **8.91%**；256时慢 **2.55%**。
+不能把1/64上的微小波动当成稳定回退或收益：四轮合看，旧/新 DT的均值
+分别为125.432/125.499、685.873/685.859、771.759/767.498 µs。
+其中256均值改善约0.55%，并非数个百分点的大优化。
+
+时钟目标及锁频范围均为1620 MHz、memory3201 MHz。共跑两组正反序、
+每候选四轮；500 ms轮询在其中三轮的正式计时窗口捕获到1560/1605 MHz
+瞬时读数，因此不能声称所有原始结果都严格恒频。上表采用唯一没有捕获到
+窗口内降频的**完整配对轮**：第一组反序 PF → 新 DT → 旧 DT，不是挑最快值。
+这一轮正式窗口内的56条GPU时钟读数均为1620 MHz；采样仍不代表逐周期保证。
+全部四轮、每轮40个样本、计时边界和降频读数均归档，未静默删除异常样本。
+
+DT 原写出已不占用 shared/TMA stage，此次只减少 store 指令/事务碎片，
+也引入了 shuffle；与 PF 从 staged epilogue切换的情形不同。
+实测说明这一点不足以解释或消除64 tokens的差距。当前此档 DT仍用
+M16 warp MMA（`mma.sync`），PF用M128/N256 WGMMA；若要缩小差距，
+需要另外消融 GEMM形状、算术路径与任务调度，不能仅凭本次结果确定各自贡献。
+
+### 验证与复现
+
+三候选通过1/64/256普通路由和256热点路由（bias std=8），共192个
+rank/sample PyTorch数值对照；新旧 DT的64组输出 SHA256 **全部相同**。
+trace确认 DT为 `kernel<16u>` / `kernel<64u>`，PF为其独立 local kernel。
+新 DT另通过1/64/256的 compute-sanitizer memcheck，8 ranks均为0 errors。
+
+本次沿用下一节的命令与冻结 profile。256仍需单独应用
+[`dt_256_capacity_probe.patch`](../benchmarks/dt_256_capacity_probe.patch)构建实验产物，
+生产 eligibility上限保持64。旧 DT基线是本次修改前的 `af3a821`；
+新 DT直接使用本次源码，没有引入新 tuning参数。
+
+完整数据、产物/配置哈希、逐位验证与SASS资源统计见
+[`dt_fc1_register_vector_20261009.json`](../benchmarks/dt_fc1_register_vector_20261009.json)。
+新 DT产物为 `build/pf_megamoe_20261008/cache_dt_vector/0f4281018282/`，
+旧 DT/PF沿用下一节产物。日志前缀 `dtvec_*`、`dtvec_recheck_*`；
+上表对应 `dtvec_{pf,dtvec,dt}_1_ep8.log`。
+
 ## 2026-10-09：Flash 小 batch，DT 与已采纳 128-bit 写出的 PF
 
 **PF 的 FC1 寄存器 shuffle → 16B 写出已正式采纳**（`85aac52`）。

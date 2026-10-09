@@ -61,15 +61,37 @@ __device__ __forceinline__ void store_fc1(const ForwardKernelArgs &a,
     if (row >= t.rows)
       continue;
     const auto gate = rows[row].gate;
+    constexpr unsigned kWords = M == 16U ? 2U : 4U;
 #pragma unroll
-    for (unsigned i = 0; i < (M == 16U ? kWarpN : kN) / 16U; ++i) {
-      const auto *g = accum + i * 8U + item * 2U;
+    for (unsigned i = 0; i < (M == 16U ? kWarpN : kN) / 16U; i += kWords) {
+      std::uint32_t words[kWords];
+#pragma unroll
+      for (unsigned j = 0; j < kWords; ++j) {
+        const auto *g = accum + (i + j) * 8U + item * 2U;
+        const auto value = static_v4_swiglu_pair(g, g + 4U, gate);
+        words[j] = float2_to_bf16x2_bits(value.x, value.y);
+      }
+      uint4 vector;
+      if constexpr (M == 16U) {
+        // A quad owns only 16 output columns in the warp-MMA path. All four
+        // lanes shuffle, then lanes 0/1 each store eight consecutive BF16s.
+        const auto mask = 0xfU << (lane / 4U * 4U);
+        const auto t = __shfl_xor_sync(
+            mask, (lane & 1U) ? words[0] : words[1], 1, 4);
+        const auto x = (lane & 1U) ? t : words[0];
+        const auto y = (lane & 1U) ? words[1] : t;
+        vector = make_uint4(x, y, __shfl_xor_sync(mask, x, 2, 4),
+                            __shfl_xor_sync(mask, y, 2, 4));
+      } else {
+        vector = static_v4_transpose_fc1_vector(
+            make_uint4(words[0], words[1], words[2], words[3]));
+      }
       const auto column = t.column * (kN / 2U) +
                           (M == 16U ? warp * (kWarpN / 2U) : 0U) + i * 8U +
-                          (lane % 4U) * 2U;
-      *reinterpret_cast<__nv_bfloat162 *>(
-          output + (t.row + row) * a.intermediate + column) =
-          __float22bfloat162_rn(static_v4_swiglu_pair(g, g + 4U, gate));
+                          (lane % 4U) * 8U;
+      if (M != 16U || (lane & 2U) == 0U)
+        *reinterpret_cast<uint4 *>(
+            output + (t.row + row) * a.intermediate + column) = vector;
     }
   }
   __threadfence();
