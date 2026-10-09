@@ -1,5 +1,9 @@
 # PF 跨机 pull / direct Return：2026-10-09
 
+补充：[去 GEMM 后的通信带宽实测](pf_communication_bandwidth_20261009.md)。
+区分纯 GIN 数据面上限与保留实际 ring/credit、机内转发的完整通信路径；
+测量代码位于独立 diagnostic 分支，不改变本分支的生产算子。
+
 ## 更新：两条独立探索与同协议交叉验证
 
 先后使用两个全新上下文的 agent，从 `7c57005` 分出独立分支，串行独占双机。

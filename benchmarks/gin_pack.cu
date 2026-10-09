@@ -413,13 +413,18 @@ void run(const std::map<std::string, std::string> &args) {
   const int hidden = setting("WEFTMOE_BENCH_HIDDEN", 4096);
   const auto *suite_env = std::getenv("WEFTMOE_GIN_BENCH_MODE");
   const std::string suite = suite_env ? suite_env : "burst";
-  if (suite != "burst" && suite != "pipeline")
+  if (suite != "burst" && suite != "pipeline" && suite != "bandwidth")
     throw std::runtime_error(
-        "WEFTMOE_GIN_BENCH_MODE must be burst or pipeline");
+        "WEFTMOE_GIN_BENCH_MODE must be burst, pipeline or bandwidth");
+  const int bandwidth_packet = setting("WEFTMOE_GIN_BENCH_PACKET", 32);
   if (contexts < 1 || contexts > 128 || batch < 64 || batch % 64 ||
       hidden < 8 || hidden % 8 || warmup < 0 || measured < 1 ||
       (suite == "pipeline" && contexts > 64))
     throw std::runtime_error("invalid contexts/batch/hidden/sample settings");
+  if (suite == "bandwidth" &&
+      (bandwidth_packet < 1 || bandwidth_packet > batch / 4 ||
+       (batch / 4) % bandwidth_packet))
+    throw std::runtime_error("bandwidth packet must divide the depth-four chunk");
   CUDA(cudaSetDevice(local));
   ncclUniqueId id;
   if (rank == 0) {
@@ -491,7 +496,9 @@ void run(const std::map<std::string, std::string> &args) {
         int depth, packet;
       };
       std::vector<Case> cases;
-      if (suite == "burst") {
+      if (suite == "bandwidth") {
+        cases.push_back({Mode::Window, 4, bandwidth_packet});
+      } else if (suite == "burst") {
         for (const int packet : {1, 4, 16, 64})
           cases.push_back({Mode::Burst, 1, packet});
       } else {
