@@ -127,4 +127,38 @@ pack-Put 使用原 phase 专用 pack worker，pack 成本计入 Dispatch；它�
   admission head 改为 system-release，与 peer system-acquire 配对。
 - 保留本机数据的 expert-row 顺序 pull，仅对远端 RX 采用 rail push。
 
-这三个候选在本记录时尚无实测收益，不作为本轮结论。
+### 后续同 binary 消融：metadata / admission / 本机顺序
+
+源码 `66dde52`，`dispatch-fanout-plan-20261010` 的
+`build/dispatch_fanout_plan_{phases,fused}/borrow`。同一 workload、1620MHz，
+每项各一次 24-sample 测量，不把跨 binary 的基线变化算作优化收益。
+
+| 实现 | 完整 GEMM 8K ms | 完整 GEMM 20K ms |
+|---|---:|---:|
+| 原 pull，本 binary 对照 | 10.861808 | 23.490672 |
+| rail push，仍读取 peer block | 11.039856 | 24.216464 |
+| 预计算 ready 增量 | 11.079840 | 24.442544 |
+| 再缓存 peer admission | 11.152432 | 24.432656 |
+| 再保留本机 expert-row pull，仅远端 RX push | 10.932800 | 23.905120 |
+
+metadata 与重复 admission 读取不是这组回退的主要解法，没有实测收益。
+保留本机 expert 顺序收回了一部分损失，但仍比原 pull 慢 0.7%/1.8%。
+不能采用这些候选替换原 pull，也不能据此宣称已证明全部回退来自就绪顺序。
+
+独立 Dispatch：
+
+| 实现 | ms，8K / 20K | 平均 GB/s，8K / 20K |
+|---|---:|---:|
+| rail push，仍读取 peer block | 2.170 / 5.367 | 30.85 / 31.08 |
+| 预计算 ready 增量 | 2.174 / 5.343 | 30.83 / 31.17 |
+| 本机 pull + 远端 RX push | 2.549 / 5.747 | 25.64 / 28.42 |
+
+这说明本机 source 的搬运方式对独立 Dispatch 收益影响很大，不能把前面的
+提升全部归因于跨机 Get 或远端 RX 转发。以上结果仍未达到 V3 目标。
+原始数据：`benchmarks/dispatch_fanout_plan_{phases,fused}_20261010.json`。
+
+正在准备的下一步：每 warp 连续发射 4 个 token，staging 仍按 shared-read
+completion 复用；批末才等待 global completion、发布各行 ready、归还 RX
+credit。用重新读取少量不可变描述符代替寄存器保留整批 descriptor，不加显存。
+另测本机按 destination/expert 顺序的静态 source push，区别于源 token fanout
+以及 destination pull。上述新候选尚未实测，不预设其收益。
