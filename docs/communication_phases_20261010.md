@@ -8,6 +8,10 @@
 10.919/23.505ms**，延迟降低 **10.6%/5.3%**。代码 `8c47a46`，
 在 `experiment/pf-dispatch-optimized-20261010`；本主分支只同步记录，
 尚未切换生产默认。没有合入双 staging、探针、payload-skip 等消融代码。
+
+最新 [ready 顺序与接收 rail push](dispatch_ready_fanout_20261010.md) 消融：
+rail push 的独立 Dispatch 达到 30.65/31.33 GB/s，但首版完整 GEMM 回退
+1.8%/3.8%，尚不采用；仍未追上历史 V3。后续继续分离同步与 FC1 就绪顺序。
 独立 Dispatch 的进一步优化没有获得明确的融合收益，详见文末。
 
 最新两组后续消融：[本地拷贝描述表](dispatch_descriptors_20261010.md) 无端到端
