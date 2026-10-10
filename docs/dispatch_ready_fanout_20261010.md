@@ -329,3 +329,33 @@ V3”写成“生产 MoE 已有同等收益”。原始记录：
 下一候选保留本机 destination-pull，只让另一个 warp 处理远端 RX fanout
 push；分别测试本机 4KiB 与 2×4KiB staging。它复用已验证有效的分流机制，
 但不要求本机输入也改成 source fanout。跨机仍为 Get，Return 不变。
+
+### 本机 destination-pull / 远端 rail fanout 混合：仍未解决融合回退
+
+源码 `29fa6ef`，`dispatch-hybrid-overlap-20261010` 的
+`build/dispatch_hybrid_overlap_{phases,fused}/borrow`。一个转发 warp 按本机
+目的 expert 行顺序 pull，另一个独立转发远端 RX；本机 staging 分别使用
+4KiB、2×4KiB。不改变 compute/RX ring 的 generation、credit 和完成条件。
+
+| 配置 | 独立 Dispatch ms，8K / 20K | 平均 GB/s，8K / 20K | 完整 kernel ms，8K / 20K |
+|---|---:|---:|---:|
+| 原 pull，同 binary | 2.587 / 5.827 | 25.20 / 28.42 | 10.733920 / 23.145696 |
+| 混合，4KiB 本机 staging | 2.757 / 6.888 | 23.43 / 23.70 | 10.707632 / 23.296288 |
+| 混合，8KiB 本机 staging | 2.474 / 6.152 | 26.12 / 26.56 | 10.661392 / 23.239184 |
+
+混合版用 8KiB 比 4KiB 好，但完整 20K 仍比原 pull 慢约 0.4%，8K 仅快约
+0.7%；不采用。相比全 rail fanout，它缓解了完整 GEMM 的回退，却也失去了
+纯通信的大部分收益，不能认为问题已经解决。本机只剩一半 pull worker
+是此方案同时引入的变化，不能把差异全部归因于 push/pull 方式本身。
+
+phase 与 fused 各 288 个 rank/shape/step 校验项通过；同负载输出 hash
+一致，fused 最大 relative L2 为 9.231e-5。两组分别 260/262 次时钟观测
+均为 1620MHz。math208/control88、N256 WGMMA 不变；wide 本机 helper
+仍有 ptxas 报告的 4B spill store、8B spill load，不宣称整个实现无 spill。
+数据：`benchmarks/dispatch_hybrid_overlap_{phases,fused}_20261010.json`。
+
+下一步对原 pull 与纯通信最快的 rail 分流版开启已有 Get 探针：区分请求
+发射、NIC completion 等待与 RX reuse credit 停顿。full kernel 的
+`dispatch_us` 未独立定义，不能把零值当成通信时间；各 worker 计时也不能
+相加作为关键路径。新 fanout 暂未实现旧 pull 的行拷贝探针，其零值不表示
+转发没有开销。
