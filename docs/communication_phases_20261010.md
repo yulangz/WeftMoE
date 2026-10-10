@@ -12,8 +12,8 @@
 最新 [ready 顺序与接收 rail push](dispatch_ready_fanout_20261010.md) 消融：
 将本机 X / 远端 RX 转发分成两条独立静态流，独立 Dispatch 达到
 **36.46/35.36 GB/s**，超过当轮重新测量 V3 的 **31.85/33.94 GB/s**。
-完整 GEMM 对照尚在进行，未替换生产路径；此前首版 rail push 的完整回退
-以及后续无收益实验仍完整保留在记录中。
+但纯通信最快者的完整 20K 仍回退约 5.3%，不替换生产路径；正在验证保留本机
+destination-pull、仅对远端 RX 做 push 的独立分流。所有无收益实验均保留记录。
 
 最新两组后续消融：[本地拷贝描述表](dispatch_descriptors_20261010.md) 无端到端
 收益，已放弃；[有序目录与连续 Get](dispatch_get_runs_20261010.md) 将请求数减少

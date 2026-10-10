@@ -2,7 +2,7 @@
 
 最新进展：将本机 X 与远端 RX 转发拆成两条独立静态流，独立 Dispatch
 达到 **36.46/35.36 GB/s**，超过本轮复测 V3 的 **31.85/33.94 GB/s**。
-完整 GEMM 验证仍在进行，**尚未替换生产路径**。前几轮单纯 rail push 的
+完整 GEMM 的 20K 仍回退，**不替换生产路径**。前几轮单纯 rail push 的
 完整性能回退没有被掩盖，失败的同步、staging、配额消融均记录在下面。
 
 目标口径：Flash 随机路由、8K/20K、EP16、1620MHz；历史 V3 Dispatch
@@ -311,4 +311,21 @@ V3 使用此前 `bbf2bd4` 的冻结 artifact，library hash 与历史一致；�
 
 这个结果确认本机与远端转发之间存在可利用的重叠空间；不能据此认为 GEMM
 融合收益已得到验证。按 tile 合并 ready 的候选此轮反而更慢，不将它计为收益。
-完整 kernel 对照进行中，之后才能决定是否保留为生产实现。
+完整 kernel 同 binary 对照如下，仍包含主 kernel 内的 planner 和真实 GEMM：
+
+| 实现 | 8K ms | 20K ms |
+|---|---:|---:|
+| 原 pull | 10.765856 | 23.101600 |
+| 本机 expert 顺序 + weighted，未分流 | 10.572880 | 23.364368 |
+| rail fanout 分流，纯通信最快者 | 10.846912 | 24.333664 |
+| 本机 expert 顺序 + weighted，再分流 | 10.706512 | 23.313536 |
+| 上一项再合并同 tile ready | 10.591072 | 23.326960 |
+
+纯通信最快者的完整 20K 回退约 5.3%，不采用。保持 expert 顺序后回退缩小，
+但仍未胜过原 pull；合并通知没有稳定解决 20K。不能将“独立 Dispatch 超过
+V3”写成“生产 MoE 已有同等收益”。原始记录：
+`benchmarks/dispatch_local_remote_fused_20261010.json`。
+
+下一候选保留本机 destination-pull，只让另一个 warp 处理远端 RX fanout
+push；分别测试本机 4KiB 与 2×4KiB staging。它复用已验证有效的分流机制，
+但不要求本机输入也改成 source fanout。跨机仍为 Get，Return 不变。
