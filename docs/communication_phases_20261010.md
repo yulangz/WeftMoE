@@ -10,6 +10,11 @@
 尚未切换生产默认。没有合入双 staging、探针、payload-skip 等消融代码。
 独立 Dispatch 的进一步优化没有获得明确的融合收益，详见文末。
 
+最新两组后续消融：[本地拷贝描述表](dispatch_descriptors_20261010.md) 无端到端
+收益，已放弃；[有序目录与连续 Get](dispatch_get_runs_20261010.md) 将请求数减少
+约 95.5%，但干净版完整 MoE 仅 8K 快约 0.54%、20K 持平。`6e5d730` 保留为
+候选，未替换上述基线；不把独立 Dispatch 的小收益当作显著融合收益。
+
 后续借用 warp 消融已定位主要原因：单 lane 串行筛选转发路由。
 保留 Get + bulk copy，仅改为 warp 并行筛选，独立 Dispatch 约
 6.29/14.37 → 2.63/5.94 ms（8K/20K）。pack+Put 没有明确额外收益。
