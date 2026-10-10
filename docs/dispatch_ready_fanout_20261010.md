@@ -157,8 +157,35 @@ metadata 与重复 admission 读取不是这组回退的主要解法，没有实
 提升全部归因于跨机 Get 或远端 RX 转发。以上结果仍未达到 V3 目标。
 原始数据：`benchmarks/dispatch_fanout_plan_{phases,fused}_20261010.json`。
 
-正在准备的下一步：每 warp 连续发射 4 个 token，staging 仍按 shared-read
+### 批量完成与本机 expert 顺序 source push
+
+源码 `ba44a02`，`dispatch-fanout-batch-20261010` 的
+`build/dispatch_fanout_batch_{phases,fused}/borrow`。每 warp 连续发射 4 个 token，staging 仍按 shared-read
 completion 复用；批末才等待 global completion、发布各行 ready、归还 RX
 credit。用重新读取少量不可变描述符代替寄存器保留整批 descriptor，不加显存。
 另测本机按 destination/expert 顺序的静态 source push，区别于源 token fanout
-以及 destination pull。上述新候选尚未实测，不预设其收益。
+以及 destination pull。本机 route push 按 destination 静态划分 warp 子组，
+每个子组遍历该目的 rank 的 expert-ordered source routes；没有动态领任务。
+
+| 配置 | 独立 Dispatch 平均 GB/s，8K / 20K | 完整 GEMM ms，8K / 20K |
+|---|---:|---:|
+| 原 pull，本 binary 对照 | 未重复测 | 10.737152 / 23.095840 |
+| rail push，预计算增量、逐 token 完成 | 30.83 / 30.97 | 11.030160 / 24.054160 |
+| rail push，4-token 批量完成 | 29.70 / 31.02 | 10.906720 / 23.843072 |
+| 本机 expert 顺序 source push，远端批量 fanout | 24.58 / 28.26 | 10.683616 / 23.339776 |
+| 本机 pull，远端批量 fanout | 25.28 / 27.87 | 未重复测 |
+
+批量完成没有独立通信收益；融合下比逐 token 的 rail push 略好，但仍落后
+原 pull。本机 expert 顺序 source push 的完整 GEMM，8K 快约 0.5%、20K 慢
+约 1.1%，这一轮不足以声称优于原实现，也不能用较好的 8K 掩盖 20K 回退。
+因此仍不替换生产/保留基线。
+
+数据：`benchmarks/dispatch_fanout_batch_{phases,fused}_20261010.json`。
+所有性能测试串行、编译结束后开始；buffer 容量和随机 trace 保持相同。
+
+下一组进一步对齐 V3 的发布协议：V3 的 `Receiver::publish_dispatch` 使用
+按 tile/source rail 区分的到达计数，且更新使用 release；当前 fanout 则通过
+通用 `ring::arrive` 对同一 X-ready 做 acq_rel 更新。实验分支
+`experiment/pf-dispatch-ready-stripes-20261010` 将分开验证 per-rail 计数与
+release-only reduction。前者需要少量随 pool 持久分配的计数器，后者不需要
+新 buffer；两者均保留接收端 acquire，未取得结果前不宣称其收益。
