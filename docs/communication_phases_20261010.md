@@ -10,9 +10,10 @@
 尚未切换生产默认。没有合入双 staging、探针、payload-skip 等消融代码。
 
 最新 [ready 顺序与接收 rail push](dispatch_ready_fanout_20261010.md) 消融：
-rail push 的独立 Dispatch 达到 30.65/31.33 GB/s，但首版完整 GEMM 回退
-1.8%/3.8%，尚不采用；仍未追上历史 V3。后续继续分离同步与 FC1 就绪顺序。
-独立 Dispatch 的进一步优化没有获得明确的融合收益，详见文末。
+将本机 X / 远端 RX 转发分成两条独立静态流，独立 Dispatch 达到
+**36.46/35.36 GB/s**，超过当轮重新测量 V3 的 **31.85/33.94 GB/s**。
+完整 GEMM 对照尚在进行，未替换生产路径；此前首版 rail push 的完整回退
+以及后续无收益实验仍完整保留在记录中。
 
 最新两组后续消融：[本地拷贝描述表](dispatch_descriptors_20261010.md) 无端到端
 收益，已放弃；[有序目录与连续 Get](dispatch_get_runs_20261010.md) 将请求数减少

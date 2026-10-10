@@ -1,9 +1,9 @@
 # PF Dispatch：ready 顺序与接收 rail fanout（2026-10-10）
 
-结论：接收 rail push 将独立 Dispatch 提高到 30.65/31.33 GB/s，但首版
-完整 GEMM 回退 1.8%/3.8%，**不采用这版替换原 pull**。ready-first/fence
-收益很小；沿用旧 pack worker 的跨机 Put 也更慢。后续继续分离 metadata、
-admission 与 FC1 就绪顺序的影响，尚未达成追上 V3 的目标。
+最新进展：将本机 X 与远端 RX 转发拆成两条独立静态流，独立 Dispatch
+达到 **36.46/35.36 GB/s**，超过本轮复测 V3 的 **31.85/33.94 GB/s**。
+完整 GEMM 验证仍在进行，**尚未替换生产路径**。前几轮单纯 rail push 的
+完整性能回退没有被掩盖，失败的同步、staging、配额消融均记录在下面。
 
 目标口径：Flash 随机路由、8K/20K、EP16、1620MHz；历史 V3 Dispatch
 32.08/33.60 GB/s。本文候选仍是实验代码，尚未替换主分支。
@@ -278,3 +278,37 @@ N256 WGMMA 未改变；wide/weighted helper 均无 spill store，ptxas 报告
 source-node windows 可以重叠；另将本机 expert 顺序流中，同一 warp 对
 同一目的 M-tile 的连续 ready 更新合并。合并只发生在本窗口内，窗口结束
 前必须 flush，不能拿未发布的旧 ready 等待未来窗口 admission。
+
+### 本机 X / 远端 RX 独立静态流：纯通信超过 V3
+
+源码 `ef4db75`（分流 `9ba828d`，合并通知独立开关 `ef4db75`），
+`dispatch-local-remote-20261010` 的 `build/dispatch_local_remote_phases/borrow`。
+两种来源各使用原来的一个转发 warp：worker 的偶数/奇数 residue 分别只遍历
+本机 source / 远端 source，各自推进窗口，不再先完成本机窗口才处理远端窗口。
+源 rank/目的节点按实际拓扑判断，没有把协议写死成两节点。
+
+仍为跨机连续 Get、接收 rail 的节点内 fanout push。RX 逐 slot 的可见 generation、
+精确 fanout retirement、目的 compute slot 的 generation 检查全部保留。
+不新增 warp、GM payload 或动态领任务原子；使用上一轮已有的 8KiB staging。
+
+| 实现 | Dispatch ms，8K / 20K | 平均 GB/s，8K / 20K |
+|---|---:|---:|
+| rail fanout，同库未分流 | 2.066 / 5.308 | 31.95 / 31.23 |
+| rail fanout，本机/远端分流 | **1.850 / 4.697** | **36.46 / 35.36** |
+| 本机 expert 顺序 + 加权分工，再分流 | 2.017 / 4.988 | 32.85 / 32.87 |
+| 上一项再合并同 tile ready | 2.087 / 5.199 | 32.37 / 31.30 |
+| V3，当轮重新测量 | 2.123 / 4.960 | 31.85 / 33.94 |
+
+分流相对同库 rail fanout 将延迟降低 10.5%/11.5%；相对新测 V3 降低
+12.9%/5.3%。带宽各样本独立计算再取 p50，所以带宽与延迟百分比不互为精确
+倒数。分流版最忙 dispatch rail 为 43.34/41.79 GB/s；Return 未修改，平均
+35.95/38.18 GB/s，最忙 rail 44.51/45.85 GB/s。
+
+V3 使用此前 `bbf2bd4` 的冻结 artifact，library hash 与历史一致；未重编译。
+所有配置的实际 payload、workload、输出 hash 一致，480 个 rank/shape/step
+校验项逐位通过，434 次节点时钟观测均为 1620MHz。数据：
+`benchmarks/dispatch_local_remote_phases_20261010.json`。
+
+这个结果确认本机与远端转发之间存在可利用的重叠空间；不能据此认为 GEMM
+融合收益已得到验证。按 tile 合并 ready 的候选此轮反而更慢，不将它计为收益。
+完整 kernel 对照进行中，之后才能决定是否保留为生产实现。
