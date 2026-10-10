@@ -12,8 +12,10 @@
 最新 [ready 顺序与接收 rail push](dispatch_ready_fanout_20261010.md) 消融：
 将本机 X / 远端 RX 转发分成两条独立静态流，独立 Dispatch 达到
 **36.46/35.36 GB/s**，超过当轮重新测量 V3 的 **31.85/33.94 GB/s**。
-但纯通信最快者的完整 20K 仍回退约 5.3%，不替换生产路径；正在验证保留本机
-destination-pull、仅对远端 RX 做 push 的独立分流。所有无收益实验均保留记录。
+但纯通信最快者的完整 20K 仍回退约 5.3%，不替换生产路径；保留本机
+destination-pull 的混合方案也未解决 20K 回退。完整 kernel 探针进一步看到
+20K Get 更早结束（5.95 → 4.94ms），kernel 却更慢（23.14 → 24.36ms）；
+接下来需要定位 tile 就绪顺序与转发/计算的竞争。所有无收益实验均保留记录。
 
 最新两组后续消融：[本地拷贝描述表](dispatch_descriptors_20261010.md) 无端到端
 收益，已放弃；[有序目录与连续 Get](dispatch_get_runs_20261010.md) 将请求数减少
@@ -473,7 +475,7 @@ shared memory 仍 222KiB，未增加显存。每 K64 仍四条 N256 WGMMA 后统
 - [冻结旧库/精简新库逐轮数据](../benchmarks/dispatch_clean_20261010.json)
 - [B128/bias8 复用压力验证](../benchmarks/dispatch_clean_stress_20261010.json)
 
-### 当前边界
+### 精简候选阶段的边界
 
 尚未追平 V3 的独立 Dispatch。实验双 4KiB stage 把差距缩至约 10%/13%，
 但完整 MoE 没有随之加速，因此未为这项单测收益增加正式实现复杂度。
@@ -481,3 +483,5 @@ shared memory 仍 222KiB，未增加显存。每 K64 仍四条 N256 WGMMA 后统
 也没有本轮 V3 真实 GEMM 的同口径结果，不据此声称完整 PF 已击败 V3。
 下一步更应分析融合入口的 FC1/FC2 等待、Return 与 admission 时序，
 而不是继续仅凭独立 Dispatch 数字切换 Get/Put 或增加 staging。
+后续独立 Dispatch 已超过新测 V3，但完整 kernel 仍未获益，见本文开头的
+[最新 fanout 消融与融合探针](dispatch_ready_fanout_20261010.md)。

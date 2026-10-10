@@ -4,6 +4,9 @@
 达到 **36.46/35.36 GB/s**，超过本轮复测 V3 的 **31.85/33.94 GB/s**。
 完整 GEMM 的 20K 仍回退，**不替换生产路径**。前几轮单纯 rail push 的
 完整性能回退没有被掩盖，失败的同步、staging、配额消融均记录在下面。
+最新完整 kernel 探针：20K 分流版的 Get 更早结束（5.95 → 4.94ms），
+但 kernel 反而更慢（23.14 → 24.36ms）。下一步重点是 tile 就绪顺序与
+转发/计算的相互影响，不能再只按独立 RDMA 吞吐挑方案。
 
 目标口径：Flash 随机路由、8K/20K、EP16、1620MHz；历史 V3 Dispatch
 32.08/33.60 GB/s。本文候选仍是实验代码，尚未替换主分支。
@@ -359,3 +362,47 @@ phase 与 fused 各 288 个 rank/shape/step 校验项通过；同负载输出 ha
 `dispatch_us` 未独立定义，不能把零值当成通信时间；各 worker 计时也不能
 相加作为关键路径。新 fanout 暂未实现旧 pull 的行拷贝探针，其零值不表示
 转发没有开销。
+
+### 完整 kernel Get 探针：网络更早完成，融合却更慢
+
+同一个冻结的 `29fa6ef` fused artifact、相同负载，打开已有
+`WEFTMOE_PF_DISPATCH_PROFILE=1`，原 pull 与 rail fanout 分流串行测量。
+探针汇总器 `d22e2de` 支持 full kernel，并保留原始 rank/step 数据。
+下面是诊断结果，不代替前面关闭探针的性能数据：
+
+| 配置 | Get 发射平均 worker ms，8K / 20K | Get completion 等待平均 worker ms，8K / 20K | Get 最晚结束 ms，8K / 20K | kernel ms，8K / 20K |
+|---|---:|---:|---:|---:|
+| 原 pull | 0.055 / 0.193 | 1.214 / 4.042 | 1.771 / 5.947 | 10.769 / 23.143 |
+| rail fanout 分流 | 0.062 / 0.334 | 1.182 / 2.881 | 1.784 / 4.941 | 10.664 / 24.364 |
+
+计时边界：Get 最晚结束是各 worker 从 **planner 之后自身启动** 到完成的
+elapsed time 的最大值，不是从 kernel 开始的绝对时间，也不是 NIC 链路
+独占耗时。平均 worker 时间、rank 最大值和 kernel 时间不可相加。此处
+full `return_us` 从 planner 完成计到融合主体末尾，包含 GEMM，不能拿它
+计算“独立 Return 带宽”。FC1/FC2 的区间同样包含等待，不等于纯算术时间。
+
+两版 Get 请求数相同，8K/20K 每 packet 分别约 1.427/1.433 次；没有少搬数据。
+RX reuse credit 失败轮询数/packet 为原 pull 的 0/0.08965，分流版的
+0/0.03367。这个计数不是等待时长，不能据此推导 credit 占总耗时的百分比。
+
+20K 的观察与关闭探针时的方向一致：Get 最晚结束提前约 1ms，而完整
+kernel 增加约 1.22ms。因此增加跨机吞吐本身没有解决这次融合回退；也不能
+根据 NIC 已先完成，就断言早期 FC1 完全不受输入到达时序影响。
+
+原 pull 的转发 worker 最晚结束为 3.583/10.701ms，等待 admission 的
+平均 worker 时间为 0.037/3.231ms，说明真实计算的 compute-ring 反压
+确实参与了转发时序。新 fanout 没有对应的拷贝/admission 探针，这些项在
+新归档中记为 `null`，不把未测量误写成零开销。
+
+后续应区分两个假设，而不是继续盲增 channel 或 staging：
+
+- 完整 M-tile 的就绪顺序：source-token fanout 与目的 expert/M-tile 的
+  消费顺序不同。本机 expert 顺序候选能缩小回退，但也同时改变了拷贝与
+  worker 负载，尚不能据此认定单一因果。
+- 转发与 GEMM 的资源竞争：请求数量相同，分流版的 Get 发射时间反而上升；
+  需要进一步区分调度、访存与同步等待，不能直接宣称 WGMMA 算力下降。
+
+两次启动均双节点 exit0；192 个 rank/shape/step 校验通过、输出 hash
+相同，最大 relative L2 9.231e-5；174 次时钟观测均为 1620MHz。结束后
+两节点全部 GPU 0MiB。本轮仍不更改生产默认或 Return 协议。
+原始记录：`benchmarks/dispatch_fused_probe_20261010.json`。
