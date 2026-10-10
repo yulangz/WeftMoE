@@ -6,7 +6,8 @@
 后续借用 warp 消融已定位主要原因：单 lane 串行筛选转发路由。
 保留 Get + bulk copy，仅改为 warp 并行筛选，独立 Dispatch 约
 6.29/14.37 → 2.63/5.94 ms（8K/20K）。pack+Put 没有明确额外收益。
-详见文末；这是实验路径结果，尚未迁移并验证真实 GEMM 融合入口。
+详见文末。后续 staging/ready 消融将独立 Dispatch 进一步降至约
+2.5/5.8 ms；两级 2KiB staging 没有胜过单级 4KiB。
 
 ## 结论与实测结果
 
@@ -318,3 +319,43 @@ Get 并行筛选相对本轮原筛选约快 2.40× / 2.44×，但仍比 V3 的�
 第一轮在 `67b146f` native artifact 上使用 runner 的 `--profile`，
 模式为 `bulk skip vector skip_local skip_remote`；跳过拷贝三组不做数值验证。
 后续 native 修改使代码布局不同，不应把重编译的新库冒充第一轮旧库。
+
+## 第三轮：pull staging 流水与 ready 发布
+
+实验分支 `experiment/pf-dispatch-pipeline-20261010`，native `15689c8`，
+runner `1adadcb`。跨机仍为 Get，384 线程、264 个机内 pull worker、
+208/88 寄存器配额、packet/ring 容量均不变。
+
+新 pull helper 把本地行的地址准备也分摊给整个 warp，远端命中 lane
+提前准备目标地址、gate 和 x_full 指针。lane0 负责 bulk 指令，命中 lane
+负责最终 gate/ready 发布。**这不只是增加 copy buffer 的单变量修改。**
+
+G2S→S2G 后，只需等 shared read 完成便可复用 staging；但发布 ready
+仍必须等 global write 完成。批量方案在一批有效行发出后统一等全部写完，
+再通过 warp join 和 release atomic 发布 ready。整个 packet 的所有写出和
+发布结束后才增加 RX consumed_total，不能提前归还 credit。
+
+第一组保持每 warp 4KiB payload staging 不变。两级时拆成 2×2KiB；
+增加的 barrier 落在原 Shared 的对齐 padding 中。五个候选使用同一个库，
+下面是各一次完整 prime32/warm8/sample24 的 p50，不择取最快样本：
+
+| 模式 | staging | ready 发布 | 8K Dispatch ms | 20K Dispatch ms |
+|---|---|---|---:|---:|
+| `coop_bulk`，前轮对照 | 1×4KiB | 逐行 | 2.672 | 6.011 |
+| `pipe1_row` | 1×4KiB | 逐行 | 2.513 | 5.782 |
+| `pipe2_row` | 2×2KiB | 逐行 | 2.536 | 5.875 |
+| `pipe1_batch` | 1×4KiB | 批量 | 2.467 | 5.788 |
+| `pipe2_batch` | 2×2KiB | 批量 | 2.508 | 5.832 |
+
+单级新 helper 相对前轮对照减少约 5.9%/3.8% 延迟。两级小 segment 没有
+额外收益；批量发布在 8K 略好、20K 持平，不能声称已找到决定性流水瓶颈。
+Return 维持约 5.65/13.27ms。此时仍落后 V3 的 2.096/4.931ms。
+
+480 个 rank/sample 的输出逐位正确，所有输出 hash、32 步 workload 与
+前轮 V3 相同。440 次节点时钟观测全为 1620MHz。五次正式启动均两机 exit0。
+第一次启动因端口 32200 被占用而未进入计算，清理该次启动的远端 rendezvous
+进程后改用 32420–32424；该失败启动不计入结果。
+
+四个新 pull helper 的 ptxas stack/spill 均为零。整个诊断入口和 GIN
+Get/Put 仍有静态 spill，不能据此宣称整个 kernel 无 spill。
+[原始结果及验证归档](../benchmarks/dispatch_pipeline_20261010.json)。
