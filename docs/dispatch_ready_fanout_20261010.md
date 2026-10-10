@@ -189,3 +189,47 @@ credit。用重新读取少量不可变描述符代替寄存器保留整批 desc
 `experiment/pf-dispatch-ready-stripes-20261010` 将分开验证 per-rail 计数与
 release-only reduction。前者需要少量随 pool 持久分配的计数器，后者不需要
 新 buffer；两者均保留接收端 acquire，未取得结果前不宣称其收益。
+
+### X-ready 的 release-only 与 per-rail 计数
+
+源码 `a2720db`，`dispatch-ready-stripes-20261010` 的
+`build/dispatch_ready_stripes_{phases,fused}/borrow`。不改 payload ring、任务
+划分、Get/Return worker 或 GEMM tile；同 binary 单独切换两个因素：
+
+- release-only：数据写完后只发布，不获取旧值。SASS 确认对应更新从
+  `ATOM.E.ADD.64.STRONG.SYS` 变为 `REDG.E.ADD.64.STRONG.SYS`，消费者
+  仍 acquire。RX credit 更新不改，不能将这项结论推广到所有原子操作。
+- per-rail：每个 compute slot 为各生产 rail 分配独立 32B counter sector，
+  消费者 acquire 并求和，到齐后缓存本地 X-ready。计数跨 generation 累积，
+  随固定 pool 一次分配/释放。此 shape 的 pool 增加 794,624B，约 0.76MiB。
+
+| 实现 | 独立 Dispatch ms，8K / 20K | 平均 GB/s，8K / 20K |
+|---|---:|---:|
+| rail push，同 binary 对照 | 2.086 / 5.344 | 31.63 / 31.07 |
+| release-only | 2.083 / 5.332 | 31.88 / 30.94 |
+| per-rail | 2.094 / 5.362 | 31.53 / 31.02 |
+| per-rail + release-only | 2.083 / 5.353 | 31.67 / 31.29 |
+
+纯通信没有明显收益。8K 与前轮绝对值略有变化，不将跨 binary 的差异计为
+收益；上述四项共用 workload、产物与 timing 口径。384 个验证项逐位正确，
+336 次双机时钟观测均为 1620MHz。Return 保持约 35.9/38.2 GB/s。
+数据：`benchmarks/dispatch_ready_stripes_phases_20261010.json`。
+
+完整 GEMM 同 binary 结果：
+
+| 实现 | 8K ms | 20K ms |
+|---|---:|---:|
+| 原 pull | 10.730944 | 23.084032 |
+| rail push，对照 | 10.783040 | 24.119760 |
+| rail push + release-only | 10.713920 | 24.154096 |
+| rail push + per-rail + release-only | 10.777600 | 24.189072 |
+| 本机 expert 顺序 source push + release-only | 10.576624 | 23.253616 |
+
+两个 ready 协议调整都没有追回 20K 的回退。最后一项保留 expert 顺序，8K
+快约 1.4%，但 20K 仍慢约 0.7%；不足以替换原 pull。新增 counter 不保留到
+生产路径。数据：`benchmarks/dispatch_ready_stripes_fused_20261010.json`。
+
+下一候选将两段 4KiB G2S 同时发出、
+使用同一 completion barrier，转发后统一保护 shared 复用；只增加 5KiB
+shared、不增加 GM payload。另独立消融按 immutable route count 加权的静态
+warp 配额，检查 expert-ordered source push 的目的 rank 负载不均问题。
