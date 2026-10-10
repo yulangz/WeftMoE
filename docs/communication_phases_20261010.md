@@ -378,3 +378,34 @@ math208/control88、线程数和 packet geometry 不变。源码 `2642394`。
 当前单轮不选择性宣称哪种更优。相对 V3，逐行版本仍慢约 10.4%/13.3%。
 三次启动均两机 exit0，正式测量间不运行编译。
 [wide-staging 原始结果](../benchmarks/dispatch_wide_20261010.json)。
+
+### 真实 GEMM：通信单测收益不能直接外推
+
+随后在真实 FC1/SwiGLU/FC2/通信/combine 入口做同库对照；未开启训练缓存。
+不是 copy-substitution，也没有阶段串行化。每项仍 prime32/warm8/sample24，
+取每步最慢 rank 再取 p50，排除固定 workspace 与权重预处理。
+
+| 模式 | 8K kernel ms | 20K kernel ms |
+|---|---:|---:|
+| 原始串行筛选 | 12.211 | 24.621 |
+| warp 并行筛选 | **10.770** | **23.170** |
+| 新单 4KiB helper，逐行 ready | 10.812 | 23.261 |
+| 双 4KiB，逐行 ready | 10.773 | 23.270 |
+| 双 4KiB，批量 ready | 10.938 | 23.566 |
+
+并行筛选让完整 kernel 延迟下降约 **11.8%/5.9%**。但本轮继续优化独立
+Dispatch，并没有获得明确额外的融合收益；批量 ready 还略有回退。
+这说明阶段单测不是当前融合入口的线性性能模型，不能把 Dispatch 缩短的
+时间直接从完整 MoE 时间里扣掉。可能涉及计算/Return 已覆盖这段时间，
+以及行发布时序变化；未采动态 stall 数据，不给这些因素分配耗时百分比。
+
+因此选择将 **并行筛选单独提取到干净借用分支**，不引入额外 staging、
+探针、payload-skip、vector 或运行时消融开关。其它候选保留在实验分支供复现。
+不能用实验双 buffer 的 2.31/5.59ms 作为这个精简候选的 Dispatch 数字。
+
+480 个 rank/sample 全部正确，各模式输出 hash 逐位相同；workload 也完全一致。
+最大 relative-L2 为 9.24e-5 以下。444 次节点时钟观测全为 1620MHz。
+五次正式启动均两机 exit0。最初 32440 端口冲突的启动未进入计算，
+清理该次 rendezvous 后改用预检空闲的 25020–25024；失败启动单独归档。
+SASS 保持每 K64 四条 N256 WGMMA 后统一等待，新 helper 均无 ptxas spill。
+[融合入口原始数据](../benchmarks/dispatch_fused_20261010.json)。
