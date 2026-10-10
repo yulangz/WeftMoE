@@ -233,3 +233,48 @@ release-only reduction。前者需要少量随 pool 持久分配的计数器，�
 使用同一 completion barrier，转发后统一保护 shared 复用；只增加 5KiB
 shared、不增加 GM payload。另独立消融按 immutable route count 加权的静态
 warp 配额，检查 expert-ordered source push 的目的 rank 负载不均问题。
+
+### 两段并行加载与按 route count 分配 warp
+
+源码 `c26eb40`，`dispatch-fanout-wide-20261010` 的
+`build/dispatch_fanout_wide_{phases,fused}/borrow`。
+
+- wide：复用闲置的 `pull[0]`，将 network pending 搬到额外 shared 区，两个
+  转发 warp 各有 2×4KiB staging。两次 G2S 同时发出，合用一个 completion
+  barrier；两次 S2G 合成一个 store group。保持 shared-read 和 global-write
+  两个完成边界。总 shared 增加 5KiB，含 static 为 227KiB。
+- weighted：仅对本机 expert-ordered source push，按各目的 rank 的 route
+  count 静态分配 warp。每 rank 至少一个 warp，余量按累计计数分配，舍入后
+  总数仍精确等于 worker 数；不增加共享任务队列。
+
+同 binary 独立 Dispatch：
+
+| 配置 | ms，8K / 20K | 平均 GB/s，8K / 20K |
+|---|---:|---:|
+| rail push + release-only，4KiB | 2.066 / 5.324 | 31.84 / 31.17 |
+| 同上，8KiB | 2.064 / 5.269 | 32.00 / 31.31 |
+| 本机 expert 顺序 + weighted + 8KiB | 2.304 / 5.318 | 28.95 / 31.43 |
+
+宽 staging 的纯通信收益很小：20K 延迟约降低 1%，8K 基本持平。不能据此
+声称两段串行加载是主要瓶颈。最后一行同时更改本机顺序和配额，不把它与
+前一行的差异归因于 weighted 单一因素。
+
+完整 kernel：
+
+| 配置 | 8K ms | 20K ms |
+|---|---:|---:|
+| 原 pull，同 binary 对照 | 10.742048 | 23.024048 |
+| rail push + 8KiB | 10.776992 | 24.315696 |
+| 本机 expert 顺序 source push + 8KiB，均分 warp | 10.584848 | 23.400752 |
+| 上一项 + weighted | 10.595728 | 23.327936 |
+
+weighted 仅对该同库 expert-order 候选的 20K 提高约 0.3%，8K 基本持平。
+两种 expert-order 候选仍在 20K 落后原 pull，均不采用。math208/control88、
+N256 WGMMA 未改变；wide/weighted helper 均无 spill store，ptxas 报告
+8/12B spill load，不宣称整个 kernel 无 spill。
+
+数据：`benchmarks/dispatch_fanout_wide_{phases,fused}_20261010.json`。
+下一轮单独验证：本机 source 与远端 RX 各一个专用转发 warp，使相邻的
+source-node windows 可以重叠；另将本机 expert 顺序流中，同一 warp 对
+同一目的 M-tile 的连续 ready 更新合并。合并只发生在本窗口内，窗口结束
+前必须 flush，不能拿未发布的旧 ready 等待未来窗口 admission。
