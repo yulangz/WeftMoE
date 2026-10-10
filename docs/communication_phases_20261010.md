@@ -359,3 +359,22 @@ Return 维持约 5.65/13.27ms。此时仍落后 V3 的 2.096/4.931ms。
 四个新 pull helper 的 ptxas stack/spill 均为零。整个诊断入口和 GIN
 Get/Put 仍有静态 spill，不能据此宣称整个 kernel 无 spill。
 [原始结果及验证归档](../benchmarks/dispatch_pipeline_20261010.json)。
+
+### 完整 4KiB 双 stage
+
+进一步复用被网络 warp 借走的 `pull[0]`：它原来仅保存 pending requests。
+把 requests 移到 ExtraShared，两个活跃 pull warp 各获得 2×4KiB staging。
+只增加 5KiB shared，包含 static 后为 227KiB；不增加 GM ring 容量。
+math208/control88、线程数和 packet geometry 不变。源码 `2642394`。
+
+| 同一 wide-staging 库内对照 | 8K Dispatch ms | 20K Dispatch ms |
+|---|---:|---:|
+| 单 4KiB，逐行 ready | 2.490 | 5.848 |
+| 双 4KiB，逐行 ready | 2.314 | 5.589 |
+| 双 4KiB，批量 ready | 2.338 | 5.523 |
+
+完整 segment 的双级预取有收益，单纯把 4KiB 拆成两半不能替代它。
+逐行版本相对同库单级减少约 7.1%/4.4% 延迟；两种 ready 粒度差约 1%，
+当前单轮不选择性宣称哪种更优。相对 V3，逐行版本仍慢约 10.4%/13.3%。
+三次启动均两机 exit0，正式测量间不运行编译。
+[wide-staging 原始结果](../benchmarks/dispatch_wide_20261010.json)。
