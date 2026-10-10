@@ -3,6 +3,11 @@
 本轮目标是分别测量通信阶段，不再用 Dispatch、Return 同时运行的区间
 分别计算两个“独立阶段”的带宽。生产默认配置不变。
 
+后续借用 warp 消融已定位主要原因：单 lane 串行筛选转发路由。
+保留 Get + bulk copy，仅改为 warp 并行筛选，独立 Dispatch 约
+6.29/14.37 → 2.63/5.94 ms（8K/20K）。pack+Put 没有明确额外收益。
+详见文末；这是实验路径结果，尚未迁移并验证真实 GEMM 融合入口。
+
 ## 结论与实测结果
 
 **当前 PF 的主要短板是 Dispatch，而不是 Return 的单 rail RDMA 带宽。**
@@ -167,3 +172,149 @@ WG3 换 artifact 和 label；V3 换 artifact、label、backend=v3，并省略 PF
 summary 脚本读取 node0 的逐 rank 原始结果并核对每步 payload。
 每次启动的 manifest 记录 library/adapter hash、源码版本、环境与命令，
 clocks 文件记录两节点的实际频率。GPU 测试串行，正式计时期间没有编译任务。
+
+## 借用 warp：Dispatch 瓶颈定位
+
+继续使用上面的 EP16、1620MHz、Flash、随机负载与 ring 几何，不增加 warp。
+实验分支 `experiment/pf-dispatch-diagnosis-20261010`。
+
+### 第一轮：不是单纯的 Get 吞吐不足，也不只是 payload 拷贝慢
+
+为 Get owner 和 pull worker 添加可关闭的设备计时。计时只做 worker 本地
+累加，退出时汇总；不在每次轮询中做全局 atomic。下表含探针开销，
+不能与前面无探针数字直接作为优化前后对比。
+
+| 消融 | 8K Dispatch ms | 20K Dispatch ms | 输出有效 |
+|---|---:|---:|---|
+| 原 bulk 转发 | 6.265 | 14.351 | 是，逐位一致 |
+| 跳过所有转发 payload 拷贝 | 5.221 | 11.837 | 否，仅定位 |
+| 只跳过本地来源拷贝 | 5.789 | 13.177 | 否，仅定位 |
+| 只跳过远端 RX 拷贝 | 5.750 | 12.890 | 否，仅定位 |
+| 改为全 warp uint4 load/store 转发 | 11.668 | 27.968 | 是，逐位一致 |
+
+跳过 payload 仍保留 ready、路由扫描、X-ready 发布、fanout 消费、admission
+与网络 RX 复用协议；绝不能当成可用算子或实际 Dispatch 带宽优化。
+这里只解释 Dispatch；这些不完整输出的 Return 时间没有性能结论价值。
+
+原 bulk 下，最晚 Get owner 完成全部任务的时间约 **1.689 / 5.212 ms**，
+最晚 pull worker 为 **6.263 / 14.349 ms**。8K 的所有 Get owner 没有
+RX credit 失败轮询；20K 平均每 packet 约 2.57 次。即使承认 owner 起始时间
+有很小偏差，也无法用 NIC 未完成解释如此长的后续转发尾部。
+
+拷贝探针：本地来源每行约 3.06 / 2.93 µs，远端 RX 每行约 2.65 / 2.73 µs。
+直接 uint4 版本每行约 17–18 µs：循环每轮只搬一个 warp 的 512B，
+仍受跨 GPU 读取依赖与逐行 system fence 约束，不代表优化过的所有 vector
+实现都如此，也不能据此推广为一般的 TMA/vector 大小关系。
+
+代码层面的关键嫌疑是转发控制路径：每个目的 GPU 的 worker 使用 lane0
+逐一访问 packet 中全部 token×topK，再筛选本 rank 的行；多数源目录在
+其它本地 rail 上。这既重复扫描非本 rank 路由，也串行化 metadata 依赖。
+“跳过全部 payload 后仍剩 82%–83% 时间”定位的是这条控制路径及同步，
+不是宣称已将剩余时间全部精确归因于某一个 metadata load。
+
+原始数据：
+[探针、逐 rank 结果、相同 workload 与 artifact hash](../benchmarks/dispatch_probe_20261010.json)。
+native 源码 `67b146f`；artifact `build/communication_phases/borrow`。
+五次有效启动均两机 exit0；中间一次跳过拷贝的 runner 被 CLI 参数检查拒绝
+（不能在不做数值验证时要求 kernel profiler），修正 runner 后重跑；
+失败启动没有进入 GPU 测量，也没有计入统计。
+
+### 第二轮：并行化路由筛选，而不是更换 RDMA 方向
+
+同一 native artifact `8666ebb`，细粒度探针关闭，首轮结果：
+
+| 跨机协议 | RX 后的机内转发 | 8K ms | 20K ms | 8K / 20K 平均卡 GB/s |
+|---|---|---:|---:|---:|
+| token Get | 原串行筛选 + bulk | 6.290 | 14.367 | 10.68 / 11.53 |
+| token Get | warp 并行筛选 + bulk | 2.630 | 5.939 | 24.61 / 27.79 |
+| pack + packet Put | 原串行筛选 + bulk | 6.282 | 14.575 | 10.64 / 11.38 |
+| pack + packet Put | warp 并行筛选 + bulk | 2.793 | 5.977 | 23.42 / 28.13 |
+
+所有组都是 384 threads、Math208 / Control88、64/48/19/1 的借用布局，
+264 个机内转发 worker。相同 buffer/ring 几何，相同 32 步随机路由。
+这是纯 Dispatch 的有效 payload 带宽，**不是融合 GEMM kernel 的加速比**。
+
+并行筛选的改动很小：
+
+1. packet 仍由原静态 worker 负责，不引入动态任务队列。
+2. 每轮 32 个 lane 各检查一条 route；使用 ballot 得到命中本 rank 的集合。
+3. 命中 lane 预取 location/gate，经 shuffle 广播；仍由 lane0 使用原来的
+   4KiB G2S→S2G bulk 中转完成该行 payload。
+4. 原 X-ready、padding 到齐计数、packet consumed_total 与 generation/credit
+   协议不变。没有新增 shared staging 或常驻通信 payload buffer。
+
+同 artifact 中仅改变这一模式，Dispatch 延迟降低约 58%，即约 2.4× 加速。
+同协议、同静态 ownership、同 payload copy 的反事实对照，把主要差距定位到
+**逐 route 串行 metadata 访问/筛选**，而非静态任务划分必然低效。
+
+需要说明诊断 artifact 的边界：为在同一二进制内切换模式，保留了探针、
+vector 与 bulk 分支，ptxas 报告 pull helper 有 28B spill stores / 32B spill loads。
+原算法在该 artifact 中约 6.29/14.37 ms，比上文旧 artifact 的
+5.99/13.75 ms 稍慢。不要把这约 5% 的差别算作正常实现回退或优化收益；
+即使对照旧 artifact，2.63/5.94 ms 仍是约 2.3× 的明确改善。
+生产迁移时应删掉诊断分支、检查寄存器，并重新测真实 GEMM 融合入口。
+
+### Put 对照到底覆盖什么
+
+跨机 token Get 替换为：本地 pack → 单 packet Put → 远端 signal import，
+**机内仍是 destination-pull**。不是把 RX rail→expert GPU 一跳改成 push。
+pack 的数据搬运和等待包含在 Dispatch 计时内，不是预先免费准备连续输入。
+
+这里只为独立 Dispatch 复用 48 个暂时空闲的 Return owner warp 做 pack，
+原 19 个 progress owner 导入 RX ready 并回传 credit；没有新增线程。
+TX 预留同时等待 remote credit 和 local NIC completion，继续保留全部
+RX fanout 消费和精确 generation。它是有真实 pack、credit 的协议消融，
+但**不是可直接照搬到融合生产 kernel 的调度**：生产 Return 同时工作，
+不能把这 48 个 warp 阻塞在整个 dispatch pack 循环里。
+
+在这种相对有利的独立阶段条件下，Put 也没有显示明确优势：未修筛选时基本
+无改善，修好后 8K 略慢、20K 近似持平。不能据此断言所有配置中 Get 优于 Put；
+能得出的工程决策是：**现在不优先切跨机 Put，先保留 Get 修转发控制路径。**
+
+后续顺序：清理并迁移 cooperative route filtering；测真实 GEMM/Return 重叠；
+再考虑紧凑的目的 rank 专属 route descriptor、bulk 多 staging/跨行流水，
+以及保留 Get 时单独测试 RX rail 的机内 push/fanout reuse。后者与跨机
+Get/Put 是两个独立决策，不能由本轮 Put 结果替代。
+
+### 反向复测与最终数字
+
+顺序：Get原版 → Get并行筛选 → Put原版 → Put并行筛选 →
+Put并行筛选 → Get并行筛选 → Get原版。
+除 Put原版一次，其余取两轮 p50 的均值：
+
+| 方案 | 8K ms | 20K ms | 平均卡 GB/s（8K / 20K） |
+|---|---:|---:|---:|
+| Get，原筛选 | 6.299 | 14.411 | 10.63 / 11.47 |
+| Get，并行筛选 | 2.626 | 5.918 | 24.69 / 27.86 |
+| pack+Put，原筛选 | 6.282 | 14.575 | 10.64 / 11.38 |
+| pack+Put，并行筛选 | 2.797 | 5.985 | 23.40 / 28.08 |
+| 前轮 V3，同 workload | 2.096 | 4.931 | 32.08 / 33.60 |
+
+Get 并行筛选相对本轮原筛选约快 2.40× / 2.44×，但仍比 V3 的独立 Dispatch
+慢约 25% / 20%，不宣称已追平 V3。Put 相对改进后的 Get，8K 延迟高约 6.5%，
+20K 约 1.1%，后者应视为基本持平。独立计算的带宽 p50 在 20K 顺序略有不同；
+这点小差别不构成选择 Put 的证据。
+
+七次 formal 启动均两机 exit0，使用同一 library hash。
+672 个 rank/sample 输出逐位一致，各方案校验输出 hash 完全相同；
+所有 token/route/gate trace 与前轮 V3 对照一致。
+每个计时样本的跨机 payload 与路由预期一致。616 次节点时钟观测全为
+1620MHz；第一轮探针另有 436 次观测，也全为 1620MHz。
+测试结束后两机 16 张 GPU 均 0MiB。
+
+[第二轮逐 rank 原始结果与复测归档](../benchmarks/dispatch_forwarding_20261010.json)。
+源码与 runner 保存在上述实验分支，不合并实验开关到生产主路径。
+复现第二轮（在实验 worktree 中，label 需唯一）：
+
+```bash
+/opt/.venv/bin/python benchmarks/build_communication_phases.py borrow \
+  --output build/communication_phases_v2
+/opt/.venv/bin/python benchmarks/run_dispatch_diagnosis.py bulk coop_bulk \
+  --artifact build/communication_phases_v2/borrow --tag get_new --master-port 32130
+/opt/.venv/bin/python benchmarks/run_dispatch_diagnosis.py bulk coop_bulk --push \
+  --artifact build/communication_phases_v2/borrow --tag put_new --master-port 32132
+```
+
+第一轮在 `67b146f` native artifact 上使用 runner 的 `--profile`，
+模式为 `bulk skip vector skip_local skip_remote`；跳过拷贝三组不做数值验证。
+后续 native 修改使代码布局不同，不应把重编译的新库冒充第一轮旧库。
