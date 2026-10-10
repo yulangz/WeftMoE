@@ -3,6 +3,13 @@
 本轮目标是分别测量通信阶段，不再用 Dispatch、Return 同时运行的区间
 分别计算两个“独立阶段”的带宽。生产默认配置不变。
 
+**后续最终保留的精简候选**：仅将借用 warp 的路由筛选并行化。
+真实 GEMM 两轮复测，8K/20K kernel 从 **12.211/24.828ms →
+10.919/23.505ms**，延迟降低 **10.6%/5.3%**。代码 `8c47a46`，
+在 `experiment/pf-dispatch-optimized-20261010`；本主分支只同步记录，
+尚未切换生产默认。没有合入双 staging、探针、payload-skip 等消融代码。
+独立 Dispatch 的进一步优化没有获得明确的融合收益，详见文末。
+
 后续借用 warp 消融已定位主要原因：单 lane 串行筛选转发路由。
 保留 Get + bulk copy，仅改为 warp 并行筛选，独立 Dispatch 约
 6.29/14.37 → 2.63/5.94 ms（8K/20K）。pack+Put 没有明确额外收益。
@@ -409,3 +416,58 @@ Dispatch，并没有获得明确额外的融合收益；批量 ready 还略有�
 清理该次 rendezvous 后改用预检空闲的 25020–25024；失败启动单独归档。
 SASS 保持每 K64 四条 N256 WGMMA 后统一等待，新 helper 均无 ptxas spill。
 [融合入口原始数据](../benchmarks/dispatch_fused_20261010.json)。
+
+## 精简候选：冻结旧库与新库复测
+
+代码从借用版 `9123f30` 单独提取，提交 `8c47a46`，只有
+`network_workers.cuh` 的 58 行增加、16 行删除。通过原来的
+`WEFTMOE_PF_BORROW_ALL_CTA` 编译条件启用，无新增运行时开关。
+跨机 Get、Return Put、packet/ring 容量、warp 数、208/88 配额均不变。
+ready 在行 bulk write 完成之后发布；packet 全部 fanout 结束后才归还 RX credit。
+没有引入动态任务领取。
+
+新库在 `../WeftMoE-experiments/dispatch-optimized-20261010/build/optimized/borrow`；
+对照直接使用借用实验中冻结的 `borrow-warp-20261010/build/borrow/gemm88`，
+不是重新编译后标成旧版本。原库源码 `9123f30`，新库源码 `8c47a46`；
+launch manifest 的 source_commit 属于启动脚本 worktree，不能混作这两个
+native artifact 的源码版本，library/adapter hash 另外记录。
+
+按旧→新→新→旧串行运行，两轮 p50 取均值。正式测量期间无编译。
+EP16、Flash H4096/I2048/E256/K6、SM1620MHz、真实随机 token/route、
+prime32/warm8/sample24，口径与前文一致。均为 inference，不缓存训练中间结果。
+
+| 实现 | 8K kernel ms | 20K kernel ms | 8K eager ms | 20K eager ms |
+|---|---:|---:|---:|---:|
+| 冻结旧借用版 | 12.211 | 24.828 | 12.423 | 25.120 |
+| 精简并行筛选 | **10.919** | **23.505** | **11.192** | **23.737** |
+| kernel 延迟降低 | **10.6%** | **5.3%** | — | — |
+
+逐轮 kernel：旧 12.195/24.914、12.228/24.742ms；
+新 10.924/23.521、10.914/23.488ms。精简库比上面的多模式实验库略慢，
+不追逐这一小差别带来的编译布局影响；以这个实际保留版本的数据作为最终结果。
+
+四轮的完整 token/route/gate trace 相同，也与阶段消融的 trace 相同；
+384 个 rank/sample 正确，旧新输出 hash 逐位相同，workspace 字节数完全一致。
+364 次节点时钟观测全为 1620MHz。另以 B128、bias8 做 8K/20K 各 3 步
+强偏斜验证，共 96 个 rank/sample；最大 relative-L2 7.83e-5 以下，
+84 次节点时钟观测全为 1620MHz。五次启动均两机 exit0，结束后全部 GPU 0MiB。
+压力测试只检查正确性/slot 复用，不把其 3 个样本作为正式性能结论。
+
+资源审计：新 pull 函数 stack/spill 为零；入口 spill store/load 56/48B、
+Get 252/384B、Put 136/276B，累计 stack336B，与旧借用版这些指标相同。
+shared memory 仍 222KiB，未增加显存。每 K64 仍四条 N256 WGMMA 后统一 wait。
+单机 PF kernel 的资源统计及 normalized SASS hash 与旧库完全相同
+（`bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce`）。
+本轮未把双机结果外推为更多节点或其它模型 shape 的性能保证。
+
+- [冻结旧库/精简新库逐轮数据](../benchmarks/dispatch_clean_20261010.json)
+- [B128/bias8 复用压力验证](../benchmarks/dispatch_clean_stress_20261010.json)
+
+### 当前边界
+
+尚未追平 V3 的独立 Dispatch。实验双 4KiB stage 把差距缩至约 10%/13%，
+但完整 MoE 没有随之加速，因此未为这项单测收益增加正式实现复杂度。
+精简候选没有单独加入分阶段诊断入口，不能用双 stage 的带宽数字代替它。
+也没有本轮 V3 真实 GEMM 的同口径结果，不据此声称完整 PF 已击败 V3。
+下一步更应分析融合入口的 FC1/FC2 等待、Return 与 admission 时序，
+而不是继续仅凭独立 Dispatch 数字切换 Get/Put 或增加 staging。
