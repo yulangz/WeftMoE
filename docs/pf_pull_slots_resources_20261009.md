@@ -1,5 +1,7 @@
 # PF pull warp、channel 容量与 WG3 资源审计（2026-10-09）
 
+后续：[每 CTA 实际借用一个 pull warp 的双机验证](pf_borrow_warp_20261010.md)。
+
 单机 3→2 pull warp：8K 无变化，20K 快约 1.4%，本轮未见性能回退。
 全 CTA 从16降到4 slot，每卡省2.32GiB，原2.53GiB增量只剩约216MiB，
 8K/20K带宽保持，不需要减少网络 owner。

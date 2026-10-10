@@ -1,0 +1,288 @@
+{
+  "schema": 1,
+  "nvcc_flags": {
+    "copy80": "-lineinfo -Xptxas=-v,--warn-on-spills -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/borrow-warp-20261010/configs/pf_network_l132_20261009 -DWEFTMOE_PF_NETWORK_WORKERS=1 -DWEFTMOE_PF_BORROW_ALL_CTA=1 -DWEFTMOE_PF_BORROW_CONTROL_REGISTERS=80 -DWEFTMOE_PF_COMMUNICATION_COPY=1",
+    "copy88": "-lineinfo -Xptxas=-v,--warn-on-spills -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/borrow-warp-20261010/configs/pf_network_l132_20261009 -DWEFTMOE_PF_NETWORK_WORKERS=1 -DWEFTMOE_PF_BORROW_ALL_CTA=1 -DWEFTMOE_PF_BORROW_CONTROL_REGISTERS=88 -DWEFTMOE_PF_COMMUNICATION_COPY=1",
+    "gemm88": "-lineinfo -Xptxas=-v,--warn-on-spills -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/borrow-warp-20261010/configs/pf_network_l132_20261009 -DWEFTMOE_PF_NETWORK_WORKERS=1 -DWEFTMOE_PF_BORROW_ALL_CTA=1 -DWEFTMOE_PF_BORROW_CONTROL_REGISTERS=88 -DWEFTMOE_PF_COMMUNICATION_COPY=0",
+    "wg3gemm": "-lineinfo -Xptxas=-v,--warn-on-spills -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE-experiments/borrow-warp-20261010/configs/pf_network_l132_20261009 -DWEFTMOE_PF_NETWORK_WORKERS=2 -DWEFTMOE_PF_WG3_ALL_CTA=1 -DWEFTMOE_PF_WG3_MATH_REGISTERS=192 -DWEFTMOE_PF_WG3_LOCAL_REGISTERS=64 -DWEFTMOE_PF_WG3_NETWORK_REGISTERS=64 -DWEFTMOE_PF_COMMUNICATION_COPY=0"
+  },
+  "source_commit": "9123f3044e8739bca1fe3d72b691d0a420109514",
+  "note": "ptxas static spill-byte statistics are not dynamic traffic. Generic atomic local fallback and inactive GIN backends contribute many static LDL/STL instructions.",
+  "variants": {
+    "copy80": {
+      "sass": {
+        "network": {
+          "registers": 168,
+          "stack_bytes": 344,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 34112,
+          "normalized_sha256": "fdcac47d80ed2e46f115f5fda5f4deb888cd7fc5f709fff813c345e769e2f1a5",
+          "hgmma": [],
+          "wait": [],
+          "local_loads": 1249,
+          "local_stores": 640
+        },
+        "local": {
+          "registers": 168,
+          "stack_bytes": 0,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 10536,
+          "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+          "hgmma": [
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 54,
+          "local_stores": 6
+        }
+      },
+      "ptxas_spill_warnings": {
+        "kernel": {
+          "store_bytes": 12,
+          "load_bytes": 12,
+          "symbol": "_ZN7weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network6kernelENS1_17ForwardKernelArgsE14CUtensorMap_stS5_S5_S5_S5_"
+        },
+        "progress": {
+          "store_bytes": 4,
+          "load_bytes": 8,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8progressERKNS2_17ForwardKernelArgsEj"
+        },
+        "put": {
+          "store_bytes": 144,
+          "load_bytes": 328,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb0EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        },
+        "get": {
+          "store_bytes": 256,
+          "load_bytes": 484,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb1EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        }
+      },
+      "build_log_sha256": "7ed920ee61deae705096db87327c4de43b9f666c7d1f967b586251638d95bca6",
+      "library_sha256": "64d7f0b6ec6525cf4e17ee98e795334f52fe48d0badeadddf5738d5e79e38030",
+      "shared_bytes": 227328
+    },
+    "copy88": {
+      "sass": {
+        "network": {
+          "registers": 168,
+          "stack_bytes": 320,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 34096,
+          "normalized_sha256": "e9d26cd5aa2652f9be10752b058b017e3ab4bd17836704e839e9a6b0f9dd1d7c",
+          "hgmma": [],
+          "wait": [],
+          "local_loads": 1210,
+          "local_stores": 627
+        },
+        "local": {
+          "registers": 168,
+          "stack_bytes": 0,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 10536,
+          "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+          "hgmma": [
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 54,
+          "local_stores": 6
+        }
+      },
+      "ptxas_spill_warnings": {
+        "kernel": {
+          "store_bytes": 12,
+          "load_bytes": 12,
+          "symbol": "_ZN7weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network6kernelENS1_17ForwardKernelArgsE14CUtensorMap_stS5_S5_S5_S5_"
+        },
+        "progress": {
+          "store_bytes": 4,
+          "load_bytes": 8,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8progressERKNS2_17ForwardKernelArgsEj"
+        },
+        "put": {
+          "store_bytes": 116,
+          "load_bytes": 236,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb0EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        },
+        "get": {
+          "store_bytes": 204,
+          "load_bytes": 316,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb1EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        }
+      },
+      "build_log_sha256": "492c1a3a18dd994dcf2fcf8b4fe99deb64791d95308d7cd3f2e23d2ae41eaaf0",
+      "library_sha256": "7ca129baae921a53ebab4f987d8701e141dd192ccf25692908a91b5d4142033b",
+      "shared_bytes": 227328
+    },
+    "gemm88": {
+      "sass": {
+        "network": {
+          "registers": 168,
+          "stack_bytes": 336,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 37720,
+          "normalized_sha256": "49e6c808599f5a3936bf03c6dadd28f7cdc2b107a072e78d84c483ebbae04e57",
+          "hgmma": [
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR12], R24, UP0;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR12], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR12], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR12], R24, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 1209,
+          "local_stores": 643
+        },
+        "local": {
+          "registers": 168,
+          "stack_bytes": 0,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 10536,
+          "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+          "hgmma": [
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 54,
+          "local_stores": 6
+        }
+      },
+      "ptxas_spill_warnings": {
+        "kernel": {
+          "store_bytes": 56,
+          "load_bytes": 48,
+          "symbol": "_ZN7weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network6kernelENS1_17ForwardKernelArgsE14CUtensorMap_stS5_S5_S5_S5_"
+        },
+        "prepare": {
+          "store_bytes": 4,
+          "load_bytes": 4,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf4ring7prepareILb1ELb0ELj384EEEvRKNS2_17ForwardKernelArgsEPh"
+        },
+        "put": {
+          "store_bytes": 136,
+          "load_bytes": 276,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb0EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        },
+        "get": {
+          "store_bytes": 252,
+          "load_bytes": 384,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb1EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        }
+      },
+      "build_log_sha256": "da1cdf0f694fe70177b571413c696a34da3f6dd38721e4931a7e454cdd582b81",
+      "library_sha256": "2512666b78b82373f5a23d700885be368d64f36018a7fb094719982e7b9214e1",
+      "shared_bytes": 227328
+    },
+    "wg3gemm": {
+      "sass": {
+        "network": {
+          "registers": 128,
+          "stack_bytes": 456,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 38648,
+          "normalized_sha256": "14c03ed46d3670a98337d3cb6398dc7f8166e767cf609cb64b7a42ba2350ac5a",
+          "hgmma": [
+            "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24, UP0;",
+            "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88, UP0;",
+            "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+            "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88;",
+            "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+            "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88;",
+            "HGMMA.64x128x16.F32.BF16 R24, gdesc[UR8], R24;",
+            "HGMMA.64x128x16.F32.BF16 R88, gdesc[UR8], R88, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 1455,
+          "local_stores": 794
+        },
+        "local": {
+          "registers": 168,
+          "stack_bytes": 0,
+          "static_shared_bytes": 1024,
+          "local_bytes": 0,
+          "instructions": 10536,
+          "normalized_sha256": "bf19584d6850f36af1e0506f91d5e4741c6b858f89ed0a39a346c9291f7204ce",
+          "hgmma": [
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, UP0;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24;",
+            "HGMMA.64x256x16.F32.BF16 R24, gdesc[UR4], R24, gsb0;"
+          ],
+          "wait": [
+            "WARPGROUP.DEPBAR.LE gsb0, 0x0;"
+          ],
+          "local_loads": 54,
+          "local_stores": 6
+        }
+      },
+      "ptxas_spill_warnings": {
+        "kernel": {
+          "store_bytes": 144,
+          "load_bytes": 140,
+          "symbol": "_ZN7weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network6kernelENS1_17ForwardKernelArgsE14CUtensorMap_stS5_S5_S5_S5_"
+        },
+        "prepare": {
+          "store_bytes": 4,
+          "load_bytes": 4,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf4ring7prepareILb1ELb0ELj512EEEvRKNS2_17ForwardKernelArgsEPh"
+        },
+        "put": {
+          "store_bytes": 476,
+          "load_bytes": 804,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb0EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        },
+        "get": {
+          "store_bytes": 560,
+          "load_bytes": 1016,
+          "symbol": "_ZN54_INTERNAL_f022019e_23_activation_transport_cu_e02dfe447weftmoe4cuda56_GLOBAL__N__f022019e_23_activation_transport_cu_e02dfe4410weftmoe_pf7network8transferILb1EEEvRKNS2_17ForwardKernelArgsEPNS4_7PendingEj"
+        }
+      },
+      "build_log_sha256": "70fa5f792c4a12c788300eba7d99faa54d501b9535ef8b587f22de2a47abbc67",
+      "library_sha256": "481581779713c6d11b40c538c78e6e33405690188bbc9a401a4f5b40da9f994d",
+      "shared_bytes": 232448
+    }
+  },
+  "gemm88_hot_k": {
+    "instruction_address_ranges": [
+      [
+        "0x3560",
+        "0x3e10"
+      ],
+      [
+        "0x1bd60",
+        "0x1bdb0"
+      ]
+    ],
+    "hgmma": 4,
+    "n": 256,
+    "wait_group": 0,
+    "LDL": 0,
+    "STL": 0
+  }
+}
