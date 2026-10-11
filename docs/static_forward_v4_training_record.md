@@ -1,5 +1,19 @@
 # V4 ring 训练对接记录
 
+## 2026-10-11：含训练缓存的 FWD 与 Megatron 同口径配对
+
+单机 EP8 的 8K/20K，包含 mini-notify、缓存申请/写出和每次权重重排的
+FWD 为 **8.222/18.786 ms**，Megatron + DeepEP 为 **9.502/20.722 ms**，
+PF 快 **13.46%/9.34%**。双机 EP16 则为 **16.722/34.152 ms** 对
+**12.705/28.398 ms**，PF 慢 **31.62%/20.26%**。两轮正反序、同随机
+trace，全部 GPU 锁频 1620 MHz；主指标是缓存仍存活时的完整 FWD wall。
+
+关键限制：新借用 warp 网络主核的 eligibility 排除了训练缓存，EP16
+实测走旧 `weftmoe_pf::kernel<false, true, false, true>`；EP8 仍走新 local
+main。因此不能将双机差值归因为新推理主核的纯缓存写出成本。
+本轮未改 CUDA，未报告 BWD 性能。计时范围、权重准备消融、完整释放口径、
+正确性与入口 trace 见 [详细记录](pf_cached_fwd_20261011.md)。
+
 ## 2026-10-09：FC2 寄存器 128-bit 直写消融，不采纳
 
 **当前 FC2 已是 shared → 128-bit vector 写出。** 本轮只测试单机 PF

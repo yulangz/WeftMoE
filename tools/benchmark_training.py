@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Eager FWD+BWD with varying per-rank tokens and synthetic routes (torchrun).
+"""Eager training FWD(+BWD) with varying tokens and synthetic routes (torchrun).
 
 Input preparation is untimed. This exercises changing communication sizes, not
 a full training step: expert weights are fixed and there is no optimizer.
+Forward-only retains X/GU until device completion and reports both cache-ready
+and release-inclusive wall time. Default PF timing includes weight packing.
 """
 
 import argparse
@@ -78,6 +80,12 @@ def main():
                         help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
     parser.add_argument("--verify", action="store_true",
                         help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
+    parser.add_argument("--forward-only", action="store_true",
+                        help="Time training forward with saved X/GU, tape release and synchronize, without backward")
+    parser.add_argument("--prepared-weights", action="store_true",
+                        help="Reuse immutable PF weights; default includes per-call packing as in training")
+    parser.add_argument("--trace-kernels", action="store_true",
+                        help="Record CUDA entries during the first numerical check, outside performance runs")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -88,6 +96,10 @@ def main():
     parser.add_argument("--route-distribution", choices=("random", "balanced"), default="random",
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
     args = parser.parse_args()
+    if args.prepared_weights and (args.backend != "pf" or not args.forward_only):
+        parser.error("--prepared-weights requires --backend pf --forward-only")
+    if args.trace_kernels and not args.verify:
+        parser.error("--trace-kernels requires --verify")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
     if not 1 <= args.top_k <= args.experts:
@@ -152,7 +164,18 @@ def main():
             from benchmarks.training_reference import verify_step
             for step, (cpu_routes, cpu_gates) in enumerate(batches):
                 x, dy = rand(cpu_routes.shape[0], args.hidden), rand(cpu_routes.shape[0], args.hidden)
+                probe = None
+                if args.trace_kernels and step == 0:
+                    probe = torch.profiler.profile(activities=[
+                        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+                    probe.start()
                 errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy)
+                if probe is not None:
+                    probe.stop()
+                    kernels = sorted({event.name for event in probe.events()
+                                      if event.device_type == torch.autograd.DeviceType.CUDA})
+                    print("TRAINING_KERNEL_JSON " + json.dumps(dict(
+                        rank=rank, tokens=tokens, kernels=kernels)), flush=True)
                 per_rank_errors = [None] * world
                 dist.all_gather_object(per_rank_errors, errors)
                 if rank == 0:
@@ -163,6 +186,8 @@ def main():
             continue
         samples = []
         forward_samples = []
+        forward_ready_samples = []
+        measurement_intervals_ns = []
         priming_steps = len(batches) if args.prime_trace else 0
         input_rng_state = generator.get_state()
         compile_graphs_before = 0
@@ -175,26 +200,45 @@ def main():
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
             dist.barrier()
             torch.cuda.synchronize()
+            interval_start = time.time_ns()
             start = time.perf_counter_ns()
-            tape = runtime.forward(x, routes, gates, w1, w2)
+            if args.prepared_weights:
+                runtime._check(x, routes, gates, w1, w2)
+                tape = runtime.native.forward(x, routes, gates, w1, w2, layer=0)
+            else:
+                tape = runtime.forward(x, routes, gates, w1, w2)
             forward_end = time.perf_counter_ns()
-            gradients = runtime.backward(tape, dy)
-            del tape, gradients
+            if args.forward_only:
+                # Keep the checkpoint alive until it is usable by Backward.
+                torch.cuda.synchronize()
+                forward_ready_us = (time.perf_counter_ns() - start) / 1000
+            else:
+                gradients = runtime.backward(tape, dy)
+                del gradients
+            del tape
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - start) / 1000
             if iteration >= priming_steps + args.warmups:
                 samples.append(elapsed)
                 forward_samples.append((forward_end - start) / 1000)
+                if args.forward_only:
+                    forward_ready_samples.append(forward_ready_us)
+                measurement_intervals_ns.append((interval_start, time.time_ns()))
             del x, dy, routes, gates
         per_rank = [None] * world
         dist.all_gather_object(per_rank, samples)
         forward_per_rank = [None] * world
         dist.all_gather_object(forward_per_rank, forward_samples)
+        ready_per_rank = [None] * world
+        dist.all_gather_object(ready_per_rank, forward_ready_samples)
+        intervals_per_rank = [None] * world
+        dist.all_gather_object(intervals_per_rank, measurement_intervals_ns)
         compile_graphs = None
         if args.backend == "megatron":
             compile_graphs = [None] * world
             dist.all_gather_object(compile_graphs,
                 torch._dynamo.utils.counters["stats"]["unique_graphs"] - compile_graphs_before)
+            assert not any(compile_graphs), compile_graphs
         workspace = [None] * world
         dist.all_gather_object(workspace, runtime.native.usage() if args.backend != "megatron" else None)
         if rank == 0:
@@ -222,14 +266,23 @@ def main():
                 experts=args.experts, top_k=args.top_k, hidden=args.hidden,
                 intermediate=args.intermediate, warmups=args.warmups,
                 priming_steps=priming_steps, compiled_graphs_during_measurement=compile_graphs,
+                forward_only=args.forward_only, weights_prepared_once=args.prepared_weights,
                 samples=args.samples, wall_slowest_rank_p50_us=statistics.median(slowest),
+                forward_ready_slowest_rank_p50_us=(statistics.median(
+                    map(max, zip(*ready_per_rank))) if args.forward_only else None),
+                per_rank_forward_ready_us=ready_per_rank,
+                forward_ready_timing_scope=("eager training forward + device synchronize; checkpoint still live"
+                                            if args.forward_only else None),
                 forward_slowest_rank_p50_us=statistics.median(
                     max(row[i] for row in forward_per_rank) for i in range(args.samples)),
-                backward_slowest_rank_p50_us=statistics.median(
+                backward_slowest_rank_p50_us=None if args.forward_only else statistics.median(
                     max(per_rank[r][i] - forward_per_rank[r][i] for r in range(world))
                     for i in range(args.samples)),
                 wall_slowest_rank_samples_us=slowest, per_rank_wall_us=per_rank,
-                measurement_scope="eager forward+backward+release+device synchronize; input preparation excluded",
+                measurement_intervals_ns_per_rank=intervals_per_rank,
+                measurement_scope=("eager training forward+release+device synchronize; input preparation excluded"
+                                   if args.forward_only else
+                                   "eager forward+backward+release+device synchronize; input preparation excluded"),
                 forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
                 checkpoint="routed X + FC1 gate/up; recompute gated SwiGLU in backward",
                 implementation=getattr(runtime, "metadata", {}),
