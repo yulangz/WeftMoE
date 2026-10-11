@@ -1,5 +1,16 @@
 # V4 ring 训练对接记录
 
+## 2026-10-11：借用 warp 多机主核接通训练缓存
+
+`d69dbab` 将已有 canonical row planner、X/GU 保存接入保留的借用 warp
+network main，不改 BWD 或 GEMM 超参。EP16 缓存 FWD 8K/20K 为
+**12.625/25.919 ms**，相对同期旧 PF **16.797/34.103 ms**，耗时降低
+**24.84%/24.00%**；Megatron `moe_act` 为 **12.559/28.309 ms**，8K 接近
+（PF 慢 0.53%）、20K PF 快 **8.44%**。计入逐调用权重重排，双轮正反序、
+全卡 1620MHz，正常及强偏斜路由的输出/四组梯度全部通过。
+代码在 `experiment/pf-borrow-training-20261011`，本轮未合并整条网络实验
+分支或报告 BWD 性能。见[实现与完整结果](pf_borrow_training_20261011.md)。
+
 ## 2026-10-11：含训练缓存的 FWD 与 Megatron 同口径配对
 
 单机 EP8 的 8K/20K，包含 mini-notify、缓存申请/写出和每次权重重排的
