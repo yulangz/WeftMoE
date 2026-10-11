@@ -1,6 +1,8 @@
 # PF pull warp、channel 容量与 WG3 资源审计（2026-10-09）
 
 后续：[每 CTA 实际借用一个 pull warp 的双机验证](pf_borrow_warp_20261010.md)。
+进一步 [2→1 个 pull warp 与第二个 RDMA warp 消融](pf_warp_budget_20261011.md)：
+单机 20K 慢约 1.8%；新增 RDMA worker 未带来完整收益，仍保留两个 pull。
 
 单机 3→2 pull warp：8K 无变化，20K 快约 1.4%，本轮未见性能回退。
 全 CTA 从16降到4 slot，每卡省2.32GiB，原2.53GiB增量只剩约216MiB，
