@@ -110,6 +110,8 @@ def main():
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--verify-kernel", action="store_true",
                         help="During verification, trace the first call and require the selected PF/DT entry")
+    parser.add_argument("--trace-stage-kernels", action="store_true",
+                        help="Separately profile single-node PF inference notify/main CUDA durations")
     parser.add_argument("--profile-device", action="store_true",
                         help="Also report PF's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
     parser.add_argument("--graph-replays", type=int, default=0,
@@ -119,6 +121,9 @@ def main():
     parser.add_argument("--forward-cache", choices=("off", "on"),
                         help="PF forward-only cache experiment; both modes use the same native tape API")
     args = parser.parse_args()
+    if args.trace_stage_kernels and (args.backend != "pf" or args.verify or
+                                    args.forward_cache or args.graph_replays):
+        parser.error("--trace-stage-kernels requires eager PF inference without verification")
     if args.forward_cache and (args.backend != "pf" or args.profile_device):
         parser.error("--forward-cache requires PF without --profile-device")
     if args.verify_kernel and (not args.verify or args.backend not in ("pf", "dt")):
@@ -187,6 +192,7 @@ def main():
         measurement_intervals_ns = []
         kernel_names = []
         output_sha256 = []
+        stage_probe = None
         graph = None
         if args.graph_replays:
             graph_x = torch.empty(nominal, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -198,6 +204,9 @@ def main():
         rng_state = generator.get_state()
         priming = 0 if args.verify else len(batches)
         for step, (cpu_routes, cpu_gates) in enumerate(batches * (1 if args.verify else 2)):
+            if args.trace_stage_kernels and step == priming + args.warmups:
+                stage_probe = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                stage_probe.start()
             if step == priming:
                 generator.set_state(rng_state)
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
@@ -265,6 +274,8 @@ def main():
                                    else "weftmoe_pf::network::kernel") if args.backend == "pf"
                                   else "weftmoe_dt::kernel")
                 assert any(expected_entry in name for name in kernel_names), kernel_names
+                if os.environ.get("WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY"):
+                    assert any("local::inference_notify_kernel" in name for name in kernel_names), kernel_names
             if args.verify:
                 expected = reference(x, routes, gates, w1, w2).float()
                 delta = output.float() - expected
@@ -290,12 +301,27 @@ def main():
                     if args.profile_device and args.backend != "megamoe":
                         device_phases.append({key: value for key, value in profile.items()
                                               if key != "output"})
+        stage_kernels = {}
+        if stage_probe is not None:
+            stage_probe.stop()
+            split = "WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY" in os.environ
+            for label, name, count in (
+                ("notify", "local::inference_notify_kernel", args.samples if split else 0),
+                ("main", "weftmoe_pf::local::kernel", args.samples),
+                ("mini_notify", "training_count_notify_kernel", 0),
+            ):
+                events = sorted((event for event in stage_probe.events()
+                                 if event.device_type == torch.autograd.DeviceType.CUDA
+                                 and name in event.name), key=lambda event: event.time_range.start)
+                assert len(events) == count, (label, len(events), count)
+                stage_kernels[label] = [event.time_range.elapsed_us() for event in events]
         records = [None] * world
         dist.all_gather_object(records, dict(samples_us=samples,
                                             device_samples_us=device_samples,
                                             measurement_intervals_ns=measurement_intervals_ns,
                                             device_phases=device_phases, errors=errors,
                                             kernel_names=kernel_names,
+                                            stage_kernels_us=stage_kernels,
                                             output_sha256=output_sha256))
         workspace = (runtime.native.usage() if args.backend != "megamoe"
                      else dict(symm_bytes=buffer.buffer.nbytes, ring_tokens=buffer.num_ring_tokens))
@@ -322,7 +348,7 @@ def main():
                     if device_samples else None),
                 device_scope=("CUDA graph events divided by graph_replays; includes fused source staging; excludes external input updates and preparation"
                               if args.graph_replays else
-                              "PF/DT: native fused-kernel clock; MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
+                              "PF/DT: native device envelope (split PF includes notify and launch gap); MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
                               if args.profile_device else None),
                 megamoe_buffer_mib=args.megamoe_buffer_mib,
                 megamoe_minimum_ring=args.megamoe_minimum_ring,
