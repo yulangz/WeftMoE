@@ -3,9 +3,6 @@
 #include "cuda/weftmoe_pf/local_schedule.cuh"
 
 namespace weftmoe_pf::local {
-#ifndef WEFTMOE_PF_FWD_WEIGHT_CACHE
-#define WEFTMOE_PF_FWD_WEIGHT_CACHE cute::TMA::CacheHintSm90::EVICT_NORMAL
-#endif
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
 
 template <class Scheduler = Schedule, bool Network = false>
@@ -45,8 +42,7 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
                                        s.a[stage], k, t.row, 2U);
         hopper::tma_load<kK, kN, 128U>(t.fc2 ? &w2_map : &w1_map,
                                        &s.full[stage], s.b[stage], k,
-                                       t.expert * columns + t.column * kN, 1U,
-                                       static_cast<uint64_t>(WEFTMOE_PF_FWD_WEIGHT_CACHE));
+                                       t.expert * columns + t.column * kN);
         s.full[stage].arrive_and_expect_tx((kM + kN) * kK * 2U);
       }
       stage = stage + 1U == kStages ? 0U : stage + 1U;
