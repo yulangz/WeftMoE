@@ -3,6 +3,101 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M5：当前 GEMM 参数的 autotune
+
+原生源码保持 `e4db718`，固定当前 FWD、通信协议、M128 canonical 行、
+184/136 寄存器配额和 wave128。新增
+`configs/pf_backward_stream_autotune.json`，复用训练 autotuner，搜索
+dU/dX 各自的 N、共用的 activation stages，以及 dW1/dW2 共用的
+M/N/stages。不混入会切回旧 kernel 的 activation K128，也不搜索
+已经不作用于新 stream 的旧 return knobs。
+
+测试为双机 EP16、Flash H4096/I2048/E256/top6、8K/20K，B2048/D2，
+正态长度波动 10%、路由偏置 std=0.5、seed=123；请求时钟 1620 MHz。
+每个候选完整 prime trace，再 4 warmups / 16 samples；比 M3/M4 的
+8 samples 更多，因此只能与本轮同 trace 基线比较。完整周期包含
+每调用重排、缓存分配/释放和 device synchronize，不计首次固定池准备。
+
+初筛完整 FWD+BWD wall p50，单位 ms：
+
+| 候选（仅列相对基线的变化） | 8K | 20K |
+|---|---:|---:|
+| 基线：dU/dX/dW M128/N256/K64，三级流水 | 33.101 | 77.767 |
+| dW M256/N128 | 33.504 | 78.258 |
+| dW M128/N128 | 37.465 | 88.181 |
+| dW 两级流水 | 34.735 | 80.887 |
+| dU N128 | 33.760 | 79.416 |
+| dX N128 | 34.490 | 81.231 |
+| dU/dX 都用 N128 | 34.974 | 82.926 |
+| dU/dX 两级流水 | 34.405 | 79.250 |
+| dU/dX 四级流水 | 33.587 | 78.819 |
+
+另一个候选 dW M128/N256 四级流水因 shared memory 超限，在编译前过滤。
+没有 C7507/C7512/C7518；dW M256/N128 和 dW 两级流水分别产生主 kernel
+40/68 B、40/228 B 的静态 spill store/load，其他候选主 kernel 均为零。
+不能据此给 spill 单独归因，因为它们同时改变了 tile 或流水深度。
+
+小 tile 没有提高当前 384-thread/168 初始寄存器配额下的驻留 CTA 数。
+仅计单个 tile 的输入、不计输出或跨 tile 复用时，BF16 GEMM 的算术强度为
+`M*N/(M+N)` FLOPs/byte；M128/N256 为 85.3，M128/N128 为 64。
+这给出了小 N 降低数据复用的一个解释，但不是实际 HBM 流量测量或
+完整的瓶颈证明。M256/N128 理论强度相同，仍需用实测决定。
+
+正反顺序各复测一次，两个 rank-max p50 的均值：
+
+| 入围配置 | 8K / ms | 20K / ms |
+|---|---:|---:|
+| 原参数 | 33.096 | 77.722 |
+| dW M256/N128 | 33.244 | 77.635 |
+
+原参数的等权几何平均分仍最好，选择结果为 `incumbent_fastest`；
+不是把不足 1% 的差异包装成收益。最终保留所有原生 GEMM 默认值，
+没有修改 FWD/DT 的参数或算法。两个入围配置均通过 129-token 两轮
+数值验证，保留版还通过 8K/20K 各两轮验证（output/dX/dr/dW1/dW2）。
+这是本轮有限搜索空间的负结果，不表示四个 GEMM 已经全局最优；
+dW1/dW2 仍共享几何/stages，本轮没有独立调参，也未改变单机参数。
+单机性能没有在本轮独立搜索，不能将这组双机结论外推为 EP8 最优。
+
+保留版最后一次完整周期为 **32.934 / 77.736 ms**，BWD host API 边界
+为 **20.682 / 49.019 ms**，后者不是独立的 GPU kernel event 时间。
+最终 8K/20K 验证最大 relative L2 为 0.000110；本轮现有 Python 回归
+117 tests / 470 subtests 通过，没有增加单元测试。
+
+时钟记录覆盖两节点，但不是连续逐 kernel 采样。确认轮的 20K 计时内，
+原参数观测到 5 个 1455–1545 MHz 点，挑战者观测到 1 个 1560 MHz 点；
+最后一次 20K sample 1 观测到 3 个 1530–1590 MHz 点。没有删除这些样本，
+不能称全程严格恒频，也不能认定两候选约 0.17% 的综合差异有统计意义。
+计时内采到的 HBM 频率均为 3201 MHz；部分短测量区间没有时钟采样点。
+因此结论是“没有确认收益，保留原参数”，不是“已证明原参数全局最优”。
+
+原始计划、编译、逐 rank 计时/验证日志和自动选择结果在
+`build/pf_backward_tune_20261012/network/`；各候选共享同一 trace hash。
+`table.json` 已导出保留参数的两个容量表项，`clocks.json` 保留全部时钟点。
+紧凑结果见 `benchmarks/pf_backward_20261012.json` 的 `gemm_autotune_m5`。
+通用命令和当前参数边界见 [autotune 说明](autotune.md)。
+
+## Return helper 的剩余 spill（后续核查）
+
+`return_canonical` 是 BWD main 内的 device helper，不是额外的 kernel。
+它由 48 个静态 return owner 的借用通信 warp 的 lane0 执行：
+等一个 M-block 的全部 dX N tiles 完成，把相邻 source/contribution 行
+合并为 fragment；远端行通过两次 GIN Put 分别发送 BF16 dX 和 FP32
+router gradient，并增加两个远端完成计数。每个 fragment 的本地 NIC
+flush/wait 完成后，整个 block 才能发布 TX returned generation。
+本机行已由 dX epilogue 直接写回，不走这里的跨机 Put。
+这些 owner 与 dW math 并行；慢 return 仍可能通过 TX credit 反压计算，
+所以不能笼统地说“通信路径 spill 不影响性能”。
+
+对 `bwd_ready_final` 的进一步 SASS 检查，报告的 8/8 B 对应
+`STL.64 [R1+0x90]` / `LDL.LU.64 [R1+0x90]`，位于
+NCCL `gin/proxy/gin_proxy.h::postGfd` 的通用地址 atomic 分支。
+`gin_backend_current` 双机运行日志再次确认使用 `GIN_IB_GDAKI`，
+该次执行不进入 proxy backend，因而不执行这对 spill 指令。
+这比“只有 8 B，影响应当很小”更准确；不能把静态报告当成当前热路径的
+动态 local-memory 流量。换 backend 或编译超参后仍需重新检查。
+原始日志在 `build/pf_backward_tune_20261012/backend/`，SASS 在
+`build/pf_backward_20261012/ready_final_spills/`。
+
 ## M4：按预计到达顺序排静态任务
 
 M3 消除了逐窗口 padding，但 expert-major 的第一个 canonical M-block

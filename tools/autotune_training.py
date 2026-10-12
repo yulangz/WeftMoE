@@ -140,7 +140,8 @@ class NativeCompiler:
             header.write_text(content)
         library = directory / "libweftmoe.so"
         log_path = log_dir / (candidate["name"] + ".build.log")
-        env = os.environ | {"NVCCFLAGS": "-lineinfo -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 "
+        env = os.environ | {"NVCCFLAGS": "-lineinfo -Xptxas=-v,--warn-on-spills "
+                           "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 "
                            + shlex.quote("-I" + str(directory))}
         commands = [[sys.executable, "build_native.py", "lib", "--output", str(library),
                      "--jobs", str(command_jobs)],
@@ -179,6 +180,7 @@ class Benchmark:
                if k.startswith(("NCCL_", "UCX_", "CUDA_")) or k == "LD_LIBRARY_PATH"}
         env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1", WEFTMOE_TENSOR_EXTENSION=str(extension),
                    NCCL_DEBUG_FILE=str(self.output / f"{label}.nccl.%h.%p.log"))
+        env.update(spec.get("environment", {}))
         processes, logs, paths = [], [], []
         start = time.monotonic()
         print(f"START {label}", flush=True)

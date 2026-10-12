@@ -1,5 +1,30 @@
 # Forward / Backward autotune
 
+## 当前 PF stream BWD 的 GEMM 搜索（2026-10-12）
+
+`configs/pf_backward_stream_autotune.json` 用于新 BWD：固定 FWD 和通信协议，
+只搜索实际生效的 GEMM 参数。沿用下面的 `tools/autotune_training.py`
+命令，将 `--config` 换为本配置即可；shape 和节点仍由 CLI 传入。
+
+- dU/dX 的 N tile 可分别取 128/256；二者共用 operand ring，stage 数
+  联合比较 2/3/4。本轮 Flash 的 M128、K64 和 cluster N2 保持不变；
+  改 K128 会退出当前 stream kernel，不能混进这次纯调参比较。
+  更换 H/I 时还需确认 `I % (2*DuN) == 0`、`H % (2*DxN) == 0`，
+  否则会退出当前 cluster-N2 stream 路径，不能沿用本轮结论。
+- dW1/dW2 共用 M/N 几何和 stage 数，比较 M128/N256、M256/N128、
+  M128/N128，以及两级/三级流水。四级流水也提出候选，但 M128/N256
+  的 shared memory 超限会被资源检查过滤。
+- 不搜索旧 `dx_claim_tiles` / `return_window_scale`，它们不控制当前
+  canonical stream 的 dX/return；下面旧记录不能当作新实现的调参结论。
+- `environment` 显式固定工作区环境参数，逐节点传入，避免改变 buffer
+  容量后把通信收益误认为 GEMM 收益。配置仍不修改时钟。
+
+保留基线，与候选使用相同变化长度/热点路由 trace，初筛后正反顺序确认，
+数值通过才导出训练表。候选编译日志包含 ptxas 寄存器/spill 报告；
+不能只按静态 spill 字节数排序，需检查执行分支和完整周期性能。
+该配置是有限预算的单参数/耦合组合筛选，不是全部超参的笛卡尔穷举，
+也尚未把 dW1/dW2 的 tile/stages 拆成四套完全独立的 GEMM 配置。
+
 ## PF 动态训练 FWD+BWD 搜索（2026-10-04）
 
 `tools/autotune_training.py` 使用 `configs/pf_training_autotune.json`，按传入

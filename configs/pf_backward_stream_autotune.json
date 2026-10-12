@@ -1,0 +1,45 @@
+{
+  "base_header": "configs/pf_network_l132_20261009/weftmoe_forward_tuning_generated.hpp",
+  "v4": {
+    "network_lanes": 132,
+    "packet_rows": 32,
+    "return_packet_rows": 128,
+    "network_prefill_min_tokens": 0,
+    "local_prefill_streaming": 1,
+    "local_prefill_fast_math": 1
+  },
+  "environment": {
+    "WEFTMOE_PF_MIN_RING_DEPTH": "2",
+    "WEFTMOE_PF_CREDIT_WINDOWS": "2"
+  },
+  "stages": ["backward"],
+  "ring": {
+    "local": [{"window_tokens": 2048, "contribution_windows": 2}],
+    "network": [{"window_tokens": 2048, "contribution_windows": 2}]
+  },
+  "backward": {
+    "variants": [
+      {"backward.dw_tile_m": 256, "backward.dw_tile_n": 128},
+      {"backward.dw_tile_n": 128},
+      {"backward.dw1_stages": 2, "backward.dw2_stages": 2},
+      {"backward.dw1_stages": 4, "backward.dw2_stages": 4},
+      {"backward.dab_tile_n": 128},
+      {"backward.dx_tile_n": 128},
+      {"backward.dab_tile_n": 128, "backward.dx_tile_n": 128},
+      {"backward.dab_stages": 2, "backward.dx_stages": 2},
+      {"backward.dab_stages": 4, "backward.dx_stages": 4}
+    ]
+  },
+  "seed": 123,
+  "token_std_fraction": 0.1,
+  "route_bias_std": 0.5,
+  "screen": {"warmups": 4, "samples": 16},
+  "final": {"warmups": 4, "samples": 16},
+  "confirmation_candidates": 2,
+  "confirmation_repeats": 2,
+  "minimum_improvement_percent": 1.0,
+  "verify_tokens": [129],
+  "verify_samples": 2,
+  "workspace_limit_bytes": 12884901888,
+  "timeout_seconds": 420
+}

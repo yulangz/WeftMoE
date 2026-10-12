@@ -207,5 +207,75 @@
       "python_subtests": 470
     }
   },
-  "status": "M3 removes communication-window GEMM padding and fixes role register allocation. M4 reduces first-GEMM blocking with static readiness ordering. Final EP16 cycle improves 4.9%/6.6% over b151d93, but is only 1.9%/0.1% faster than old PF: no claimed substantial 20K lead."
+  "gemm_autotune_m5": {
+    "native_source_commit": "e4db718",
+    "config": "configs/pf_backward_stream_autotune.json",
+    "raw_directory": "build/pf_backward_tune_20261012/network",
+    "topology": "two-node EP16 only; no EP8 search in this milestone",
+    "tokens_per_rank": [8192, 20480],
+    "window_tokens": 2048,
+    "contribution_windows": 2,
+    "warmups": 4,
+    "samples": 16,
+    "prime_trace": true,
+    "requested_sm_clock_mhz": 1620,
+    "workload": "Gaussian token std fraction 0.1, route bias std 0.5, seed123; identical trace for all candidates",
+    "metric": "Full FWD+BWD+release+synchronize rank-max wall p50; excludes first fixed-pool preparation",
+    "scope": "One-at-a-time/coupled variants, not exhaustive. dU/dX N independent, activation stages coupled, dW1/dW2 M/N/stages coupled. FWD, canonical M128, activation K64, communication, registers and wave128 unchanged.",
+    "legal_candidates": 9,
+    "resource_filtered": "dW M128/N256 stages4 exceeds shared-memory limit",
+    "screen_full_ms": {
+      "incumbent_m128_n256_k64_stages3": [33.101004, 77.767343],
+      "dw_m256_n128": [33.504228, 78.258291],
+      "dw_n128": [37.465454, 88.1812955],
+      "dw_stages2": [34.73529, 80.887379],
+      "du_n128": [33.7600355, 79.41566],
+      "dx_n128": [34.490312, 81.231051],
+      "du_dx_n128": [34.9743245, 82.926169],
+      "activation_stages2": [34.4053515, 79.2503485],
+      "activation_stages4": [33.58677, 78.8188795]
+    },
+    "confirmation_full_ms": {
+      "incumbent": [[33.0427715, 77.7691925], [33.149192, 77.674124]],
+      "dw_m256_n128": [[33.1281175, 77.3675735], [33.359144, 77.901692]]
+    },
+    "confirmation_mean_full_ms": {
+      "incumbent": [33.09598175, 77.72165825],
+      "dw_m256_n128": [33.24363075, 77.63463275]
+    },
+    "selection": "incumbent_fastest; no confirmed gain, native parameters unchanged",
+    "selected_candidate": "d69679670276",
+    "final_full_ms": [32.9336035, 77.736257],
+    "final_backward_host_boundary_ms": [20.6823705, 49.0185585],
+    "timing_caveat": "BWD host boundary is not a standalone GPU event timing. This 16-sample trace differs from M3/M4 eight-sample traces; do not attribute cross-trace timing differences to tuning.",
+    "clock_caveats": {
+      "confirm_incumbent": "Five 1455-1545 MHz GPU observations inside 20K intervals across two rounds",
+      "confirm_challenger": "One 1560 MHz GPU observation inside a 20K interval across two rounds",
+      "final": "Three 1530-1590 MHz GPU observations inside 20K sample1",
+      "sampling": "All samples retained. Some short timed intervals contain no clock observation. All timed HBM observations were 3201 MHz. Roughly 0.17% aggregate candidate difference is not a statistically established ranking."
+    },
+    "compiler_spill_store_load_bytes": {
+      "incumbent_main": [0, 0],
+      "incumbent_return_helper": [8, 8],
+      "dw_m256_n128_main": [40, 68],
+      "dw_stages2_main": [40, 228],
+      "other_candidate_main": [0, 0]
+    },
+    "return_spill_audit": {
+      "sass_directory": "build/pf_backward_20261012/ready_final_spills",
+      "backend_logs": "build/pf_backward_tune_20261012/backend",
+      "location": "NCCL gin/proxy/gin_proxy.h::postGfd generic-address atomic branch; STL.64 [R1+0x90] and LDL.LU.64 [R1+0x90]",
+      "runtime_backend": "GIN_IB_GDAKI confirmed on both nodes",
+      "conclusion": "This specific spill pair is in the unexecuted proxy backend, not current GDAKI traffic or a GEMM accumulator spill. Recheck after backend/config changes; not a claim of no local-memory traffic anywhere."
+    },
+    "verification": {
+      "finalists": "Both passed 129-token two-call numerical parity",
+      "retained": "Passed 8192/20480-token two-call output/dX/dr/dW1/dW2 parity",
+      "final_max_relative_l2": 0.00010979356738971546,
+      "python_tests": 117,
+      "python_subtests": 470,
+      "exported_capacity_entries": 2
+    }
+  },
+  "status": "M3 removes communication-window GEMM padding and fixes role register allocation. M4 reduces first-GEMM blocking with static readiness ordering. Final EP16 cycle improves 4.9%/6.6% over b151d93, but is only 1.9%/0.1% faster than old PF: no claimed substantial 20K lead. M5 bounded GEMM autotune finds no confirmed gain and retains native parameters; remaining 8/8 B return spill is in the unused proxy backend."
 }
