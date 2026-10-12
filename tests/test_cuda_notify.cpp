@@ -6,8 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -22,8 +22,8 @@
 
 #include <unistd.h>
 
-#include <cuda_runtime_api.h>
 #include <cuda_profiler_api.h>
+#include <cuda_runtime_api.h>
 
 #include "benchmark_tensor_allocator.hpp"
 #include "cuda/activation_transport_internal.hpp"
@@ -52,9 +52,9 @@ std::uint64_t benchmark_dimension(const char *name, std::uint64_t fallback) {
   if (!configured)
     return fallback;
   const std::string text(configured);
-  if (text.empty() ||
-      !std::all_of(text.begin(), text.end(),
-                   [](char value) { return value >= '0' && value <= '9'; }))
+  if (text.empty() || !std::all_of(text.begin(), text.end(), [](char value) {
+        return value >= '0' && value <= '9';
+      }))
     throw std::runtime_error(std::string(name) + " must be a positive integer");
   const auto value = std::stoull(text);
   if (value == 0ULL)
@@ -67,15 +67,15 @@ void write_device_timeline(
     const weftmoe::cuda::profiling::DeviceTimelineSnapshot &snapshot,
     const std::string &prefix) {
   const auto phase = "forward";
-  const auto path = prefix + ".rank" + std::to_string(snapshot.rank) + "." +
-                    phase + ".json";
+  const auto path =
+      prefix + ".rank" + std::to_string(snapshot.rank) + "." + phase + ".json";
   std::ofstream output(path, std::ios::trunc);
   if (!output)
     throw std::runtime_error("cannot create device timeline: " + path);
   output << "{\"schema\":" << snapshot.schema_version
          << ",\"rank\":" << snapshot.rank
-         << ",\"generation\":" << snapshot.generation
-         << ",\"phase\":\"" << phase << "\""
+         << ",\"generation\":" << snapshot.generation << ",\"phase\":\""
+         << phase << "\""
          << ",\"max_ctas\":" << snapshot.max_ctas
          << ",\"capacity_per_cta\":" << snapshot.capacity_per_cta
          << ",\"overflow_events\":" << snapshot.overflow_events
@@ -91,16 +91,15 @@ void write_device_timeline(
            << ",\"phase\":" << ((event.metadata >> 24U) & 0xffU)
            << ",\"role\":" << ((event.metadata >> 16U) & 0xffU)
            << ",\"event\":" << (event.metadata & 0xffffU)
-           << ",\"arg0\":" << event.arg0 << ",\"arg1\":" << event.arg1
-           << '}';
+           << ",\"arg0\":" << event.arg0 << ",\"arg1\":" << event.arg1 << '}';
   }
   output << "]}\n";
   if (!output)
     throw std::runtime_error("failed writing device timeline: " + path);
-  std::cout << "DEVICE_TIMELINE rank=" << snapshot.rank
-            << " phase=" << phase << " events=" << snapshot.records.size()
-            << " overflow=" << snapshot.overflow_events
-            << " path=" << path << std::endl;
+  std::cout << "DEVICE_TIMELINE rank=" << snapshot.rank << " phase=" << phase
+            << " events=" << snapshot.records.size()
+            << " overflow=" << snapshot.overflow_events << " path=" << path
+            << std::endl;
 }
 #endif
 
@@ -109,12 +108,14 @@ void require(bool condition, const std::string &message) {
     throw std::runtime_error(message);
 }
 
-weftmoe::cuda::CudaTensorBuffer prepare_benchmark_barrier(
-    BenchmarkTensorAllocator &allocator, cudaStream_t stream) {
+weftmoe::cuda::CudaTensorBuffer
+prepare_benchmark_barrier(BenchmarkTensorAllocator &allocator,
+                          cudaStream_t stream) {
   if (!benchmark_synchronize_ranks())
     return {};
   auto scratch = allocator.allocate(sizeof(std::uint32_t));
-  require(cudaMemsetAsync(scratch.data, 0, scratch.bytes, stream) == cudaSuccess,
+  require(cudaMemsetAsync(scratch.data, 0, scratch.bytes, stream) ==
+              cudaSuccess,
           "initialize benchmark rank barrier");
   return scratch;
 }
@@ -124,26 +125,25 @@ void benchmark_rank_barrier(const weftmoe::cuda::CudaTensorBuffer &scratch,
                             cudaStream_t stream) {
   if (!scratch.data)
     return;
-  const auto nccl = weftmoe::cuda::internal::NcclSessionAccess::checked(session);
+  const auto nccl =
+      weftmoe::cuda::internal::NcclSessionAccess::checked(session);
   require(ncclAllReduce(scratch.data, scratch.data, 1, ncclUint32, ncclSum,
-                       nccl->comm, stream) == ncclSuccess,
+                        nccl->comm, stream) == ncclSuccess,
           "benchmark rank barrier");
   require(cudaStreamSynchronize(stream) == cudaSuccess,
           "complete benchmark rank barrier");
 }
-weftmoe::cuda::CudaGateInput make_unit_gates(
-    const weftmoe::cuda::CudaRouteInput &routes,
-    const weftmoe::RankCollectiveContext &context,
-    const weftmoe::cuda::CudaExecution &execution) {
+weftmoe::cuda::CudaGateInput
+make_unit_gates(const weftmoe::cuda::CudaRouteInput &routes,
+                const weftmoe::RankCollectiveContext &context,
+                const weftmoe::cuda::CudaExecution &execution) {
   return weftmoe::cuda::testing::upload_fp32_gates_for_testing(
-      std::vector<float>(static_cast<std::size_t>(routes.route_count()),
-                         1.0F),
+      std::vector<float>(static_cast<std::size_t>(routes.route_count()), 1.0F),
       routes, context, execution);
 }
 
 weftmoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
-                                   std::uint32_t experts,
-                                   std::uint32_t top_k,
+                                   std::uint32_t experts, std::uint32_t top_k,
                                    std::uint32_t mtile) {
   weftmoe::RuntimeConfig config;
   config.num_experts = experts;
@@ -157,15 +157,14 @@ weftmoe::RuntimeConfig make_config(std::uint32_t nodes, std::uint32_t gpus,
       config.topology.rank_to_local_rank.push_back(local);
     }
   for (std::uint32_t expert = 0; expert < experts; ++expert)
-    config.topology.expert_to_rank.push_back(
-        expert % config.topology.world_size);
+    config.topology.expert_to_rank.push_back(expert %
+                                             config.topology.world_size);
   return config;
 }
 
 std::vector<weftmoe::RankRoutingInput>
-seeded_inputs(std::uint32_t world, std::uint32_t experts,
-              std::uint32_t top_k, std::uint64_t seed,
-              std::uint64_t max_tokens = 10) {
+seeded_inputs(std::uint32_t world, std::uint32_t experts, std::uint32_t top_k,
+              std::uint64_t seed, std::uint64_t max_tokens = 10) {
   const auto next = [&seed]() mutable {
     seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
     return seed;
@@ -179,8 +178,8 @@ seeded_inputs(std::uint32_t world, std::uint32_t experts,
       for (std::uint32_t expert = 0; expert < experts; ++expert)
         choices[expert] = expert;
       for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-        const auto selected = slot + static_cast<std::uint32_t>(
-                                         random() % (experts - slot));
+        const auto selected =
+            slot + static_cast<std::uint32_t>(random() % (experts - slot));
         std::swap(choices[slot], choices[selected]);
         result[rank].selected_experts.push_back(
             static_cast<std::int32_t>(choices[slot]));
@@ -200,9 +199,10 @@ std::vector<std::uint64_t> fixed_seeds() {
           0xf00dcafeULL};
 }
 
-std::vector<float> fixed_random_selected_gates(
-    std::uint64_t tokens, std::uint32_t top_k, std::uint32_t rank,
-    std::uint64_t seed) {
+std::vector<float> fixed_random_selected_gates(std::uint64_t tokens,
+                                               std::uint32_t top_k,
+                                               std::uint32_t rank,
+                                               std::uint64_t seed) {
   std::vector<float> gates(
       static_cast<std::size_t>(tokens * static_cast<std::uint64_t>(top_k)));
   for (std::uint64_t token = 0; token < tokens; ++token) {
@@ -229,8 +229,7 @@ std::uint64_t hash_fp32(const std::vector<float> &values) {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     for (unsigned byte = 0; byte < sizeof(bits); ++byte)
-      hash = (hash ^ ((bits >> (byte * 8U)) & 0xffU)) *
-             1099511628211ULL;
+      hash = (hash ^ ((bits >> (byte * 8U)) & 0xffU)) * 1099511628211ULL;
   }
   return hash;
 }
@@ -240,14 +239,13 @@ std::uint64_t hash_i32(const std::vector<std::int32_t> &values) {
   for (const auto value : values) {
     const auto bits = static_cast<std::uint32_t>(value);
     for (unsigned byte = 0; byte < sizeof(bits); ++byte)
-      hash = (hash ^ ((bits >> (byte * 8U)) & 0xffU)) *
-             1099511628211ULL;
+      hash = (hash ^ ((bits >> (byte * 8U)) & 0xffU)) * 1099511628211ULL;
   }
   return hash;
 }
 
-std::uint64_t hash_bf16_indexed(
-    const std::vector<weftmoe::transport::BFloat16> &values) {
+std::uint64_t
+hash_bf16_indexed(const std::vector<weftmoe::transport::BFloat16> &values) {
   std::uint64_t hash = 0;
   for (std::size_t index = 0; index < values.size(); ++index)
     hash += static_cast<std::uint64_t>(values[index].bits) *
@@ -265,14 +263,12 @@ std::uint32_t fixture_mix32_host(std::uint32_t value) {
 }
 
 std::uint16_t fixture_weight_bits(std::uint32_t expert,
-                                  std::uint32_t tensor_kind,
-                                  std::uint64_t row,
+                                  std::uint32_t tensor_kind, std::uint64_t row,
                                   std::uint64_t column) {
   auto key = fixture_mix32_host(expert ^ 0x9e3779b9U);
   key ^= fixture_mix32_host(tensor_kind ^ 0x85ebca6bU);
   key ^= fixture_mix32_host(static_cast<std::uint32_t>(row) ^ 0xc2b2ae35U);
-  key ^=
-      fixture_mix32_host(static_cast<std::uint32_t>(column) ^ 0x27d4eb2fU);
+  key ^= fixture_mix32_host(static_cast<std::uint32_t>(column) ^ 0x27d4eb2fU);
   const auto signed_value =
       static_cast<int>(fixture_mix32_host(key) & 1U) * 2 - 1;
   return weftmoe::transport::float_to_bfloat16(
@@ -292,16 +288,14 @@ std::uint64_t forward_weight_sample_hash(std::uint32_t expert_begin,
       const auto column = (sample * 104729ULL + 17ULL) % hidden;
       const auto bits = fixture_weight_bits(expert, 1U, row, column);
       hash = (hash ^ static_cast<std::uint8_t>(bits)) * 1099511628211ULL;
-      hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) *
-             1099511628211ULL;
+      hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) * 1099511628211ULL;
     }
     for (std::uint64_t sample = 0; sample < 32ULL; ++sample) {
       const auto row = (sample * 65537ULL + 11ULL) % hidden;
       const auto column = (sample * 8191ULL + 3ULL) % intermediate;
       const auto bits = fixture_weight_bits(expert, 2U, row, column);
       hash = (hash ^ static_cast<std::uint8_t>(bits)) * 1099511628211ULL;
-      hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) *
-             1099511628211ULL;
+      hash = (hash ^ static_cast<std::uint8_t>(bits >> 8U)) * 1099511628211ULL;
     }
   }
   return hash;
@@ -320,11 +314,11 @@ struct RunResult {
   std::exception_ptr error;
 };
 
-std::vector<RunResult> run_fixture(
-    const weftmoe::RuntimeConfig &config,
-    const std::vector<weftmoe::RankRoutingInput> &routes,
-    const std::string &identity, std::uint64_t generation,
-    std::uint64_t max_tokens, bool stagger = false) {
+std::vector<RunResult>
+run_fixture(const weftmoe::RuntimeConfig &config,
+            const std::vector<weftmoe::RankRoutingInput> &routes,
+            const std::string &identity, std::uint64_t generation,
+            std::uint64_t max_tokens, bool stagger = false) {
   const auto world = config.topology.world_size;
   auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
   std::vector<RunResult> results(world);
@@ -446,12 +440,12 @@ make_reusable_resources(const weftmoe::RuntimeConfig &config,
   return resources;
 }
 
-std::vector<RunResult> run_reused_fixture(
-    const weftmoe::RuntimeConfig &config,
-    const std::vector<weftmoe::RankRoutingInput> &routes,
-    const std::vector<ReusableRankResources> &resources,
-    const std::string &identity, std::uint64_t generation,
-    std::uint64_t max_tokens) {
+std::vector<RunResult>
+run_reused_fixture(const weftmoe::RuntimeConfig &config,
+                   const std::vector<weftmoe::RankRoutingInput> &routes,
+                   const std::vector<ReusableRankResources> &resources,
+                   const std::string &identity, std::uint64_t generation,
+                   std::uint64_t max_tokens) {
   const auto world = config.topology.world_size;
   std::vector<RunResult> results(world);
   std::vector<std::thread> threads;
@@ -462,24 +456,24 @@ std::vector<RunResult> run_reused_fixture(
             resources[rank].base_session, identity, generation);
         const auto context = weftmoe::make_rank_collective_context(
             session.session(), rank, resources[rank].execution.token());
-        const auto exact_routes = resources[rank].device_routes
-                                      ? weftmoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
-                                            resources[rank].device_routes,
-                                            context,
-                                            resources[rank].execution)
-                                      : weftmoe::cuda::CudaRouteInput{};
-        const auto exact_gates = exact_routes
-            ? weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
-                  resources[rank].device_gates, exact_routes, context,
-                  resources[rank].execution)
-            : weftmoe::cuda::CudaGateInput{};
+        const auto exact_routes =
+            resources[rank].device_routes
+                ? weftmoe::cuda::DeviceRouteProvenanceBridge::
+                      reissue_for_testing(resources[rank].device_routes,
+                                          context, resources[rank].execution)
+                : weftmoe::cuda::CudaRouteInput{};
+        const auto exact_gates =
+            exact_routes ? weftmoe::cuda::DeviceGateProvenanceBridge::
+                               reissue_for_testing(resources[rank].device_gates,
+                                                   exact_routes, context,
+                                                   resources[rank].execution)
+                         : weftmoe::cuda::CudaGateInput{};
         weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
             session, resources[rank].execution, resources[rank].pool);
         auto result = exact_routes
                           ? coordinator.run_device(
                                 {config, exact_routes, exact_gates, max_tokens})
-                          : coordinator.run(
-                                {config, routes[rank], max_tokens});
+                          : coordinator.run({config, routes[rank], max_tokens});
         results[rank].metadata = weftmoe::serialize_dispatch_metadata(
             weftmoe::cuda::download_device_metadata_for_validation(
                 result.dispatch(), resources[rank].execution));
@@ -515,24 +509,23 @@ void test_local(std::uint32_t world) {
   const auto config = make_config(1, world, experts, top_k, 7);
   for (const auto seed : fixed_seeds()) {
     const auto routes = seeded_inputs(world, experts, top_k, seed);
-    const auto actual = run_fixture(config, routes, "local-fixture", seed + 1,
-                                    10, true);
+    const auto actual =
+        run_fixture(config, routes, "local-fixture", seed + 1, 10, true);
     rethrow_errors(actual);
     const auto expected = weftmoe::build_notify_dispatch_for_testing(
         config, routes, "local-fixture", seed + 1);
     for (std::uint32_t rank = 0; rank < world; ++rank) {
       require(actual[rank].metadata ==
                   weftmoe::serialize_dispatch_metadata(expected[rank]),
-              "CUDA/NCCL full-field mismatch rank=" +
-                  std::to_string(rank) + " seed=" + std::to_string(seed));
+              "CUDA/NCCL full-field mismatch rank=" + std::to_string(rank) +
+                  " seed=" + std::to_string(seed));
       const auto audit = actual[rank].audit;
       require(audit.control_starts == 1 && audit.config_starts == 1 &&
                   audit.expert_count_starts == 1 &&
                   audit.packet_summary_starts == 1,
               "successful audit is not 1/1/1/1");
       const auto staging = actual[rank].device_audit;
-      require(staging.bulk_route_d2h == 0 &&
-                  staging.bulk_collective_d2h == 0 &&
+      require(staging.bulk_route_d2h == 0 && staging.bulk_collective_d2h == 0 &&
                   staging.host_materializations == 0 &&
                   staging.bulk_metadata_h2d == 0,
               "production generation used a retired host roundtrip");
@@ -541,8 +534,8 @@ void test_local(std::uint32_t world) {
   const auto repeated = seeded_inputs(world, experts, top_k, 0x1234abcdULL);
   std::vector<std::string> baseline(world);
   for (std::uint64_t iteration = 0; iteration < 20; ++iteration) {
-    const auto actual = run_fixture(config, repeated, "repeat", 900,
-                                    10, iteration % 2 != 0);
+    const auto actual =
+        run_fixture(config, repeated, "repeat", 900, 10, iteration % 2 != 0);
     rethrow_errors(actual);
     for (std::uint32_t rank = 0; rank < world; ++rank) {
       if (iteration == 0)
@@ -619,8 +612,8 @@ void mutate_scenario(const std::string &scenario, std::uint32_t rank,
     config.capacity.expert_rows.assign(config.num_experts, 100);
     config.capacity.expert_rows[0] = 101;
   } else if (scenario == "workspace_capacity_mismatch") {
-    config.capacity.workspace_rows_per_rank.assign(
-        config.topology.world_size, 1000);
+    config.capacity.workspace_rows_per_rank.assign(config.topology.world_size,
+                                                   1000);
     config.capacity.workspace_rows_per_rank[0] = 1001;
   }
 }
@@ -673,8 +666,7 @@ void test_failure(const std::string &scenario) {
   for (const auto &result : results)
     if (result.unexpected)
       std::rethrow_exception(result.unexpected);
-  require(!results[0].error.empty() &&
-              results[0].error == results[1].error,
+  require(!results[0].error.empty() && results[0].error == results[1].error,
           "ranks reported different structured errors");
   const bool config_failure = scenario == "topology_mismatch" ||
                               scenario == "expert_capacity_mismatch" ||
@@ -696,9 +688,8 @@ void test_protocol_regressions() {
   for (const auto *scenario :
        {"out_of_range", "duplicate", "max_mismatch", "over_capacity",
         "generation_mismatch", "session_mismatch", "mtile_mismatch",
-        "two_failures", "multi_field_mismatch",
-        "topology_mismatch", "expert_capacity_mismatch",
-        "workspace_capacity_mismatch"})
+        "two_failures", "multi_field_mismatch", "topology_mismatch",
+        "expert_capacity_mismatch", "workspace_capacity_mismatch"})
     test_failure(scenario);
 }
 
@@ -721,28 +712,27 @@ void test_device_capacity_failure_and_recovery() {
             "capacity-base", world, rank, 6200, rank, bootstrap);
         auto pool = weftmoe::cuda::make_device_notify_resource_pool(
             base, execution, {good_config, 1, 4096, 1, 2});
-        auto bad_session = weftmoe::cuda::make_nccl_generation(
-            base, "capacity-bad", 6201);
-        weftmoe::cuda::CudaNotifyGenerationCoordinator bad(
-            bad_session, execution, pool);
+        auto bad_session =
+            weftmoe::cuda::make_nccl_generation(base, "capacity-bad", 6201);
+        weftmoe::cuda::CudaNotifyGenerationCoordinator bad(bad_session,
+                                                           execution, pool);
         bool rejected = false;
         try {
           (void)bad.run({bad_config, {1, {0}}, 1});
         } catch (const weftmoe::NotifyDispatchError &error) {
-          rejected = error.code() ==
-                     weftmoe::NotifyErrorCode::ExpertCapacityExceeded;
+          rejected =
+              error.code() == weftmoe::NotifyErrorCode::ExpertCapacityExceeded;
         }
         require(rejected, "device expert capacity did not reject generation");
         const auto bad_audit = bad.audit();
-        require(bad_audit.control_starts == 1 &&
-                    bad_audit.config_starts == 1 &&
+        require(bad_audit.control_starts == 1 && bad_audit.config_starts == 1 &&
                     bad_audit.expert_count_starts == 1 &&
                     bad_audit.packet_summary_starts == 1,
                 "device capacity failure occurred before complete collectives");
-        auto good_session = weftmoe::cuda::make_nccl_generation(
-            base, "capacity-good", 6202);
-        weftmoe::cuda::CudaNotifyGenerationCoordinator good(
-            good_session, execution, pool);
+        auto good_session =
+            weftmoe::cuda::make_nccl_generation(base, "capacity-good", 6202);
+        weftmoe::cuda::CudaNotifyGenerationCoordinator good(good_session,
+                                                            execution, pool);
         auto result = good.run({good_config, {1, {0}}, 1});
         require(static_cast<bool>(result),
                 "valid exact-capacity recovery did not publish");
@@ -888,8 +878,7 @@ void test_release_fused_status_and_config_fallback() {
           auto result = coordinator.run({config, good_routes[rank], 10});
           const auto audit = coordinator.audit();
           require(result && audit.fused_notify_starts == 1U &&
-                      audit.control_starts == 0U &&
-                      audit.config_starts == 0U &&
+                      audit.control_starts == 0U && audit.config_starts == 0U &&
                       audit.expert_count_starts == 0U &&
                       audit.packet_summary_starts == 0U,
                   "release recovery did not use one fused collective");
@@ -908,13 +897,12 @@ void test_release_fused_status_and_config_fallback() {
         {
           auto session = weftmoe::cuda::make_nccl_generation(
               base, "release-contract", 6601);
-          weftmoe::cuda::CudaNotifyGenerationCoordinator prime(
-              session, execution, pool);
+          weftmoe::cuda::CudaNotifyGenerationCoordinator prime(session,
+                                                               execution, pool);
           auto result = prime.run({config, good_routes[rank], 10});
           const auto audit = prime.audit();
           require(result && audit.fused_notify_starts == 0U &&
-                      audit.control_starts == 1U &&
-                      audit.config_starts == 1U &&
+                      audit.control_starts == 1U && audit.config_starts == 1U &&
                       audit.expert_count_starts == 1U &&
                       audit.packet_summary_starts == 1U,
                   "release config prime did not use the complete protocol");
@@ -938,8 +926,7 @@ void test_release_fused_status_and_config_fallback() {
           }
           const auto audit = invalid.audit();
           require(audit.fused_notify_starts == 1U &&
-                      audit.control_starts == 0U &&
-                      audit.config_starts == 0U &&
+                      audit.control_starts == 0U && audit.config_starts == 0U &&
                       audit.expert_count_starts == 0U &&
                       audit.packet_summary_starts == 0U,
                   "same-config invalid route crossed the fused boundary");
@@ -962,8 +949,7 @@ void test_release_fused_status_and_config_fallback() {
           }
           const auto audit = changed.audit();
           require(audit.fused_notify_starts == 0U &&
-                      audit.control_starts == 1U &&
-                      audit.config_starts == 0U &&
+                      audit.control_starts == 1U && audit.config_starts == 0U &&
                       audit.expert_count_starts == 0U &&
                       audit.packet_summary_starts == 0U,
                   "layout-changing config entered the cached fused path");
@@ -997,9 +983,8 @@ void test_failure_recovery_rounds() {
   auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
   std::vector<std::exception_ptr> errors(world);
   std::vector<std::vector<std::vector<std::string>>> structured(
-      scenarios.size(),
-      std::vector<std::vector<std::string>>(
-          recovery_rounds, std::vector<std::string>(world)));
+      scenarios.size(), std::vector<std::vector<std::string>>(
+                            recovery_rounds, std::vector<std::string>(world)));
   std::vector<std::thread> threads;
   for (std::uint32_t rank = 0; rank < world; ++rank) {
     threads.emplace_back([&, rank] {
@@ -1020,8 +1005,8 @@ void test_failure_recovery_rounds() {
                               round * 2U;
             mutate_scenario(scenarios[category], rank, bad_config, routes,
                             max_tokens, identity, generation);
-            auto bad_session = weftmoe::cuda::make_nccl_generation(
-                base, identity, generation);
+            auto bad_session =
+                weftmoe::cuda::make_nccl_generation(base, identity, generation);
             auto bad =
                 weftmoe::cuda::testing::make_unpooled_coordinator_for_testing(
                     bad_session, execution);
@@ -1039,8 +1024,7 @@ void test_failure_recovery_rounds() {
             const bool config_failure =
                 scenarios[category] == "topology_mismatch";
             require(bad_audit.control_starts == 1 &&
-                        bad_audit.config_starts ==
-                            (config_failure ? 1U : 0U) &&
+                        bad_audit.config_starts == (config_failure ? 1U : 0U) &&
                         bad_audit.expert_count_starts == 0 &&
                         bad_audit.packet_summary_starts == 0,
                     "invalid recovery audit crossed protocol boundary");
@@ -1058,10 +1042,13 @@ void test_failure_recovery_rounds() {
                         result.audit().expert_count_starts == 1 &&
                         result.audit().packet_summary_starts == 1,
                     "recovery audit is not 1/1/1/1");
-            require(result && !weftmoe::serialize_dispatch_metadata(
-                                   weftmoe::cuda::download_device_metadata_for_validation(
-                                       result.dispatch(), execution)).empty(),
-                    "recovery did not publish checked metadata");
+            require(
+                result &&
+                    !weftmoe::serialize_dispatch_metadata(
+                         weftmoe::cuda::download_device_metadata_for_validation(
+                             result.dispatch(), execution))
+                         .empty(),
+                "recovery did not publish checked metadata");
           }
         }
       } catch (...) {
@@ -1124,21 +1111,17 @@ void test_fault_injection() {
       {Point::D2HStaging, {1, 0, 0, 0}, "control-d2h-staging"},
       {Point::EventRecord, {1, 0, 0, 0}, "control-event-record"},
       {Point::EventWait, {1, 0, 0, 0}, "control-event-wait"},
-      {Point::ConfigSlotAllocation, {1, 0, 0, 0},
-       "config-slot-allocation"},
-      {Point::CountSlotAllocation, {1, 1, 0, 0},
-       "count-slot-allocation"},
-      {Point::SummarySlotAllocation, {1, 1, 0, 0},
-       "summary-slot-allocation"},
-      {Point::BackendCompletion, {1, 1, 1, 1},
-       "summary-backend-completion"}};
+      {Point::ConfigSlotAllocation, {1, 0, 0, 0}, "config-slot-allocation"},
+      {Point::CountSlotAllocation, {1, 1, 0, 0}, "count-slot-allocation"},
+      {Point::SummarySlotAllocation, {1, 1, 0, 0}, "summary-slot-allocation"},
+      {Point::BackendCompletion, {1, 1, 1, 1}, "summary-backend-completion"}};
   const auto config = make_config(1, 1, 8, 3, 4);
   for (std::size_t index = 0; index < points.size(); ++index) {
     weftmoe::cuda::testing::reset_nccl_lifecycle_counters();
     auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
     auto execution = weftmoe::cuda::make_cuda_execution("fault-exec", 0);
-    auto session = weftmoe::cuda::make_nccl_session(
-        "fault", 1, 0, 4000 + index, 0, bootstrap);
+    auto session = weftmoe::cuda::make_nccl_session("fault", 1, 0, 4000 + index,
+                                                    0, bootstrap);
     weftmoe::cuda::CollectiveProtocolAudit audit;
     {
       auto pool = weftmoe::cuda::make_device_notify_resource_pool(
@@ -1149,12 +1132,11 @@ void test_fault_injection() {
       // setup prime. Lifecycle assertions below distinguish both modes.
 #if !WEFTMOE_DEBUG_VALIDATE
       {
-        auto prime_session = weftmoe::cuda::make_nccl_generation(
-            session, "fault", 3900 + index);
-        weftmoe::cuda::CudaNotifyGenerationCoordinator prime(
-            prime_session, execution, pool);
-        require(static_cast<bool>(
-                    prime.run({config, {1, {0, 1, 2}}, 10})),
+        auto prime_session =
+            weftmoe::cuda::make_nccl_generation(session, "fault", 3900 + index);
+        weftmoe::cuda::CudaNotifyGenerationCoordinator prime(prime_session,
+                                                             execution, pool);
+        require(static_cast<bool>(prime.run({config, {1, {0, 1, 2}}, 10})),
                 "failed to prime fault-recovery static config");
       }
 #endif
@@ -1173,15 +1155,16 @@ void test_fault_injection() {
         require(message.find("controlled test fault") != std::string::npos,
                 "fault error lost original backend text");
       }
-      require(failed, std::string("fault generation published validated result at ") +
-                          points[index].stage);
+      require(failed,
+              std::string("fault generation published validated result at ") +
+                  points[index].stage);
       audit = coordinator.audit();
       require(pool.usage().slots_in_use == 0,
               "pooled fault did not return failed generation slot");
-      auto recovery_session = weftmoe::cuda::make_nccl_generation(
-          session, "fault", 5000 + index);
-      weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(
-          recovery_session, execution, pool);
+      auto recovery_session =
+          weftmoe::cuda::make_nccl_generation(session, "fault", 5000 + index);
+      weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
+                                                              execution, pool);
       const weftmoe::RankRoutingInput routes{1, {0, 1, 2}};
       auto recovered = recovery.run({config, routes, 10});
       require_recovery(recovered, recovery.audit(), config, routes, execution,
@@ -1193,15 +1176,13 @@ void test_fault_injection() {
     require(audit.control_starts == expected.control_starts &&
                 audit.config_starts == expected.config_starts &&
                 audit.expert_count_starts == expected.expert_count_starts &&
-                audit.packet_summary_starts ==
-                    expected.packet_summary_starts,
+                audit.packet_summary_starts == expected.packet_summary_starts,
             "fault audit does not match enqueue boundary");
     require(audit.control_starts <= 1 && audit.config_starts <= 1 &&
                 audit.expert_count_starts <= 1 &&
                 audit.packet_summary_starts <= 1,
             "fault audit regressed or double-incremented");
-    const auto lifecycle =
-        weftmoe::cuda::testing::nccl_lifecycle_snapshot();
+    const auto lifecycle = weftmoe::cuda::testing::nccl_lifecycle_snapshot();
     require(lifecycle.slot_allocations == lifecycle.slot_destructions,
             "fault leaked a collective slot allocation");
     require(lifecycle.completion_lease_creates ==
@@ -1216,47 +1197,45 @@ void test_fault_injection() {
 #endif
     require(lifecycle.operation_cancels <= 1,
             "coordinator fault double-cancelled");
-    require(lifecycle.operation_waits <= 8 &&
-                lifecycle.destructor_drains <= 2,
+    require(lifecycle.operation_waits <= 8 && lifecycle.destructor_drains <= 2,
             "fault lifecycle repeated wait/drain");
   }
   const std::vector<FaultExpectation> device_stage_points{
-      {Point::CountKernelCompletion, {1, 1, 1, 0},
-       "count-kernel-completion"},
-      {Point::SummaryKernelCompletion, {1, 1, 1, 1},
+      {Point::CountKernelCompletion, {1, 1, 1, 0}, "count-kernel-completion"},
+      {Point::SummaryKernelCompletion,
+       {1, 1, 1, 1},
        "summary-kernel-completion"},
-      {Point::MaterializationKernel, {1, 1, 1, 1},
-       "materialization-kernel"}};
+      {Point::MaterializationKernel, {1, 1, 1, 1}, "materialization-kernel"}};
   for (std::size_t index = 0; index < device_stage_points.size(); ++index) {
     weftmoe::cuda::testing::reset_nccl_lifecycle_counters();
     auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-    auto execution = weftmoe::cuda::make_cuda_execution(
-        "device-stage-fault-exec", 0);
-    auto session = weftmoe::cuda::make_nccl_session(
-        "device-stage-fault", 1, 0, 4050 + index, 0, bootstrap);
+    auto execution =
+        weftmoe::cuda::make_cuda_execution("device-stage-fault-exec", 0);
+    auto session = weftmoe::cuda::make_nccl_session("device-stage-fault", 1, 0,
+                                                    4050 + index, 0, bootstrap);
     auto pool = weftmoe::cuda::make_device_notify_resource_pool(
         session, execution, {config, 10, 4096, 1, 2});
 #if !WEFTMOE_DEBUG_VALIDATE
     {
       auto prime_session = weftmoe::cuda::make_nccl_generation(
           session, "device-stage-fault", 3950 + index);
-      weftmoe::cuda::CudaNotifyGenerationCoordinator prime(
-          prime_session, execution, pool);
-      require(static_cast<bool>(
-                  prime.run({config, {1, {0, 1, 2}}, 10})),
+      weftmoe::cuda::CudaNotifyGenerationCoordinator prime(prime_session,
+                                                           execution, pool);
+      require(static_cast<bool>(prime.run({config, {1, {0, 1, 2}}, 10})),
               "failed to prime device-stage recovery static config");
     }
 #endif
-    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-        session, execution, pool);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                               execution, pool);
     weftmoe::cuda::testing::inject_next_nccl_fault(
         device_stage_points[index].point);
     bool failed = false;
     try {
       (void)coordinator.run({config, {1, {0, 1, 2}}, 10});
     } catch (const weftmoe::NotifyDispatchError &error) {
-      failed = std::string(error.what()).find(
-                   device_stage_points[index].stage) != std::string::npos;
+      failed =
+          std::string(error.what()).find(device_stage_points[index].stage) !=
+          std::string::npos;
     }
     require(failed && pool.usage().slots_in_use == 0,
             "pooled device-stage fault leaked/published its slot");
@@ -1265,21 +1244,19 @@ void test_fault_injection() {
     require(actual.control_starts == expected.control_starts &&
                 actual.config_starts == expected.config_starts &&
                 actual.expert_count_starts == expected.expert_count_starts &&
-                actual.packet_summary_starts ==
-                    expected.packet_summary_starts,
+                actual.packet_summary_starts == expected.packet_summary_starts,
             "device-stage fault audit crossed the wrong boundary");
     auto recovery_session = weftmoe::cuda::make_nccl_generation(
         session, "device-stage-fault", 4150 + index);
-    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(
-        recovery_session, execution, pool);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
+                                                            execution, pool);
     const weftmoe::RankRoutingInput routes{1, {0, 1, 2}};
     auto recovered = recovery.run({config, routes, 10});
     require_recovery(recovered, recovery.audit(), config, routes, execution,
                      "device-stage-fault", 4150 + index,
                      "device-stage fault did not recover with the exact "
                      "protocol on the same communicator");
-    const auto lifecycle =
-        weftmoe::cuda::testing::nccl_lifecycle_snapshot();
+    const auto lifecycle = weftmoe::cuda::testing::nccl_lifecycle_snapshot();
 #if WEFTMOE_DEBUG_VALIDATE
     require(lifecycle.validated_publishes == 1 &&
                 lifecycle.operation_cancels == 0,
@@ -1297,9 +1274,9 @@ void test_fault_injection() {
     auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
     auto execution = weftmoe::cuda::make_cuda_execution(
         deadline ? "deadline-exec" : "cancel-exec", 0);
-    auto session = weftmoe::cuda::make_nccl_session(
-        deadline ? "deadline" : "cancel", 1, 0,
-        deadline ? 4091 : 4090, 0, bootstrap);
+    auto session =
+        weftmoe::cuda::make_nccl_session(deadline ? "deadline" : "cancel", 1, 0,
+                                         deadline ? 4091 : 4090, 0, bootstrap);
     auto pool = weftmoe::cuda::make_device_notify_resource_pool(
         session, execution, {config, 10, 4096, 1, 2});
     weftmoe::cuda::GenerationRunOptions options;
@@ -1307,8 +1284,8 @@ void test_fault_injection() {
       options.deadline_after = std::chrono::microseconds(1);
     else
       options.cancellation.request_cancel();
-    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-        session, execution, pool);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                               execution, pool);
     bool failed = false;
     try {
       (void)coordinator.run({config, {1, {0, 1, 2}}, 10}, options);
@@ -1322,21 +1299,18 @@ void test_fault_injection() {
                 audit.expert_count_starts == 1 &&
                 audit.packet_summary_starts == 0,
             "cancellation audit is not 1/1/1/0");
-    const auto lifecycle =
-        weftmoe::cuda::testing::nccl_lifecycle_snapshot();
+    const auto lifecycle = weftmoe::cuda::testing::nccl_lifecycle_snapshot();
     require(lifecycle.operation_cancels == 1 &&
                 lifecycle.validated_publishes == 0,
             "cancellation was not executed exactly once or published a handle");
     auto recovery_session = weftmoe::cuda::make_nccl_generation(
-        session, deadline ? "deadline" : "cancel",
-        deadline ? 4191 : 4190);
-    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(
-        recovery_session, execution, pool);
+        session, deadline ? "deadline" : "cancel", deadline ? 4191 : 4190);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
+                                                            execution, pool);
     const weftmoe::RankRoutingInput routes{1, {0, 1, 2}};
     auto recovered = recovery.run({config, routes, 10});
     require_recovery(recovered, recovery.audit(), config, routes, execution,
-                     deadline ? "deadline" : "cancel",
-                     deadline ? 4191 : 4190,
+                     deadline ? "deadline" : "cancel", deadline ? 4191 : 4190,
                      "communicator did not recover with the exact protocol "
                      "after cancellation/deadline");
   }
@@ -1411,8 +1385,8 @@ void test_exact_session_identity_agreement(bool different_length) {
         // Display name and header summary are deliberately equal. Only one raw
         // byte differs, proving that exact identity bytes are the final gate.
         auto session = weftmoe::cuda::make_nccl_session(
-            "same-display", world, rank, different_length ? 5201 : 5200,
-            rank, bootstrap);
+            "same-display", world, rank, different_length ? 5201 : 5200, rank,
+            bootstrap);
         std::vector<std::byte> raw_identity{
             std::byte{0x41}, std::byte{0x42},
             static_cast<std::byte>(0x43U + rank)};
@@ -1454,8 +1428,7 @@ void test_exact_session_identity_agreement(bool different_length) {
                 result.audit.packet_summary_starts == 0,
             "exact session identity audit is not 1/1/0/0");
   std::cout << "[PASS] equal summary/display but different raw session identity"
-            << (different_length ? " length" : " byte")
-            << " audit=1/1/0/0\n";
+            << (different_length ? " length" : " byte") << " audit=1/1/0/0\n";
 }
 
 void test_protocol_failure_suite() {
@@ -1470,21 +1443,20 @@ void test_device_only_sanitizer_paths() {
   const auto config = make_config(1, 1, 8, 3, 4);
   auto execution = weftmoe::cuda::make_cuda_execution("device-only", 0);
   auto session = weftmoe::make_collective_session("device-only", 1, 5001);
-  auto context = weftmoe::make_rank_collective_context(
-      session, 0, execution.token());
+  auto context =
+      weftmoe::make_rank_collective_context(session, 0, execution.token());
   const auto run = [&](weftmoe::RankRoutingInput input, bool valid) {
-    auto routes = weftmoe::cuda::upload_cuda_routes(
-        input, config.top_k, context, execution);
-    auto plan = weftmoe::cuda::query_cuda_notify_workspace(
-        config, 0, input.num_tokens, 4);
-    auto workspace = weftmoe::cuda::allocate_cuda_notify_workspace(
-        plan, context, execution);
+    auto routes = weftmoe::cuda::upload_cuda_routes(input, config.top_k,
+                                                    context, execution);
+    auto plan = weftmoe::cuda::query_cuda_notify_workspace(config, 0,
+                                                           input.num_tokens, 4);
+    auto workspace =
+        weftmoe::cuda::allocate_cuda_notify_workspace(plan, context, execution);
     auto gates = make_unit_gates(routes, context, execution);
     auto operation = weftmoe::cuda::start_cuda_rank_local_notify(
         config, context, execution, routes, gates, std::move(workspace));
     const auto result = operation.wait_preflight();
-    require(result.valid() == valid,
-            "device-only validation status mismatch");
+    require(result.valid() == valid, "device-only validation status mismatch");
     if (!valid)
       require(result.status().error ==
                   weftmoe::cuda::ControlLocalError::ExpertOutOfRange,
@@ -1507,8 +1479,8 @@ void test_device_only_sanitizer_paths() {
         consumer_plan, consumer_context, consumer_execution);
     auto gates = make_unit_gates(producer_routes, context, execution);
     (void)weftmoe::cuda::start_cuda_rank_local_notify(
-        config, consumer_context, consumer_execution, producer_routes,
-        gates, std::move(workspace));
+        config, consumer_context, consumer_execution, producer_routes, gates,
+        std::move(workspace));
   } catch (const weftmoe::NotifyDispatchError &) {
     no_wait_failed = true;
   }
@@ -1518,11 +1490,11 @@ void test_device_only_sanitizer_paths() {
       producer_routes, consumer_context, consumer_execution);
   auto imported_workspace = weftmoe::cuda::allocate_cuda_notify_workspace(
       consumer_plan, consumer_context, consumer_execution);
-  auto imported_gates = make_unit_gates(
-      imported, consumer_context, consumer_execution);
+  auto imported_gates =
+      make_unit_gates(imported, consumer_context, consumer_execution);
   auto imported_operation = weftmoe::cuda::start_cuda_rank_local_notify(
-      config, consumer_context, consumer_execution, imported,
-      imported_gates, std::move(imported_workspace));
+      config, consumer_context, consumer_execution, imported, imported_gates,
+      std::move(imported_workspace));
   require(imported_operation.wait_preflight().valid(),
           "legal cross-stream event handoff failed");
   auto foreign_session =
@@ -1553,8 +1525,8 @@ void test_device_only_sanitizer_paths() {
   const auto wide_config = make_config(73, 1, 146, 6, 4);
   auto wide_session =
       weftmoe::make_collective_session("device-wide-mask", 73, 5002);
-  auto wide_context = weftmoe::make_rank_collective_context(
-      wide_session, 0, execution.token());
+  auto wide_context =
+      weftmoe::make_rank_collective_context(wide_session, 0, execution.token());
   std::vector<weftmoe::RankRoutingInput> wide_inputs(73);
   for (std::uint32_t rank = 0; rank < 73; ++rank) {
     wide_inputs[rank].num_tokens = rank % 5U == 0 ? 0 : 1;
@@ -1572,8 +1544,7 @@ void test_device_only_sanitizer_paths() {
     for (const auto selected : wide_inputs[source].selected_experts) {
       const auto expert = static_cast<std::uint32_t>(selected);
       ++count_matrix[static_cast<std::size_t>(source) * 146U + expert];
-      const auto destination_rank =
-          wide_config.topology.expert_to_rank[expert];
+      const auto destination_rank = wide_config.topology.expert_to_rank[expert];
       seen_node[wide_config.topology.rank_to_node[destination_rank]] = true;
     }
     for (std::uint32_t node = 0; node < 73; ++node)
@@ -1586,13 +1557,14 @@ void test_device_only_sanitizer_paths() {
   weftmoe::cuda::DeviceDispatchHandle wide_handle;
   for (std::uint32_t repeat = 0; repeat < 20; ++repeat) {
     wide_handle = weftmoe::cuda::testing::materialize_fake_device_collectives(
-        wide_config, wide_context, execution, wide_inputs[0], 4,
-        count_matrix, summary_matrix);
+        wide_config, wide_context, execution, wide_inputs[0], 4, count_matrix,
+        summary_matrix);
     const auto downloaded =
-        weftmoe::cuda::download_device_metadata_for_validation(
-            wide_handle, execution);
+        weftmoe::cuda::download_device_metadata_for_validation(wide_handle,
+                                                               execution);
     const auto serialized = weftmoe::serialize_dispatch_metadata(downloaded);
-    require(serialized == weftmoe::serialize_dispatch_metadata(expected_wide[0]),
+    require(serialized ==
+                weftmoe::serialize_dispatch_metadata(expected_wide[0]),
             "73-node full device materializer/oracle mismatch");
     if (repeat == 0)
       wide_baseline = serialized;
@@ -1612,8 +1584,8 @@ void test_device_only_sanitizer_paths() {
   // The transport-only persistent worker consumes the immutable device
   // dispatch handle directly. No activation bulk download occurs until the
   // explicit validation call below.
-  const weftmoe::RankRoutingInput transport_routes{
-      3, {5, 1, 7, 1, 2, 3, 0, 7, 4}};
+  const weftmoe::RankRoutingInput transport_routes{3,
+                                                   {5, 1, 7, 1, 2, 3, 0, 7, 4}};
   std::vector<std::uint64_t> transport_counts(8, 0);
   for (const auto selected : transport_routes.selected_experts)
     ++transport_counts[static_cast<std::size_t>(selected)];
@@ -1651,8 +1623,8 @@ void test_device_only_sanitizer_paths() {
   auto activation_lease =
       weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
           activations, 3, 33, context, execution, transport_pool);
-  weftmoe::cuda::DeviceActivationTransport transport(
-      session, execution, transport_pool);
+  weftmoe::cuda::DeviceActivationTransport transport(session, execution,
+                                                     transport_pool);
   const auto api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
   auto transport_result = transport.run_device_simulation_synthetic(
       transport_dispatch, activation_lease, transport_config);
@@ -1668,7 +1640,7 @@ void test_device_only_sanitizer_paths() {
       weftmoe::cuda::download_activation_transport_for_validation(
           transport_result, execution);
   require(downloaded_transport.contribution_by_route ==
-              oracle.contribution_by_route &&
+                  oracle.contribution_by_route &&
               downloaded_transport.combined_tokens == oracle.combined_tokens,
           "device transport synthetic contribution/combine oracle mismatch");
   require(std::equal(oracle.canonical_expert_rows.begin(),
@@ -1711,14 +1683,13 @@ void test_device_only_sanitizer_paths() {
           transport_pool);
   bool generation_failed = false;
   try {
-    (void)transport.run_device_simulation_synthetic(transport_dispatch,
-                                  wrong_generation_activation,
-                                  transport_config);
+    (void)transport.run_device_simulation_synthetic(
+        transport_dispatch, wrong_generation_activation, transport_config);
   } catch (const weftmoe::NotifyDispatchError &error) {
-    generation_failed = error.code() == weftmoe::NotifyErrorCode::WorkspaceMismatch;
+    generation_failed =
+        error.code() == weftmoe::NotifyErrorCode::WorkspaceMismatch;
   }
-  require(generation_failed,
-          "cross-generation activation lease was accepted");
+  require(generation_failed, "cross-generation activation lease was accepted");
   wrong_generation_activation = {};
 
   auto exhausted_config = transport_pool_config;
@@ -1763,8 +1734,7 @@ void test_device_only_sanitizer_paths() {
         static_cast<float>(i + 1U) / 8.0F);
   auto wide_activation =
       weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
-          wide_activations, 1, 7, wide_context, execution,
-          wide_transport_pool);
+          wide_activations, 1, 7, wide_context, execution, wide_transport_pool);
   weftmoe::cuda::DeviceActivationTransport wide_transport(
       wide_session, execution, wide_transport_pool);
   auto wide_transport_result = wide_transport.run_device_simulation_synthetic(
@@ -1787,19 +1757,17 @@ void test_device_only_sanitizer_paths() {
   const auto wide_transport_oracle =
       weftmoe::transport::simulate_activation_transport(
           expected_wide[0], wide_activations,
-          std::vector<float>(
-              expected_wide[0]->outgoing.expert_id.size(), 1.0F),
+          std::vector<float>(expected_wide[0]->outgoing.expert_id.size(), 1.0F),
           wide_transport_config, 1);
   require(wide_transport_download.contribution_by_route ==
-              wide_transport_oracle.contribution_by_route &&
+                  wide_transport_oracle.contribution_by_route &&
               wide_transport_download.combined_tokens ==
                   wide_transport_oracle.combined_tokens &&
               wide_transport_download.protocol.dispatch_packets == 6,
           "73-node full device transport/oracle mismatch");
   const auto capability =
       weftmoe::cuda::probe_activation_transport_capability(2);
-  require(capability.nccl_device_headers &&
-              capability.gin_headers_available &&
+  require(capability.nccl_device_headers && capability.gin_headers_available &&
               capability.gin_backend_implemented && !capability.gin_usable,
           "GIN header/runtime capability boundary was not detected");
   require(weftmoe::cuda::testing::run_local_p2p_put_signal_probe(0, 1, 4096),
@@ -1825,33 +1793,32 @@ void test_delayed_route_producer_readiness() {
   auto producer = weftmoe::cuda::make_cuda_execution("delay-producer", 0);
   auto consumer = weftmoe::cuda::make_cuda_execution("delay-consumer", 0);
   auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-  auto base = weftmoe::cuda::make_nccl_session(
-      "delay-session", 1, 0, 6900, 0, bootstrap);
+  auto base = weftmoe::cuda::make_nccl_session("delay-session", 1, 0, 6900, 0,
+                                               bootstrap);
   const auto producer_context = weftmoe::make_rank_collective_context(
       base.session(), 0, producer.token());
-  auto storage = weftmoe::cuda::upload_cuda_routes(
-      {1, {0}}, 1, producer_context, producer);
-  auto delayed = weftmoe::cuda::DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
-      storage, 5, 5000000, producer_context, producer);
+  auto storage = weftmoe::cuda::upload_cuda_routes({1, {0}}, 1,
+                                                   producer_context, producer);
+  auto delayed =
+      weftmoe::cuda::DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
+          storage, 5, 5000000, producer_context, producer);
   const auto consumer_context = weftmoe::make_rank_collective_context(
       base.session(), 0, consumer.token());
   auto imported = weftmoe::cuda::import_selected_expert_routes(
       delayed, consumer_context, consumer);
   auto pool = weftmoe::cuda::make_device_notify_resource_pool(
       base, consumer, {config, 2, 4096, 1, 2});
-  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-      base, consumer, pool);
+  weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(base, consumer,
+                                                             pool);
   auto imported_gates = make_unit_gates(imported, consumer_context, consumer);
-  auto result = coordinator.run_device(
-      {config, imported, imported_gates, 2});
+  auto result = coordinator.run_device({config, imported, imported_gates, 2});
   const auto downloaded =
-      weftmoe::cuda::download_device_metadata_for_validation(
-          result.dispatch(), consumer);
+      weftmoe::cuda::download_device_metadata_for_validation(result.dispatch(),
+                                                             consumer);
   require(downloaded->outgoing.expert_id == std::vector<std::uint32_t>{5},
           "cross-stream Notify observed poison instead of ready-event result");
 
-  auto next = weftmoe::cuda::make_nccl_generation(
-      base, "delay-session", 6901);
+  auto next = weftmoe::cuda::make_nccl_generation(base, "delay-session", 6901);
   const auto next_producer_context = weftmoe::make_rank_collective_context(
       next.session(), 0, producer.token());
   auto delayed_without_ready =
@@ -1866,50 +1833,48 @@ void test_delayed_route_producer_readiness() {
   } catch (const weftmoe::NotifyDispatchError &) {
     missing_ready_failed = true;
   }
-  require(missing_ready_failed,
-          "unrecorded producer-ready event was accepted");
+  require(missing_ready_failed, "unrecorded producer-ready event was accepted");
 
   auto unsafe_delayed =
       weftmoe::cuda::DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
           storage, 4, 100000000, next_producer_context, producer);
-  auto unsafe =
-      weftmoe::cuda::DeviceRouteProvenanceBridge::unsafe_import_without_wait_for_testing(
-          unsafe_delayed, next_consumer_context, consumer);
+  auto unsafe = weftmoe::cuda::DeviceRouteProvenanceBridge::
+      unsafe_import_without_wait_for_testing(unsafe_delayed,
+                                             next_consumer_context, consumer);
   bool unsafe_failed = false;
   try {
     weftmoe::cuda::CudaNotifyGenerationCoordinator unsafe_coordinator(
         next, consumer, pool);
-    auto unsafe_gates = make_unit_gates(unsafe, next_consumer_context,
-                                        consumer);
-    (void)unsafe_coordinator.run_device(
-        {config, unsafe, unsafe_gates, 2});
+    auto unsafe_gates =
+        make_unit_gates(unsafe, next_consumer_context, consumer);
+    (void)unsafe_coordinator.run_device({config, unsafe, unsafe_gates, 2});
   } catch (const weftmoe::NotifyDispatchError &) {
     unsafe_failed = true;
   }
   require(unsafe_failed,
           "negative no-wait seam did not demonstrate producer race");
 
-  auto same_session = weftmoe::cuda::make_nccl_session(
-      "delay-same-stream", 1, 0, 6920, 0,
-      weftmoe::cuda::make_nccl_bootstrap_id());
+  auto same_session =
+      weftmoe::cuda::make_nccl_session("delay-same-stream", 1, 0, 6920, 0,
+                                       weftmoe::cuda::make_nccl_bootstrap_id());
   const auto same_context = weftmoe::make_rank_collective_context(
       same_session.session(), 0, producer.token());
-  auto same_storage = weftmoe::cuda::upload_cuda_routes(
-      {1, {0}}, 1, same_context, producer);
-  auto same_delayed = weftmoe::cuda::DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
-      same_storage, 6, 5000000, same_context, producer);
+  auto same_storage =
+      weftmoe::cuda::upload_cuda_routes({1, {0}}, 1, same_context, producer);
+  auto same_delayed =
+      weftmoe::cuda::DeviceRouteProvenanceBridge::schedule_delayed_for_testing(
+          same_storage, 6, 5000000, same_context, producer);
   auto same_pool = weftmoe::cuda::make_device_notify_resource_pool(
       same_session, producer, {config, 2, 4096, 1, 2});
   weftmoe::cuda::CudaNotifyGenerationCoordinator same_coordinator(
       same_session, producer, same_pool);
   auto same_gates = make_unit_gates(same_delayed, same_context, producer);
-  auto same_result = same_coordinator.run_device(
-      {config, same_delayed, same_gates, 2});
+  auto same_result =
+      same_coordinator.run_device({config, same_delayed, same_gates, 2});
   const auto same_download =
       weftmoe::cuda::download_device_metadata_for_validation(
           same_result.dispatch(), producer);
-  require(same_download->outgoing.expert_id ==
-              std::vector<std::uint32_t>{6},
+  require(same_download->outgoing.expert_id == std::vector<std::uint32_t>{6},
           "same-stream producer order was not preserved");
   std::cout << "[PASS] delayed producer ready-event cross/same-stream + "
                "no-wait negative seam\n";
@@ -1922,8 +1887,8 @@ void test_device_dispatch_handle_lifetime() {
   weftmoe::cuda::DeviceDispatchHandle retained;
   {
     auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-    auto session = weftmoe::cuda::make_nccl_session(
-        "handle-lifetime", 1, 0, 6100, 0, bootstrap);
+    auto session = weftmoe::cuda::make_nccl_session("handle-lifetime", 1, 0,
+                                                    6100, 0, bootstrap);
     auto coordinator =
         weftmoe::cuda::testing::make_unpooled_coordinator_for_testing(
             session, execution);
@@ -1934,11 +1899,17 @@ void test_device_dispatch_handle_lifetime() {
     require(!first_copy && moved, "device handle move state is unsafe");
     const auto &identity = moved.identity();
     const auto expectation = weftmoe::cuda::DeviceDispatchViewExpectation{
-        6100, 0, 1, routes.num_tokens, config.top_k,
-        identity.config_digest_word0, identity.config_digest_word1};
+        6100,
+        0,
+        1,
+        routes.num_tokens,
+        config.top_k,
+        identity.config_digest_word0,
+        identity.config_digest_word1};
     auto consumer = moved.acquire_consumer(execution, expectation);
-    require(consumer && consumer.state() ==
-                            weftmoe::cuda::DeviceDispatchConsumerState::Acquired,
+    require(consumer &&
+                consumer.state() ==
+                    weftmoe::cuda::DeviceDispatchConsumerState::Acquired,
             "owning device consumer was not acquired");
     consumer.finish();
   }
@@ -1954,10 +1925,9 @@ void test_device_dispatch_handle_lifetime() {
   bool mismatch_failed = false;
   try {
     (void)retained.acquire_consumer(
-        execution,
-        {6101, 0, 1, routes.num_tokens, config.top_k,
-         retained.identity().config_digest_word0,
-         retained.identity().config_digest_word1});
+        execution, {6101, 0, 1, routes.num_tokens, config.top_k,
+                    retained.identity().config_digest_word0,
+                    retained.identity().config_digest_word1});
   } catch (const weftmoe::NotifyDispatchError &) {
     mismatch_failed = true;
   }
@@ -1967,9 +1937,13 @@ void test_device_dispatch_handle_lifetime() {
       weftmoe::cuda::make_cuda_execution("handle-consumer-stream-2", 0);
   const auto retained_id = retained.identity();
   const weftmoe::cuda::DeviceDispatchViewExpectation retained_expectation{
-      retained_id.generation, retained_id.calling_rank, retained_id.world_size,
-      retained_id.num_tokens, retained_id.top_k,
-      retained_id.config_digest_word0, retained_id.config_digest_word1};
+      retained_id.generation,
+      retained_id.calling_rank,
+      retained_id.world_size,
+      retained_id.num_tokens,
+      retained_id.top_k,
+      retained_id.config_digest_word0,
+      retained_id.config_digest_word1};
   auto first_stream_consumer =
       retained.acquire_consumer(execution, retained_expectation);
   auto second_stream_consumer =
@@ -1987,7 +1961,8 @@ void test_device_dispatch_handle_lifetime() {
     empty_failed = true;
   }
   require(empty_failed, "empty device handle accessor did not fail closed");
-  std::cout << "[PASS] immutable device handle copy/move/lifetime/consumer checks\n";
+  std::cout
+      << "[PASS] immutable device handle copy/move/lifetime/consumer checks\n";
 }
 
 void test_resource_pool_and_cuda_api_audit() {
@@ -1995,8 +1970,8 @@ void test_resource_pool_and_cuda_api_audit() {
   const auto routes = seeded_inputs(1, 16, 4, 0xabcddcbaULL).front();
   auto execution = weftmoe::cuda::make_cuda_execution("pool-exec", 0);
   auto bootstrap = weftmoe::cuda::make_nccl_bootstrap_id();
-  auto base = weftmoe::cuda::make_nccl_session(
-      "pool-base", 1, 0, 6200, 0, bootstrap);
+  auto base =
+      weftmoe::cuda::make_nccl_session("pool-base", 1, 0, 6200, 0, bootstrap);
   auto pool = weftmoe::cuda::make_device_notify_resource_pool(
       base, execution, {config, 10, 4096, 2, 4});
   const auto initial_usage = pool.usage();
@@ -2011,11 +1986,10 @@ void test_resource_pool_and_cuda_api_audit() {
       weftmoe::make_rank_collective_context(base.session(), 0,
                                             execution.token()),
       execution);
-  auto device_gates = make_unit_gates(
-      device_routes,
-      weftmoe::make_rank_collective_context(base.session(), 0,
-                                            execution.token()),
-      execution);
+  auto device_gates = make_unit_gates(device_routes,
+                                      weftmoe::make_rank_collective_context(
+                                          base.session(), 0, execution.token()),
+                                      execution);
   const auto exact_routes = [&](const weftmoe::cuda::NcclSession &session) {
     return weftmoe::cuda::DeviceRouteProvenanceBridge::reissue_for_testing(
         device_routes,
@@ -2028,23 +2002,22 @@ void test_resource_pool_and_cuda_api_audit() {
     auto gates_for_generation =
         weftmoe::cuda::DeviceGateProvenanceBridge::reissue_for_testing(
             device_gates, routes_for_generation,
-            weftmoe::make_rank_collective_context(
-                session.session(), 0, execution.token()),
+            weftmoe::make_rank_collective_context(session.session(), 0,
+                                                  execution.token()),
             execution);
     return weftmoe::cuda::DeviceNotifyGenerationRequest{
         config, std::move(routes_for_generation),
         std::move(gates_for_generation), 10};
   };
   {
-    auto next = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6201);
+    auto next = weftmoe::cuda::make_nccl_generation(base, "pool-base", 6201);
     auto next_routes = exact_routes(next);
     bool stale_gate_failed = false;
     try {
       weftmoe::cuda::DeviceGateProvenanceBridge::validate(
           device_gates, next_routes,
-          weftmoe::make_rank_collective_context(
-              next.session(), 0, execution.token()),
+          weftmoe::make_rank_collective_context(next.session(), 0,
+                                                execution.token()),
           execution);
     } catch (const weftmoe::NotifyDispatchError &) {
       stale_gate_failed = true;
@@ -2055,12 +2028,11 @@ void test_resource_pool_and_cuda_api_audit() {
   for (std::uint64_t generation = 6201; generation <= 6210; ++generation) {
     bool rejected = false;
     try {
-      auto mismatched = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base", generation);
+      auto mismatched =
+          weftmoe::cuda::make_nccl_generation(base, "pool-base", generation);
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           mismatched, execution, pool);
-      (void)coordinator.run_device(
-          {config, device_routes, device_gates, 10});
+      (void)coordinator.run_device({config, device_routes, device_gates, 10});
     } catch (const weftmoe::NotifyDispatchError &error) {
       const std::string message = error.what();
       rejected = message.find("field=generation") != std::string::npos &&
@@ -2070,8 +2042,8 @@ void test_resource_pool_and_cuda_api_audit() {
     }
     require(rejected,
             "generation-6200 route lease was accepted by a later generation");
-    const auto rebound = exact_routes(weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", generation));
+    const auto rebound = exact_routes(
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", generation));
     require(rebound.route_generation() == generation &&
                 device_routes.route_generation() == 6200,
             "private exact-generation reissue mutated or forged provenance");
@@ -2079,10 +2051,10 @@ void test_resource_pool_and_cuda_api_audit() {
   const auto before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
   weftmoe::cuda::DeviceDispatchHandle retained;
   for (std::uint64_t iteration = 0; iteration < 10; ++iteration) {
-    auto session = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6201 + iteration);
-    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-        session, execution, pool);
+    auto session = weftmoe::cuda::make_nccl_generation(base, "pool-base",
+                                                       6201 + iteration);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                               execution, pool);
     auto result = coordinator.run_device(exact_request(session));
     require(result.dispatch().audit().bulk_route_d2h == 0 &&
                 result.dispatch().audit().bulk_collective_d2h == 0 &&
@@ -2092,14 +2064,14 @@ void test_resource_pool_and_cuda_api_audit() {
     if (iteration >= 2U) {
       const auto audit = result.audit();
 #if WEFTMOE_DEBUG_VALIDATE
-      require(audit.fused_notify_starts == 0U &&
-                  audit.control_starts == 1U && audit.config_starts == 1U &&
+      require(audit.fused_notify_starts == 0U && audit.control_starts == 1U &&
+                  audit.config_starts == 1U &&
                   audit.expert_count_starts == 1U &&
                   audit.packet_summary_starts == 1U,
               "debug generation did not retain the full Notify protocol");
 #else
-      require(audit.fused_notify_starts == 1U &&
-                  audit.control_starts == 0U && audit.config_starts == 0U &&
+      require(audit.fused_notify_starts == 1U && audit.control_starts == 0U &&
+                  audit.config_starts == 0U &&
                   audit.expert_count_starts == 0U &&
                   audit.packet_summary_starts == 0U,
               "steady single-node release generation did not use one fused "
@@ -2128,10 +2100,10 @@ void test_resource_pool_and_cuda_api_audit() {
 #if !WEFTMOE_DEBUG_VALIDATE
   const auto require_base_recovery = [&](std::uint64_t generation,
                                          const char *failure) {
-    auto recovery_session = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", generation);
-    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(
-        recovery_session, execution, pool);
+    auto recovery_session =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", generation);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
+                                                            execution, pool);
     auto recovered = recovery.run_device(exact_request(recovery_session));
     const auto audit = recovery.audit();
     require(recovered && audit.fused_notify_starts == 1U &&
@@ -2161,8 +2133,8 @@ void test_resource_pool_and_cuda_api_audit() {
                                                               execution, pool);
     (void)host_prime.run({config, routes, 10});
   }
-  auto invalid_session = weftmoe::cuda::make_nccl_generation(
-      base, "pool-base", 6299);
+  auto invalid_session =
+      weftmoe::cuda::make_nccl_generation(base, "pool-base", 6299);
   weftmoe::cuda::CudaNotifyGenerationCoordinator invalid_coordinator(
       invalid_session, execution, pool);
   auto invalid_routes = routes;
@@ -2194,8 +2166,8 @@ void test_resource_pool_and_cuda_api_audit() {
   // at control validation; forcing it through fused would interpret the old
   // layout.  Returning to the cached config on the same communicator must
   // recover through fused and reproduce the oracle bytes.
-  auto changed_session = weftmoe::cuda::make_nccl_generation(
-      base, "pool-base", 6301);
+  auto changed_session =
+      weftmoe::cuda::make_nccl_generation(base, "pool-base", 6301);
   weftmoe::cuda::CudaNotifyGenerationCoordinator changed_coordinator(
       changed_session, execution, pool);
   auto changed_config = config;
@@ -2222,8 +2194,8 @@ void test_resource_pool_and_cuda_api_audit() {
             "to the cached release protocol");
 #endif
 
-  auto second_session = weftmoe::cuda::make_nccl_generation(
-      base, "pool-base", 6310);
+  auto second_session =
+      weftmoe::cuda::make_nccl_generation(base, "pool-base", 6310);
   weftmoe::cuda::CudaNotifyGenerationCoordinator second_coordinator(
       second_session, execution, pool);
   auto second = second_coordinator.run_device(exact_request(second_session));
@@ -2231,8 +2203,8 @@ void test_resource_pool_and_cuda_api_audit() {
           "two live handles did not occupy two exclusive pool slots");
   bool exhausted = false;
   try {
-    auto third_session = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6311);
+    auto third_session =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6311);
     weftmoe::cuda::CudaNotifyGenerationCoordinator third_coordinator(
         third_session, execution, pool);
     (void)third_coordinator.run_device(exact_request(third_session));
@@ -2247,8 +2219,8 @@ void test_resource_pool_and_cuda_api_audit() {
       weftmoe::cuda::testing::NcclFaultPoint::ControlStart);
   bool injected_failed = false;
   try {
-    auto failed_session = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6312);
+    auto failed_session =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6312);
     weftmoe::cuda::CudaNotifyGenerationCoordinator failed_coordinator(
         failed_session, execution, pool);
     (void)failed_coordinator.run_device(exact_request(failed_session));
@@ -2257,12 +2229,12 @@ void test_resource_pool_and_cuda_api_audit() {
   }
   require(injected_failed && pool.usage().slots_in_use == 1,
           "failed generation leaked or published a pool slot");
-  auto recovery_session = weftmoe::cuda::make_nccl_generation(
-      base, "pool-base", 6313);
+  auto recovery_session =
+      weftmoe::cuda::make_nccl_generation(base, "pool-base", 6313);
   weftmoe::cuda::CudaNotifyGenerationCoordinator recovery_coordinator(
       recovery_session, execution, pool);
-  auto recovered = recovery_coordinator.run_device(
-      exact_request(recovery_session));
+  auto recovered =
+      recovery_coordinator.run_device(exact_request(recovery_session));
   require(recovered && pool.usage().slots_in_use == 2,
           "released pool slot was not reusable");
 
@@ -2290,8 +2262,8 @@ void test_resource_pool_and_cuda_api_audit() {
     std::vector<weftmoe::cuda::ValidatedCudaGeneration> live;
     for (std::uint32_t slot = 0; slot < slot_count; ++slot) {
       const auto generation = 6400U + slot_count * 10U + slot;
-      auto session = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base", generation);
+      auto session =
+          weftmoe::cuda::make_nccl_generation(base, "pool-base", generation);
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
       live.push_back(coordinator.run_device(exact_request(session)));
@@ -2300,9 +2272,8 @@ void test_resource_pool_and_cuda_api_audit() {
             "pool size 1/N did not retain every live slot");
     bool sized_exhausted = false;
     try {
-      auto session = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base",
-          6500U + slot_count);
+      auto session = weftmoe::cuda::make_nccl_generation(base, "pool-base",
+                                                         6500U + slot_count);
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
       (void)coordinator.run_device(exact_request(session));
@@ -2316,9 +2287,8 @@ void test_resource_pool_and_cuda_api_audit() {
     require(sized_pool.usage().slots_in_use == 0,
             "pool size 1/N did not release all final handle leases");
     {
-      auto session = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base",
-          6600U + slot_count);
+      auto session = weftmoe::cuda::make_nccl_generation(base, "pool-base",
+                                                         6600U + slot_count);
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           session, execution, sized_pool);
       auto reused = coordinator.run_device(exact_request(session));
@@ -2332,23 +2302,23 @@ void test_resource_pool_and_cuda_api_audit() {
   {
     auto stale_pool = weftmoe::cuda::make_device_notify_resource_pool(
         base, execution, {config, 10, 4096, 1, 1});
-    auto generation = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6700);
+    auto generation =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6700);
     weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         generation, execution, stale_pool);
     auto gen1 = coordinator.run_device(exact_request(generation));
     auto handle = gen1.dispatch();
     const auto &id = handle.identity();
     auto consumer = handle.acquire_consumer(
-        execution, {id.generation, id.calling_rank, id.world_size,
-                    id.num_tokens, id.top_k, id.config_digest_word0,
-                    id.config_digest_word1});
+        execution,
+        {id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+         id.config_digest_word0, id.config_digest_word1});
     bool consumer_exhausted = false;
     try {
       (void)handle.acquire_consumer(
-          execution, {id.generation, id.calling_rank, id.world_size,
-                      id.num_tokens, id.top_k, id.config_digest_word0,
-                      id.config_digest_word1});
+          execution,
+          {id.generation, id.calling_rank, id.world_size, id.num_tokens,
+           id.top_k, id.config_digest_word0, id.config_digest_word1});
     } catch (const weftmoe::NotifyDispatchError &error) {
       consumer_exhausted =
           error.code() == weftmoe::NotifyErrorCode::ResourceExhausted;
@@ -2373,8 +2343,8 @@ void test_resource_pool_and_cuda_api_audit() {
             "submitted consumer did not retain generation slot");
     bool stale_exhausted = false;
     try {
-      auto blocked_generation = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base", 6701);
+      auto blocked_generation =
+          weftmoe::cuda::make_nccl_generation(base, "pool-base", 6701);
       weftmoe::cuda::CudaNotifyGenerationCoordinator blocked(
           blocked_generation, execution, stale_pool);
       (void)blocked.run_device(exact_request(blocked_generation));
@@ -2390,12 +2360,12 @@ void test_resource_pool_and_cuda_api_audit() {
             "old consumer did not read generation-1 canonical row");
     require(stale_pool.usage().slots_in_use == 0,
             "finished consumer did not release final slot lease");
-    auto recovered_generation = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6702);
+    auto recovered_generation =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6702);
     weftmoe::cuda::CudaNotifyGenerationCoordinator recovered_coordinator(
         recovered_generation, execution, stale_pool);
-    auto gen2 = recovered_coordinator.run_device(
-        exact_request(recovered_generation));
+    auto gen2 =
+        recovered_coordinator.run_device(exact_request(recovered_generation));
     require(gen2 && stale_pool.usage().slots_in_use == 1,
             "slot was not reusable after final consumer completion");
   }
@@ -2403,17 +2373,17 @@ void test_resource_pool_and_cuda_api_audit() {
   {
     auto quarantine_pool = weftmoe::cuda::make_device_notify_resource_pool(
         base, execution, {config, 10, 4096, 1, 2});
-    auto generation = weftmoe::cuda::make_nccl_generation(
-        base, "pool-base", 6800);
+    auto generation =
+        weftmoe::cuda::make_nccl_generation(base, "pool-base", 6800);
     weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
         generation, execution, quarantine_pool);
     auto result = coordinator.run_device(exact_request(generation));
     auto handle = result.dispatch();
     const auto &id = handle.identity();
     auto consumer = handle.acquire_consumer(
-        execution, {id.generation, id.calling_rank, id.world_size,
-                    id.num_tokens, id.top_k, id.config_digest_word0,
-                    id.config_digest_word1});
+        execution,
+        {id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+         id.config_digest_word0, id.config_digest_word1});
     weftmoe::cuda::testing::submit_dispatch_probe(consumer, 1000);
     weftmoe::cuda::testing::inject_next_consumer_fault(
         weftmoe::cuda::testing::ConsumerFaultPoint::EventAndStreamSynchronize);
@@ -2435,9 +2405,9 @@ void test_resource_pool_and_cuda_api_audit() {
     bool handle_failed = false;
     try {
       (void)handle.acquire_consumer(
-          execution, {id.generation, id.calling_rank, id.world_size,
-                      id.num_tokens, id.top_k, id.config_digest_word0,
-                      id.config_digest_word1});
+          execution,
+          {id.generation, id.calling_rank, id.world_size, id.num_tokens,
+           id.top_k, id.config_digest_word0, id.config_digest_word1});
     } catch (const weftmoe::NotifyDispatchError &) {
       handle_failed = true;
     }
@@ -2445,10 +2415,9 @@ void test_resource_pool_and_cuda_api_audit() {
             "quarantined generation handle accepted another consumer");
     bool next_failed = false;
     try {
-      auto next = weftmoe::cuda::make_nccl_generation(
-          base, "pool-base", 6801);
-      weftmoe::cuda::CudaNotifyGenerationCoordinator blocked(
-          next, execution, quarantine_pool);
+      auto next = weftmoe::cuda::make_nccl_generation(base, "pool-base", 6801);
+      weftmoe::cuda::CudaNotifyGenerationCoordinator blocked(next, execution,
+                                                             quarantine_pool);
       (void)blocked.run_device(exact_request(next));
     } catch (const weftmoe::NotifyDispatchError &error) {
       next_failed = error.code() == weftmoe::NotifyErrorCode::ResourceExhausted;
@@ -2457,9 +2426,9 @@ void test_resource_pool_and_cuda_api_audit() {
             "quarantined slot was allocated to a later generation");
   }
 
-  for (const auto fault : {
-           weftmoe::cuda::testing::ConsumerFaultPoint::EventRecord,
-           weftmoe::cuda::testing::ConsumerFaultPoint::EventSynchronize}) {
+  for (const auto fault :
+       {weftmoe::cuda::testing::ConsumerFaultPoint::EventRecord,
+        weftmoe::cuda::testing::ConsumerFaultPoint::EventSynchronize}) {
     auto event_pool = weftmoe::cuda::make_device_notify_resource_pool(
         base, execution, {config, 10, 4096, 1, 2});
     auto generation = weftmoe::cuda::make_nccl_generation(
@@ -2472,9 +2441,9 @@ void test_resource_pool_and_cuda_api_audit() {
     auto result = coordinator.run_device(exact_request(generation));
     const auto &id = result.dispatch().identity();
     auto consumer = result.dispatch().acquire_consumer(
-        execution, {id.generation, id.calling_rank, id.world_size,
-                    id.num_tokens, id.top_k, id.config_digest_word0,
-                    id.config_digest_word1});
+        execution,
+        {id.generation, id.calling_rank, id.world_size, id.num_tokens, id.top_k,
+         id.config_digest_word0, id.config_digest_word1});
     weftmoe::cuda::testing::inject_next_consumer_fault(fault);
     bool failed = false;
     try {
@@ -2485,12 +2454,12 @@ void test_resource_pool_and_cuda_api_audit() {
     }
     require(failed, "consumer event-only fault was not surfaced");
     const auto usage = event_pool.usage();
-    require(usage.slots_quarantined == 0 &&
-                usage.slots_in_use == 1 &&
-                usage.consumer_events_quarantined == 1 &&
-                usage.consumer_events_available == 1 &&
-                usage.consumer_events_in_use == 0,
-            "event-only failure incorrectly recycled event or quarantined slot");
+    require(
+        usage.slots_quarantined == 0 && usage.slots_in_use == 1 &&
+            usage.consumer_events_quarantined == 1 &&
+            usage.consumer_events_available == 1 &&
+            usage.consumer_events_in_use == 0,
+        "event-only failure incorrectly recycled event or quarantined slot");
   }
 
   std::cout << "[PASS] exact route generation 6200->6201..6210 rejection + "
@@ -2498,9 +2467,9 @@ void test_resource_pool_and_cuda_api_audit() {
                "10-generation "
                "CUDA API audit alloc/free/pinned/event/device-sync=0/0/0/0/0, "
                "H2D_bytes="
-            << after.h2d_bytes - before.h2d_bytes << ", D2H_bytes="
-            << after.d2h_bytes - before.d2h_bytes << ", D2D_bytes="
-            << after.d2d_bytes - before.d2d_bytes << '\n';
+            << after.h2d_bytes - before.h2d_bytes
+            << ", D2H_bytes=" << after.d2h_bytes - before.d2h_bytes
+            << ", D2D_bytes=" << after.d2d_bytes - before.d2d_bytes << '\n';
 }
 void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                             std::uint32_t world,
@@ -2674,8 +2643,8 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
     forward_hashes[distribution] = hash_bf16_indexed(
         download_forward_output_for_validation(forward, execution));
     BackwardMegaKernelConfig backward_config{hidden, intermediate};
-    backward_config.tensors = backward_kernel.prepare_tensors(
-        forward, backward_config, {}, allocate);
+    backward_config.tensors =
+        backward_kernel.prepare_tensors(forward, backward_config, {}, allocate);
     auto backward =
         backward_kernel.enqueue(forward, gradients, backward_config);
     auto result = BackwardValidationBridge::download(backward, execution);
@@ -2786,35 +2755,37 @@ void test_buffer_modes_rank(std::uint32_t rank, std::uint32_t nodes,
                "gradient_bits=all\n";
 }
 
-void run_cached_backward_rank(
-    std::uint32_t rank, std::uint32_t nodes, std::uint32_t world,
-    std::uint32_t experts, std::uint32_t top_k, std::uint64_t max_tokens,
-    const weftmoe::RuntimeConfig &config,
-    const weftmoe::RankRoutingInput &routes,
-    const weftmoe::cuda::NcclSession &base,
-    const weftmoe::cuda::CudaExecution &execution, bool validation) {
+void run_cached_backward_rank(std::uint32_t rank, std::uint32_t nodes,
+                              std::uint32_t world, std::uint32_t experts,
+                              std::uint32_t top_k, std::uint64_t max_tokens,
+                              const weftmoe::RuntimeConfig &config,
+                              const weftmoe::RankRoutingInput &routes,
+                              const weftmoe::cuda::NcclSession &base,
+                              const weftmoe::cuda::CudaExecution &execution,
+                              bool validation) {
   const auto hidden = benchmark_dimension(
       "WEFTMOE_BENCH_HIDDEN", weftmoe::cuda::forward_tuning::kMainHidden);
-  const auto intermediate = benchmark_dimension(
-      "WEFTMOE_BENCH_INTERMEDIATE",
-      weftmoe::cuda::forward_tuning::kMainIntermediate);
+  const auto intermediate =
+      benchmark_dimension("WEFTMOE_BENCH_INTERMEDIATE",
+                          weftmoe::cuda::forward_tuning::kMainIntermediate);
   require((nodes == 1U && (world == 1U || world == 2U || world == 8U)) ||
               (nodes == 2U && world == 16U),
           "cached Backward requires local 1/2/8 GPUs or GIN 2x8 GPUs");
   require(experts % world == 0U && routes.num_tokens == max_tokens,
           "cached Backward fixture shape is inconsistent");
 
-  auto generation = weftmoe::cuda::make_nccl_generation(
-      base, "cuda-cached-backward", 701U);
-  auto context = weftmoe::make_rank_collective_context(
-      generation.session(), rank, execution.token());
+  auto generation =
+      weftmoe::cuda::make_nccl_generation(base, "cuda-cached-backward", 701U);
+  auto context = weftmoe::make_rank_collective_context(generation.session(),
+                                                       rank, execution.token());
   auto notify_pool = weftmoe::cuda::make_device_notify_resource_pool(
-      base, execution, {config, max_tokens, 8192, 3U, 4U, false,
-                       std::getenv("WEFTMOE_STATIC_RING_TOKENS") != nullptr});
-  auto route_storage = weftmoe::cuda::upload_cuda_routes(
-      routes, top_k, context, execution);
-  const auto route_gates = fixed_random_selected_gates(
-      max_tokens, top_k, rank, 0x4d4547414d4f4547ULL);
+      base, execution,
+      {config, max_tokens, 8192, 3U, 4U, false,
+       std::getenv("WEFTMOE_STATIC_RING_TOKENS") != nullptr});
+  auto route_storage =
+      weftmoe::cuda::upload_cuda_routes(routes, top_k, context, execution);
+  const auto route_gates = fixed_random_selected_gates(max_tokens, top_k, rank,
+                                                       0x4d4547414d4f4547ULL);
   auto gate_storage = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
       route_gates, route_storage, context, execution);
 
@@ -2838,7 +2809,8 @@ void run_cached_backward_rank(
   pool_config.enable_gin_rdma = nodes == 2U;
   if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
     pool_config.static_forward_window_tokens = std::stoul(window);
-  if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+  if (const auto *depth =
+          std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
     pool_config.static_forward_contribution_windows = std::stoul(depth);
   auto activation_pool = weftmoe::cuda::prepare_activation_transport_pool(
       generation.session(), execution, pool_config, notify.dispatch());
@@ -2848,12 +2820,10 @@ void run_cached_backward_rank(
   std::vector<weftmoe::transport::BFloat16> dy_host(activation_host.size());
   for (std::size_t index = 0; index < activation_host.size(); ++index) {
     activation_host[index] = weftmoe::transport::float_to_bfloat16(
-        static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) -
-                           63) /
+        static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) - 63) /
         64.0F);
     dy_host[index] = weftmoe::transport::float_to_bfloat16(
-        static_cast<float>(static_cast<int>((index * 29U + rank * 17U) %
-                                            113U) -
+        static_cast<float>(static_cast<int>((index * 29U + rank * 17U) % 113U) -
                            56) /
         64.0F);
   }
@@ -2899,19 +2869,20 @@ void run_cached_backward_rank(
                           ? static_cast<std::uint32_t>(std::stoul(rounds_text))
                           : (validation ? 2U : 30U);
   const auto warmups_text = std::getenv("WEFTMOE_BACKWARD_WARMUPS");
-  const auto warmups = warmups_text
-                           ? static_cast<std::uint32_t>(
-                                 std::stoul(warmups_text))
-                           : (validation ? 0U : 10U);
+  const auto warmups =
+      warmups_text ? static_cast<std::uint32_t>(std::stoul(warmups_text))
+                   : (validation ? 0U : 10U);
   require(rounds > warmups, "Backward requires at least one measured round");
   const auto pause_text = std::getenv("WEFTMOE_BACKWARD_BENCH_PAUSE_US");
   const auto pause_us = pause_text ? std::stoull(pause_text) : 0ULL;
-  require(pause_us <= 1000000ULL, "Backward benchmark pause exceeds one second");
+  require(pause_us <= 1000000ULL,
+          "Backward benchmark pause exceeds one second");
   const bool record_windows =
       std::getenv("WEFTMOE_BACKWARD_BENCH_TIMESTAMPS") != nullptr;
   const auto unix_ns = [] {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::system_clock::now().time_since_epoch()).count();
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
   };
   std::vector<std::int64_t> sample_begin_unix_ns;
   std::vector<std::int64_t> sample_end_unix_ns;
@@ -2948,7 +2919,8 @@ void run_cached_backward_rank(
                        cudaMemcpyHostToDevice) == cudaSuccess,
             "upload Backward allocation fixture");
   } else {
-    backward_config.tensors = backward.prepare_tensors(forward, backward_config);
+    backward_config.tensors =
+        backward.prepare_tensors(forward, backward_config);
   }
   std::uint64_t warm_misses = 0;
   const auto rank_barrier =
@@ -2980,8 +2952,8 @@ void run_cached_backward_rank(
       output_gradients = producer.publish_output_gradients(
           static_cast<const weftmoe::transport::BFloat16 *>(input.data),
           dy_host.size(), max_tokens, hidden, input.owner);
-      backward_config.tensors = backward.prepare_tensors(
-          forward, backward_config, {}, allocate);
+      backward_config.tensors =
+          backward.prepare_tensors(forward, backward_config, {}, allocate);
     }
     auto output =
         backward.enqueue(forward, output_gradients, backward_config, {});
@@ -2996,7 +2968,8 @@ void run_cached_backward_rank(
     }
     if (validation) {
       cudaStream_t output_stream = nullptr;
-      require(cudaStreamCreateWithFlags(&output_stream, cudaStreamNonBlocking) == cudaSuccess,
+      require(cudaStreamCreateWithFlags(&output_stream,
+                                        cudaStreamNonBlocking) == cudaSuccess,
               "create async consumer stream");
       output.wait_on(output_stream);
       require(cudaStreamSynchronize(output_stream) == cudaSuccess,
@@ -3005,7 +2978,8 @@ void run_cached_backward_rank(
               "destroy async consumer stream");
     }
     output.wait();
-    if (validation) output.wait();  // completion is idempotent
+    if (validation)
+      output.wait(); // completion is idempotent
     const auto end = Clock::now();
     const auto window_end = record_windows ? unix_ns() : 0;
     if (round >= warmups) {
@@ -3047,13 +3021,12 @@ void run_cached_backward_rank(
   std::uint64_t dw2_hash = 0ULL;
   if (validation) {
     progress("validation_download_enter");
-    auto first = weftmoe::cuda::BackwardValidationBridge::download(
-        last, execution);
-    last = backward.run(forward, output_gradients,
-                        {hidden, intermediate}, {});
+    auto first =
+        weftmoe::cuda::BackwardValidationBridge::download(last, execution);
+    last = backward.run(forward, output_gradients, {hidden, intermediate}, {});
     progress("validation_repeat_done");
-    auto repeated = weftmoe::cuda::BackwardValidationBridge::download(
-        last, execution);
+    auto repeated =
+        weftmoe::cuda::BackwardValidationBridge::download(last, execution);
     const auto equal_bytes = [](const auto &left, const auto &right) {
       return left.size() == right.size() &&
              (left.empty() ||
@@ -3069,11 +3042,10 @@ void run_cached_backward_rank(
     dw1_hash = hash_bf16_indexed(repeated.dw1);
     dw2_hash = hash_bf16_indexed(repeated.dw2);
     if (const auto *artifact_dir = std::getenv("WEFTMOE_BACKWARD_OUTPUT_DIR")) {
-      const auto prefix = std::string(artifact_dir) + "/rank-" +
-                          std::to_string(rank) + "-";
+      const auto prefix =
+          std::string(artifact_dir) + "/rank-" + std::to_string(rank) + "-";
       const auto write = [&](const std::string &name, const auto &values) {
-        std::ofstream output(prefix + name,
-                             std::ios::binary | std::ios::trunc);
+        std::ofstream output(prefix + name, std::ios::binary | std::ios::trunc);
         require(output.good(), "failed opening Backward artifact " + name);
         output.write(reinterpret_cast<const char *>(values.data()),
                      static_cast<std::streamsize>(values.size() *
@@ -3159,7 +3131,8 @@ void run_cached_backward_rank(
   if (record_windows) {
     const auto emit_ns = [](const std::vector<std::int64_t> &values) {
       for (std::size_t index = 0; index < values.size(); ++index) {
-        if (index != 0U) std::cout << ',';
+        if (index != 0U)
+          std::cout << ',';
         std::cout << values[index];
       }
     };
@@ -3182,11 +3155,12 @@ void run_communication_benchmark_rank(
   constexpr std::uint64_t hidden = weftmoe::cuda::forward_tuning::kMainHidden;
   constexpr std::uint64_t intermediate =
       weftmoe::cuda::forward_tuning::kMainIntermediate;
-  require((nodes == 1U &&
-           (world == 1U || world == 2U || world == 4U || world == 8U)) ||
-              (nodes > 1U && world == nodes * 8U),
-          "communication benchmark requires local 1/2/4/8 GPUs or GIN nodes of 8 "
-          "GPUs");
+  require(
+      (nodes == 1U &&
+       (world == 1U || world == 2U || world == 4U || world == 8U)) ||
+          (nodes > 1U && world == nodes * 8U),
+      "communication benchmark requires local 1/2/4/8 GPUs or GIN nodes of 8 "
+      "GPUs");
   require(max_tokens != 0U && experts % world == 0U &&
               routes.num_tokens == max_tokens,
           "communication benchmark fixture shape is inconsistent");
@@ -3308,8 +3282,7 @@ void run_communication_benchmark_rank(
     require(actual.size() == activation_host.size(),
             "communication output size");
     for (std::size_t i = 0; i < actual.size(); ++i) {
-      const auto x =
-          weftmoe::transport::bfloat16_to_float(activation_host[i]);
+      const auto x = weftmoe::transport::bfloat16_to_float(activation_host[i]);
       float sum = 0.0F;
       for (unsigned slot = 0; slot < top_k; ++slot)
         sum += x;
@@ -3318,9 +3291,8 @@ void run_communication_benchmark_rank(
     }
   }
   std::cout << "COMM_BENCH rank=" << rank << " world=" << world
-            << " tokens=" << max_tokens
-            << " top_k=" << top_k << " hidden=" << hidden
-            << " experts=" << experts
+            << " tokens=" << max_tokens << " top_k=" << top_k
+            << " hidden=" << hidden << " experts=" << experts
             << " dispatch_peer_bytes=" << audit.actual_dispatch_peer_bytes
             << " return_peer_bytes=" << audit.actual_return_peer_bytes
             << " gin_dispatch_bytes=" << audit.gin_dispatch_payload_bytes
@@ -3359,11 +3331,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
           ? std::stoul(std::getenv("WEFTMOE_TEST_ROUTE_STRIDE"))
           : 53U;
   constexpr std::array<std::uint32_t, 12> kCrossEpExperts{
-      1U, 68U, 135U, 202U, 269U, 336U,
-      145U, 289U, 10U, 90U, 230U, 350U};
+      1U, 68U, 135U, 202U, 269U, 336U, 145U, 289U, 10U, 90U, 230U, 350U};
   const auto benchmark_p2p = scenario == "activation_p2p_bench";
-  const auto benchmark_integrated =
-      scenario == "activation_integrated_bench";
+  const auto benchmark_integrated = scenario == "activation_integrated_bench";
   const auto gin_forward_smoke = scenario == "gin_forward_smoke";
   const auto gin_forward_benchmark = scenario == "gin_forward_bench";
   const auto gin_backward_smoke = scenario == "gin_backward_smoke";
@@ -3408,12 +3378,12 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                   (benchmark_communication && world == nodes * 8U))),
             "CUDA benchmark requires local 1/2/4/8 GPUs or GIN 2x1/2x8 GPUs");
     experts = std::getenv("WEFTMOE_BENCH_EXPERTS")
-                  ? std::stoul(std::getenv("WEFTMOE_BENCH_EXPERTS")) : 384U;
+                  ? std::stoul(std::getenv("WEFTMOE_BENCH_EXPERTS"))
+                  : 384U;
     require(experts > 0 && experts % world == 0, "experts must divide EP");
-    const auto benchmark_top_k =
-        std::getenv("WEFTMOE_INTEGRATED_TOP_K")
-            ? std::getenv("WEFTMOE_INTEGRATED_TOP_K")
-            : std::getenv("WEFTMOE_P2P_TOP_K");
+    const auto benchmark_top_k = std::getenv("WEFTMOE_INTEGRATED_TOP_K")
+                                     ? std::getenv("WEFTMOE_INTEGRATED_TOP_K")
+                                     : std::getenv("WEFTMOE_P2P_TOP_K");
     top_k = benchmark_top_k
                 ? static_cast<std::uint32_t>(std::stoul(benchmark_top_k))
                 : 6U;
@@ -3445,7 +3415,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         static_cast<std::size_t>(max_tokens * top_k));
     for (std::uint64_t token = 0; token < max_tokens; ++token) {
       const auto base = static_cast<std::uint32_t>(
-          ((token + fixture_token_offset) * 17U + fixture_rank * 31U) % experts);
+          ((token + fixture_token_offset) * 17U + fixture_rank * 31U) %
+          experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
         common_routes.selected_experts.push_back(
             static_cast<std::int32_t>((base + slot * route_stride) % experts));
@@ -3460,8 +3431,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         common_routes.num_tokens = std::max<std::uint64_t>(1U, max_tokens / 2U);
       common_routes.selected_experts.resize(common_routes.num_tokens * top_k);
       for (std::uint64_t token = 0; token < common_routes.num_tokens; ++token) {
-        const auto base = mode == "hotspot" ? route_seed % experts :
-            (token * 17U + rank * 31U + route_seed * 13U) % experts;
+        const auto base =
+            mode == "hotspot"
+                ? route_seed % experts
+                : (token * 17U + rank * 31U + route_seed * 13U) % experts;
         for (unsigned slot = 0; slot < top_k; ++slot)
           common_routes.selected_experts[token * top_k + slot] =
               static_cast<std::int32_t>((base + slot) % experts);
@@ -3470,10 +3443,12 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     // Diagnostic only: hold per-expert row counts and GEMM dimensions fixed
     // while changing where tokens originate. This changes routing semantics
     // and must not be used as an output-equivalence fixture.
-    if (const char *scope = std::getenv("WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE")) {
+    if (const char *scope =
+            std::getenv("WEFTMOE_FORWARD_DIAGNOSTIC_ROUTE_SCOPE")) {
       require(benchmark_forward && (world == 8U || world == 16U) &&
                   max_tokens % experts == 0U && std::gcd(17U, experts) == 1U,
-              "route-scope diagnostic requires EP8/EP16 and balanced whole expert cycles");
+              "route-scope diagnostic requires EP8/EP16 and balanced whole "
+              "expert cycles");
       const std::string mode(scope);
       require(mode == "self" || mode == "node" || mode == "remote",
               "diagnostic route scope must be self, node, or remote");
@@ -3481,8 +3456,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       require((mode != "remote" || nodes == 2U) &&
                   top_k <= width / std::gcd(route_stride, width),
               "route-scope diagnostic must preserve distinct selected experts");
-      const auto owner = mode == "self" ? rank :
-          (mode == "node" ? rank / gpus_per_node : 1U - rank / gpus_per_node);
+      const auto owner = mode == "self"
+                             ? rank
+                             : (mode == "node" ? rank / gpus_per_node
+                                               : 1U - rank / gpus_per_node);
       for (auto &expert : common_routes.selected_experts)
         expert = static_cast<std::int32_t>(
             owner * width + static_cast<std::uint32_t>(expert) % width);
@@ -3509,8 +3486,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     common_routes.selected_experts.clear();
     for (std::uint64_t token = 0; token < max_tokens; ++token)
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
-        common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            kCrossEpExperts[token * 6U + slot]));
+        common_routes.selected_experts.push_back(
+            static_cast<std::int32_t>(kCrossEpExperts[token * 6U + slot]));
   }
   if (scenario == "activation_gin") {
     common_routes.num_tokens = max_tokens;
@@ -3518,11 +3495,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     common_routes.selected_experts.reserve(
         static_cast<std::size_t>(max_tokens * top_k));
     for (std::uint64_t token = 0; token < max_tokens; ++token) {
-      const auto base_expert = static_cast<std::uint32_t>(
-          (token * 17U + rank * 31U) % experts);
+      const auto base_expert =
+          static_cast<std::uint32_t>((token * 17U + rank * 31U) % experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
-        common_routes.selected_experts.push_back(static_cast<std::int32_t>(
-            (base_expert + slot * 5U) % experts));
+        common_routes.selected_experts.push_back(
+            static_cast<std::int32_t>((base_expert + slot * 5U) % experts));
     }
   }
   if (backward_validation) {
@@ -3552,8 +3529,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     common_routes.selected_experts.reserve(
         static_cast<std::size_t>(max_tokens * top_k));
     for (std::uint64_t token = 0; token < max_tokens; ++token) {
-      const auto base = static_cast<std::uint32_t>(
-          (token * world + rank) % experts);
+      const auto base =
+          static_cast<std::uint32_t>((token * world + rank) % experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot)
         common_routes.selected_experts.push_back(
             static_cast<std::int32_t>((base + slot * route_stride) % experts));
@@ -3583,17 +3560,14 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
   if (scenario == "gin_probe") {
     const auto capability =
         weftmoe::cuda::probe_activation_transport_capability(base, execution);
-    std::cout << "GIN_DISTRIBUTED_PROBE rank=" << rank
-              << " world=" << world
+    std::cout << "GIN_DISTRIBUTED_PROBE rank=" << rank << " world=" << world
               << " headers=" << capability.gin_headers_available
               << " symbols=" << capability.gin_symbols_present
               << " runtime_initializable="
               << capability.gin_runtime_initializable
-              << " backend_implemented="
-              << capability.gin_backend_implemented
+              << " backend_implemented=" << capability.gin_backend_implemented
               << " usable=" << capability.gin_usable
-              << " reason=" << capability.gin_unavailable_reason
-              << std::endl;
+              << " reason=" << capability.gin_unavailable_reason << std::endl;
     return;
   }
   if (scenario == "gin_put_probe") {
@@ -3619,9 +3593,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                            ? 0U
                            : static_cast<std::uint32_t>(std::stoul(shift_text));
     const auto *warmup_text = std::getenv("WEFTMOE_GIN_BENCH_WARMUP");
-    const auto warmup = warmup_text == nullptr
-                            ? 4U
-                            : static_cast<std::uint32_t>(std::stoul(warmup_text));
+    const auto warmup =
+        warmup_text == nullptr
+            ? 4U
+            : static_cast<std::uint32_t>(std::stoul(warmup_text));
     const auto *measured_text = std::getenv("WEFTMOE_GIN_BENCH_MEASURED");
     const auto measured =
         measured_text == nullptr
@@ -3632,8 +3607,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                            ? 32U
                            : static_cast<std::uint32_t>(std::stoul(batch_text));
     const auto *contexts_text = std::getenv("WEFTMOE_GIN_BENCH_CONTEXTS");
-    const auto contexts = contexts_text == nullptr
-        ? 1U : static_cast<std::uint32_t>(std::stoul(contexts_text));
+    const auto contexts =
+        contexts_text == nullptr
+            ? 1U
+            : static_cast<std::uint32_t>(std::stoul(contexts_text));
     const std::vector<std::uint64_t> payloads{
         1ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
         2ULL * 7168ULL * sizeof(weftmoe::transport::BFloat16),
@@ -3660,24 +3637,22 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                 << " gin_type=" << benchmark.gin_type
                 << " railed_gin_type=" << benchmark.railed_gin_type
                 << " payload=" << sample.payload_bytes
-                << " puts=" << sample.puts_per_sample
-                << " durations_ns=";
+                << " puts=" << sample.puts_per_sample << " durations_ns=";
       for (std::size_t index = 0; index < sample.duration_ns.size(); ++index) {
         if (index != 0)
           std::cout << ',';
         std::cout << sample.duration_ns[index];
       }
       std::cout << " received_hash=" << benchmark.received_hash
-                << " expected_hash=" << benchmark.expected_hash
-                << " match="
+                << " expected_hash=" << benchmark.expected_hash << " match="
                 << (benchmark.received_hash == benchmark.expected_hash)
                 << std::endl;
     }
     return;
   }
   if (scenario == "gin_team_pool") {
-    auto generation = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-gin-team-pool", 701);
+    auto generation =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-gin-team-pool", 701);
     weftmoe::cuda::ActivationTransportPoolConfig config;
     config.max_tokens_per_rank = 2;
     config.max_hidden_size = 17;
@@ -3691,16 +3666,15 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     config.enable_gin_rdma = true;
     auto activation_pool = weftmoe::cuda::make_activation_transport_pool(
         generation.session(), execution, config);
-    weftmoe::cuda::GinRdmaActivationTransport transport(
-        generation, execution, activation_pool);
+    weftmoe::cuda::GinRdmaActivationTransport transport(generation, execution,
+                                                        activation_pool);
     const auto usage = activation_pool.usage();
     require(usage.compute_device_bytes != 0 &&
                 usage.gin_registered_bytes != 0 &&
                 usage.device_bytes > usage.compute_device_bytes,
             "GIN pool did not separate compute and registered storage");
     std::cout << "GIN_TEAM_POOL rank=" << rank << " world=" << world
-              << " nodes=" << nodes
-              << " local_world=" << gpus_per_node
+              << " nodes=" << nodes << " local_world=" << gpus_per_node
               << " local_rank=" << local_rank
               << " compute_bytes=" << usage.compute_device_bytes
               << " registered_bytes=" << usage.gin_registered_bytes
@@ -3733,13 +3707,13 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
   if (benchmark_forward) {
     const auto hidden = benchmark_dimension(
         "WEFTMOE_BENCH_HIDDEN", weftmoe::cuda::forward_tuning::kMainHidden);
-    const auto intermediate = benchmark_dimension(
-        "WEFTMOE_BENCH_INTERMEDIATE",
-        weftmoe::cuda::forward_tuning::kMainIntermediate);
+    const auto intermediate =
+        benchmark_dimension("WEFTMOE_BENCH_INTERMEDIATE",
+                            weftmoe::cuda::forward_tuning::kMainIntermediate);
     const bool retain_backward_state =
         std::getenv("WEFTMOE_FORWARD_BENCH_RETAIN_STATE") != nullptr;
-    auto setup_generation = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-forward-bench", 701);
+    auto setup_generation =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-forward-bench", 701);
     auto setup_context = weftmoe::make_rank_collective_context(
         setup_generation.session(), rank, execution.token());
     auto route_storage = weftmoe::cuda::upload_cuda_routes(
@@ -3750,9 +3724,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         fixture_gates.begin() + fixture_token_offset * top_k,
         fixture_gates.begin() +
             (fixture_token_offset + common_routes.num_tokens) * top_k);
-    auto gate_storage =
-        weftmoe::cuda::testing::upload_fp32_gates_for_testing(
-            route_gates, route_storage, setup_context, execution);
+    auto gate_storage = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
+        route_gates, route_storage, setup_context, execution);
     weftmoe::cuda::ActivationTransportPoolConfig transport_config;
     transport_config.max_tokens_per_rank = max_tokens;
     transport_config.max_hidden_size = hidden;
@@ -3768,18 +3741,22 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     transport_config.enable_gin_rdma = gin_forward_benchmark;
     if (const auto *window = std::getenv("WEFTMOE_STATIC_RING_TOKENS"))
       transport_config.static_forward_window_tokens = std::stoul(window);
-    if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+    if (const auto *depth =
+            std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
       transport_config.static_forward_contribution_windows = std::stoul(depth);
     const auto setup_start = Clock::now();
     weftmoe::cuda::ActivationTransportResourcePool owned_transport_pool;
-    auto &transport_pool = resources ? resources->transport : owned_transport_pool;
+    auto &transport_pool =
+        resources ? resources->transport : owned_transport_pool;
     std::vector<weftmoe::transport::BFloat16> activation_host(
         static_cast<std::size_t>(max_tokens * hidden));
     for (std::size_t index = 0; index < activation_host.size(); ++index)
       activation_host[index] = weftmoe::transport::float_to_bfloat16(
-          static_cast<float>(static_cast<int>(
-                                 (index + fixture_token_offset * hidden +
-                                  fixture_rank * 13U) % 127U) - 63) /
+          static_cast<float>(
+              static_cast<int>(
+                  (index + fixture_token_offset * hidden + fixture_rank * 13U) %
+                  127U) -
+              63) /
           64.0F);
     // Caller-owned inputs and weights are prepared before timing. Transport
     // storage is allocated after the first timed Notify, just as in dynamic
@@ -3807,12 +3784,14 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     const auto gate_hash = hash_fp32(route_gates);
     const auto weight_hash = forward_weight_sample_hash(
         rank * experts_per_rank, experts_per_rank, hidden, intermediate);
-    auto weights = resources ? resources->weights : weftmoe::cuda::ForwardWeightLease{};
-    auto actual_weight_hashes = resources ? resources->weight_hashes
-        : weftmoe::cuda::ForwardWeightStorageHashes{};
+    auto weights =
+        resources ? resources->weights : weftmoe::cuda::ForwardWeightLease{};
+    auto actual_weight_hashes =
+        resources ? resources->weight_hashes
+                  : weftmoe::cuda::ForwardWeightStorageHashes{};
     if (!weights) {
-      weights =
-          weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
+      weights = weftmoe::cuda::testing::
+          make_deterministic_forward_weights_for_testing(
               experts_per_rank, rank * experts_per_rank, hidden, intermediate,
               setup_generation.session(), execution);
       actual_weight_hashes =
@@ -3837,37 +3816,34 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             "actual W2 device storage is not expert-distinct");
     require(all_distinct(actual_weight_hashes.sampled_w2_output_rows),
             "actual W2 device output rows are not distinct");
-    std::unique_ptr<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>
-        local_forward;
+    std::unique_ptr<weftmoe::cuda::LocalCudaP2pForwardMegaKernel> local_forward;
     std::unique_ptr<weftmoe::cuda::GinRdmaForwardMegaKernel> gin_forward;
-    const auto run_forward = [&](const auto &dispatch,
-                                 const auto &activations,
-                                 const auto &forward_weights,
-                                 const weftmoe::cuda::ForwardMegaKernelConfig
-                                     &forward_config,
-                                 const weftmoe::cuda::
-                                     ActivationTransportRunOptions
-                                         &run_options) {
-      if (gin_forward)
-        return gin_forward->run(dispatch, activations, forward_weights,
-                                forward_config, run_options);
-      return local_forward->run(dispatch, activations, forward_weights,
-                                forward_config, run_options);
-    };
+    const auto run_forward =
+        [&](const auto &dispatch, const auto &activations,
+            const auto &forward_weights,
+            const weftmoe::cuda::ForwardMegaKernelConfig &forward_config,
+            const weftmoe::cuda::ActivationTransportRunOptions &run_options) {
+          if (gin_forward)
+            return gin_forward->run(dispatch, activations, forward_weights,
+                                    forward_config, run_options);
+          return local_forward->run(dispatch, activations, forward_weights,
+                                    forward_config, run_options);
+        };
     const auto one_time_setup_us =
         std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
             .count();
     const auto rounds_text = std::getenv("WEFTMOE_FORWARD_BENCH_ROUNDS");
-    const auto rounds = rounds_text
-                            ? static_cast<std::uint32_t>(
-                                  std::stoul(rounds_text))
-                            : 110U;
+    const auto rounds =
+        rounds_text ? static_cast<std::uint32_t>(std::stoul(rounds_text))
+                    : 110U;
     require(rounds > 10, "forward benchmark requires >10 rounds");
     const auto generation_base_text =
         std::getenv("WEFTMOE_FORWARD_BENCH_GENERATION_BASE");
-    const auto generation_base = (generation_base_text
-            ? static_cast<std::uint64_t>(std::stoull(generation_base_text))
-            : 1000ULL) + case_index * (static_cast<std::uint64_t>(rounds) + 1U);
+    const auto generation_base =
+        (generation_base_text
+             ? static_cast<std::uint64_t>(std::stoull(generation_base_text))
+             : 1000ULL) +
+        case_index * (static_cast<std::uint64_t>(rounds) + 1U);
     require(generation_base <=
                 std::numeric_limits<std::uint64_t>::max() - rounds,
             "forward benchmark generation range overflows");
@@ -3921,8 +3897,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         require(std::string(properties.name) == expected_gpu,
                 "autotune GPU differs from configuration key");
       }
-      require(!retain_backward_state &&
-                  !allocate_tensors,
+      require(!retain_backward_state && !allocate_tensors,
               "Forward graph benchmark requires inference with reused "
               "tensors");
       forward_config.serialized_graph_replay = true;
@@ -3942,15 +3917,14 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
               gate_storage, routes, context, execution);
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           generation, execution, pool);
-      auto notify = coordinator.run_device(
-          {common_config, routes, gates, max_tokens});
+      auto notify =
+          coordinator.run_device({common_config, routes, gates, max_tokens});
       transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
-          generation.session(), execution, transport_config,
-          notify.dispatch(), transport_pool);
+          generation.session(), execution, transport_config, notify.dispatch(),
+          transport_pool);
       if (gin_forward_benchmark)
-        gin_forward =
-            std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
-                generation, execution, transport_pool);
+        gin_forward = std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
+            generation, execution, transport_pool);
       else
         local_forward =
             std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
@@ -3968,13 +3942,13 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       check_input_cuda(cudaStreamSynchronize(execution_state->stream));
 
       check_input_cuda(cudaStreamBeginCapture(execution_state->stream,
-                                               cudaStreamCaptureModeGlobal));
+                                              cudaStreamCaptureModeGlobal));
       notify.dispatch().enqueue_notify(generation);
       auto output = gin_forward
-          ? gin_forward->enqueue(notify.dispatch(), activations, weights,
-                                  forward_config)
-          : local_forward->enqueue(notify.dispatch(), activations, weights,
-                                    forward_config);
+                        ? gin_forward->enqueue(notify.dispatch(), activations,
+                                               weights, forward_config)
+                        : local_forward->enqueue(notify.dispatch(), activations,
+                                                 weights, forward_config);
       cudaGraph_t graph = nullptr;
       cudaGraphExec_t executable = nullptr;
       check_input_cuda(cudaStreamEndCapture(execution_state->stream, &graph));
@@ -4001,14 +3975,12 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       check_input_cuda(cudaEventCreate(&start));
       check_input_cuda(cudaEventCreate(&end));
       const auto batch_text = std::getenv("WEFTMOE_FORWARD_GRAPH_BATCH");
-      const auto batch = batch_text
-                             ? static_cast<unsigned>(std::stoul(batch_text))
-                             : 20U;
+      const auto batch =
+          batch_text ? static_cast<unsigned>(std::stoul(batch_text)) : 20U;
       require(batch > 0U, "Forward graph batch must be positive");
       std::vector<double> samples;
       for (std::uint32_t round = 0; round < rounds; ++round) {
-        benchmark_rank_barrier(rank_barrier, base,
-                               execution_state->stream);
+        benchmark_rank_barrier(rank_barrier, base, execution_state->stream);
         check_input_cuda(cudaEventRecord(start, execution_state->stream));
         for (unsigned replay = 0; replay < batch; ++replay)
           check_input_cuda(
@@ -4025,14 +3997,13 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       const auto graph_timings = output.timings();
       const auto graph_output =
           weftmoe::cuda::download_forward_output_for_validation(output,
-                                                                 execution);
+                                                                execution);
       std::uint64_t output_hash = 1469598103934665603ULL;
       std::uint64_t prefix_hash = output_hash;
       std::size_t output_index = 0;
       for (const auto value : graph_output) {
-        output_hash =
-            (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
-            1099511628211ULL;
+        output_hash = (output_hash ^ static_cast<std::uint8_t>(value.bits)) *
+                      1099511628211ULL;
         output_hash =
             (output_hash ^ static_cast<std::uint8_t>(value.bits >> 8U)) *
             1099511628211ULL;
@@ -4040,33 +4011,36 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
           prefix_hash = output_hash;
       }
       std::cout << "FORWARD_GRAPH_BENCH rank=" << rank
-                << " case_index=" << case_index
-                << " backend=" << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
+                << " case_index=" << case_index << " backend="
+                << (gin_forward_benchmark ? "gin-rdma" : "local-cuda-p2p")
                 << " world=" << world << " tokens=" << max_tokens
                 << " actual_tokens=" << common_routes.num_tokens
                 << " experts=" << experts << " top_k=" << top_k
-                << " hidden=" << hidden
-                << " intermediate=" << intermediate << " batch=" << batch
-                << " graph_nodes=" << graph_node_count
+                << " hidden=" << hidden << " intermediate=" << intermediate
+                << " batch=" << batch << " graph_nodes=" << graph_node_count
                 << " graph_kernel_nodes=" << graph_kernel_nodes
                 << " graph_memcpy_nodes=" << graph_memcpy_nodes
                 << " graph_event_record_nodes=" << graph_event_record_nodes
                 << " graph_event_wait_nodes=" << graph_event_wait_nodes
-                << " static_schedule="
-                << (std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr)
-                << " ring_window_tokens=" << transport_config.static_forward_window_tokens
-                << " ring_contribution_windows=" << transport_config.static_forward_contribution_windows
+                << " static_schedule=" << true << " ring_window_tokens="
+                << transport_config.static_forward_window_tokens
+                << " ring_contribution_windows="
+                << transport_config.static_forward_contribution_windows
                 << " device_bytes=" << transport_pool.usage().device_bytes
-                << " compute_device_bytes=" << transport_pool.usage().compute_device_bytes
-                << " gin_registered_bytes=" << transport_pool.usage().gin_registered_bytes
+                << " compute_device_bytes="
+                << transport_pool.usage().compute_device_bytes
+                << " gin_registered_bytes="
+                << transport_pool.usage().gin_registered_bytes
                 << " device_kernel_us=" << graph_device_kernel_us
                 << " route_exchange_us=" << graph_timings.route_exchange_us
                 << " fc1_swiglu_us=" << graph_timings.fc1_swiglu_us
                 << " fc2_us=" << graph_timings.fc2_us
                 << " after_combine_us=" << graph_timings.after_combine_us
-                << " input_hash=" << activation_hash << ":" << route_hash << ":" << gate_hash
-                << ":" << actual_weight_hashes.w1.low << ":" << actual_weight_hashes.w1.high
-                << ":" << actual_weight_hashes.w2.low << ":" << actual_weight_hashes.w2.high
+                << " input_hash=" << activation_hash << ":" << route_hash << ":"
+                << gate_hash << ":" << actual_weight_hashes.w1.low << ":"
+                << actual_weight_hashes.w1.high << ":"
+                << actual_weight_hashes.w2.low << ":"
+                << actual_weight_hashes.w2.high
                 << " prefix_hash=" << prefix_hash
                 << " output_hash=" << output_hash << " samples=";
       for (std::size_t index = 0; index < samples.size(); ++index)
@@ -4133,8 +4107,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             cudaMemcpyDeviceToDevice, execution_state->stream));
         routes = producer.publish_selected_experts(
             static_cast<const std::int32_t *>(fresh_routes.data),
-            common_routes.selected_experts.size(), common_routes.num_tokens, top_k,
-            fresh_routes.owner);
+            common_routes.selected_experts.size(), common_routes.num_tokens,
+            top_k, fresh_routes.owner);
         gates = producer.publish_gates(
             static_cast<const float *>(fresh_gates.data), route_gates.size(),
             routes, fresh_gates.owner);
@@ -4148,8 +4122,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       const auto notify_start = Clock::now();
       weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
           generation, execution, pool);
-      auto notify = coordinator.run_device(
-          {common_config, routes, gates, max_tokens});
+      auto notify =
+          coordinator.run_device({common_config, routes, gates, max_tokens});
       const auto notify_end = Clock::now();
       transport_pool = weftmoe::cuda::prepare_activation_transport_pool(
           generation.session(), execution, transport_config, notify.dispatch(),
@@ -4183,9 +4157,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             allocate_tensors ? allocate : weftmoe::cuda::CudaTensorAllocator{});
       const auto buffer_prepare_end = Clock::now();
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
-        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
-                  << " round=" << round << " phase=notify_done"
-                  << std::endl;
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank << " round=" << round
+                  << " phase=notify_done" << std::endl;
       weftmoe::cuda::ActivationTransportRunOptions run_options;
       auto progress_deadline_seconds = 5U;
       if (const auto *deadline =
@@ -4199,15 +4172,13 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
               ? std::chrono::seconds(progress_deadline_seconds)
               : std::chrono::seconds(300);
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
-        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
-                  << " round=" << round << " phase=forward_enter"
-                  << std::endl;
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank << " round=" << round
+                  << " phase=forward_enter" << std::endl;
       auto output = run_forward(notify.dispatch(), activations, weights,
                                 forward_config, run_options);
       if (std::getenv("WEFTMOE_FORWARD_PROGRESS"))
-        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank
-                  << " round=" << round << " phase=forward_done"
-                  << std::endl;
+        std::cerr << "FORWARD_HOST_PROGRESS rank=" << rank << " round=" << round
+                  << " phase=forward_done" << std::endl;
       const auto wall_end = Clock::now();
       if (profile_last_round && round + 1U == rounds)
         check_input_cuda(cudaProfilerStop());
@@ -4252,8 +4223,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         return_samples.push_back(output.timings().combine_return_us);
         reduce_samples.push_back(output.timings().reduce_us);
         after_combine_samples.push_back(output.timings().after_combine_us);
-        fc1_fc2_overlap_samples.push_back(
-            output.timings().fc1_fc2_overlap_us);
+        fc1_fc2_overlap_samples.push_back(output.timings().fc1_fc2_overlap_us);
         fc2_return_overlap_samples.push_back(
             output.timings().fc2_return_overlap_us);
         return_reduce_overlap_samples.push_back(
@@ -4269,11 +4239,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
               "Forward tensor cache missed after warmup");
 #if WEFTMOE_DEVICE_TIMELINE
     if (std::getenv("WEFTMOE_DEVICE_TIMELINE_PREFIX") != nullptr) {
-      const std::string prefix =
-          std::getenv("WEFTMOE_DEVICE_TIMELINE_PREFIX");
+      const std::string prefix = std::getenv("WEFTMOE_DEVICE_TIMELINE_PREFIX");
       write_device_timeline(
-          weftmoe::cuda::testing::download_forward_device_timeline(
-              last_output),
+          weftmoe::cuda::testing::download_forward_device_timeline(last_output),
           prefix);
     }
 #endif
@@ -4300,7 +4268,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     };
     const auto downloaded_output =
         weftmoe::cuda::download_forward_output_for_validation(last_output,
-                                                               execution);
+                                                              execution);
     std::uint64_t output_hash = 1469598103934665603ULL;
     std::vector<std::uint16_t> first_token_unique;
     for (const auto value : downloaded_output) {
@@ -4312,9 +4280,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     }
     for (std::uint64_t column = 0;
          column < hidden && first_token_unique.size() < 32U; ++column) {
-      const auto bits = downloaded_output[static_cast<std::size_t>(column)].bits;
-      if (std::find(first_token_unique.begin(), first_token_unique.end(), bits) ==
-          first_token_unique.end())
+      const auto bits =
+          downloaded_output[static_cast<std::size_t>(column)].bits;
+      if (std::find(first_token_unique.begin(), first_token_unique.end(),
+                    bits) == first_token_unique.end())
         first_token_unique.push_back(bits);
     }
     require(first_token_unique.size() > 1U,
@@ -4338,8 +4307,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       if (std::getenv("WEFTMOE_FORWARD_DUMP_INPUTS")) {
         const bool prefix_inputs =
             std::string(std::getenv("WEFTMOE_FORWARD_DUMP_INPUTS")) == "prefix";
-        const auto prefix = std::string(output_dir) + "/weftmoe-rank-" +
-                            std::to_string(rank);
+        const auto prefix =
+            std::string(output_dir) + "/weftmoe-rank-" + std::to_string(rank);
         const auto dump = [&](const std::string &suffix, const auto &values) {
           std::ofstream file(prefix + suffix, std::ios::binary);
           const auto width = suffix == ".input.bf16" ? hidden : top_k;
@@ -4467,31 +4436,29 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
   if (forward_smoke) {
     constexpr std::uint64_t hidden = 7168;
     constexpr std::uint64_t intermediate = 3072;
-    auto generation = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-forward-smoke", 701);
+    auto generation =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-forward-smoke", 701);
     auto context = weftmoe::make_rank_collective_context(
         generation.session(), rank, execution.token());
-    auto routes = weftmoe::cuda::upload_cuda_routes(
-        common_routes, top_k, context, execution);
+    auto routes = weftmoe::cuda::upload_cuda_routes(common_routes, top_k,
+                                                    context, execution);
     const auto gate_mode = std::getenv("WEFTMOE_GATE_MODE")
                                ? std::getenv("WEFTMOE_GATE_MODE")
                                : "fixed-random";
-    const auto gates = std::string(gate_mode) == "unit"
-                           ? std::vector<float>(max_tokens * top_k, 1.0F)
-                           : fixed_random_selected_gates(
-                                 max_tokens, top_k, rank,
-                                 0x4d4547414d4f4547ULL);
-    auto device_gates =
-        weftmoe::cuda::testing::upload_fp32_gates_for_testing(
-            gates, routes, context, execution);
+    const auto gates =
+        std::string(gate_mode) == "unit"
+            ? std::vector<float>(max_tokens * top_k, 1.0F)
+            : fixed_random_selected_gates(max_tokens, top_k, rank,
+                                          0x4d4547414d4f4547ULL);
+    auto device_gates = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
+        gates, routes, context, execution);
     weftmoe::cuda::ActivationTransportPoolConfig transport_config;
     transport_config.max_tokens_per_rank = max_tokens;
     transport_config.max_hidden_size = hidden;
     transport_config.max_top_k = top_k;
     transport_config.max_world_size = world;
     transport_config.max_nodes = nodes;
-    transport_config.max_destination_rows_per_rank =
-        world * max_tokens * top_k;
+    transport_config.max_destination_rows_per_rank = world * max_tokens * top_k;
     transport_config.channels = 1;
     transport_config.ring_slots_per_source_channel = 1;
     transport_config.max_inflight_generations = world == 1U ? 2U : 1U;
@@ -4505,8 +4472,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     for (std::uint64_t index = 0; index < max_tokens * hidden; ++index)
       input[static_cast<std::size_t>(index)] =
           weftmoe::transport::float_to_bfloat16(
-              static_cast<float>(static_cast<int>((index + rank * 13U) %
-                                                   127U) -
+              static_cast<float>(static_cast<int>((index + rank * 13U) % 127U) -
                                  63) /
               64.0F);
     auto activations =
@@ -4516,31 +4482,28 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         weftmoe::cuda::testing::make_deterministic_forward_weights_for_testing(
             experts / world, rank * (experts / world), hidden, intermediate,
             generation.session(), execution);
-    std::unique_ptr<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>
-        local_forward;
+    std::unique_ptr<weftmoe::cuda::LocalCudaP2pForwardMegaKernel> local_forward;
     std::unique_ptr<weftmoe::cuda::GinRdmaForwardMegaKernel> gin_forward;
     if (gin_forward_smoke)
-      gin_forward =
-          std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
-              generation, execution, transport_pool);
+      gin_forward = std::make_unique<weftmoe::cuda::GinRdmaForwardMegaKernel>(
+          generation, execution, transport_pool);
     else
       local_forward =
           std::make_unique<weftmoe::cuda::LocalCudaP2pForwardMegaKernel>(
               generation, execution, transport_pool);
-    const auto run_forward = [&](const auto &dispatch_handle,
-                                 const auto &activation_handle,
-                                 const auto &weight_handle,
-                                 const weftmoe::cuda::ForwardMegaKernelConfig
-                                     &forward_config,
-                                 const auto &run_options_value) {
-      return gin_forward_smoke
-                 ? gin_forward->run(dispatch_handle, activation_handle,
-                                    weight_handle, forward_config,
-                                    run_options_value)
-                 : local_forward->run(dispatch_handle, activation_handle,
-                                      weight_handle, forward_config,
-                                      run_options_value);
-    };
+    const auto run_forward =
+        [&](const auto &dispatch_handle, const auto &activation_handle,
+            const auto &weight_handle,
+            const weftmoe::cuda::ForwardMegaKernelConfig &forward_config,
+            const auto &run_options_value) {
+          return gin_forward_smoke
+                     ? gin_forward->run(dispatch_handle, activation_handle,
+                                        weight_handle, forward_config,
+                                        run_options_value)
+                     : local_forward->run(dispatch_handle, activation_handle,
+                                          weight_handle, forward_config,
+                                          run_options_value);
+        };
     weftmoe::cuda::ActivationTransportRunOptions run_options;
     run_options.deadline_after = std::chrono::seconds(120);
     // Saved outputs remain independent while completed executions release
@@ -4550,8 +4513,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       for (auto &value : second_input)
         value = weftmoe::transport::float_to_bfloat16(
             -weftmoe::transport::bfloat16_to_float(value));
-      auto second_generation = weftmoe::cuda::make_nccl_generation(
-          base, "cuda-forward-smoke", 702U);
+      auto second_generation =
+          weftmoe::cuda::make_nccl_generation(base, "cuda-forward-smoke", 702U);
       auto second_context = weftmoe::make_rank_collective_context(
           second_generation.session(), rank, execution.token());
       auto second_activations =
@@ -4577,23 +4540,21 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             current_generation, execution, pool);
         auto notify = coordinator.run_device(
             {common_config, current_routes, current_gates, max_tokens});
-        return run_forward(
-            notify.dispatch(), current_activation, weights,
-            {hidden, intermediate}, run_options);
+        return run_forward(notify.dispatch(), current_activation, weights,
+                           {hidden, intermediate}, run_options);
       };
       auto live_first = run_exact(780U, activations);
-      auto first_before =
-          weftmoe::cuda::download_forward_output_for_validation(live_first,
-                                                                 execution);
+      auto first_before = weftmoe::cuda::download_forward_output_for_validation(
+          live_first, execution);
       activations = {};
       auto live_second = run_exact(781U, second_activations);
       second_activations = {};
       const auto second_output =
           weftmoe::cuda::download_forward_output_for_validation(live_second,
-                                                                 execution);
+                                                                execution);
       const auto first_after =
           weftmoe::cuda::download_forward_output_for_validation(live_first,
-                                                                 execution);
+                                                                execution);
       require(first_before == first_after && first_before != second_output,
               "two live generations aliased output storage");
       auto live_usage = transport_pool.usage();
@@ -4616,8 +4577,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     weftmoe::cuda::ForwardMegaKernelTimings reference_timings;
     const auto forward_smoke_repeats =
         std::getenv("WEFTMOE_FORWARD_SMOKE_REPEATS")
-            ? static_cast<std::uint32_t>(std::stoul(
-                  std::getenv("WEFTMOE_FORWARD_SMOKE_REPEATS")))
+            ? static_cast<std::uint32_t>(
+                  std::stoul(std::getenv("WEFTMOE_FORWARD_SMOKE_REPEATS")))
             : 20U;
     require(forward_smoke_repeats >= 1U,
             "Forward smoke repeat count must be nonzero");
@@ -4649,12 +4610,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                     notify.dispatch(), execution)
               : weftmoe::DispatchHandle{};
       auto current = run_forward(notify.dispatch(), repeat_activations, weights,
-                                 {hidden, intermediate,
-                                  retain_backward_state},
+                                 {hidden, intermediate, retain_backward_state},
                                  run_options);
       const auto current_output =
           weftmoe::cuda::download_forward_output_for_validation(current,
-                                                                 execution);
+                                                                execution);
       if (retain_backward_state) {
         const auto state =
             weftmoe::cuda::download_forward_backward_state_for_validation(
@@ -4665,21 +4625,18 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                         state.canonical_x.size() / hidden,
                 "retained Forward state has inconsistent compact row shapes");
         if (!state.fc1_ab.empty())
-          require(std::any_of(state.fc1_ab.begin(), state.fc1_ab.end(),
-                              [](const auto value) {
-                                return value.bits != 0U;
-                              }),
-                  "retained BF16 FC1 A/B checkpoint is all zero");
+          require(
+              std::any_of(state.fc1_ab.begin(), state.fc1_ab.end(),
+                          [](const auto value) { return value.bits != 0U; }),
+              "retained BF16 FC1 A/B checkpoint is all zero");
         if (!saw_backward_state) {
           require(retained_metadata &&
                       retained_metadata->incoming.incoming_rows.size() ==
                           state.canonical_x.size() / hidden,
                   "retained canonical X metadata shape mismatch");
-          for (const auto &row :
-               retained_metadata->incoming.incoming_rows) {
+          for (const auto &row : retained_metadata->incoming.incoming_rows) {
             const auto route = std::find(kCrossEpExperts.begin(),
-                                         kCrossEpExperts.end(),
-                                         row.expert_id);
+                                         kCrossEpExperts.end(), row.expert_id);
             require(route != kCrossEpExperts.end(),
                     "retained canonical X referenced an unknown smoke expert");
             const auto token =
@@ -4687,11 +4644,12 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                 6ULL;
             for (std::uint64_t column = 0; column < hidden; ++column) {
               const auto linear = token * hidden + column;
-              const auto expected =
-                  weftmoe::transport::float_to_bfloat16(
-                      static_cast<float>(static_cast<int>(
-                          (linear + row.source_rank * 13U) % 127U) - 63) /
-                      64.0F);
+              const auto expected = weftmoe::transport::float_to_bfloat16(
+                  static_cast<float>(
+                      static_cast<int>((linear + row.source_rank * 13U) %
+                                       127U) -
+                      63) /
+                  64.0F);
               require(state.canonical_x[static_cast<std::size_t>(
                           row.dst_row * hidden + column)] == expected,
                       "retained canonical X was overwritten by FC2 output");
@@ -4709,9 +4667,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         std::uint64_t repeat_hash = 1469598103934665603ULL;
         for (const auto value : current_output)
           repeat_hash = (repeat_hash ^ value.bits) * 1099511628211ULL;
-        std::cerr << "FORWARD_SMOKE_HASH rank=" << rank
-                  << " repeat=" << repeat << " hash=" << repeat_hash
-                  << std::endl;
+        std::cerr << "FORWARD_SMOKE_HASH rank=" << rank << " repeat=" << repeat
+                  << " hash=" << repeat_hash << std::endl;
       }
       if (repeat == 0U) {
         reference_output = current_output;
@@ -4720,11 +4677,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       } else {
         if (current_output != reference_output &&
             std::getenv("WEFTMOE_FORWARD_PROGRESS")) {
-          const auto mismatch = std::mismatch(reference_output.begin(),
-                                              reference_output.end(),
-                                              current_output.begin());
-          const auto index = static_cast<std::size_t>(
-              mismatch.first - reference_output.begin());
+          const auto mismatch =
+              std::mismatch(reference_output.begin(), reference_output.end(),
+                            current_output.begin());
+          const auto index = static_cast<std::size_t>(mismatch.first -
+                                                      reference_output.begin());
           std::cerr << "FORWARD_SMOKE_MISMATCH rank=" << rank
                     << " repeat=" << repeat << " index=" << index
                     << " expected_bits=" << mismatch.first->bits
@@ -4745,24 +4702,24 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     for (const auto value : reference_output)
       output_hash = (output_hash ^ value.bits) * 1099511628211ULL;
     if (const auto *output_dir = std::getenv("WEFTMOE_FORWARD_OUTPUT_DIR")) {
-      const auto prefix = std::string(output_dir) + "/weftmoe-rank-" +
-                          std::to_string(rank);
+      const auto prefix =
+          std::string(output_dir) + "/weftmoe-rank-" + std::to_string(rank);
       std::ofstream output_file(prefix + ".bf16",
                                 std::ios::binary | std::ios::trunc);
       require(output_file.good(), "failed to open Forward smoke output");
-      output_file.write(reinterpret_cast<const char *>(reference_output.data()),
-                        static_cast<std::streamsize>(
-                            reference_output.size() * sizeof(reference_output[0])));
+      output_file.write(
+          reinterpret_cast<const char *>(reference_output.data()),
+          static_cast<std::streamsize>(reference_output.size() *
+                                       sizeof(reference_output[0])));
       std::ofstream cache_file(prefix + ".ab.bf16",
                                std::ios::binary | std::ios::trunc);
       require(cache_file.good(),
               "failed to open Forward A/B checkpoint artifact");
-      cache_file.write(
-          reinterpret_cast<const char *>(
-              reference_backward_state.fc1_ab.data()),
-          static_cast<std::streamsize>(
-              reference_backward_state.fc1_ab.size() *
-              sizeof(reference_backward_state.fc1_ab[0])));
+      cache_file.write(reinterpret_cast<const char *>(
+                           reference_backward_state.fc1_ab.data()),
+                       static_cast<std::streamsize>(
+                           reference_backward_state.fc1_ab.size() *
+                           sizeof(reference_backward_state.fc1_ab[0])));
     }
     std::cout << "FORWARD_SMOKE rank=" << rank
               << " specialization=sm90-wgmma-tma-7168x3072"
@@ -4772,11 +4729,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
               << " tma=" << reference_audit.tma_loads
               << " fc1_tasks=" << reference_audit.fc1_tasks
               << " fc2_tasks=" << reference_audit.fc2_tasks
-              << " repeat_equal=1 repeats="
-              << forward_smoke_repeats << " gate_mode="
-              << gate_mode << " top_k=" << top_k
-              << " output_hash=" << output_hash
-              << " pool2_isolated=1"
+              << " repeat_equal=1 repeats=" << forward_smoke_repeats
+              << " gate_mode=" << gate_mode << " top_k=" << top_k
+              << " output_hash=" << output_hash << " pool2_isolated=1"
               << " backward_state_equal=1"
               << " total_us=" << reference_timings.total_us
               << " dispatch_us=" << reference_timings.dispatch_us
@@ -4791,27 +4746,28 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             "integrated benchmark requires one 2/8-GPU node");
     constexpr std::uint64_t hidden = 7168;
     const auto setup_start = Clock::now();
-    auto setup_generation = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-multinode-base", 701);
+    auto setup_generation =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-multinode-base", 701);
     auto setup_context = weftmoe::make_rank_collective_context(
         setup_generation.session(), rank, execution.token());
     auto route_storage = weftmoe::cuda::upload_cuda_routes(
         common_routes, top_k, setup_context, execution);
     const auto gate_mode_text = std::getenv("WEFTMOE_GATE_MODE");
-    const std::string gate_mode = gate_mode_text ? gate_mode_text
-                                                  : "fixed-random";
+    const std::string gate_mode =
+        gate_mode_text ? gate_mode_text : "fixed-random";
     require(gate_mode == "fixed-random" || gate_mode == "unit",
             "gate mode must be fixed-random or unit");
-    auto route_gates = gate_mode == "unit"
-        ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
-        : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
-                                      0x4d4547414d4f4547ULL);
+    auto route_gates =
+        gate_mode == "unit"
+            ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
+            : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
+                                          0x4d4547414d4f4547ULL);
     if (gate_mode == "fixed-random")
       for (std::uint64_t token = 0; token < common_routes.num_tokens; ++token) {
         float sum = 0.0F;
         for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-          const auto gate = route_gates[
-              static_cast<std::size_t>(token * top_k + slot)];
+          const auto gate =
+              route_gates[static_cast<std::size_t>(token * top_k + slot)];
           require(gate > 0.0F && gate <= 1.0F,
                   "fixed-random gate is outside (0,1]");
           sum += gate;
@@ -4831,11 +4787,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     std::vector<std::uint64_t> destination_rows(world, 0);
     for (std::uint32_t source = 0; source < world; ++source)
       for (std::uint64_t token = 0; token < max_tokens; ++token) {
-        const auto base_expert = static_cast<std::uint32_t>(
-            (token * 17U + source * 31U) % experts);
+        const auto base_expert =
+            static_cast<std::uint32_t>((token * 17U + source * 31U) % experts);
         for (std::uint32_t route_slot = 0; route_slot < top_k; ++route_slot) {
-          const auto expert =
-              (base_expert + route_slot * 53U) % experts;
+          const auto expert = (base_expert + route_slot * 53U) % experts;
           ++destination_rows[expert / (experts / world)];
         }
       }
@@ -4872,12 +4827,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         weftmoe::transport::ActivationExpertTransform::Identity;
     transport_config.gate_placement =
         weftmoe::transport::ActivationGatePlacement::SourceAfter;
-    const auto rounds_text =
-        std::getenv("WEFTMOE_INTEGRATED_BENCH_ROUNDS");
-    const auto rounds = rounds_text
-                            ? static_cast<std::uint32_t>(
-                                  std::stoul(rounds_text))
-                            : 110U;
+    const auto rounds_text = std::getenv("WEFTMOE_INTEGRATED_BENCH_ROUNDS");
+    const auto rounds =
+        rounds_text ? static_cast<std::uint32_t>(std::stoul(rounds_text))
+                    : 110U;
     require(rounds > 10,
             "integrated benchmark requires 10 warmups plus measurements");
     std::vector<double> wall_samples;
@@ -4894,8 +4847,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     std::vector<double> terminal_samples;
     weftmoe::cuda::ActivationTransportDeviceAudit last_audit;
     weftmoe::cuda::CollectiveProtocolAudit last_notify_audit;
-    const auto api_before =
-        weftmoe::cuda::testing::cuda_api_audit_snapshot();
+    const auto api_before = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     for (std::uint32_t round = 0; round < rounds; ++round) {
       const auto generation = 10000ULL + round;
       auto generation_session = weftmoe::cuda::make_nccl_generation(
@@ -4927,9 +4879,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             notify.dispatch(), exact_activation, transport_config, options);
         transport_timing = transported.timings();
         last_audit = transported.audit();
-        require(last_audit.backend ==
-                    weftmoe::transport::ActivationTransportBackend::LocalCudaP2p,
-                "integrated benchmark did not run LocalCudaP2p");
+        require(
+            last_audit.backend ==
+                weftmoe::transport::ActivationTransportBackend::LocalCudaP2p,
+            "integrated benchmark did not run LocalCudaP2p");
         require(last_audit.activation_d2h_bytes == 0 &&
                     last_audit.activation_h2d_bytes == 0 &&
                     last_audit.hot_path_allocations == 0,
@@ -4947,20 +4900,16 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         control_samples.push_back(notify_timing.control_config_us);
         count_summary_samples.push_back(notify_timing.expert_count_us +
                                         notify_timing.packet_summary_us);
-        materialize_samples.push_back(
-            notify_timing.device_materialization_us);
+        materialize_samples.push_back(notify_timing.device_materialization_us);
         transport_samples.push_back(transport_timing.total_us);
-        transport_setup_samples.push_back(
-            transport_timing.generation_setup_us);
+        transport_setup_samples.push_back(transport_timing.generation_setup_us);
         dispatch_samples.push_back(transport_timing.dispatch_put_us);
-        relay_return_samples.push_back(
-            transport_timing.synthetic_return_us);
+        relay_return_samples.push_back(transport_timing.synthetic_return_us);
         reduce_samples.push_back(transport_timing.combine_reduce_us);
         terminal_samples.push_back(transport_timing.terminal_completion_us);
       }
     }
-    const auto api_after =
-        weftmoe::cuda::testing::cuda_api_audit_snapshot();
+    const auto api_after = weftmoe::cuda::testing::cuda_api_audit_snapshot();
     require(api_after.device_allocations == api_before.device_allocations &&
                 api_after.device_frees == api_before.device_frees &&
                 api_after.pinned_allocations == api_before.pinned_allocations &&
@@ -4971,8 +4920,8 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             "integrated steady generations performed dynamic CUDA setup");
 
     // One explicit validation generation is outside every timed sample.
-    auto validation_session = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-multinode-base", 50000);
+    auto validation_session =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-multinode-base", 50000);
     auto validation_context = weftmoe::make_rank_collective_context(
         validation_session.session(), rank, execution.token());
     auto validation_routes =
@@ -5006,31 +4955,31 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         std::vector<std::uint32_t> order(top_k);
         for (std::uint32_t slot = 0; slot < top_k; ++slot)
           order[slot] = slot;
-        std::sort(order.begin(), order.end(), [&](std::uint32_t lhs,
-                                                  std::uint32_t rhs) {
-          return common_routes.selected_experts[
-                     static_cast<std::size_t>(token * top_k + lhs)] <
-                 common_routes.selected_experts[
-                     static_cast<std::size_t>(token * top_k + rhs)];
-        });
+        std::sort(
+            order.begin(), order.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+              return common_routes.selected_experts[static_cast<std::size_t>(
+                         token * top_k + lhs)] <
+                     common_routes.selected_experts[static_cast<std::size_t>(
+                         token * top_k + rhs)];
+            });
         for (const auto slot : order) {
           const auto route = static_cast<std::size_t>(token * top_k + slot);
           volatile float product =
-              route_gates[route] *
-              weftmoe::transport::bfloat16_to_float(input);
+              route_gates[route] * weftmoe::transport::bfloat16_to_float(input);
           expected += product;
         }
-        expected_by_token_value[
-            static_cast<std::size_t>(token * 97U + value_index)] =
+        expected_by_token_value[static_cast<std::size_t>(token * 97U +
+                                                         value_index)] =
             weftmoe::transport::float_to_bfloat16(expected);
       }
     std::uint64_t output_hash = 1469598103934665603ULL;
     bool output_equal = true;
     for (std::size_t index = 0; index < output.size(); ++index) {
       const auto token = index / static_cast<std::size_t>(hidden);
-      output_equal = output_equal &&
-                     output[index] == expected_by_token_value[
-                         token * 97U + index % 97U];
+      output_equal =
+          output_equal &&
+          output[index] == expected_by_token_value[token * 97U + index % 97U];
       output_hash = (output_hash ^ output[index].bits) * 1099511628211ULL;
     }
     require(output_equal,
@@ -5044,56 +4993,40 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       }
     };
     const auto usage = transport_pool.usage();
-    std::cout << "INTEGRATED_BENCH rank=" << rank
-              << " backend=local-cuda-p2p"
-              << " setup_us=" << one_time_setup_us
-              << " device_bytes=" << usage.device_bytes
-              << " pinned_bytes=" << usage.pinned_bytes
-              << " route_input_bytes=" << route_storage.device_bytes()
-              << " local_gate_bytes=" << gate_storage.device_bytes()
-              << " peer_gate_bytes=0"
-              << " gate_mode=" << gate_mode
-              << " gate_hash=" << gate_hash
-              << " output_equal=1 output_hash=" << output_hash
-              << " raw_bytes=" << last_audit.raw_cross_node_payload_bytes
-              << " dedup_bytes="
-              << last_audit.deduplicated_cross_node_payload_bytes
-              << " actual_dispatch_peer_bytes="
-              << last_audit.actual_dispatch_peer_bytes
-              << " actual_return_peer_bytes="
-              << last_audit.actual_return_peer_bytes
-              << " derived_route_bytes="
-              << last_audit.derived_route_input_bytes
-              << " derived_local_gate_bytes="
-              << last_audit.derived_local_gate_bytes
-              << " derived_peer_gate_bytes="
-              << last_audit.derived_peer_gate_bytes
-              << " generation_memset_calls="
-              << last_audit.generation_memset_calls
-              << " generation_memset_bytes="
-              << last_audit.generation_memset_bytes
-              << " kernel_launches=" << last_audit.kernel_launches
-              << " control_enqueues=" << last_notify_audit.control_starts
-              << " config_enqueues=" << last_notify_audit.config_starts
-              << " count_enqueues="
-              << last_notify_audit.expert_count_starts
-              << " summary_enqueues="
-              << last_notify_audit.packet_summary_starts
-              << " dispatch_kernel_blocks="
-              << last_audit.dispatch_kernel_blocks
-              << " return_kernel_blocks="
-              << last_audit.return_kernel_blocks
-              << " reduce_kernel_blocks="
-              << last_audit.reduce_kernel_blocks
-              << " steady_allocs="
-              << api_after.device_allocations - api_before.device_allocations
-              << " steady_h2d_bytes="
-              << api_after.h2d_bytes - api_before.h2d_bytes
-              << " steady_d2h_bytes="
-              << api_after.d2h_bytes - api_before.d2h_bytes
-              << " steady_d2d_bytes="
-              << api_after.d2d_bytes - api_before.d2d_bytes
-              << " wall=";
+    std::cout
+        << "INTEGRATED_BENCH rank=" << rank << " backend=local-cuda-p2p"
+        << " setup_us=" << one_time_setup_us
+        << " device_bytes=" << usage.device_bytes
+        << " pinned_bytes=" << usage.pinned_bytes
+        << " route_input_bytes=" << route_storage.device_bytes()
+        << " local_gate_bytes=" << gate_storage.device_bytes()
+        << " peer_gate_bytes=0"
+        << " gate_mode=" << gate_mode << " gate_hash=" << gate_hash
+        << " output_equal=1 output_hash=" << output_hash
+        << " raw_bytes=" << last_audit.raw_cross_node_payload_bytes
+        << " dedup_bytes=" << last_audit.deduplicated_cross_node_payload_bytes
+        << " actual_dispatch_peer_bytes="
+        << last_audit.actual_dispatch_peer_bytes
+        << " actual_return_peer_bytes=" << last_audit.actual_return_peer_bytes
+        << " derived_route_bytes=" << last_audit.derived_route_input_bytes
+        << " derived_local_gate_bytes=" << last_audit.derived_local_gate_bytes
+        << " derived_peer_gate_bytes=" << last_audit.derived_peer_gate_bytes
+        << " generation_memset_calls=" << last_audit.generation_memset_calls
+        << " generation_memset_bytes=" << last_audit.generation_memset_bytes
+        << " kernel_launches=" << last_audit.kernel_launches
+        << " control_enqueues=" << last_notify_audit.control_starts
+        << " config_enqueues=" << last_notify_audit.config_starts
+        << " count_enqueues=" << last_notify_audit.expert_count_starts
+        << " summary_enqueues=" << last_notify_audit.packet_summary_starts
+        << " dispatch_kernel_blocks=" << last_audit.dispatch_kernel_blocks
+        << " return_kernel_blocks=" << last_audit.return_kernel_blocks
+        << " reduce_kernel_blocks=" << last_audit.reduce_kernel_blocks
+        << " steady_allocs="
+        << api_after.device_allocations - api_before.device_allocations
+        << " steady_h2d_bytes=" << api_after.h2d_bytes - api_before.h2d_bytes
+        << " steady_d2h_bytes=" << api_after.d2h_bytes - api_before.d2h_bytes
+        << " steady_d2d_bytes=" << api_after.d2d_bytes - api_before.d2d_bytes
+        << " wall=";
     emit_values(wall_samples);
     std::cout << " notify=";
     emit_values(notify_samples);
@@ -5129,27 +5062,27 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             socket_fallback || gin_rdma
                 ? "cross-host activation scenario requires exactly two nodes"
                 : "local CUDA P2P scenario requires exactly one node");
-    auto session = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-local-p2p", 701);
+    auto session =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-local-p2p", 701);
     auto context = weftmoe::make_rank_collective_context(
         session.session(), rank, execution.token());
-    auto device_routes = weftmoe::cuda::upload_cuda_routes(
-        common_routes, top_k, context, execution);
+    auto device_routes = weftmoe::cuda::upload_cuda_routes(common_routes, top_k,
+                                                           context, execution);
     const auto gate_mode_text = std::getenv("WEFTMOE_GATE_MODE");
-    const std::string gate_mode = gate_mode_text ? gate_mode_text
-                                                  : "fixed-random";
+    const std::string gate_mode =
+        gate_mode_text ? gate_mode_text : "fixed-random";
     require(gate_mode == "fixed-random" || gate_mode == "unit",
             "gate mode must be fixed-random or unit");
-    auto route_gates = gate_mode == "unit"
-        ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
-        : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
-                                      0x4d4547414d4f4547ULL);
-    auto device_gates =
-        weftmoe::cuda::testing::upload_fp32_gates_for_testing(
-            route_gates, device_routes, context, execution);
+    auto route_gates =
+        gate_mode == "unit"
+            ? std::vector<float>(common_routes.selected_experts.size(), 1.0F)
+            : fixed_random_selected_gates(common_routes.num_tokens, top_k, rank,
+                                          0x4d4547414d4f4547ULL);
+    auto device_gates = weftmoe::cuda::testing::upload_fp32_gates_for_testing(
+        route_gates, device_routes, context, execution);
     const auto gate_hash = hash_fp32(route_gates);
-    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(
-        session, execution, pool);
+    weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
+                                                               execution, pool);
     auto notify = coordinator.run_device(
         {common_config, device_routes, device_gates, max_tokens});
     weftmoe::DispatchHandle cross_host_oracle_dispatch;
@@ -5164,9 +5097,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     transport_pool_config.max_top_k = top_k;
     transport_pool_config.max_world_size = world;
     transport_pool_config.max_nodes = nodes;
-    transport_pool_config.max_destination_rows_per_rank = benchmark_p2p
-        ? max_tokens * top_k
-        : static_cast<std::uint64_t>(world) * max_tokens * top_k;
+    transport_pool_config.max_destination_rows_per_rank =
+        benchmark_p2p ? max_tokens * top_k
+                      : static_cast<std::uint64_t>(world) * max_tokens * top_k;
     transport_pool_config.channels = 1;
     const auto no_wrap_test = std::getenv("WEFTMOE_P2P_NO_WRAP") != nullptr;
     const auto ring_slots_text = std::getenv("WEFTMOE_P2P_RING_SLOTS");
@@ -5176,10 +5109,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
             : (no_wrap_test
                    ? static_cast<std::uint32_t>(
                          transport_pool_config.max_destination_rows_per_rank)
-                   : (ring_slots_text
-                          ? static_cast<std::uint32_t>(
-                                std::stoul(ring_slots_text))
-                          : 2U));
+                   : (ring_slots_text ? static_cast<std::uint32_t>(
+                                            std::stoul(ring_slots_text))
+                                      : 2U));
     transport_pool_config.max_inflight_generations = 1;
     transport_pool_config.enable_socket_fallback = socket_fallback;
     transport_pool_config.enable_gin_rdma = gin_rdma;
@@ -5210,12 +5142,12 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
           std::make_unique<weftmoe::cuda::GinRdmaActivationTransport>(
               session, execution, transport_pool);
     else
-      local_transport = std::make_unique<
-          weftmoe::cuda::LocalCudaP2pActivationTransport>(
-          session, execution, transport_pool);
-    const auto setup_us = std::chrono::duration<double, std::micro>(
-                              Clock::now() - setup_start)
-                              .count();
+      local_transport =
+          std::make_unique<weftmoe::cuda::LocalCudaP2pActivationTransport>(
+              session, execution, transport_pool);
+    const auto setup_us =
+        std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
+            .count();
     weftmoe::transport::ActivationTransportConfig transport_config;
     transport_config.hidden_size = hidden;
     transport_config.channels = 1;
@@ -5246,18 +5178,14 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       return;
     }
     const auto rounds_text = std::getenv("WEFTMOE_P2P_ROUNDS");
-    const auto benchmark_rounds_text =
-        std::getenv("WEFTMOE_P2P_BENCH_ROUNDS");
-    const auto rounds = benchmark_p2p
-                            ? (benchmark_rounds_text
-                                   ? static_cast<std::uint32_t>(
-                                         std::stoul(benchmark_rounds_text))
-                                   : 110U)
-                            : (rounds_text ? static_cast<std::uint32_t>(
-                                                 std::stoul(rounds_text))
-                                           : (socket_fallback || gin_rdma
-                                                  ? 20U
-                                                  : 1U));
+    const auto benchmark_rounds_text = std::getenv("WEFTMOE_P2P_BENCH_ROUNDS");
+    const auto rounds =
+        benchmark_p2p
+            ? (benchmark_rounds_text ? static_cast<std::uint32_t>(
+                                           std::stoul(benchmark_rounds_text))
+                                     : 110U)
+            : (rounds_text ? static_cast<std::uint32_t>(std::stoul(rounds_text))
+                           : (socket_fallback || gin_rdma ? 20U : 1U));
     require(rounds > 0, "local P2P rounds must be positive");
     require(!benchmark_p2p || rounds > 10,
             "local P2P benchmark requires 10 warmups plus measurements");
@@ -5290,8 +5218,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         total_samples.push_back(transported.timings().total_us);
         dispatch_samples.push_back(transported.timings().dispatch_put_us);
         relay_samples.push_back(transported.timings().relay_us);
-        synthetic_samples.push_back(
-            transported.timings().synthetic_return_us);
+        synthetic_samples.push_back(transported.timings().synthetic_return_us);
         reduce_samples.push_back(transported.timings().combine_reduce_us);
       }
       if (benchmark_p2p) {
@@ -5312,15 +5239,14 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         transported = {};
       }
     }
-    require(transported.audit().backend ==
-                (socket_fallback
-                     ? weftmoe::transport::ActivationTransportBackend::
-                           NcclSocketFallback
-                     : gin_rdma
-                           ? weftmoe::transport::ActivationTransportBackend::Gin
-                     : weftmoe::transport::ActivationTransportBackend::
-                           LocalCudaP2p),
-            "concrete activation backend audit mismatch");
+    require(
+        transported.audit().backend ==
+            (socket_fallback ? weftmoe::transport::ActivationTransportBackend::
+                                   NcclSocketFallback
+             : gin_rdma ? weftmoe::transport::ActivationTransportBackend::Gin
+                        : weftmoe::transport::ActivationTransportBackend::
+                              LocalCudaP2p),
+        "concrete activation backend audit mismatch");
     require(transported.audit().activation_d2h_bytes == 0 &&
                 transported.audit().activation_h2d_bytes == 0 &&
                 transported.audit().hot_path_allocations == 0,
@@ -5330,35 +5256,37 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
           cross_host_oracle_dispatch, activations, route_gates,
           transport_config, 1);
       if (downloaded.contribution_by_route != oracle.contribution_by_route) {
-        const auto mismatch = std::mismatch(
-            downloaded.contribution_by_route.begin(),
-            downloaded.contribution_by_route.end(),
-            oracle.contribution_by_route.begin());
+        const auto mismatch =
+            std::mismatch(downloaded.contribution_by_route.begin(),
+                          downloaded.contribution_by_route.end(),
+                          oracle.contribution_by_route.begin());
         const auto index = static_cast<std::size_t>(
             mismatch.first - downloaded.contribution_by_route.begin());
         throw std::runtime_error(
             "cross-host route contributions differ from host oracle: "
-            "index=" + std::to_string(index) + ", actual=" +
-            std::to_string(mismatch.first->bits) + ", expected=" +
-            std::to_string(mismatch.second->bits));
+            "index=" +
+            std::to_string(index) +
+            ", actual=" + std::to_string(mismatch.first->bits) +
+            ", expected=" + std::to_string(mismatch.second->bits));
       }
       require(downloaded.combined_tokens == oracle.combined_tokens,
               "cross-host combined output differs from host oracle");
     }
     const auto steady_api_after =
         weftmoe::cuda::testing::cuda_api_audit_snapshot();
-    require(steady_api_after.device_allocations ==
+    require(
+        steady_api_after.device_allocations ==
                 steady_api_before.device_allocations &&
-                steady_api_after.device_frees == steady_api_before.device_frees &&
-                steady_api_after.pinned_allocations ==
-                    steady_api_before.pinned_allocations &&
-                steady_api_after.pinned_frees == steady_api_before.pinned_frees &&
-                steady_api_after.event_creates == steady_api_before.event_creates &&
-                steady_api_after.event_destroys ==
-                    steady_api_before.event_destroys &&
-                steady_api_after.device_synchronizes ==
-                    steady_api_before.device_synchronizes,
-            "real local P2P steady path allocated or device-synchronized");
+            steady_api_after.device_frees == steady_api_before.device_frees &&
+            steady_api_after.pinned_allocations ==
+                steady_api_before.pinned_allocations &&
+            steady_api_after.pinned_frees == steady_api_before.pinned_frees &&
+            steady_api_after.event_creates == steady_api_before.event_creates &&
+            steady_api_after.event_destroys ==
+                steady_api_before.event_destroys &&
+            steady_api_after.device_synchronizes ==
+                steady_api_before.device_synchronizes,
+        "real local P2P steady path allocated or device-synchronized");
     if (benchmark_p2p) {
       const auto emit_values = [](const std::vector<double> &values) {
         for (std::size_t index = 0; index < values.size(); ++index) {
@@ -5371,8 +5299,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       std::cout << "P2P_BENCH rank=" << rank
                 << " backend=local-cuda-p2p setup_us=" << setup_us
                 << " device_bytes=" << usage.device_bytes
-                << " pinned_bytes=" << usage.pinned_bytes
-                << " raw_bytes="
+                << " pinned_bytes=" << usage.pinned_bytes << " raw_bytes="
                 << transported.audit().raw_cross_node_payload_bytes
                 << " dedup_bytes="
                 << transported.audit().deduplicated_cross_node_payload_bytes
@@ -5396,20 +5323,18 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       return;
     }
     if (socket_fallback) {
-      std::cout << "SOCKET_RESULT rank=" << rank
-                << " backend="
+      std::cout << "SOCKET_RESULT rank=" << rank << " backend="
                 << weftmoe::transport::activation_transport_backend_name(
                        transported.audit().backend)
-                << " tokens=" << common_routes.num_tokens
-                << " top_k=" << top_k << " hidden=" << hidden
+                << " tokens=" << common_routes.num_tokens << " top_k=" << top_k
+                << " hidden=" << hidden
                 << " packets=" << transported.audit().packet_count
                 << " fanout=" << transported.audit().fanout_count
                 << " raw_bytes="
                 << transported.audit().raw_cross_node_payload_bytes
                 << " dedup_bytes="
                 << transported.audit().deduplicated_cross_node_payload_bytes
-                << " gate_mode=" << gate_mode
-                << " gate_hash=" << gate_hash
+                << " gate_mode=" << gate_mode << " gate_hash=" << gate_hash
                 << " output_hash="
                 << hash_bf16_indexed(downloaded.combined_tokens)
                 << " contribution_hash="
@@ -5420,12 +5345,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
       return;
     }
     if (gin_rdma) {
-      std::cout << "GIN_RESULT rank=" << rank
-                << " backend="
+      std::cout << "GIN_RESULT rank=" << rank << " backend="
                 << weftmoe::transport::activation_transport_backend_name(
                        transported.audit().backend)
-                << " tokens=" << common_routes.num_tokens
-                << " top_k=" << top_k << " hidden=" << hidden
+                << " tokens=" << common_routes.num_tokens << " top_k=" << top_k
+                << " hidden=" << hidden
                 << " packets=" << transported.audit().packet_count
                 << " fanout=" << transported.audit().fanout_count
                 << " raw_remote_bytes="
@@ -5434,8 +5358,7 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                 << transported.audit().deduplicated_cross_node_payload_bytes
                 << " return_remote_bytes="
                 << transported.audit().actual_return_peer_bytes
-                << " gate_mode=" << gate_mode
-                << " gate_hash=" << gate_hash
+                << " gate_mode=" << gate_mode << " gate_hash=" << gate_hash
                 << " output_hash="
                 << hash_bf16_indexed(downloaded.combined_tokens)
                 << " contribution_hash="
@@ -5452,12 +5375,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
         std::cout << values[index].bits;
       }
     };
-    std::cout << "P2P_RESULT rank=" << rank
-              << " backend="
+    std::cout << "P2P_RESULT rank=" << rank << " backend="
               << weftmoe::transport::activation_transport_backend_name(
                      transported.audit().backend)
-              << " tokens=" << common_routes.num_tokens
-              << " top_k=" << top_k << " hidden=" << hidden
+              << " tokens=" << common_routes.num_tokens << " top_k=" << top_k
+              << " hidden=" << hidden
               << " packets=" << transported.audit().packet_count
               << " fanout=" << transported.audit().fanout_count
               << " stalls=" << transported.audit().credit_stalls
@@ -5466,11 +5388,9 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
               << transported.audit().raw_cross_node_payload_bytes
               << " dedup_bytes="
               << transported.audit().deduplicated_cross_node_payload_bytes
-              << " gate_mode=" << gate_mode
-              << " gate_hash=" << gate_hash
+              << " gate_mode=" << gate_mode << " gate_hash=" << gate_hash
               << " rounds=" << rounds
-              << " total_us=" << transported.timings().total_us
-              << " combined=";
+              << " total_us=" << transported.timings().total_us << " combined=";
     emit_bits(downloaded.combined_tokens);
     std::cout << " contribution=";
     emit_bits(downloaded.contribution_by_route);
@@ -5480,11 +5400,10 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     return;
   }
   if (scenario == "valid") {
-    auto session = weftmoe::cuda::make_nccl_generation(
-        base, "cuda-multinode", 701);
+    auto session =
+        weftmoe::cuda::make_nccl_generation(base, "cuda-multinode", 701);
     weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
-                                                                execution,
-                                                                pool);
+                                                               execution, pool);
     auto result = coordinator.run({common_config, common_routes, 10});
     std::cout << weftmoe::serialize_dispatch_metadata(
                      weftmoe::cuda::download_device_metadata_for_validation(
@@ -5505,18 +5424,16 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     std::uint64_t generation = 800 + round * 2;
     mutate_scenario(scenario, rank, config, routes, max_tokens, identity,
                     generation);
-    auto session = weftmoe::cuda::make_nccl_generation(
-        base, identity, generation);
+    auto session =
+        weftmoe::cuda::make_nccl_generation(base, identity, generation);
     weftmoe::cuda::CudaNotifyGenerationCoordinator coordinator(session,
-                                                                execution,
-                                                                pool);
+                                                               execution, pool);
     try {
       (void)coordinator.run({config, routes, max_tokens});
       throw std::runtime_error("invalid cross-host generation passed");
     } catch (const weftmoe::NotifyDispatchError &error) {
       const auto audit = coordinator.audit();
-      require(audit.control_starts == 1 &&
-                  audit.expert_count_starts == 0 &&
+      require(audit.control_starts == 1 && audit.expert_count_starts == 0 &&
                   audit.packet_summary_starts == 0,
               "failed cross-host generation entered data collective");
       std::cout << "CONTROL_ERROR round=" << round << " " << error.what()
@@ -5526,24 +5443,24 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
     auto recovery_session = weftmoe::cuda::make_nccl_generation(
         base, "cuda-multinode-recovery-" + scenario, 801 + round * 2);
     weftmoe::cuda::CudaNotifyGenerationCoordinator recovery(recovery_session,
-                                                             execution,
-                                                             pool);
+                                                            execution, pool);
     std::vector<std::int32_t> recovery_experts;
     for (std::uint32_t slot = 0; slot < top_k; ++slot)
       recovery_experts.push_back(static_cast<std::int32_t>(slot));
-    auto recovered = recovery.run({common_config,
-                                   {1, std::move(recovery_experts)}, 10});
+    auto recovered =
+        recovery.run({common_config, {1, std::move(recovery_experts)}, 10});
     require(recovered.audit().control_starts == 1 &&
                 recovered.audit().config_starts == 1 &&
                 recovered.audit().expert_count_starts == 1 &&
                 recovered.audit().packet_summary_starts == 1,
             "cross-host recovery failed");
-    require(recovered && !weftmoe::serialize_dispatch_metadata(
-                              weftmoe::cuda::download_device_metadata_for_validation(
-                                  recovered.dispatch(), execution)).empty(),
+    require(recovered &&
+                !weftmoe::serialize_dispatch_metadata(
+                     weftmoe::cuda::download_device_metadata_for_validation(
+                         recovered.dispatch(), execution))
+                     .empty(),
             "cross-host recovery metadata missing");
-    std::cout << "RECOVERY_OK rank=" << rank << " round=" << round
-              << std::endl;
+    std::cout << "RECOVERY_OK rank=" << rank << " round=" << round << std::endl;
   }
   throw weftmoe::NotifyDispatchError(
       weftmoe::NotifyErrorCode::ControlProtocolFailure,
@@ -5573,9 +5490,9 @@ void run_rank(std::uint32_t rank, std::uint32_t nodes,
   }
   auto execution = weftmoe::cuda::make_cuda_execution(
       "multinode-exec-" + std::to_string(rank), local_rank);
-  auto base = weftmoe::cuda::make_nccl_session(
-      "cuda-multinode-base", nodes * gpus_per_node, rank, 700, local_rank,
-      bootstrap);
+  auto base = weftmoe::cuda::make_nccl_session("cuda-multinode-base",
+                                               nodes * gpus_per_node, rank, 700,
+                                               local_rank, bootstrap);
   const auto *suite = std::getenv("WEFTMOE_TUNE_CASES");
   if (!suite) {
     run_rank_workload(rank, nodes, gpus_per_node, local_rank, seed, scenario,
@@ -5620,8 +5537,8 @@ Statistics summarize(std::vector<double> values) {
         std::ceil(fraction * static_cast<double>(values.size())));
     return values[std::max<std::size_t>(1, ordinal) - 1];
   };
-  return {sum / values.size(), percentile(.5), percentile(.95),
-          values.front(), values.back()};
+  return {sum / values.size(), percentile(.5), percentile(.95), values.front(),
+          values.back()};
 }
 
 void transport_benchmark() {
@@ -5633,16 +5550,16 @@ void transport_benchmark() {
   const auto config = make_config(8, 1, experts, top_k, 64);
   // Use the exact requested shape and deterministic, duplicate-free tuples.
   std::vector<weftmoe::RankRoutingInput> exact(world);
-  std::vector<std::uint64_t> counts(
-      static_cast<std::size_t>(world) * experts, 0);
-  std::vector<std::uint64_t> summaries(
-      static_cast<std::size_t>(world) * world, 0);
+  std::vector<std::uint64_t> counts(static_cast<std::size_t>(world) * experts,
+                                    0);
+  std::vector<std::uint64_t> summaries(static_cast<std::size_t>(world) * world,
+                                       0);
   for (std::uint32_t rank = 0; rank < world; ++rank) {
     exact[rank].num_tokens = tokens;
     for (std::uint64_t token = 0; token < tokens; ++token) {
       bool seen_node[world]{};
-      const auto base = static_cast<std::uint32_t>(
-          (token * 17U + rank * 31U) % experts);
+      const auto base =
+          static_cast<std::uint32_t>((token * 17U + rank * 31U) % experts);
       for (std::uint32_t slot = 0; slot < top_k; ++slot) {
         // Distinct experts on one destination node make the node-level
         // payload-dedup traffic reduction directly measurable.
@@ -5658,10 +5575,10 @@ void transport_benchmark() {
     }
   }
   auto execution = weftmoe::cuda::make_cuda_execution("transport-bench", 0);
-  auto session = weftmoe::make_collective_session("transport-bench", world,
-                                                   9100);
-  auto context = weftmoe::make_rank_collective_context(
-      session, 0, execution.token());
+  auto session =
+      weftmoe::make_collective_session("transport-bench", world, 9100);
+  auto context =
+      weftmoe::make_rank_collective_context(session, 0, execution.token());
   auto dispatch = weftmoe::cuda::testing::materialize_fake_device_collectives(
       config, context, execution, exact[0], tokens, counts, summaries);
   weftmoe::cuda::ActivationTransportPoolConfig pool_config;
@@ -5675,11 +5592,11 @@ void transport_benchmark() {
   pool_config.ring_slots_per_source_channel = 8;
   pool_config.max_inflight_generations = 1;
   const auto setup_start = Clock::now();
-  auto pool = weftmoe::cuda::make_activation_transport_pool(
-      session, execution, pool_config);
-  const auto setup_us = std::chrono::duration<double, std::micro>(
-                            Clock::now() - setup_start)
-                            .count();
+  auto pool = weftmoe::cuda::make_activation_transport_pool(session, execution,
+                                                            pool_config);
+  const auto setup_us =
+      std::chrono::duration<double, std::micro>(Clock::now() - setup_start)
+          .count();
   std::vector<weftmoe::transport::BFloat16> host(
       static_cast<std::size_t>(tokens * hidden));
   for (std::size_t i = 0; i < host.size(); ++i)
@@ -5711,10 +5628,9 @@ void transport_benchmark() {
   const auto reduce_stats = summarize(combine_reduce);
   const auto usage = pool.usage();
   const auto print_stats = [](const char *name, const Statistics &stats) {
-    std::cout << "  " << name << " mean=" << stats.mean
-              << " p50=" << stats.p50 << " p95=" << stats.p95
-              << " min=" << stats.minimum << " max=" << stats.maximum
-              << '\n';
+    std::cout << "  " << name << " mean=" << stats.mean << " p50=" << stats.p50
+              << " p95=" << stats.p95 << " min=" << stats.minimum
+              << " max=" << stats.maximum << '\n';
   };
   std::cout << "Activation transport benchmark: tokens/rank=" << tokens
             << " hidden=" << hidden << " top_k=" << top_k
@@ -5740,16 +5656,16 @@ void transport_benchmark() {
       << ",\"device_workspace_bytes\":" << usage.device_bytes
       << ",\"pinned_workspace_bytes\":" << usage.pinned_bytes
       << ",\"dispatch_relay_us\":{\"mean\":" << dispatch_stats.mean
-      << ",\"p50\":" << dispatch_stats.p50 << ",\"p95\":"
-      << dispatch_stats.p95 << ",\"min\":" << dispatch_stats.minimum
+      << ",\"p50\":" << dispatch_stats.p50 << ",\"p95\":" << dispatch_stats.p95
+      << ",\"min\":" << dispatch_stats.minimum
       << ",\"max\":" << dispatch_stats.maximum
       << "},\"combine_reduce_us\":{\"mean\":" << reduce_stats.mean
-      << ",\"p50\":" << reduce_stats.p50 << ",\"p95\":"
-      << reduce_stats.p95 << ",\"min\":" << reduce_stats.minimum
+      << ",\"p50\":" << reduce_stats.p50 << ",\"p95\":" << reduce_stats.p95
+      << ",\"min\":" << reduce_stats.minimum
       << ",\"max\":" << reduce_stats.maximum
       << "},\"steady_total_us\":{\"mean\":" << total_stats.mean
-      << ",\"p50\":" << total_stats.p50 << ",\"p95\":"
-      << total_stats.p95 << ",\"min\":" << total_stats.minimum
+      << ",\"p50\":" << total_stats.p50 << ",\"p95\":" << total_stats.p95
+      << ",\"min\":" << total_stats.minimum
       << ",\"max\":" << total_stats.maximum << "}}\n";
 }
 
@@ -5761,8 +5677,8 @@ void benchmark(std::uint32_t world) {
     for (std::uint64_t token = 0; token < 8192; ++token) {
       const auto base = (token * 17U + rank * 31U) % 384U;
       for (std::uint32_t slot = 0; slot < 6; ++slot)
-        routes[rank].selected_experts.push_back(static_cast<std::int32_t>(
-            (base + slot * 53U) % 384U));
+        routes[rank].selected_experts.push_back(
+            static_cast<std::int32_t>((base + slot * 53U) % 384U));
     }
   }
   constexpr std::size_t warmup = 10;
@@ -5772,18 +5688,26 @@ void benchmark(std::uint32_t world) {
   std::vector<double> generation_end_to_end;
   using SetupMember = double weftmoe::cuda::GenerationSetupTimings::*;
   const std::vector<std::pair<const char *, SetupMember>> setup_stages{
-      {"pool_acquire_us", &weftmoe::cuda::GenerationSetupTimings::pool_acquire_us},
-      {"coordinator_backend_create_us", &weftmoe::cuda::GenerationSetupTimings::coordinator_backend_create_us},
-      {"control_slot_allocation_us", &weftmoe::cuda::GenerationSetupTimings::control_slot_allocation_us},
-      {"config_slot_allocation_us", &weftmoe::cuda::GenerationSetupTimings::config_slot_allocation_us},
-      {"count_slot_allocation_us", &weftmoe::cuda::GenerationSetupTimings::count_slot_allocation_us},
-      {"summary_slot_allocation_us", &weftmoe::cuda::GenerationSetupTimings::summary_slot_allocation_us},
-      {"event_allocation_us", &weftmoe::cuda::GenerationSetupTimings::event_allocation_us},
-      {"pinned_allocation_us", &weftmoe::cuda::GenerationSetupTimings::pinned_allocation_us},
-      {"device_allocation_us", &weftmoe::cuda::GenerationSetupTimings::device_allocation_us}};
+      {"pool_acquire_us",
+       &weftmoe::cuda::GenerationSetupTimings::pool_acquire_us},
+      {"coordinator_backend_create_us",
+       &weftmoe::cuda::GenerationSetupTimings::coordinator_backend_create_us},
+      {"control_slot_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::control_slot_allocation_us},
+      {"config_slot_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::config_slot_allocation_us},
+      {"count_slot_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::count_slot_allocation_us},
+      {"summary_slot_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::summary_slot_allocation_us},
+      {"event_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::event_allocation_us},
+      {"pinned_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::pinned_allocation_us},
+      {"device_allocation_us",
+       &weftmoe::cuda::GenerationSetupTimings::device_allocation_us}};
   std::vector<std::vector<double>> setup_stage_samples(setup_stages.size());
-  using ExecutionMember =
-      double weftmoe::cuda::GenerationExecutionTimings::*;
+  using ExecutionMember = double weftmoe::cuda::GenerationExecutionTimings::*;
   const std::vector<std::pair<const char *, ExecutionMember>> execution_stages{
       {"local_mapping_us",
        &weftmoe::cuda::GenerationExecutionTimings::local_mapping_us},
@@ -5798,7 +5722,8 @@ void benchmark(std::uint32_t world) {
       {"prefix_planning_us",
        &weftmoe::cuda::GenerationExecutionTimings::prefix_planning_us},
       {"remaining_parallel_materialization_us",
-       &weftmoe::cuda::GenerationExecutionTimings::remaining_parallel_materialization_us},
+       &weftmoe::cuda::GenerationExecutionTimings::
+           remaining_parallel_materialization_us},
       {"pool_acquire_release_us",
        &weftmoe::cuda::GenerationExecutionTimings::pool_acquire_release_us}};
   std::vector<std::vector<double>> execution_stage_samples(
@@ -5812,18 +5737,13 @@ void benchmark(std::uint32_t world) {
     const auto context = weftmoe::make_rank_collective_context(
         resources[rank].base_session.session(), rank,
         resources[rank].execution.token());
-    resources[rank].device_routes =
-        weftmoe::cuda::upload_cuda_routes(
-            routes[rank], config.top_k,
-            context,
-            resources[rank].execution);
+    resources[rank].device_routes = weftmoe::cuda::upload_cuda_routes(
+        routes[rank], config.top_k, context, resources[rank].execution);
     resources[rank].device_gates =
         weftmoe::cuda::testing::upload_fp32_gates_for_testing(
-            fixed_random_selected_gates(routes[rank].num_tokens,
-                                        config.top_k, rank,
-                                        0x4d4547414d4f4547ULL),
-            resources[rank].device_routes, context,
-            resources[rank].execution);
+            fixed_random_selected_gates(routes[rank].num_tokens, config.top_k,
+                                        rank, 0x4d4547414d4f4547ULL),
+            resources[rank].device_routes, context, resources[rank].execution);
   }
   std::vector<double> session_setup;
   std::vector<double> pool_setup;
@@ -5835,8 +5755,7 @@ void benchmark(std::uint32_t world) {
   const auto pool_setup_stats = summarize(pool_setup);
   for (std::size_t iteration = 0; iteration < warmup + measured; ++iteration) {
     const auto result = run_reused_fixture(
-        config, routes, resources, "benchmark-session",
-        3000 + iteration, 8192);
+        config, routes, resources, "benchmark-session", 3000 + iteration, 8192);
     rethrow_errors(result);
     if (iteration >= warmup) {
       double slow_wall = 0;
@@ -5856,40 +5775,39 @@ void benchmark(std::uint32_t world) {
           slow_setup_stages[stage] = std::max(
               slow_setup_stages[stage], rank.setup.*setup_stages[stage].second);
         for (std::size_t stage = 0; stage < execution_stages.size(); ++stage)
-          slow_execution_stages[stage] = std::max(
-              slow_execution_stages[stage],
-              rank.execution.*execution_stages[stage].second);
-        peak.device_bytes = std::max(peak.device_bytes,
-                                     rank.workspace.device_bytes);
-        peak.pinned_host_bytes = std::max(
-            peak.pinned_host_bytes, rank.workspace.pinned_host_bytes);
-        peak.control_slot_bytes = std::max(
-            peak.control_slot_bytes, rank.workspace.control_slot_bytes);
-        peak.config_wire_bytes = std::max(
-            peak.config_wire_bytes, rank.workspace.config_wire_bytes);
-        peak.config_slot_bytes = std::max(
-            peak.config_slot_bytes, rank.workspace.config_slot_bytes);
-        peak.expert_slot_bytes = std::max(
-            peak.expert_slot_bytes, rank.workspace.expert_slot_bytes);
-        peak.summary_slot_bytes = std::max(
-            peak.summary_slot_bytes, rank.workspace.summary_slot_bytes);
-        peak.route_input_device_bytes = std::max(
-            peak.route_input_device_bytes,
-            rank.workspace.route_input_device_bytes);
-        peak.device_notify_arena_bytes = std::max(
-            peak.device_notify_arena_bytes,
-            rank.workspace.device_notify_arena_bytes);
-        peak.device_notify_pinned_staging_bytes = std::max(
-            peak.device_notify_pinned_staging_bytes,
-            rank.workspace.device_notify_pinned_staging_bytes);
+          slow_execution_stages[stage] =
+              std::max(slow_execution_stages[stage],
+                       rank.execution.*execution_stages[stage].second);
+        peak.device_bytes =
+            std::max(peak.device_bytes, rank.workspace.device_bytes);
+        peak.pinned_host_bytes =
+            std::max(peak.pinned_host_bytes, rank.workspace.pinned_host_bytes);
+        peak.control_slot_bytes = std::max(peak.control_slot_bytes,
+                                           rank.workspace.control_slot_bytes);
+        peak.config_wire_bytes =
+            std::max(peak.config_wire_bytes, rank.workspace.config_wire_bytes);
+        peak.config_slot_bytes =
+            std::max(peak.config_slot_bytes, rank.workspace.config_slot_bytes);
+        peak.expert_slot_bytes =
+            std::max(peak.expert_slot_bytes, rank.workspace.expert_slot_bytes);
+        peak.summary_slot_bytes = std::max(peak.summary_slot_bytes,
+                                           rank.workspace.summary_slot_bytes);
+        peak.route_input_device_bytes =
+            std::max(peak.route_input_device_bytes,
+                     rank.workspace.route_input_device_bytes);
+        peak.device_notify_arena_bytes =
+            std::max(peak.device_notify_arena_bytes,
+                     rank.workspace.device_notify_arena_bytes);
+        peak.device_notify_pinned_staging_bytes =
+            std::max(peak.device_notify_pinned_staging_bytes,
+                     rank.workspace.device_notify_pinned_staging_bytes);
         peak.final_device_metadata_arena_view_capacity_bytes = std::max(
             peak.final_device_metadata_arena_view_capacity_bytes,
             rank.workspace.final_device_metadata_arena_view_capacity_bytes);
-        peak.event_count = std::max(peak.event_count,
-                                    rank.workspace.event_count);
+        peak.event_count =
+            std::max(peak.event_count, rank.workspace.event_count);
         peak.quantified_event_bytes = std::max(
-            peak.quantified_event_bytes,
-            rank.workspace.quantified_event_bytes);
+            peak.quantified_event_bytes, rank.workspace.quantified_event_bytes);
       }
       steady.push_back(slow_steady);
       setup.push_back(slow_setup);
@@ -5897,8 +5815,7 @@ void benchmark(std::uint32_t world) {
       for (std::size_t stage = 0; stage < setup_stages.size(); ++stage)
         setup_stage_samples[stage].push_back(slow_setup_stages[stage]);
       for (std::size_t stage = 0; stage < execution_stages.size(); ++stage)
-        execution_stage_samples[stage].push_back(
-            slow_execution_stages[stage]);
+        execution_stage_samples[stage].push_back(slow_execution_stages[stage]);
     }
   }
   const auto steady_stats = summarize(steady);
@@ -5910,12 +5827,12 @@ void benchmark(std::uint32_t world) {
   std::vector<Statistics> execution_stage_stats;
   for (auto &samples : execution_stage_samples)
     execution_stage_stats.push_back(summarize(std::move(samples)));
-  std::cout << "BENCH world=" << world
-            << " warmup=" << warmup << " measured=" << measured
+  std::cout << "BENCH world=" << world << " warmup=" << warmup
+            << " measured=" << measured
             << " aggregation=slowest-rank"
                " session_reused=true\n"
-            << "  one_time_session_setup_us mean="
-            << session_setup_stats.mean << " p50=" << session_setup_stats.p50
+            << "  one_time_session_setup_us mean=" << session_setup_stats.mean
+            << " p50=" << session_setup_stats.p50
             << " p95=" << session_setup_stats.p95
             << " min=" << session_setup_stats.minimum
             << " max=" << session_setup_stats.maximum << '\n'
@@ -5926,71 +5843,65 @@ void benchmark(std::uint32_t world) {
             << " max=" << pool_setup_stats.maximum << '\n'
             << "  per_generation_setup_us mean=" << setup_stats.mean
             << " p50=" << setup_stats.p50 << " p95=" << setup_stats.p95
-            << " min=" << setup_stats.minimum
-            << " max=" << setup_stats.maximum << '\n'
+            << " min=" << setup_stats.minimum << " max=" << setup_stats.maximum
+            << '\n'
             << "  setup_inclusive_generation_end_to_end_us mean="
             << generation_stats.mean << " p50=" << generation_stats.p50
             << " p95=" << generation_stats.p95
             << " min=" << generation_stats.minimum
             << " max=" << generation_stats.maximum << '\n'
             << "  steady_state_execution_us mean=" << steady_stats.mean
-            << " p50=" << steady_stats.p50
-            << " p95=" << steady_stats.p95
+            << " p50=" << steady_stats.p50 << " p95=" << steady_stats.p95
             << " min=" << steady_stats.minimum
             << " max=" << steady_stats.maximum << '\n';
   for (std::size_t stage = 0; stage < setup_stages.size(); ++stage) {
     const auto &stats = setup_stage_stats[stage];
     std::cout << "  " << setup_stages[stage].first << " mean=" << stats.mean
               << " p50=" << stats.p50 << " p95=" << stats.p95
-              << " min=" << stats.minimum << " max=" << stats.maximum
-              << '\n';
+              << " min=" << stats.minimum << " max=" << stats.maximum << '\n';
   }
   for (std::size_t stage = 0; stage < execution_stages.size(); ++stage) {
     const auto &stats = execution_stage_stats[stage];
-    std::cout << "  " << execution_stages[stage].first << " mean="
-              << stats.mean << " p50=" << stats.p50 << " p95=" << stats.p95
-              << " min=" << stats.minimum << " max=" << stats.maximum
-              << '\n';
+    std::cout << "  " << execution_stages[stage].first << " mean=" << stats.mean
+              << " p50=" << stats.p50 << " p95=" << stats.p95
+              << " min=" << stats.minimum << " max=" << stats.maximum << '\n';
   }
-  std::cout << "BENCH_JSON {\"schema\":7,\"warmup\":" << warmup
-            << ",\"measured\":" << measured << ','
-            << "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
-               "\"session_setup_sample\":\"one establishment; samples are ranks\","
-               "\"one_time_session_setup_us\":{\"mean\":"
-            << session_setup_stats.mean << ",\"p50\":"
-            << session_setup_stats.p50 << ",\"p95\":"
-            << session_setup_stats.p95 << ",\"min\":"
-            << session_setup_stats.minimum << ",\"max\":"
-            << session_setup_stats.maximum
-            << "},\"one_time_pool_setup_us\":{\"mean\":"
-            << pool_setup_stats.mean << ",\"p50\":"
-            << pool_setup_stats.p50 << ",\"p95\":"
-            << pool_setup_stats.p95 << ",\"min\":"
-            << pool_setup_stats.minimum << ",\"max\":"
-            << pool_setup_stats.maximum
-            << "},\"per_generation_setup_us\":{\"mean\":"
-            << setup_stats.mean << ",\"p50\":" << setup_stats.p50
-            << ",\"p95\":" << setup_stats.p95 << ",\"min\":"
-            << setup_stats.minimum << ",\"max\":" << setup_stats.maximum
-            << "},\"setup_inclusive_generation_end_to_end_us\":{\"mean\":"
-            << generation_stats.mean << ",\"p50\":"
-            << generation_stats.p50 << ",\"p95\":"
-            << generation_stats.p95 << ",\"min\":"
-            << generation_stats.minimum << ",\"max\":"
-            << generation_stats.maximum
-            << "},\"steady_state_execution_us\":{\"mean\":"
-            << steady_stats.mean << ",\"p50\":" << steady_stats.p50
-            << ",\"p95\":" << steady_stats.p95 << ",\"min\":"
-            << steady_stats.minimum << ",\"max\":" << steady_stats.maximum
-            << "},\"setup_stages\":{";
+  std::cout
+      << "BENCH_JSON {\"schema\":7,\"warmup\":" << warmup
+      << ",\"measured\":" << measured << ','
+      << "\"aggregation\":\"slowest-rank\",\"session_reused\":true,"
+         "\"session_setup_sample\":\"one establishment; samples are ranks\","
+         "\"one_time_session_setup_us\":{\"mean\":"
+      << session_setup_stats.mean << ",\"p50\":" << session_setup_stats.p50
+      << ",\"p95\":" << session_setup_stats.p95
+      << ",\"min\":" << session_setup_stats.minimum
+      << ",\"max\":" << session_setup_stats.maximum
+      << "},\"one_time_pool_setup_us\":{\"mean\":" << pool_setup_stats.mean
+      << ",\"p50\":" << pool_setup_stats.p50
+      << ",\"p95\":" << pool_setup_stats.p95
+      << ",\"min\":" << pool_setup_stats.minimum
+      << ",\"max\":" << pool_setup_stats.maximum
+      << "},\"per_generation_setup_us\":{\"mean\":" << setup_stats.mean
+      << ",\"p50\":" << setup_stats.p50 << ",\"p95\":" << setup_stats.p95
+      << ",\"min\":" << setup_stats.minimum
+      << ",\"max\":" << setup_stats.maximum
+      << "},\"setup_inclusive_generation_end_to_end_us\":{\"mean\":"
+      << generation_stats.mean << ",\"p50\":" << generation_stats.p50
+      << ",\"p95\":" << generation_stats.p95
+      << ",\"min\":" << generation_stats.minimum
+      << ",\"max\":" << generation_stats.maximum
+      << "},\"steady_state_execution_us\":{\"mean\":" << steady_stats.mean
+      << ",\"p50\":" << steady_stats.p50 << ",\"p95\":" << steady_stats.p95
+      << ",\"min\":" << steady_stats.minimum
+      << ",\"max\":" << steady_stats.maximum << "},\"setup_stages\":{";
   for (std::size_t stage = 0; stage < setup_stages.size(); ++stage) {
     if (stage != 0)
       std::cout << ',';
     const auto &stats = setup_stage_stats[stage];
-    std::cout << '\"' << setup_stages[stage].first << "\":{\"mean\":"
-              << stats.mean << ",\"p50\":" << stats.p50
-              << ",\"p95\":" << stats.p95 << ",\"min\":"
-              << stats.minimum << ",\"max\":" << stats.maximum << '}';
+    std::cout << '\"' << setup_stages[stage].first
+              << "\":{\"mean\":" << stats.mean << ",\"p50\":" << stats.p50
+              << ",\"p95\":" << stats.p95 << ",\"min\":" << stats.minimum
+              << ",\"max\":" << stats.maximum << '}';
   }
   std::cout << "},\"execution_stages\":{";
   for (std::size_t stage = 0; stage < execution_stages.size(); ++stage) {
@@ -6002,26 +5913,22 @@ void benchmark(std::uint32_t world) {
               << ",\"p95\":" << stats.p95 << ",\"min\":" << stats.minimum
               << ",\"max\":" << stats.maximum << '}';
   }
-  std::cout << "},\"workspace\":{\"control_slot\":"
-            << peak.control_slot_bytes << ",\"config_wire\":"
-            << peak.config_wire_bytes << ",\"config_slot\":"
-            << peak.config_slot_bytes << ",\"expert_slot\":"
-            << peak.expert_slot_bytes << ",\"summary_slot\":"
-            << peak.summary_slot_bytes << ",\"device\":"
-            << peak.device_bytes << ",\"pinned\":"
-            << peak.pinned_host_bytes
-            << ",\"route_input_device\":"
-            << peak.route_input_device_bytes
-            << ",\"device_notify_arena\":"
-            << peak.device_notify_arena_bytes
+  std::cout << "},\"workspace\":{\"control_slot\":" << peak.control_slot_bytes
+            << ",\"config_wire\":" << peak.config_wire_bytes
+            << ",\"config_slot\":" << peak.config_slot_bytes
+            << ",\"expert_slot\":" << peak.expert_slot_bytes
+            << ",\"summary_slot\":" << peak.summary_slot_bytes
+            << ",\"device\":" << peak.device_bytes
+            << ",\"pinned\":" << peak.pinned_host_bytes
+            << ",\"route_input_device\":" << peak.route_input_device_bytes
+            << ",\"device_notify_arena\":" << peak.device_notify_arena_bytes
             << ",\"device_notify_pinned_staging\":"
             << peak.device_notify_pinned_staging_bytes
             << ",\"final_device_metadata_arena_view_capacity\":"
             << peak.final_device_metadata_arena_view_capacity_bytes
             << ",\"final_metadata_is_arena_subview\":true"
             << ",\"event_count\":" << peak.event_count
-            << ",\"quantified_event_bytes\":"
-            << peak.quantified_event_bytes
+            << ",\"quantified_event_bytes\":" << peak.quantified_event_bytes
             << "},\"hot_path\":{\"per_route_copy\":false,"
                "\"per_route_allocation\":false,\"per_route_sync\":false}}\n";
 }
@@ -6068,9 +5975,9 @@ void test_randomized_generation_scheduler() {
       if (!inflight.empty() && (next() & 1U) != 0U) {
         const auto choice = static_cast<std::size_t>(next() % inflight.size());
         const auto item = inflight[choice];
-        require(model.complete(static_cast<TaskClass>(item[0]), item[1],
-                               item[2]),
-                "claimed task failed completion");
+        require(
+            model.complete(static_cast<TaskClass>(item[0]), item[1], item[2]),
+            "claimed task failed completion");
         inflight.erase(inflight.begin() + static_cast<std::ptrdiff_t>(choice));
         continue;
       }
@@ -6138,46 +6045,6 @@ int main(int argc, char **argv) {
       test_device_only_sanitizer_paths();
       return 0;
     }
-    if (argc == 2 && std::string(argv[1]) == "--v3-protocol-smoke") {
-      const auto probe =
-          weftmoe::cuda::testing::run_persistent_v3_protocol_probe();
-      require(probe.rdma_ctas == 8U && probe.relay_ctas == 8U &&
-                  probe.compute_ctas + probe.rdma_ctas + probe.relay_ctas ==
-                      probe.sm_count,
-              "V3 fixed CTA role partition mismatch");
-      require(probe.tasks_completed == 8ULL * probe.tasks_per_context &&
-                  probe.observed_checksum == probe.expected_checksum &&
-                  probe.terminal_epoch != 0ULL &&
-                  probe.terminal_publish_count == 1ULL &&
-                  probe.error_code == 0ULL,
-              "V3 ticket/scoreboard protocol probe failed");
-      std::cout << "[PASS] V3 fixed roles rdma=" << probe.rdma_ctas
-                << " relay=" << probe.relay_ctas
-                << " compute=" << probe.compute_ctas
-                << " tasks=" << probe.tasks_completed
-                << " terminal_publish_count="
-                << probe.terminal_publish_count << '\n';
-      const auto backward_probe =
-          weftmoe::cuda::testing::run_backward_scheduler_probe();
-      require(backward_probe.dx_completed == 36ULL &&
-                  backward_probe.dab_completed == 60ULL &&
-                  backward_probe.dw2_completed == 28ULL &&
-                  backward_probe.dw1_completed == 268ULL &&
-                  backward_probe.total_completed == 392ULL &&
-                  backward_probe.duplicate_claims == 0ULL &&
-                  backward_probe.dependency_errors == 0ULL &&
-                  backward_probe.priority_errors == 0ULL &&
-                  backward_probe.timeout_errors == 0ULL &&
-                  backward_probe.terminal_epoch != 0ULL &&
-                  backward_probe.terminal_publish_count == 1ULL,
-              "BWD four-queue scheduler probe failed");
-      std::cout << "[PASS] BWD scheduler compute="
-                << backward_probe.compute_ctas
-                << " participating=" << backward_probe.participating_ctas
-                << " tasks=" << backward_probe.total_completed
-                << " priority=dx>dab>dw2>dw1\n";
-      return 0;
-    }
     if (argc == 3 && std::string(argv[1]) == "--bench") {
       benchmark(static_cast<std::uint32_t>(parse_u64(argv[2])));
       return 0;
@@ -6193,16 +6060,14 @@ int main(int argc, char **argv) {
                 << capability.compiled_nccl_version
                 << " runtime_nccl=" << capability.runtime_nccl_version
                 << " device_headers=" << capability.nccl_device_headers
-                << " gin_headers_available="
-                << capability.gin_headers_available
+                << " gin_headers_available=" << capability.gin_headers_available
                 << " gin_symbols_present=" << capability.gin_symbols_present
                 << " gin_runtime_initializable="
                 << capability.gin_runtime_initializable
                 << " gin_backend_implemented="
                 << capability.gin_backend_implemented
                 << " gin_usable=" << capability.gin_usable
-                << " system_scope_atomics="
-                << capability.system_scope_atomics
+                << " system_scope_atomics=" << capability.system_scope_atomics
                 << " reason='" << capability.gin_unavailable_reason << "'\n";
       for (std::size_t i = 0; i < capability.peer_access_matrix.size(); ++i)
         std::cout << static_cast<unsigned int>(
@@ -6211,8 +6076,7 @@ int main(int argc, char **argv) {
       const auto ordering_ok =
           weftmoe::cuda::testing::run_local_p2p_put_signal_probe(
               0, 1, 64U * 1024U * 1024U);
-      std::cout << "LOCAL_P2P_ORDERING bytes="
-                << (64U * 1024U * 1024U)
+      std::cout << "LOCAL_P2P_ORDERING bytes=" << (64U * 1024U * 1024U)
                 << " last_block_signal_verified=" << ordering_ok
                 << " early_signal_rejected=" << ordering_ok << '\n';
       std::cout << "LOCAL_P2P_DEVICE_PUT_GBPS gpu0_to_gpu1="
@@ -6230,14 +6094,22 @@ int main(int argc, char **argv) {
       std::string scenario = "valid";
       for (int index = 2; index + 1 < argc; index += 2) {
         const std::string key = argv[index];
-        if (key == "--rank") rank = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
-        else if (key == "--nodes") nodes = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
-        else if (key == "--gpus-per-node") gpus = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
-        else if (key == "--local-rank") local = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
-        else if (key == "--seed") seed = parse_u64(argv[index + 1]);
-        else if (key == "--bootstrap-input-fd") bootstrap_input_fd = std::stoi(argv[index + 1]);
-        else if (key == "--bootstrap-output-fd") bootstrap_output_fd = std::stoi(argv[index + 1]);
-        else if (key == "--scenario") scenario = argv[index + 1];
+        if (key == "--rank")
+          rank = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
+        else if (key == "--nodes")
+          nodes = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
+        else if (key == "--gpus-per-node")
+          gpus = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
+        else if (key == "--local-rank")
+          local = static_cast<std::uint32_t>(parse_u64(argv[index + 1]));
+        else if (key == "--seed")
+          seed = parse_u64(argv[index + 1]);
+        else if (key == "--bootstrap-input-fd")
+          bootstrap_input_fd = std::stoi(argv[index + 1]);
+        else if (key == "--bootstrap-output-fd")
+          bootstrap_output_fd = std::stoi(argv[index + 1]);
+        else if (key == "--scenario")
+          scenario = argv[index + 1];
       }
       print_nccl_runtime_info();
       run_rank(rank, nodes, gpus, local, seed, bootstrap_input_fd,

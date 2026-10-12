@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstdint>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,8 +24,7 @@ namespace weftmoe::cuda {
 const char *forward_tuning_id();
 
 template <class T> class SelectedActivationLease;
-using BFloat16ActivationLease =
-    SelectedActivationLease<transport::BFloat16>;
+using BFloat16ActivationLease = SelectedActivationLease<transport::BFloat16>;
 class BFloat16OutputGradientLease;
 class BackwardMegaKernel;
 class BackwardValidationBridge;
@@ -124,9 +123,10 @@ private:
   explicit ActivationTransportResourcePool(std::shared_ptr<Impl> impl)
       : impl_(std::move(impl)) {}
   std::shared_ptr<Impl> impl_;
-  friend ActivationTransportResourcePool make_activation_transport_pool(
-      const CollectiveSession &, const CudaExecution &,
-      ActivationTransportPoolConfig);
+  friend ActivationTransportResourcePool
+  make_activation_transport_pool(const CollectiveSession &,
+                                 const CudaExecution &,
+                                 ActivationTransportPoolConfig);
   friend ActivationTransportResourcePool prepare_activation_transport_pool(
       const CollectiveSession &, const CudaExecution &,
       ActivationTransportPoolConfig, const DeviceDispatchHandle &,
@@ -136,9 +136,10 @@ private:
   friend class ExternalCudaProducer;
 };
 
-ActivationTransportResourcePool make_activation_transport_pool(
-    const CollectiveSession &session, const CudaExecution &execution,
-    ActivationTransportPoolConfig config);
+ActivationTransportResourcePool
+make_activation_transport_pool(const CollectiveSession &session,
+                               const CudaExecution &execution,
+                               ActivationTransportPoolConfig config);
 
 // Combine explicit capacities with the current Notify requirements. Capture
 // preparation without Notify must provide a destination-row capacity. Reuse
@@ -156,7 +157,6 @@ struct ActivationTransportExpectation {
   std::uint64_t tokens = 0;
   std::uint64_t hidden = 0;
 };
-
 
 struct ActivationTransportRunOptions {
   GenerationCancellationToken cancellation;
@@ -216,7 +216,6 @@ private:
   friend class ExternalCudaProducer;
 };
 
-
 struct ForwardMegaKernelTimings {
   double device_kernel_us = 0;
   double route_exchange_us = 0;
@@ -262,7 +261,6 @@ struct ForwardMegaKernelAudit {
   std::uint64_t activation_d2h_bytes = 0;
   std::uint64_t activation_h2d_bytes = 0;
   std::uint64_t workspace_bytes = 0;
-  bool communication_copy = false;
 };
 
 class DeviceForwardHandle {
@@ -313,14 +311,15 @@ public:
   std::uint32_t device_ordinal() const;
   explicit operator bool() const noexcept { return static_cast<bool>(state_); }
 
-  CudaRouteInput publish_selected_experts(
-      const std::int32_t *device_data, std::uint64_t capacity_elements,
-      std::uint64_t num_tokens, std::uint32_t top_k,
-      std::shared_ptr<const void> allocation_owner) const;
-  CudaGateInput publish_gates(
-      const float *device_data, std::uint64_t capacity_elements,
-      const CudaRouteInput &exact_routes,
-      std::shared_ptr<const void> allocation_owner) const;
+  CudaRouteInput
+  publish_selected_experts(const std::int32_t *device_data,
+                           std::uint64_t capacity_elements,
+                           std::uint64_t num_tokens, std::uint32_t top_k,
+                           std::shared_ptr<const void> allocation_owner) const;
+  CudaGateInput
+  publish_gates(const float *device_data, std::uint64_t capacity_elements,
+                const CudaRouteInput &exact_routes,
+                std::shared_ptr<const void> allocation_owner) const;
   BFloat16ActivationLease
   publish_activations(const transport::BFloat16 *device_data,
                       std::uint64_t capacity_elements, std::uint64_t num_tokens,
@@ -329,35 +328,36 @@ public:
   // dY is caller-owned and does not reserve a second transport-pool slot.
   // The returned lease records producer-stream readiness and retains the
   // allocation until Backward has consumed it.
-  BFloat16OutputGradientLease publish_output_gradients(
-      const transport::BFloat16 *device_data,
-      std::uint64_t capacity_elements, std::uint64_t num_tokens,
-      std::uint64_t hidden_size,
-      std::shared_ptr<const void> allocation_owner) const;
+  BFloat16OutputGradientLease
+  publish_output_gradients(const transport::BFloat16 *device_data,
+                           std::uint64_t capacity_elements,
+                           std::uint64_t num_tokens, std::uint64_t hidden_size,
+                           std::shared_ptr<const void> allocation_owner) const;
   ForwardWeightLease publish_weights(
       const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
-      std::shared_ptr<const void> w1_owner,
-      const transport::BFloat16 *w2, std::uint64_t w2_capacity_elements,
-      std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
-      std::uint32_t global_expert_begin, std::uint64_t hidden_size,
-      std::uint64_t intermediate_size) const;
+      std::shared_ptr<const void> w1_owner, const transport::BFloat16 *w2,
+      std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
+      std::uint32_t owned_experts, std::uint32_t global_expert_begin,
+      std::uint64_t hidden_size, std::uint64_t intermediate_size) const;
   // Optional caller-owned W1 packing scratch, retained by the lease. Packing
   // still runs on every publication; this reuses storage, not weight values.
   ForwardWeightLease publish_weights(
       const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
-      std::shared_ptr<const void> w1_owner,
-      const transport::BFloat16 *w2, std::uint64_t w2_capacity_elements,
-      std::shared_ptr<const void> w2_owner, std::uint32_t owned_experts,
-      std::uint32_t global_expert_begin, std::uint64_t hidden_size,
-      std::uint64_t intermediate_size, const CudaTensorBuffer &packed_w1) const;
+      std::shared_ptr<const void> w1_owner, const transport::BFloat16 *w2,
+      std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
+      std::uint32_t owned_experts, std::uint32_t global_expert_begin,
+      std::uint64_t hidden_size, std::uint64_t intermediate_size,
+      const CudaTensorBuffer &packed_w1) const;
+
 private:
   struct State;
   explicit ExternalCudaProducer(std::shared_ptr<const State> state)
       : state_(std::move(state)) {}
   std::shared_ptr<const State> state_;
-  friend ExternalCudaProducer make_external_cuda_producer(
-      RankCollectiveContext, std::uint32_t, CUstream_st *,
-      std::shared_ptr<const void>, std::string);
+  friend ExternalCudaProducer
+  make_external_cuda_producer(RankCollectiveContext, std::uint32_t,
+                              CUstream_st *, std::shared_ptr<const void>,
+                              std::string);
 };
 
 ExternalCudaProducer make_external_cuda_producer(
@@ -367,28 +367,27 @@ ExternalCudaProducer make_external_cuda_producer(
 
 class LocalCudaP2pForwardMegaKernel {
 public:
-  LocalCudaP2pForwardMegaKernel(
-      const NcclSession &session, const CudaExecution &execution,
-      const ActivationTransportResourcePool &pool);
+  LocalCudaP2pForwardMegaKernel(const NcclSession &session,
+                                const CudaExecution &execution,
+                                const ActivationTransportResourcePool &pool);
 
-  DeviceForwardHandle enqueue(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const ForwardWeightLease &weights,
-      const ForwardMegaKernelConfig &config,
-      const ActivationTransportRunOptions &options = {});
+  DeviceForwardHandle
+  enqueue(const DeviceDispatchHandle &dispatch,
+          const BFloat16ActivationLease &activations,
+          const ForwardWeightLease &weights,
+          const ForwardMegaKernelConfig &config,
+          const ActivationTransportRunOptions &options = {});
 
-  DeviceForwardHandle run(
-      const DeviceDispatchHandle &dispatch,
-      const BFloat16ActivationLease &activations,
-      const ForwardWeightLease &weights,
-      const ForwardMegaKernelConfig &config,
-      const ActivationTransportRunOptions &options = {});
+  DeviceForwardHandle run(const DeviceDispatchHandle &dispatch,
+                          const BFloat16ActivationLease &activations,
+                          const ForwardWeightLease &weights,
+                          const ForwardMegaKernelConfig &config,
+                          const ActivationTransportRunOptions &options = {});
 
 private:
-  LocalCudaP2pForwardMegaKernel(
-      const NcclSession &, const CudaExecution &,
-      const ActivationTransportResourcePool &, bool use_gin);
+  LocalCudaP2pForwardMegaKernel(const NcclSession &, const CudaExecution &,
+                                const ActivationTransportResourcePool &,
+                                bool use_gin);
   struct Impl;
   std::shared_ptr<Impl> impl_;
   friend class GinRdmaForwardMegaKernel;
@@ -401,15 +400,17 @@ class GinRdmaForwardMegaKernel {
 public:
   GinRdmaForwardMegaKernel(const NcclSession &, const CudaExecution &,
                            const ActivationTransportResourcePool &);
-  DeviceForwardHandle enqueue(
-      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
-      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
-      const ActivationTransportRunOptions & = {});
+  DeviceForwardHandle enqueue(const DeviceDispatchHandle &,
+                              const BFloat16ActivationLease &,
+                              const ForwardWeightLease &,
+                              const ForwardMegaKernelConfig &,
+                              const ActivationTransportRunOptions & = {});
 
-  DeviceForwardHandle run(
-      const DeviceDispatchHandle &, const BFloat16ActivationLease &,
-      const ForwardWeightLease &, const ForwardMegaKernelConfig &,
-      const ActivationTransportRunOptions & = {});
+  DeviceForwardHandle run(const DeviceDispatchHandle &,
+                          const BFloat16ActivationLease &,
+                          const ForwardWeightLease &,
+                          const ForwardMegaKernelConfig &,
+                          const ActivationTransportRunOptions & = {});
 
 private:
   std::shared_ptr<LocalCudaP2pForwardMegaKernel> delegate_;
@@ -429,15 +430,16 @@ struct ActivationTransportCapability {
   std::string gin_unavailable_reason;
 };
 
-ActivationTransportCapability probe_activation_transport_capability(
-    std::uint32_t world_size);
+ActivationTransportCapability
+probe_activation_transport_capability(std::uint32_t world_size);
 
 // Run the device-communicator/window portion of the GIN capability probe on
 // an already established communicator.  Window registration is collective,
 // so every rank in `session` must call this overload in the same order.  The
 // returned value contains no native NCCL/CUDA handles.
-ActivationTransportCapability probe_activation_transport_capability(
-    const NcclSession &session, const CudaExecution &execution);
+ActivationTransportCapability
+probe_activation_transport_capability(const NcclSession &session,
+                                      const CudaExecution &execution);
 
 } // namespace weftmoe::cuda
 

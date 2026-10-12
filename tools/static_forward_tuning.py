@@ -57,7 +57,7 @@ def validate(config):
     choices = dict(local_prefill_streaming=(0, 1), local_prefill_fast_math=(0, 1),
                    decode_math_m=(0, 16, 64), decode_stages=(2, 3),
                    decode_cta_multiplier=(0, 1, 2, 3),
-                   network_lanes=(1, 2, 4, 8, 16, 32), packet_rows=(8, 16, 32, 64, 128),
+                   network_lanes=(1, 2, 4, 8, 16, 32, 64, 132), packet_rows=(8, 16, 32, 64, 128),
                    return_packet_rows=(16, 32, 64, 128),
                    network_min_depth=(8, 16, 32),
                    network_max_workers=(1, 2, 4, 8, 16, 32),

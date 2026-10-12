@@ -5,8 +5,8 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -26,9 +26,8 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "cuda/backward/cluster_task.cuh"
 #include "cuda/nccl_protocol_internal.hpp"
-#include "cuda/persistent_v3/backward/cluster_task.cuh"
-#include "cuda/persistent_v3/forward/pipeline_state.cuh"
 #include "cuda/weftmoe_pf/ring_layout.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 #include "transport/activation_protocol_testing.hpp"
@@ -85,12 +84,12 @@ std::ptrdiff_t scripted_bootstrap_read(int, void *destination,
     errno = EINTR;
     return -1;
   }
-  const auto remaining = bootstrap_io_script->input.size() -
-                         bootstrap_io_script->input_offset;
+  const auto remaining =
+      bootstrap_io_script->input.size() - bootstrap_io_script->input_offset;
   if (remaining == 0)
     return 0;
-  const auto count = std::min(
-      {capacity, remaining, bootstrap_io_script->read_chunk});
+  const auto count =
+      std::min({capacity, remaining, bootstrap_io_script->read_chunk});
   std::memcpy(destination,
               bootstrap_io_script->input.data() +
                   bootstrap_io_script->input_offset,
@@ -135,9 +134,9 @@ class BootstrapIoHookGuard {
 public:
   explicit BootstrapIoHookGuard(BootstrapIoScript &script) {
     bootstrap_io_script = &script;
-    weftmoe::cuda::testing::set_bootstrap_io_hooks(
-        scripted_bootstrap_read, scripted_bootstrap_write,
-        scripted_bootstrap_close);
+    weftmoe::cuda::testing::set_bootstrap_io_hooks(scripted_bootstrap_read,
+                                                   scripted_bootstrap_write,
+                                                   scripted_bootstrap_close);
   }
   BootstrapIoHookGuard(const BootstrapIoHookGuard &) = delete;
   BootstrapIoHookGuard &operator=(const BootstrapIoHookGuard &) = delete;
@@ -168,14 +167,12 @@ static_assert(!std::is_copy_constructible_v<CollectiveOperation>);
 static_assert(std::is_move_constructible_v<CollectiveOperation>);
 static_assert(
     !std::is_copy_constructible_v<weftmoe::cuda::NcclBootstrapInputChannel>);
-static_assert(
-    std::is_nothrow_move_constructible_v<
-        weftmoe::cuda::NcclBootstrapInputChannel>);
+static_assert(std::is_nothrow_move_constructible_v<
+              weftmoe::cuda::NcclBootstrapInputChannel>);
 static_assert(
     !std::is_copy_constructible_v<weftmoe::cuda::NcclBootstrapOutputChannel>);
-static_assert(
-    std::is_nothrow_move_constructible_v<
-        weftmoe::cuda::NcclBootstrapOutputChannel>);
+static_assert(std::is_nothrow_move_constructible_v<
+              weftmoe::cuda::NcclBootstrapOutputChannel>);
 
 Topology homogeneous_topology(std::uint32_t nodes, std::uint32_t gpus,
                               std::uint32_t experts) {
@@ -529,16 +526,15 @@ void test_activation_transport_protocol_oracle() {
   REQUIRE(canonical.audit.relayed_fanout == 9);
   REQUIRE(canonical.audit.synthetic_contributions == 9);
   const auto bad_sequence =
-      weftmoe::testing::NotifyCorruptionHook::with_packet_sequence(
-          handles[0], 0, 7);
-  expect_error(NotifyErrorCode::InvalidHandle,
-               [&] {
-                 (void)weftmoe::transport::simulate_activation_transport(
-                     bad_sequence, activations, gates, transport_config, 1,
-                     reversed);
-               },
-               {"phase=dispatch-validation",
-                "field=transport.packet.identity"});
+      weftmoe::testing::NotifyCorruptionHook::with_packet_sequence(handles[0],
+                                                                   0, 7);
+  expect_error(
+      NotifyErrorCode::InvalidHandle,
+      [&] {
+        (void)weftmoe::transport::simulate_activation_transport(
+            bad_sequence, activations, gates, transport_config, 1, reversed);
+      },
+      {"phase=dispatch-validation", "field=transport.packet.identity"});
 
   auto many = make_config(73, 1, 73, 2, 8);
   std::vector<RankRoutingInput> many_inputs(73);
@@ -557,7 +553,7 @@ void test_activation_transport_protocol_oracle() {
   // Descriptor/team logic is runtime-shaped and is not restricted to the
   // physically available two-node, 1/8-GPU acceptance topology.
   const auto verify_runtime_topology = [&](std::uint32_t nodes,
-                                            std::uint32_t gpus) {
+                                           std::uint32_t gpus) {
     const auto world = nodes * gpus;
     const auto top_k = std::min<std::uint32_t>(6U, world);
     auto runtime = make_config(nodes, gpus, world, top_k, 4);
@@ -609,14 +605,13 @@ void test_activation_transport_protocol_oracle() {
 
   auto invalid = transport_config;
   invalid.ring_slots_per_source_channel = 0;
-  expect_error(NotifyErrorCode::TransportProtocolFailure,
-               [&] {
-                 (void)weftmoe::transport::simulate_activation_transport(
-                     many_handles[0], many_activations, {0.25F, 0.75F},
-                     invalid, 2);
-               },
-               {"phase=activation-transport",
-                "field=ring_slots_per_source_channel"});
+  expect_error(
+      NotifyErrorCode::TransportProtocolFailure,
+      [&] {
+        (void)weftmoe::transport::simulate_activation_transport(
+            many_handles[0], many_activations, {0.25F, 0.75F}, invalid, 2);
+      },
+      {"phase=activation-transport", "field=ring_slots_per_source_channel"});
 }
 
 void test_topology_route_capacity_and_overflow() {
@@ -1318,30 +1313,33 @@ void test_handle_copy_move_workspace_and_overflow() {
 }
 void test_fixed_control_protocol_agreement() {
   const auto config = make_config(1, 2, 8, 3, 4);
-  const auto context0 = make_context(config, 0, "control", 17, "control-exec-0");
-  const auto context1 = make_context(config, 1, "control", 17, "control-exec-1");
-  const auto record0 = weftmoe::cuda::make_control_record(
-      config, context0, 2, 6, 10);
-  const auto record1 = weftmoe::cuda::make_control_record(
-      config, context1, 3, 9, 10);
+  const auto context0 =
+      make_context(config, 0, "control", 17, "control-exec-0");
+  const auto context1 =
+      make_context(config, 1, "control", 17, "control-exec-1");
+  const auto record0 =
+      weftmoe::cuda::make_control_record(config, context0, 2, 6, 10);
+  const auto record1 =
+      weftmoe::cuda::make_control_record(config, context1, 3, 9, 10);
   weftmoe::cuda::validate_control_matrix({record0, record1});
 
-  const auto expect_control_error = [&](const weftmoe::cuda::ControlMatrix &rows,
-                                        const std::vector<std::string> &fields) {
-    expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] { weftmoe::cuda::validate_control_matrix(rows); },
-                 fields);
-  };
+  const auto expect_control_error =
+      [&](const weftmoe::cuda::ControlMatrix &rows,
+          const std::vector<std::string> &fields) {
+        expect_error(
+            NotifyErrorCode::ControlProtocolFailure,
+            [&] { weftmoe::cuda::validate_control_matrix(rows); }, fields);
+      };
 
-  const auto max_mismatch = weftmoe::cuda::make_control_record(
-      config, context1, 3, 9, 11);
+  const auto max_mismatch =
+      weftmoe::cuda::make_control_record(config, context1, 3, 9, 11);
   expect_control_error({record0, max_mismatch},
                        {"phase=control-agreement", "field=max_tokens_per_rank",
                         "origin_rank=1", "expected=10", "actual=11"});
 
   auto expert_config = make_config(1, 2, 9, 3, 4);
-  const auto expert_mismatch = weftmoe::cuda::make_control_record(
-      expert_config, context1, 3, 9, 10);
+  const auto expert_mismatch =
+      weftmoe::cuda::make_control_record(expert_config, context1, 3, 9, 10);
   expect_control_error({record0, expert_mismatch},
                        {"field=num_experts", "origin_rank=1"});
 
@@ -1356,20 +1354,20 @@ void test_fixed_control_protocol_agreement() {
   const auto bad_route = weftmoe::cuda::make_control_record(
       config, context1, 5, 15, 10, invalid_route);
   expect_control_error({record0, bad_route},
-                       {"field=local_validation", "origin_rank=1",
-                        "token=4", "slot=2", "expert=99"});
+                       {"field=local_validation", "origin_rank=1", "token=4",
+                        "slot=2", "expert=99"});
 
-  const auto over_capacity = weftmoe::cuda::make_control_record(
-      config, context1, 11, 33, 10);
-  expect_control_error({record0, over_capacity},
-                       {"field=num_tokens", "origin_rank=1",
-                        "expected=10", "actual=11"});
+  const auto over_capacity =
+      weftmoe::cuda::make_control_record(config, context1, 11, 33, 10);
+  expect_control_error(
+      {record0, over_capacity},
+      {"field=num_tokens", "origin_rank=1", "expected=10", "actual=11"});
 
   auto generation_mismatch = record1;
   ++generation_mismatch.generation;
-  expect_control_error({record0, generation_mismatch},
-                       {"field=generation", "origin_rank=1",
-                        "expected=17", "actual=18"});
+  expect_control_error(
+      {record0, generation_mismatch},
+      {"field=generation", "origin_rank=1", "expected=17", "actual=18"});
 
   auto session_mismatch = record1;
   ++session_mismatch.session_id_word1;
@@ -1398,12 +1396,12 @@ void test_fixed_control_protocol_agreement() {
           static_cast<unsigned>(wire0[7]) == 0x4dU);
   auto corrupt_wire = wire0;
   corrupt_wire[80] ^= std::byte{1};
-  expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] { (void)weftmoe::cuda::decode_control_header(corrupt_wire); },
-               {"field=checksum"});
+  expect_error(
+      NotifyErrorCode::ControlProtocolFailure,
+      [&] { (void)weftmoe::cuda::decode_control_header(corrupt_wire); },
+      {"field=checksum"});
   auto byteswapped = wire0;
-  for (std::size_t word = 0; word < weftmoe::cuda::kControlSchemaWords;
-       ++word)
+  for (std::size_t word = 0; word < weftmoe::cuda::kControlSchemaWords; ++word)
     std::reverse(byteswapped.begin() + static_cast<std::ptrdiff_t>(word * 8),
                  byteswapped.begin() +
                      static_cast<std::ptrdiff_t>((word + 1) * 8));
@@ -1413,8 +1411,7 @@ void test_fixed_control_protocol_agreement() {
 
   const auto config0 = weftmoe::cuda::encode_canonical_config(
       config, 10, context0.session().stable_identity_bytes());
-  const auto decoded_config =
-      weftmoe::cuda::decode_canonical_config(config0);
+  const auto decoded_config = weftmoe::cuda::decode_canonical_config(config0);
   REQUIRE(decoded_config.rank_to_node == config.topology.rank_to_node);
   REQUIRE(decoded_config.expert_to_rank == config.topology.expert_to_rank);
   REQUIRE(decoded_config.stable_session_identity ==
@@ -1425,17 +1422,16 @@ void test_fixed_control_protocol_agreement() {
       std::byte{0x46}, std::byte{0x43}, std::byte{0x4d}, std::byte{0x4d},
       std::byte{0x01}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
-  REQUIRE(std::equal(config_golden.begin(), config_golden.end(),
-                     config0.begin()));
+  REQUIRE(
+      std::equal(config_golden.begin(), config_golden.end(), config0.begin()));
   {
     auto byteswapped_config = config0;
     for (std::size_t word = 0;
          word * 8U < weftmoe::cuda::kCanonicalConfigHeaderBytes; ++word)
-      std::reverse(
-          byteswapped_config.begin() +
-              static_cast<std::ptrdiff_t>(word * 8U),
-          byteswapped_config.begin() +
-              static_cast<std::ptrdiff_t>((word + 1U) * 8U));
+      std::reverse(byteswapped_config.begin() +
+                       static_cast<std::ptrdiff_t>(word * 8U),
+                   byteswapped_config.begin() +
+                       static_cast<std::ptrdiff_t>((word + 1U) * 8U));
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
                    (void)weftmoe::cuda::decode_canonical_config(
@@ -1458,11 +1454,10 @@ void test_fixed_control_protocol_agreement() {
     damaged.at(offset) ^= std::byte{1};
     auto header = world1_header;
     header.config_digest = weftmoe::cuda::config_wire_digest(damaged);
-    expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] {
-                   weftmoe::cuda::validate_config_matrix({damaged}, {header});
-                 },
-                 {needle});
+    expect_error(
+        NotifyErrorCode::ControlProtocolFailure,
+        [&] { weftmoe::cuda::validate_config_matrix({damaged}, {header}); },
+        {needle});
   };
   corrupt_config(0, "magic");
   corrupt_config(8, "protocol_version");
@@ -1477,11 +1472,10 @@ void test_fixed_control_protocol_agreement() {
     auto header = world1_header;
     header.config_blob_bytes = truncated.size();
     header.config_digest = weftmoe::cuda::config_wire_digest(truncated);
-    expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] {
-                   weftmoe::cuda::validate_config_matrix({truncated}, {header});
-                 },
-                 {"truncated"});
+    expect_error(
+        NotifyErrorCode::ControlProtocolFailure,
+        [&] { weftmoe::cuda::validate_config_matrix({truncated}, {header}); },
+        {"truncated"});
   }
   {
     auto trailing = config0;
@@ -1489,19 +1483,18 @@ void test_fixed_control_protocol_agreement() {
     auto header = world1_header;
     header.config_blob_bytes = trailing.size();
     header.config_digest = weftmoe::cuda::config_wire_digest(trailing);
-    expect_error(NotifyErrorCode::ControlProtocolFailure,
-                 [&] {
-                   weftmoe::cuda::validate_config_matrix({trailing}, {header});
-                 },
-                 {"trailing_bytes"});
+    expect_error(
+        NotifyErrorCode::ControlProtocolFailure,
+        [&] { weftmoe::cuda::validate_config_matrix({trailing}, {header}); },
+        {"trailing_bytes"});
   }
   {
     auto wrong_header_digest = world1_header;
     ++wrong_header_digest.config_digest;
     expect_error(NotifyErrorCode::ControlProtocolFailure,
                  [&] {
-                   weftmoe::cuda::validate_config_matrix(
-                       {config0}, {wrong_header_digest});
+                   weftmoe::cuda::validate_config_matrix({config0},
+                                                         {wrong_header_digest});
                  },
                  {"field=config_digest", "control_header_vs_wire"});
   }
@@ -1516,13 +1509,13 @@ void test_fixed_control_protocol_agreement() {
   same_digest1.config_blob_bytes = config1.size();
   same_digest0.config_digest = weftmoe::cuda::config_wire_digest(config0);
   same_digest1.config_digest = weftmoe::cuda::config_wire_digest(config1);
-  expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] {
-                 weftmoe::cuda::validate_config_matrix(
-                     {config0, config1}, {same_digest0, same_digest1});
-               },
-               {"phase=config-agreement", "field=expert_to_rank",
-                "origin_rank=1"});
+  expect_error(
+      NotifyErrorCode::ControlProtocolFailure,
+      [&] {
+        weftmoe::cuda::validate_config_matrix({config0, config1},
+                                              {same_digest0, same_digest1});
+      },
+      {"phase=config-agreement", "field=expert_to_rank", "origin_rank=1"});
 
   // A forged equal diagnostic digest cannot bypass per-rank integrity. Once
   // both diagnostic digests are correctly recomputed, exact decoded/byte
@@ -1538,26 +1531,26 @@ void test_fixed_control_protocol_agreement() {
 
   // Original stable identity bytes, not their two header summaries or display
   // names, are the final session agreement boundary.
-  const std::vector<std::byte> raw_identity0{
-      std::byte{0x10}, std::byte{0x20}, std::byte{0x30}};
-  const std::vector<std::byte> raw_identity1{
-      std::byte{0x10}, std::byte{0x20}, std::byte{0x31}};
-  const auto raw_session0 = weftmoe::make_collective_session(
-      "same-display", raw_identity0, 2, 91);
-  const auto raw_session1 = weftmoe::make_collective_session(
-      "same-display", raw_identity1, 2, 91);
+  const std::vector<std::byte> raw_identity0{std::byte{0x10}, std::byte{0x20},
+                                             std::byte{0x30}};
+  const std::vector<std::byte> raw_identity1{std::byte{0x10}, std::byte{0x20},
+                                             std::byte{0x31}};
+  const auto raw_session0 =
+      weftmoe::make_collective_session("same-display", raw_identity0, 2, 91);
+  const auto raw_session1 =
+      weftmoe::make_collective_session("same-display", raw_identity1, 2, 91);
   const auto raw_context0 = weftmoe::make_rank_collective_context(
       raw_session0, 0, weftmoe::make_execution_token("raw-exec-0"));
   const auto raw_context1 = weftmoe::make_rank_collective_context(
       raw_session1, 1, weftmoe::make_execution_token("raw-exec-1"));
-  const auto raw_wire0 = weftmoe::cuda::encode_canonical_config(
-      config, 10, raw_identity0);
-  const auto raw_wire1 = weftmoe::cuda::encode_canonical_config(
-      config, 10, raw_identity1);
-  auto raw_header0 = weftmoe::cuda::make_control_record(
-      config, raw_context0, 1, 3, 10);
-  auto raw_header1 = weftmoe::cuda::make_control_record(
-      config, raw_context1, 1, 3, 10);
+  const auto raw_wire0 =
+      weftmoe::cuda::encode_canonical_config(config, 10, raw_identity0);
+  const auto raw_wire1 =
+      weftmoe::cuda::encode_canonical_config(config, 10, raw_identity1);
+  auto raw_header0 =
+      weftmoe::cuda::make_control_record(config, raw_context0, 1, 3, 10);
+  auto raw_header1 =
+      weftmoe::cuda::make_control_record(config, raw_context1, 1, 3, 10);
   // Simulate an adversarial summary collision: fixed control passes, exact raw
   // identity comparison in config agreement still fails.
   raw_header1.session_id_word0 = raw_header0.session_id_word0;
@@ -1574,30 +1567,24 @@ void test_fixed_control_protocol_agreement() {
   const auto context30 = make_context(config3, 0, "common", 44, "e0");
   const auto context31 = make_context(config3, 1, "common", 44, "e1");
   const auto context32 = make_context(config3, 2, "common", 44, "e2");
-  const auto row30 = weftmoe::cuda::make_control_record(
-      config3, context30, 1, 3, 10);
-  auto row31 = weftmoe::cuda::make_control_record(
-      config3, context31, 1, 3, 10);
-  auto row32 = weftmoe::cuda::make_control_record(
-      config3, context32, 1, 3, 10);
+  const auto row30 =
+      weftmoe::cuda::make_control_record(config3, context30, 1, 3, 10);
+  auto row31 = weftmoe::cuda::make_control_record(config3, context31, 1, 3, 10);
+  auto row32 = weftmoe::cuda::make_control_record(config3, context32, 1, 3, 10);
   ++row31.session_id_word1;
   ++row32.generation;
-  expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] {
-                 weftmoe::cuda::validate_control_matrix(
-                     {row30, row31, row32});
-               },
-               {"field=session_id_word1", "origin_rank=1"});
+  expect_error(
+      NotifyErrorCode::ControlProtocolFailure,
+      [&] { weftmoe::cuda::validate_control_matrix({row30, row31, row32}); },
+      {"field=session_id_word1", "origin_rank=1"});
 
   // For one rank with several differences, fixed field order selects
   // generation before session and config fields.
   ++row31.generation;
-  expect_error(NotifyErrorCode::ControlProtocolFailure,
-               [&] {
-                 weftmoe::cuda::validate_control_matrix(
-                     {row30, row31, row32});
-               },
-               {"field=generation", "origin_rank=1"});
+  expect_error(
+      NotifyErrorCode::ControlProtocolFailure,
+      [&] { weftmoe::cuda::validate_control_matrix({row30, row31, row32}); },
+      {"field=generation", "origin_rank=1"});
 }
 void test_bootstrap_exact_frame_io() {
   std::vector<std::uint8_t> frame(
@@ -1616,12 +1603,10 @@ void test_bootstrap_exact_frame_io() {
     REQUIRE(static_cast<bool>(result));
     REQUIRE(script.input_offset == frame.size());
     REQUIRE(script.close_count == 1);
-    REQUIRE(channel.state() ==
-            weftmoe::cuda::BootstrapChannelState::Consumed);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)channel.read(); },
-                 {"field=read-state", "expected=state=Open",
-                  "actual=state=Consumed"});
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed);
+    expect_error(
+        NotifyErrorCode::NcclFailure, [&] { (void)channel.read(); },
+        {"field=read-state", "expected=state=Open", "actual=state=Consumed"});
     REQUIRE(script.close_count == 1);
     return result;
   };
@@ -1631,17 +1616,16 @@ void test_bootstrap_exact_frame_io() {
   (void)read_valid(17, true);
   (void)read_valid(127, false);
 
-  for (const auto short_size : {std::size_t{0}, std::size_t{1},
-                                std::size_t{127}}) {
+  for (const auto short_size :
+       {std::size_t{0}, std::size_t{1}, std::size_t{127}}) {
     BootstrapIoScript script;
     script.input.assign(frame.begin(), frame.begin() + short_size);
     script.read_chunk = 17;
     BootstrapIoHookGuard guard(script);
     weftmoe::cuda::NcclBootstrapInputChannel channel(7);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)channel.read(); },
-                 {"phase=bootstrap-channel-read", "field=bytes",
-                  "expected=128", "actual=" + std::to_string(short_size)});
+    expect_error(NotifyErrorCode::NcclFailure, [&] { (void)channel.read(); },
+                 {"phase=bootstrap-channel-read", "field=bytes", "expected=128",
+                  "actual=" + std::to_string(short_size)});
     REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     REQUIRE(script.close_count == 1);
   }
@@ -1652,21 +1636,18 @@ void test_bootstrap_exact_frame_io() {
     script.read_chunk = 17;
     BootstrapIoHookGuard guard(script);
     weftmoe::cuda::NcclBootstrapInputChannel channel(7);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)channel.read(); },
+    expect_error(NotifyErrorCode::NcclFailure, [&] { (void)channel.read(); },
                  {"phase=bootstrap-channel-read", "field=frame-length",
                   "expected=128", "actual=>=129"});
     REQUIRE(script.input_offset == 129);
     REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)channel.read(); },
+    expect_error(NotifyErrorCode::NcclFailure, [&] { (void)channel.read(); },
                  {"field=read-state", "actual=state=Failed"});
     REQUIRE(script.input_offset == 129);
     REQUIRE(script.close_count == 1);
   }
 
-  for (const auto chunk : {std::size_t{1}, std::size_t{17},
-                           std::size_t{127}}) {
+  for (const auto chunk : {std::size_t{1}, std::size_t{17}, std::size_t{127}}) {
     BootstrapIoScript script;
     script.write_chunk = chunk;
     BootstrapIoHookGuard guard(script);
@@ -1674,8 +1655,7 @@ void test_bootstrap_exact_frame_io() {
     channel.write(bootstrap);
     REQUIRE(script.output == frame);
     REQUIRE(script.close_count == 1);
-    REQUIRE(channel.state() ==
-            weftmoe::cuda::BootstrapChannelState::Consumed);
+    REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Consumed);
   }
 
   {
@@ -1705,10 +1685,9 @@ void test_bootstrap_exact_frame_io() {
     script.write_broken_pipe = true;
     BootstrapIoHookGuard guard(script);
     weftmoe::cuda::NcclBootstrapOutputChannel channel(8);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { channel.write(bootstrap); },
-                 {"phase=bootstrap-channel-write", "field=write",
-                  "actual=I/O failure"});
+    expect_error(
+        NotifyErrorCode::NcclFailure, [&] { channel.write(bootstrap); },
+        {"phase=bootstrap-channel-write", "field=write", "actual=I/O failure"});
     REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     REQUIRE(script.close_count == 1);
   }
@@ -1720,8 +1699,8 @@ void test_bootstrap_exact_frame_io() {
     weftmoe::cuda::NcclBootstrapInputChannel moved(std::move(source));
     REQUIRE(source.state() == weftmoe::cuda::BootstrapChannelState::Closed);
     REQUIRE(source.native_fd_for_testing() == -1);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)source.read(); }, {"actual=state=Closed"});
+    expect_error(NotifyErrorCode::NcclFailure, [&] { (void)source.read(); },
+                 {"actual=state=Closed"});
     auto *self_alias = &moved;
     moved = std::move(*self_alias);
     (void)moved.read();
@@ -1768,7 +1747,9 @@ void test_bootstrap_exact_frame_io() {
   {
     BootstrapIoScript script;
     BootstrapIoHookGuard guard(script);
-    { weftmoe::cuda::NcclBootstrapInputChannel abandoned(7); }
+    {
+      weftmoe::cuda::NcclBootstrapInputChannel abandoned(7);
+    }
     REQUIRE(script.close_count == 1);
     REQUIRE(script.closed_fds == std::vector<int>{7});
   }
@@ -1777,8 +1758,8 @@ void test_bootstrap_exact_frame_io() {
 void write_pipe_frame(int fd, const std::vector<std::uint8_t> &bytes) {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
-    const auto result = ::write(fd, bytes.data() + offset,
-                                bytes.size() - offset);
+    const auto result =
+        ::write(fd, bytes.data() + offset, bytes.size() - offset);
     if (result < 0 && errno == EINTR)
       continue;
     if (result <= 0)
@@ -1795,9 +1776,9 @@ void test_bootstrap_real_pipe_one_shot() {
   for (std::size_t index = 0; index < frame.size(); ++index)
     frame[index] = static_cast<std::uint8_t>((index * 19U + 5U) & 0xffU);
 
-  for (const auto size : {std::size_t{0}, std::size_t{1}, std::size_t{127},
-                          std::size_t{128}, std::size_t{129},
-                          std::size_t{257}}) {
+  for (const auto size :
+       {std::size_t{0}, std::size_t{1}, std::size_t{127}, std::size_t{128},
+        std::size_t{129}, std::size_t{257}}) {
     int descriptors[2] = {-1, -1};
     REQUIRE(::pipe(descriptors) == 0);
     std::vector<std::uint8_t> bytes(size, 0x6dU);
@@ -1819,15 +1800,13 @@ void test_bootstrap_real_pipe_one_shot() {
         first_rejected = true;
       }
       REQUIRE(first_rejected);
-      REQUIRE(channel.state() ==
-              weftmoe::cuda::BootstrapChannelState::Failed);
+      REQUIRE(channel.state() == weftmoe::cuda::BootstrapChannelState::Failed);
     }
     errno = 0;
     std::uint8_t probe = 0;
     REQUIRE(::read(original_read_fd, &probe, 1) == -1);
     REQUIRE(errno == EBADF);
-    expect_error(NotifyErrorCode::NcclFailure,
-                 [&] { (void)channel.read(); },
+    expect_error(NotifyErrorCode::NcclFailure, [&] { (void)channel.read(); },
                  {"field=read-state", "expected=state=Open"});
     if (size == 257) {
       std::cout << "first_oversize_rejected = " << (first_rejected ? 1 : 0)
@@ -1843,8 +1822,8 @@ void test_bootstrap_real_pipe_one_shot() {
 
   // A reader rejects at byte 129 and closes immediately; it never drains an
   // attacker that keeps the write end open.
-  struct sigaction ignore_action {};
-  struct sigaction old_action {};
+  struct sigaction ignore_action{};
+  struct sigaction old_action{};
   ignore_action.sa_handler = SIG_IGN;
   REQUIRE(::sigemptyset(&ignore_action.sa_mask) == 0);
   REQUIRE(::sigaction(SIGPIPE, &ignore_action, &old_action) == 0);
@@ -1893,9 +1872,8 @@ void test_bootstrap_real_pipe_one_shot() {
   std::vector<std::uint8_t> received(frame.size());
   std::size_t offset = 0;
   while (offset < received.size()) {
-    const auto count =
-        ::read(output_pipe[0], received.data() + offset,
-               received.size() - offset);
+    const auto count = ::read(output_pipe[0], received.data() + offset,
+                              received.size() - offset);
     REQUIRE(count > 0);
     offset += static_cast<std::size_t>(count);
   }
@@ -1903,8 +1881,7 @@ void test_bootstrap_real_pipe_one_shot() {
   REQUIRE(::read(output_pipe[0], &trailing, 1) == 0);
   REQUIRE(::close(output_pipe[0]) == 0);
   REQUIRE(received == frame);
-  expect_error(NotifyErrorCode::NcclFailure,
-               [&] { output.write(id); },
+  expect_error(NotifyErrorCode::NcclFailure, [&] { output.write(id); },
                {"field=write-state", "actual=state=Consumed"});
 
   // Once a terminal channel has relinquished its number, it cannot touch a
@@ -1915,8 +1892,8 @@ void test_bootstrap_real_pipe_one_shot() {
   write_pipe_frame(stale_pipe[1], oversized);
   const int stale_number = stale_pipe[0];
   weftmoe::cuda::NcclBootstrapInputChannel stale(stale_number);
-  expect_error(NotifyErrorCode::NcclFailure,
-               [&] { (void)stale.read(); }, {"actual=>=129"});
+  expect_error(NotifyErrorCode::NcclFailure, [&] { (void)stale.read(); },
+               {"actual=>=129"});
   int replacement[2] = {-1, -1};
   REQUIRE(::pipe(replacement) == 0);
   if (replacement[0] != stale_number) {
@@ -1927,8 +1904,8 @@ void test_bootstrap_real_pipe_one_shot() {
   const std::uint8_t marker = 0x4cU;
   REQUIRE(::write(replacement[1], &marker, 1) == 1);
   REQUIRE(::close(replacement[1]) == 0);
-  expect_error(NotifyErrorCode::NcclFailure,
-               [&] { (void)stale.read(); }, {"actual=state=Failed"});
+  expect_error(NotifyErrorCode::NcclFailure, [&] { (void)stale.read(); },
+               {"actual=state=Failed"});
   std::uint8_t observed = 0;
   REQUIRE(::read(replacement[0], &observed, 1) == 1);
   REQUIRE(observed == marker);
@@ -1973,9 +1950,9 @@ void test_static_forward_window_packets() {
         std::array<plan::TokenRoute, top_k> routes{};
         std::map<unsigned, unsigned> expected;
         for (unsigned k = 0; k < top_k; ++k) {
-          const auto expert = token % 3U == 0U
-                                  ? experts - 1U
-                                  : (source * 13U + token * 7U + k / 2U) % experts;
+          const auto expert =
+              token % 3U == 0U ? experts - 1U
+                               : (source * 13U + token * 7U + k / 2U) % experts;
           routes[k] = {expert, !(k == 3U && token % 5U == 0U)};
           if (routes[k].valid) {
             ++expected[expert / (local_world * owned)];
@@ -1983,16 +1960,16 @@ void test_static_forward_window_packets() {
             ++route_count;
           }
         }
-        plan::for_each_token_node(
-            routes.data(), top_k, local_world * owned,
-            [&](unsigned node, unsigned fanouts) {
-              const auto found = expected.find(node);
-              REQUIRE(found != expected.end());
-              REQUIRE(found->second == fanouts);
-              packets[{w, source, node}].emplace_back(token, fanouts);
-              fanout_count += fanouts;
-              expected.erase(found);
-            });
+        plan::for_each_token_node(routes.data(), top_k, local_world * owned,
+                                  [&](unsigned node, unsigned fanouts) {
+                                    const auto found = expected.find(node);
+                                    REQUIRE(found != expected.end());
+                                    REQUIRE(found->second == fanouts);
+                                    packets[{w, source, node}].emplace_back(
+                                        token, fanouts);
+                                    fanout_count += fanouts;
+                                    expected.erase(found);
+                                  });
         REQUIRE(expected.empty());
       }
     }
@@ -2023,7 +2000,8 @@ void test_static_forward_window_packets() {
         packet_count += n;
         for (std::uint64_t sequence = 0; sequence < n; ++sequence) {
           const auto begin = partition.token_begin(lane, sequence);
-          const auto rows = partition.token_count(tokens.size(), lane, sequence);
+          const auto rows =
+              partition.token_count(tokens.size(), lane, sequence);
           unsigned expected = 0;
           for (unsigned i = 0; i < rows; ++i) {
             REQUIRE(packed_tokens.insert(tokens[begin + i].first).second);
@@ -2088,9 +2066,8 @@ void test_static_forward_slot_lifetimes() {
   copied += 32U;
   REQUIRE(reached(copied, c.target, 64U));
   REQUIRE(c.publish(3U) == 131U); // Next-generation tail; no reset.
-  std::array<plan::RingCapacity, 3> planes{{{6U, 4U, 8U},
-                                          {6U, 0U, 8U},
-                                          {6U, 3U, 8U}}};
+  std::array<plan::RingCapacity, 3> planes{
+      {{6U, 4U, 8U}, {6U, 0U, 8U}, {6U, 3U, 8U}}};
   REQUIRE(planes[0].fits(3U) && !planes[1].fits(3U) && planes[2].fits(3U));
   // No partial reservation while S is full.
   for (const auto &plane : planes)
@@ -2162,27 +2139,8 @@ void test_static_forward_network_layout() {
   }
 }
 
-void test_forward_multicast_task_pairs() {
-  using weftmoe::cuda::persistent_v3::fc1_group_task;
-  for (unsigned mblocks = 1; mblocks <= 8; ++mblocks) {
-    for (unsigned ntiles : {2U, 6U, 8U, 12U}) {
-      std::set<std::pair<unsigned, unsigned>> tasks;
-      for (unsigned position = 0; position < mblocks * ntiles; position += 2U) {
-        const auto a = fc1_group_task(position, mblocks, ntiles);
-        const auto b = fc1_group_task(position + 1U, mblocks, ntiles);
-        REQUIRE(a.member == b.member || a.ntile == b.ntile);
-        REQUIRE(a.member < mblocks && b.member < mblocks);
-        REQUIRE(a.ntile < ntiles && b.ntile < ntiles);
-        REQUIRE(tasks.emplace(a.member, a.ntile).second);
-        REQUIRE(tasks.emplace(b.member, b.ntile).second);
-      }
-      REQUIRE(tasks.size() == mblocks * ntiles);
-    }
-  }
-}
-
 void test_backward_multicast_task_pairs() {
-  using weftmoe::cuda::persistent_v3::backward::cluster_tile;
+  using weftmoe::cuda::pipeline::backward::cluster_tile;
   for (unsigned mtiles = 1; mtiles <= 21; ++mtiles) {
     for (unsigned ntiles = 1; ntiles <= 13; ++ntiles) {
       for (bool share_a : {false, true}) {
@@ -2215,7 +2173,6 @@ int main() {
       {"static_forward_window_packets", test_static_forward_window_packets},
       {"static_forward_slot_lifetimes", test_static_forward_slot_lifetimes},
       {"static_forward_network_layout", test_static_forward_network_layout},
-      {"forward_multicast_task_pairs", test_forward_multicast_task_pairs},
       {"backward_multicast_task_pairs", test_backward_multicast_task_pairs},
       {"rank_local_async_and_deterministic_mapping",
        test_rank_local_async_and_deterministic_mapping},

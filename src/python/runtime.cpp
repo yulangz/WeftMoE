@@ -1,11 +1,12 @@
-// Application tensor bindings. Python owns tensors; native handles retain their owners.
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <cuda_runtime_api.h>
-#include <weftmoe/cuda/backward.hpp>
+// Application tensor bindings. Python owns tensors; native handles retain their
+// owners.
 #include <cstdlib>
+#include <cuda_runtime_api.h>
 #include <map>
 #include <optional>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <weftmoe/cuda/backward.hpp>
 #if WEFTMOE_DEVICE_TIMELINE
 #include "cuda/profiling/device_timeline_host.hpp"
 #endif
@@ -17,13 +18,14 @@ using namespace weftmoe::cuda;
 namespace {
 std::shared_ptr<const void> owner(const py::object &value) {
   return {new py::object(value), [](const void *p) {
-    py::gil_scoped_acquire gil;
-    delete static_cast<const py::object *>(p);
-  }};
+            py::gil_scoped_acquire gil;
+            delete static_cast<const py::object *>(p);
+          }};
 }
 
 void *pointer(const py::object &tensor) {
-  return reinterpret_cast<void *>(tensor.attr("data_ptr")().cast<std::uintptr_t>());
+  return reinterpret_cast<void *>(
+      tensor.attr("data_ptr")().cast<std::uintptr_t>());
 }
 
 std::uint64_t elements(const py::object &tensor) {
@@ -31,7 +33,8 @@ std::uint64_t elements(const py::object &tensor) {
 }
 
 CudaTensorBuffer binding(const py::object &tensor) {
-  return {pointer(tensor), elements(tensor) * tensor.attr("element_size")().cast<unsigned>(),
+  return {pointer(tensor),
+          elements(tensor) * tensor.attr("element_size")().cast<unsigned>(),
           owner(tensor)};
 }
 
@@ -43,7 +46,8 @@ struct Tape {
 };
 
 void check_cuda(cudaError_t error) {
-  if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+  if (error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(error));
 }
 
 struct InferenceBucket {
@@ -67,26 +71,33 @@ struct InferencePlan {
   std::uintptr_t x_address = 0, routes_address = 0, gates_address = 0;
   std::uintptr_t w1 = 0, w2 = 0;
   ~InferencePlan() {
-    if (executable) (void)cudaGraphExecDestroy(executable);
-    if (graph) (void)cudaGraphDestroy(graph);
+    if (executable)
+      (void)cudaGraphExecDestroy(executable);
+    if (graph)
+      (void)cudaGraphDestroy(graph);
   }
 };
 
 class Runtime {
- public:
+public:
   Runtime(py::bytes bootstrap, unsigned rank, unsigned world, unsigned nodes,
           unsigned device, std::uintptr_t stream, py::object stream_owner,
-          unsigned experts, unsigned top_k, unsigned hidden, unsigned intermediate,
-          std::uint64_t max_tokens, std::uint64_t max_rows, bool training,
-          unsigned max_saved, py::dict tuning = py::dict())
+          unsigned experts, unsigned top_k, unsigned hidden,
+          unsigned intermediate, std::uint64_t max_tokens,
+          std::uint64_t max_rows, bool training, unsigned max_saved,
+          py::dict tuning = py::dict())
       : rank_(rank), hidden_(hidden), intermediate_(intermediate),
-        max_tokens_(max_tokens), training_(training), stream_(reinterpret_cast<cudaStream_t>(stream)) {
-    if (!world || !nodes || world % nodes || experts % world || !top_k || !max_saved)
-      throw std::invalid_argument("invalid EP topology or saved-tensor capacity");
+        max_tokens_(max_tokens), training_(training),
+        stream_(reinterpret_cast<cudaStream_t>(stream)) {
+    if (!world || !nodes || world % nodes || experts % world || !top_k ||
+        !max_saved)
+      throw std::invalid_argument(
+          "invalid EP topology or saved-tensor capacity");
     const auto *ring_setting = std::getenv("WEFTMOE_STATIC_RING_TOKENS");
     const auto ring_tokens = tuning.contains("window_tokens")
-        ? tuning["window_tokens"].cast<unsigned>()
-        : ring_setting ? std::stoul(ring_setting) : 0U;
+                                 ? tuning["window_tokens"].cast<unsigned>()
+                             : ring_setting ? std::stoul(ring_setting)
+                                            : (nodes == 1U ? 2048U : 4096U);
     const bool training_ring = training && ring_tokens;
     const auto peer_capacity_rows = max_rows;
     if (training_ring) {
@@ -94,12 +105,14 @@ class Runtime {
       // capacity. X/S stay bounded and saved tensors use R; Backward peer
       // storage starts with the caller's capacity hint, not the global maximum.
       if (max_tokens > UINT32_MAX / top_k / world)
-        throw std::invalid_argument("training ring metadata exceeds uint32 row indices");
+        throw std::invalid_argument(
+            "training ring metadata exceeds uint32 row indices");
       max_rows = std::max(max_rows, max_tokens * top_k * world);
     }
     std::string bytes = bootstrap;
     auto id = NcclBootstrapId::from_bytes({bytes.begin(), bytes.end()});
-    execution_ = make_external_cuda_execution("torch", device, stream_, owner(stream_owner));
+    execution_ = make_external_cuda_execution("torch", device, stream_,
+                                              owner(stream_owner));
     base_ = make_nccl_session("weftmoe-torch", world, rank, 1, device, id);
     config_.num_experts = experts;
     config_.top_k = top_k;
@@ -113,9 +126,7 @@ class Runtime {
     for (unsigned e = 0; e < experts; ++e)
       config_.topology.expert_to_rank.push_back(e / (experts / world));
     config_.capacity.workspace_rows_per_rank.assign(world, max_rows);
-    fused_inference_ =
-        !training &&
-        std::getenv("WEFTMOE_DISABLE_SINGLE_NODE_INFERENCE") == nullptr;
+    fused_inference_ = !training;
     if (!WEFTMOE_ENABLE_GIN_RDMA && nodes != 1)
       throw std::invalid_argument(
           "this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and supports a "
@@ -135,26 +146,31 @@ class Runtime {
     capacity.ring_slots_per_source_channel = 1;
     capacity.enable_backward_state = training;
     capacity.static_forward_window_tokens = ring_tokens;
-    if (const auto *depth = std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
+    if (const auto *depth =
+            std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
       capacity.static_forward_contribution_windows = std::stoul(depth);
     if (tuning.contains("contribution_windows"))
       capacity.static_forward_contribution_windows =
           tuning["contribution_windows"].cast<unsigned>();
-    capacity.enable_gin_rdma =
-        WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
-    pool_ = prepare_activation_transport_pool(base_.session(), execution_, capacity);
-    deferred_training_notify_ = training_ring && pool_.separates_forward_notify();
+    capacity.enable_gin_rdma = WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
+    pool_ = prepare_activation_transport_pool(base_.session(), execution_,
+                                              capacity);
+    deferred_training_notify_ =
+        training_ring && pool_.separates_forward_notify();
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
-        {config_, max_tokens, 8192, max_saved, 4,
-         fused_inference_, training_ring, deferred_training_notify_});
+        {config_, max_tokens, 8192, max_saved, 4, fused_inference_,
+         training_ring, deferred_training_notify_});
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (WEFTMOE_ENABLE_GIN_RDMA && nodes > 1)
-      gin_ = std::make_unique<GinRdmaForwardMegaKernel>(base_, execution_, pool_);
+      gin_ =
+          std::make_unique<GinRdmaForwardMegaKernel>(base_, execution_, pool_);
     else
-      local_ = std::make_unique<LocalCudaP2pForwardMegaKernel>(base_, execution_, pool_);
+      local_ = std::make_unique<LocalCudaP2pForwardMegaKernel>(
+          base_, execution_, pool_);
 #else
-    local_ = std::make_unique<LocalCudaP2pForwardMegaKernel>(base_, execution_, pool_);
+    local_ = std::make_unique<LocalCudaP2pForwardMegaKernel>(base_, execution_,
+                                                             pool_);
 #endif
     torch_ = py::module_::import("torch");
     device_ = "cuda:" + std::to_string(device);
@@ -169,14 +185,20 @@ class Runtime {
     // after returning its output.  Drain it while the backend/pools and Python
     // tensor owners are still valid.  Destructors cannot report an error, so
     // explicit users should call drain_eager_inference() at a phase boundary.
-    try { drain_eager_inference(); } catch (...) {}
-    if (input_ready_) (void)cudaEventDestroy(input_ready_);
+    try {
+      drain_eager_inference();
+    } catch (...) {
+    }
+    if (input_ready_)
+      (void)cudaEventDestroy(input_ready_);
   }
 
   py::object eager_inference(py::object x, py::object routes, py::object gates,
-                             py::object w1, py::object w2, std::uintptr_t caller_stream,
+                             py::object w1, py::object w2,
+                             std::uintptr_t caller_stream,
                              std::optional<unsigned> layer = std::nullopt) {
-    if (training_) throw std::invalid_argument("eager_inference is inference-only");
+    if (training_)
+      throw std::invalid_argument("eager_inference is inference-only");
     drain_eager_inference();
     auto caller = reinterpret_cast<cudaStream_t>(caller_stream);
     check_cuda(cudaEventRecord(input_ready_, caller));
@@ -184,11 +206,11 @@ class Runtime {
     return execute_forward(x, routes, gates, w1, w2, true, layer)->output;
   }
 
-  py::object eager_inference_async(py::object x, py::object routes,
-                                   py::object gates, py::object w1,
-                                   py::object w2,
-                                   std::uintptr_t caller_stream,
-                                   std::optional<unsigned> layer = std::nullopt) {
+  py::object
+  eager_inference_async(py::object x, py::object routes, py::object gates,
+                        py::object w1, py::object w2,
+                        std::uintptr_t caller_stream,
+                        std::optional<unsigned> layer = std::nullopt) {
     if (training_)
       throw std::invalid_argument("eager_inference_async is inference-only");
     // There is one persistent transport workspace.  Reclaim the preceding
@@ -207,8 +229,8 @@ class Runtime {
     return output;
   }
 
-  py::dict profile_inference(py::object x, py::object routes,
-                             py::object gates, py::object w1, py::object w2,
+  py::dict profile_inference(py::object x, py::object routes, py::object gates,
+                             py::object w1, py::object w2,
                              std::uintptr_t caller_stream,
                              std::optional<unsigned> layer = std::nullopt) {
     if (training_)
@@ -228,10 +250,10 @@ class Runtime {
     result["fc2_us"] = timings.fc2_us;
     result["return_us"] = timings.combine_return_us;
     result["reduce_us"] = timings.reduce_us;
-    result["completion_tail_us"] = timings.total_us - timings.route_exchange_us -
-                                    timings.combine_return_us;
+    result["completion_tail_us"] = timings.total_us -
+                                   timings.route_exchange_us -
+                                   timings.combine_return_us;
     const auto &audit = tape->forward.audit();
-    result["communication_copy"] = audit.communication_copy;
     result["dispatch_payload_bytes"] = audit.gin_dispatch_payload_bytes;
     result["return_payload_bytes"] = audit.gin_return_payload_bytes;
     result["max_active_clusters"] = audit.max_active_clusters;
@@ -249,51 +271,60 @@ class Runtime {
     pending->forward.wait();
   }
 
-  std::shared_ptr<Tape> forward(py::object x, py::object routes, py::object gates,
-                                py::object w1, py::object w2,
+  std::shared_ptr<Tape> forward(py::object x, py::object routes,
+                                py::object gates, py::object w1, py::object w2,
                                 std::optional<unsigned> layer = std::nullopt) {
     return execute_forward(x, routes, gates, w1, w2, true, layer);
   }
 
-  std::shared_ptr<Tape> execute_forward(py::object x, py::object routes,
-                                        py::object gates, py::object w1,
-                                        py::object w2, bool synchronize,
-                                        std::optional<unsigned> layer = std::nullopt) {
+  std::shared_ptr<Tape>
+  execute_forward(py::object x, py::object routes, py::object gates,
+                  py::object w1, py::object w2, bool synchronize,
+                  std::optional<unsigned> layer = std::nullopt) {
     cudaStreamCaptureStatus status;
-    if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone)
-      throw std::runtime_error("dynamic forward requires preparation before CUDA Graph capture");
+    if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
+        status != cudaStreamCaptureStatusNone)
+      throw std::runtime_error(
+          "dynamic forward requires preparation before CUDA Graph capture");
     auto tape = std::make_shared<Tape>();
     auto tokens = elements(x) / hidden_;
     if (tokens > max_tokens_)
       throw std::invalid_argument("token capacity exceeded");
-    tape->generation = make_nccl_generation(base_, "weftmoe-torch", ++generation_);
-    auto context = make_rank_collective_context(tape->generation.session(), rank_, execution_.token());
-    auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_,
-                                                owner(x), "torch");
-    auto r = producer.publish_selected_experts(static_cast<const std::int32_t *>(pointer(routes)),
-                                               elements(routes), tokens, config_.top_k, owner(routes));
-    auto g = producer.publish_gates(static_cast<const float *>(pointer(gates)), elements(gates), r, owner(gates));
+    tape->generation =
+        make_nccl_generation(base_, "weftmoe-torch", ++generation_);
+    auto context = make_rank_collective_context(tape->generation.session(),
+                                                rank_, execution_.token());
+    auto producer = make_external_cuda_producer(
+        context, execution_.device_ordinal(), stream_, owner(x), "torch");
+    auto r = producer.publish_selected_experts(
+        static_cast<const std::int32_t *>(pointer(routes)), elements(routes),
+        tokens, config_.top_k, owner(routes));
+    auto g = producer.publish_gates(static_cast<const float *>(pointer(gates)),
+                                    elements(gates), r, owner(gates));
     r = import_selected_expert_routes(r, context, execution_);
     g = import_selected_expert_gates(g, r, context, execution_);
-    CudaNotifyGenerationCoordinator coordinator(tape->generation, execution_, notify_pool_);
-    tape->dispatch = coordinator.run_device({config_, r, g, max_tokens_}).dispatch();
+    CudaNotifyGenerationCoordinator coordinator(tape->generation, execution_,
+                                                notify_pool_);
+    tape->dispatch =
+        coordinator.run_device({config_, r, g, max_tokens_}).dispatch();
     BFloat16ActivationLease input;
     ForwardWeightLease weights;
     ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
     prepare_tensors([&] {
       input = producer.publish_activations(
-          static_cast<const transport::BFloat16 *>(pointer(x)),
-          elements(x), tokens, hidden_, owner(x));
+          static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
+          tokens, hidden_, owner(x));
       if (layer) {
         weights = prepared_inference_weights(*layer, producer, w1, w2);
       } else {
         auto packed_w1 = empty({elements(w1)}, "bfloat16");
         weights = producer.publish_weights(
-            static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-            static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+            static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
+            owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
+            elements(w2), owner(w2),
             config_.num_experts / config_.topology.world_size,
-            rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_,
-            binding(packed_w1));
+            rank_ * (config_.num_experts / config_.topology.world_size),
+            hidden_, intermediate_, binding(packed_w1));
       }
       // Output/weights do not depend on the plan. Only a deferred training
       // tape needs the exact row count produced by standalone PF notify.
@@ -308,16 +339,17 @@ class Runtime {
       fc.tensor_factory = [&] {
         ForwardTensorBuffers buffers;
         buffers.output = binding(tape->output);
-        return prepare_forward_tensors(tape->dispatch, execution_, fc,
-                                       buffers, allocator());
+        return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers,
+                                       allocator());
       };
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
                            : local_->run(tape->dispatch, input, weights, fc);
     else
-      tape->forward = gin_ ? gin_->enqueue(tape->dispatch, input, weights, fc)
-                           : local_->enqueue(tape->dispatch, input, weights, fc);
+      tape->forward = gin_
+                          ? gin_->enqueue(tape->dispatch, input, weights, fc)
+                          : local_->enqueue(tape->dispatch, input, weights, fc);
 #else
     tape->forward = synchronize
                         ? local_->run(tape->dispatch, input, weights, fc)
@@ -329,11 +361,14 @@ class Runtime {
   py::tuple backward(std::shared_ptr<Tape> tape, py::object dy) {
     if (!training_ || !tape->forward)
       throw std::invalid_argument("backward requires a live training tape");
-    auto context = make_rank_collective_context(tape->generation.session(), rank_, execution_.token());
-    auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_, owner(dy), "torch-dy");
+    auto context = make_rank_collective_context(tape->generation.session(),
+                                                rank_, execution_.token());
+    auto producer = make_external_cuda_producer(
+        context, execution_.device_ordinal(), stream_, owner(dy), "torch-dy");
     auto tokens = elements(dy) / hidden_;
-    auto input = producer.publish_output_gradients(static_cast<const transport::BFloat16 *>(pointer(dy)),
-                                                   elements(dy), tokens, hidden_, owner(dy));
+    auto input = producer.publish_output_gradients(
+        static_cast<const transport::BFloat16 *>(pointer(dy)), elements(dy),
+        tokens, hidden_, owner(dy));
     auto local_experts = config_.num_experts / config_.topology.world_size;
     py::object dx, dg, dw1, dw2;
     BackwardMegaKernelConfig bc{hidden_, intermediate_};
@@ -342,7 +377,8 @@ class Runtime {
       dg = empty({tokens, config_.top_k}, "float32");
       dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
       dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
-      bc.tensors = BackwardMegaKernel().prepare_tensors(tape->forward, bc,
+      bc.tensors = BackwardMegaKernel().prepare_tensors(
+          tape->forward, bc,
           {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
     });
     BackwardMegaKernel().run(tape->forward, input, bc);
@@ -376,7 +412,8 @@ class Runtime {
   py::object graph_forward(unsigned layer, py::object x, py::object routes,
                            py::object gates, py::object w1, py::object w2,
                            std::uintptr_t caller_stream) {
-    if (training_) throw std::invalid_argument("graph_forward is inference-only");
+    if (training_)
+      throw std::invalid_argument("graph_forward is inference-only");
     auto caller = reinterpret_cast<cudaStream_t>(caller_stream);
     cudaStreamCaptureStatus capture;
     check_cuda(cudaStreamIsCapturing(caller, &capture));
@@ -390,18 +427,20 @@ class Runtime {
     const auto key = std::make_pair(layer, tokens);
     if (plans_.find(key) == plans_.end()) {
       if (capture != cudaStreamCaptureStatusNone)
-        throw std::runtime_error("Warm every inference layer/token bucket before outer graph capture");
-      // All graph preparation is outside the application's capture and hot path.
+        throw std::runtime_error("Warm every inference layer/token bucket "
+                                 "before outer graph capture");
+      // All graph preparation is outside the application's capture and hot
+      // path.
       check_cuda(cudaDeviceSynchronize());
-      if (buckets_.find(tokens) == buckets_.end()) prepare_bucket(tokens);
+      if (buckets_.find(tokens) == buckets_.end())
+        prepare_bucket(tokens);
       prepare_plan(key, x, routes, gates, w1, w2);
     }
     auto &plan = *plans_.at(key);
     if (plan.x_address != reinterpret_cast<std::uintptr_t>(pointer(x)) ||
         plan.routes_address !=
             reinterpret_cast<std::uintptr_t>(pointer(routes)) ||
-        plan.gates_address !=
-            reinterpret_cast<std::uintptr_t>(pointer(gates)))
+        plan.gates_address != reinterpret_cast<std::uintptr_t>(pointer(gates)))
       throw std::runtime_error(
           "Inference input addresses changed: use stable CUDA Graph buffers "
           "or call invalidate_inference_layer(layer) before re-preparation");
@@ -417,25 +456,28 @@ class Runtime {
       const cudaGraphNode_t *dependencies = nullptr;
       std::size_t count = 0;
       unsigned long long capture_id = 0;
-      check_cuda(cudaStreamGetCaptureInfo_v2(caller, &capture, &capture_id, &parent,
-                                             &dependencies, &count));
+      check_cuda(cudaStreamGetCaptureInfo_v2(caller, &capture, &capture_id,
+                                             &parent, &dependencies, &count));
       cudaGraphNode_t child;
       check_cuda(cudaGraphAddChildGraphNode(&child, parent, dependencies, count,
                                             plan.graph));
-      check_cuda(cudaStreamUpdateCaptureDependencies(caller, &child, 1,
-                                                     cudaStreamSetCaptureDependencies));
+      check_cuda(cudaStreamUpdateCaptureDependencies(
+          caller, &child, 1, cudaStreamSetCaptureDependencies));
     }
     return plan.output;
   }
 
-  void invalidate_inference_layer(unsigned layer, std::uintptr_t caller_stream) {
+  void invalidate_inference_layer(unsigned layer,
+                                  std::uintptr_t caller_stream) {
     if (training_)
-      throw std::invalid_argument("inference plans are unavailable in training mode");
+      throw std::invalid_argument(
+          "inference plans are unavailable in training mode");
     cudaStreamCaptureStatus capture;
-    check_cuda(cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(caller_stream),
-                                     &capture));
+    check_cuda(cudaStreamIsCapturing(
+        reinterpret_cast<cudaStream_t>(caller_stream), &capture));
     if (capture != cudaStreamCaptureStatusNone)
-      throw std::runtime_error("invalidate inference plans outside CUDA Graph capture");
+      throw std::runtime_error(
+          "invalidate inference plans outside CUDA Graph capture");
     drain_eager_inference();
     // Explicit model-update boundary, never a replay-path version check. The
     // caller must first discard outer graphs that reference this layer's plans.
@@ -448,10 +490,10 @@ class Runtime {
     inference_weights_.erase(layer);
   }
 
- private:
-  const ForwardWeightLease &prepared_inference_weights(
-      unsigned layer, ExternalCudaProducer &producer,
-      const py::object &w1, const py::object &w2) {
+private:
+  const ForwardWeightLease &
+  prepared_inference_weights(unsigned layer, ExternalCudaProducer &producer,
+                             const py::object &w1, const py::object &w2) {
     const auto w1_address = reinterpret_cast<std::uintptr_t>(pointer(w1));
     const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
     auto entry = inference_weights_.find(layer);
@@ -459,16 +501,21 @@ class Runtime {
       // The immutable packed copy belongs to a resident layer, not a token
       // bucket or invocation. Eager and graph inference share its lifetime.
       auto weight_producer = make_external_cuda_producer(
-          producer.context(), execution_.device_ordinal(), stream_,
-          owner(w1), "inference-weights");
+          producer.context(), execution_.device_ordinal(), stream_, owner(w1),
+          "inference-weights");
       auto weights = weight_producer.publish_weights(
-          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1), owner(w1),
-          static_cast<const transport::BFloat16 *>(pointer(w2)), elements(w2), owner(w2),
+          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
+          owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
+          elements(w2), owner(w2),
           config_.num_experts / config_.topology.world_size,
-          rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_);
-      entry = inference_weights_.emplace(
-          layer, InferenceWeights{std::move(weights), w1_address, w2_address}).first;
-    } else if (entry->second.w1 != w1_address || entry->second.w2 != w2_address) {
+          rank_ * (config_.num_experts / config_.topology.world_size), hidden_,
+          intermediate_);
+      entry = inference_weights_
+                  .emplace(layer, InferenceWeights{std::move(weights),
+                                                   w1_address, w2_address})
+                  .first;
+    } else if (entry->second.w1 != w1_address ||
+               entry->second.w2 != w2_address) {
       throw std::runtime_error(
           "Expert addresses changed: discard outer graphs and call "
           "invalidate_inference_layer(layer) before re-preparation");
@@ -477,31 +524,37 @@ class Runtime {
   }
 
   void prepare_bucket(std::uint64_t tokens) {
-    if (tokens > max_tokens_) throw std::invalid_argument("inference token capacity exceeded");
+    if (tokens > max_tokens_)
+      throw std::invalid_argument("inference token capacity exceeded");
     auto bucket = std::make_unique<InferenceBucket>();
     bucket->routes = empty({tokens, config_.top_k}, "int32");
-    auto ids = torch_.attr("arange")(config_.top_k, py::arg("device")=device_,
-                                    py::arg("dtype")=torch_.attr("int32"));
+    auto ids = torch_.attr("arange")(config_.top_k, py::arg("device") = device_,
+                                     py::arg("dtype") = torch_.attr("int32"));
     bucket->routes.attr("copy_")(ids);
     bucket->gates = empty({tokens, config_.top_k}, "float32");
     bucket->gates.attr("fill_")(1.0 / config_.top_k);
     check_cuda(cudaDeviceSynchronize());
-    bucket->generation = make_nccl_generation(base_, "weftmoe-torch", ++generation_);
-    auto context = make_rank_collective_context(bucket->generation.session(), rank_, execution_.token());
-    auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_,
-                                                owner(bucket->routes), "inference-bucket");
+    bucket->generation =
+        make_nccl_generation(base_, "weftmoe-torch", ++generation_);
+    auto context = make_rank_collective_context(bucket->generation.session(),
+                                                rank_, execution_.token());
+    auto producer = make_external_cuda_producer(
+        context, execution_.device_ordinal(), stream_, owner(bucket->routes),
+        "inference-bucket");
     auto routes = producer.publish_selected_experts(
-        static_cast<const std::int32_t *>(pointer(bucket->routes)), elements(bucket->routes),
-        tokens, config_.top_k, owner(bucket->routes));
-    auto gates = producer.publish_gates(static_cast<const float *>(pointer(bucket->gates)),
-                                        elements(bucket->gates), routes, owner(bucket->gates));
+        static_cast<const std::int32_t *>(pointer(bucket->routes)),
+        elements(bucket->routes), tokens, config_.top_k, owner(bucket->routes));
+    auto gates = producer.publish_gates(
+        static_cast<const float *>(pointer(bucket->gates)),
+        elements(bucket->gates), routes, owner(bucket->gates));
     routes = import_selected_expert_routes(routes, context, execution_);
     gates = import_selected_expert_gates(gates, routes, context, execution_);
     bucket->notify_pool = make_device_notify_resource_pool(
-        base_, execution_,
-        {config_, tokens, 8192, 1, 4, fused_inference_});
-    CudaNotifyGenerationCoordinator coordinator(bucket->generation, execution_, bucket->notify_pool);
-    bucket->dispatch = coordinator.run_device({config_, routes, gates, tokens}).dispatch();
+        base_, execution_, {config_, tokens, 8192, 1, 4, fused_inference_});
+    CudaNotifyGenerationCoordinator coordinator(bucket->generation, execution_,
+                                                bucket->notify_pool);
+    bucket->dispatch =
+        coordinator.run_device({config_, routes, gates, tokens}).dispatch();
     buckets_[tokens] = std::move(bucket);
   }
 
@@ -509,15 +562,18 @@ class Runtime {
                     py::object routes, py::object gates, py::object w1,
                     py::object w2) {
     auto &bucket = *buckets_.at(key.second);
-    auto context = make_rank_collective_context(bucket.generation.session(), rank_, execution_.token());
-    auto producer = make_external_cuda_producer(context, execution_.device_ordinal(), stream_,
-                                                owner(x), "inference-plan");
+    auto context = make_rank_collective_context(bucket.generation.session(),
+                                                rank_, execution_.token());
+    auto producer =
+        make_external_cuda_producer(context, execution_.device_ordinal(),
+                                    stream_, owner(x), "inference-plan");
     auto activation = producer.publish_activations(
         static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
         key.second, hidden_, owner(x));
     const auto w1_address = reinterpret_cast<std::uintptr_t>(pointer(w1));
     const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
-    const auto &weights = prepared_inference_weights(key.first, producer, w1, w2);
+    const auto &weights =
+        prepared_inference_weights(key.first, producer, w1, w2);
     auto plan = std::make_unique<InferencePlan>();
     plan->output = empty({key.second, hidden_}, "bfloat16");
     plan->x = x;
@@ -536,13 +592,16 @@ class Runtime {
     fc.inference_gates = binding(gates);
     ForwardTensorBuffers buffers;
     buffers.output = binding(plan->output);
-    fc.tensors = prepare_forward_tensors(bucket.dispatch, execution_, fc, buffers, allocator());
+    fc.tensors = prepare_forward_tensors(bucket.dispatch, execution_, fc,
+                                         buffers, allocator());
     check_cuda(cudaStreamSynchronize(stream_));
-    check_cuda(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+    check_cuda(
+        cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
     bucket.dispatch.enqueue_notify(bucket.generation);
 #if WEFTMOE_ENABLE_GIN_RDMA
-    plan->forward = gin_ ? gin_->enqueue(bucket.dispatch, activation, weights, fc)
-                         : local_->enqueue(bucket.dispatch, activation, weights, fc);
+    plan->forward =
+        gin_ ? gin_->enqueue(bucket.dispatch, activation, weights, fc)
+             : local_->enqueue(bucket.dispatch, activation, weights, fc);
 #else
 #if WEFTMOE_NOTIFY_TIMING_MODE >= 1
     // Measurement-only: capture the notify stage without the forward kernel.
@@ -560,10 +619,13 @@ class Runtime {
   }
 
   py::object empty(std::vector<std::uint64_t> shape, const char *dtype) {
-    return torch_.attr("empty")(shape, py::arg("device") = device_, py::arg("dtype") = torch_.attr(dtype));
+    return torch_.attr("empty")(shape, py::arg("device") = device_,
+                                py::arg("dtype") = torch_.attr(dtype));
   }
   CudaTensorAllocator allocator() {
-    return [this](std::uint64_t bytes) { return binding(empty({bytes}, "uint8")); };
+    return [this](std::uint64_t bytes) {
+      return binding(empty({bytes}, "uint8"));
+    };
   }
   void prepare_tensors(const std::function<void()> &prepare) {
     if (tensor_preparation_)
@@ -588,58 +650,70 @@ class Runtime {
 #endif
   py::object torch_;
   std::string device_;
-  // Destroy graph executables before their metadata, packed weights and workspace.
+  // Destroy graph executables before their metadata, packed weights and
+  // workspace.
   std::map<unsigned, InferenceWeights> inference_weights_;
   std::map<std::uint64_t, std::unique_ptr<InferenceBucket>> buckets_;
-  std::map<std::pair<unsigned, std::uint64_t>, std::unique_ptr<InferencePlan>> plans_;
+  std::map<std::pair<unsigned, std::uint64_t>, std::unique_ptr<InferencePlan>>
+      plans_;
   // One-generation pipeline for eager inference.  The pool intentionally has
   // one large workspace; completion is delayed to the next MoE boundary.
   std::shared_ptr<Tape> pending_inference_;
 };
-}
+} // namespace
 
 PYBIND11_MODULE(_runtime, m) {
   m.def("forward_tuning_id", &forward_tuning_id);
   m.def("bootstrap_id", [] {
     auto id = make_nccl_bootstrap_id();
-    return py::bytes(reinterpret_cast<const char *>(id.bytes().data()), id.bytes().size());
+    return py::bytes(reinterpret_cast<const char *>(id.bytes().data()),
+                     id.bytes().size());
   });
-  auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape")
-      .def_readonly("output", &Tape::output);
+  auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape").def_readonly(
+      "output", &Tape::output);
 #if WEFTMOE_DEVICE_TIMELINE
   using namespace pybind11::literals;
   tape.def_property_readonly("timeline", [](const Tape &tape) {
-    const auto snapshot = testing::download_forward_device_timeline(tape.forward);
+    const auto snapshot =
+        testing::download_forward_device_timeline(tape.forward);
     py::list events;
     for (const auto &e : snapshot.records)
-      events.append(py::dict("timestamp_ns"_a=e.timestamp_ns, "generation"_a=e.generation,
-          "rank"_a=e.rank, "cta"_a=e.cta, "channel"_a=e.channel,
-          "phase"_a=(e.metadata >> 24U), "role"_a=((e.metadata >> 16U) & 0xffU),
-          "event"_a=(e.metadata & 0xffffU), "arg0"_a=e.arg0, "arg1"_a=e.arg1));
-    return py::dict("schema"_a=snapshot.schema_version, "rank"_a=snapshot.rank,
-        "generation"_a=snapshot.generation, "phase"_a="forward",
-        "overflow_events"_a=snapshot.overflow_events, "events"_a=events);
+      events.append(py::dict("timestamp_ns"_a = e.timestamp_ns,
+                             "generation"_a = e.generation, "rank"_a = e.rank,
+                             "cta"_a = e.cta, "channel"_a = e.channel,
+                             "phase"_a = (e.metadata >> 24U),
+                             "role"_a = ((e.metadata >> 16U) & 0xffU),
+                             "event"_a = (e.metadata & 0xffffU),
+                             "arg0"_a = e.arg0, "arg1"_a = e.arg1));
+    return py::dict(
+        "schema"_a = snapshot.schema_version, "rank"_a = snapshot.rank,
+        "generation"_a = snapshot.generation, "phase"_a = "forward",
+        "overflow_events"_a = snapshot.overflow_events, "events"_a = events);
   });
 #endif
   py::class_<Runtime, std::shared_ptr<Runtime>>(m, "Runtime")
-      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
-                    unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())
-      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
-                    unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned, py::dict>())
-      .def("forward", &Runtime::forward,
-           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned,
+                    std::uintptr_t, py::object, unsigned, unsigned, unsigned,
+                    unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())
+      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned,
+                    std::uintptr_t, py::object, unsigned, unsigned, unsigned,
+                    unsigned, std::uint64_t, std::uint64_t, bool, unsigned,
+                    py::dict>())
+      .def("forward", &Runtime::forward, py::arg("x"), py::arg("routes"),
+           py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("layer") = std::nullopt)
       .def("backward", &Runtime::backward)
       .def("graph_forward", &Runtime::graph_forward)
       .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)
-      .def("eager_inference", &Runtime::eager_inference,
-           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+      .def("eager_inference", &Runtime::eager_inference, py::arg("x"),
+           py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("caller_stream"), py::arg("layer") = std::nullopt)
       .def("eager_inference_async", &Runtime::eager_inference_async,
-           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
-           py::arg("caller_stream"), py::arg("layer") = std::nullopt)
-      .def("profile_inference", &Runtime::profile_inference,
-           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("x"), py::arg("routes"), py::arg("gates"), py::arg("w1"),
+           py::arg("w2"), py::arg("caller_stream"),
+           py::arg("layer") = std::nullopt)
+      .def("profile_inference", &Runtime::profile_inference, py::arg("x"),
+           py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("caller_stream"), py::arg("layer") = std::nullopt)
       .def("drain_eager_inference", &Runtime::drain_eager_inference)
       .def("retire_peer_mappings", &Runtime::retire_peer_mappings)

@@ -6,7 +6,7 @@
 
 // Included after the private kernel contracts and peer-address helpers.
 namespace return_queue_detail {
-using Queue = persistent_v3::ReturnRowQueue;
+using Queue = communication::ReturnRowQueue;
 
 template <class Args> __device__ __forceinline__ Queue *queues(const Args &a) {
   return peer_at<Queue>(a.local_base, a.forward_return_queues_offset);
@@ -19,7 +19,8 @@ __device__ __forceinline__ unsigned *entries(const Args &a) {
   return peer_at<unsigned>(a.local_base, a.forward_return_rows_offset);
 }
 
-inline constexpr unsigned kReadyBlockRows = persistent_v3::kReturnReadyBlockRows;
+inline constexpr unsigned kReadyBlockRows =
+    communication::kReturnReadyBlockRows;
 
 template <class Args>
 __device__ __forceinline__ unsigned *ready_counts(const Args &a) {
@@ -31,10 +32,11 @@ template <class Args>
 __device__ __forceinline__ bool block_ready(const Args &a, const Queue &q,
                                             unsigned long long position) {
   const auto block = position / kReadyBlockRows;
-  const auto expected = unsigned(min(1ULL * kReadyBlockRows,
-                                     q.capacity - block * kReadyBlockRows));
+  const auto expected = unsigned(
+      min(1ULL * kReadyBlockRows, q.capacity - block * kReadyBlockRows));
   return ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-      ready_counts(a)[q.ready_begin + block]).load(::cuda::memory_order_acquire) == expected;
+             ready_counts(a)[q.ready_begin + block])
+             .load(::cuda::memory_order_acquire) == expected;
 }
 
 // All producer threads join before this call. An atomic count describes one
@@ -42,12 +44,15 @@ __device__ __forceinline__ bool block_ready(const Args &a, const Queue &q,
 // Producers add only their own disjoint reservation and never wait for peers.
 template <class Args>
 __device__ __forceinline__ void publish_ready(const Args &a, const Queue &q,
-                                              unsigned long long begin, unsigned rows) {
+                                              unsigned long long begin,
+                                              unsigned rows) {
   while (rows) {
     const auto block = begin / kReadyBlockRows;
-    const auto n = min(rows, kReadyBlockRows - unsigned(begin % kReadyBlockRows));
+    const auto n =
+        min(rows, kReadyBlockRows - unsigned(begin % kReadyBlockRows));
     ::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
-        ready_counts(a)[q.ready_begin + block]).fetch_add(n, ::cuda::memory_order_acq_rel);
+        ready_counts(a)[q.ready_begin + block])
+        .fetch_add(n, ::cuda::memory_order_acq_rel);
     begin += n;
     rows -= n;
   }
@@ -55,17 +60,23 @@ __device__ __forceinline__ void publish_ready(const Args &a, const Queue &q,
 
 template <class Args>
 __device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
-                                              unsigned long long begin, unsigned limit) {
+                                               unsigned long long begin,
+                                               unsigned limit) {
   unsigned count = 0;
   while (count < limit && begin + count < q.capacity) {
     const auto position = begin + count;
-    const auto n = unsigned(min(min(1ULL * (limit - count), q.capacity - position),
-                           kReadyBlockRows - position % kReadyBlockRows));
-    if (block_ready(a, q, position)) { count += n; continue; }
+    const auto n =
+        unsigned(min(min(1ULL * (limit - count), q.capacity - position),
+                     kReadyBlockRows - position % kReadyBlockRows));
+    if (block_ready(a, q, position)) {
+      count += n;
+      continue;
+    }
     for (unsigned i = 0; i < n; ++i) {
       if (::cuda::atomic_ref<unsigned, ::cuda::thread_scope_device>(
               entries(a)[q.begin + begin + count])
-              .load(::cuda::memory_order_acquire) == UINT32_MAX) return count;
+              .load(::cuda::memory_order_acquire) == UINT32_MAX)
+        return count;
       ++count;
     }
   }
@@ -74,7 +85,8 @@ __device__ __forceinline__ unsigned ready_rows(const Args &a, const Queue &q,
 
 template <class Args>
 __device__ __forceinline__ bool ready_block(const Args &a, const Queue &q,
-                                           unsigned long long begin, unsigned rows) {
+                                            unsigned long long begin,
+                                            unsigned rows) {
   return ready_rows(a, q, begin, rows) == rows;
 }
 
@@ -106,8 +118,10 @@ __device__ __forceinline__ void initialize(const Args &a) {
     const auto blocks = total / kReadyBlockRows + 1ULL + a.world;
     const auto tid = 1ULL * blockIdx.x * blockDim.x + threadIdx.x;
     const auto stride = 1ULL * gridDim.x * blockDim.x;
-    for (auto i = tid; i < total; i += stride) entries(a)[i] = UINT32_MAX;
-    for (auto i = tid; i < blocks; i += stride) entries(a)[total + i] = 0U;
+    for (auto i = tid; i < total; i += stride)
+      entries(a)[i] = UINT32_MAX;
+    for (auto i = tid; i < blocks; i += stride)
+      entries(a)[total + i] = 0U;
   }
   if (blockIdx.x)
     return;
@@ -142,14 +156,16 @@ __device__ __forceinline__ void initialize(const Args &a) {
   }
   __syncthreads();
   if constexpr (ParallelClear) {
-    if (q[a.world].begin + q[a.world].capacity != dispatch_sizes(a.dispatch).incoming_row_count)
+    if (q[a.world].begin + q[a.world].capacity !=
+        dispatch_sizes(a.dispatch).incoming_row_count)
       asm volatile("trap;");
     return;
   }
   const auto total = q[a.world].begin + q[a.world].capacity;
   for (unsigned long long i = threadIdx.x; i < total; i += blockDim.x)
     entries(a)[i] = UINT32_MAX;
-  const auto blocks = q[a.world].ready_begin +
+  const auto blocks =
+      q[a.world].ready_begin +
       (q[a.world].capacity + kReadyBlockRows - 1U) / kReadyBlockRows;
   for (unsigned long long i = threadIdx.x; i < blocks; i += blockDim.x)
     ready_counts(a)[i] = 0U;

@@ -23,7 +23,7 @@ command = [sys.executable, str(ROOT / "benchmarks/run_pf_network.py"),
            "--benchmark", str(ROOT / ("benchmarks/torchrun_megamoe_prefill.py"
                                       if inference else "tools/benchmark_training.py"))]
 for value in ("WEFTMOE_PF_MIN_RING_DEPTH=2", "WEFTMOE_PF_CREDIT_WINDOWS=2",
-              "WEFTMOE_PF_WG3_PUBLICATION_PLAN=1", "WEFTMOE_PF_DEDUPLICATE_RETURN_READY=1",
+
               f"NCCL_DEBUG_FILE={output / args.label}.nccl.%h.%p.log", *args.env):
     command += ["--env", value]
 command += ["--", "--backend", "pf", "--hidden", "4096", "--intermediate", "2048",

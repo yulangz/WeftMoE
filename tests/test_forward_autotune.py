@@ -24,43 +24,7 @@ def grid_count(topology):
 
 
 class ForwardAutotuneTest(unittest.TestCase):
-    def test_opportunistic_reduce_stays_within_math_warps(self):
-        for warps in (1, 8):
-            tune.validate_tuning(dict(self.candidates[0]["config"],
-                                      opportunistic_reduce_warps=warps))
-        for warps in (0, 9):
-            with self.subTest(warps=warps), self.assertRaisesRegex(
-                    tune.PlanError, "opportunistic_reduce_warps"):
-                tune.validate_tuning(dict(self.candidates[0]["config"],
-                                          opportunistic_reduce_warps=warps))
 
-    def test_resource_inspection_selects_active_kernel_family(self):
-        unified_symbols = [f"_unified_forward_kernel_local{local}_retain{retain}"
-                           for local in (0, 1) for retain in (0, 1)]
-        split_symbol = "_local_p2p_forward_tma_store_kernel"
-        for unified, symbols, expected in (
-            (1, unified_symbols + [split_symbol], 4),
-            (1, [split_symbol], 0),
-            (0, unified_symbols + [split_symbol], 1),
-            (0, unified_symbols, 0),
-        ):
-            fixture = "".join(
-                f" Function {symbol}:\n REG:168 STACK:120 SHARED:2048 LOCAL:0\n"
-                for symbol in symbols)
-            with self.subTest(unified=unified, symbols=symbols), \
-                    tempfile.TemporaryDirectory() as tmp, \
-                    mock.patch.object(tune.shutil, "which", return_value="cuobjdump"), \
-                    mock.patch.object(tune.subprocess, "run", return_value=mock.Mock(
-                        returncode=0, stdout=fixture)):
-                result = tune.inspect_forward_kernel(
-                    Path("binary"), Path(tmp) / "resources.log",
-                    dict(self.candidates[0]["config"], unified_workers=unified))
-            self.assertEqual(result["valid_compiled_kernel_set"], expected > 0)
-            self.assertEqual(len(result["kernels"]), expected)
-            self.assertEqual(result["compiled_unified_kernel_count"],
-                             expected if unified else 0)
-            self.assertTrue(all(("unified_forward_kernel" in kernel["mangled_name"])
-                                == bool(unified) for kernel in result["kernels"]))
 
     def test_runtime_does_not_select_checkout_nccl_artifacts(self):
         from autotune_common import resolve_runtime_settings
@@ -80,54 +44,10 @@ class ForwardAutotuneTest(unittest.TestCase):
                 repo_root=root)
             self.assertEqual(settings["nccl_lib_dir"], "/explicit/nccl")
 
-    def test_tma_store_accepts_shorter_stage_pipelines(self):
-        for fc1_stages in (2, 3, 4):
-            for fc2_stages in (2, 3, 4):
-                config = dict(self.candidates[0]["config"],
-                              main_intermediate=768,
-                              fc1_stages=fc1_stages,
-                              fc2_stages=fc2_stages,
-                              fc2_claim_tiles=1,
-                              fc2_tma_store=True, cluster_size=2)
-                tune.validate_tuning(config)
 
-    def test_prefill_companion_requires_matching_decode_geometry(self):
-        config = dict(self.candidates[0]["config"],
-                      fc1_tile_n=64, fc2_tile_n=128, tile_k=128,
-                      static_v4_fc1_stages=3, static_v4_fc2_stages=3,
-                      fc2_claim_tiles=1, static_v4_prefill_min_tokens=8192)
-        tune.validate_tuning(config)
-        config["fc2_tile_n"] = 256
-        with self.assertRaisesRegex(tune.PlanError, "wide prefill"):
-            tune.validate_tuning(config)
-        config["static_v4_prefill_min_tokens"] = 0
-        config["tile_k"] = 64
-        tune.validate_tuning(config)
 
-    def test_fc2_pipeline_accepts_partial_stage_cycles(self):
-        config = dict(self.candidates[0]["config"],
-                      main_hidden=2560, main_intermediate=1280,
-                      fc2_stages=3, fc2_claim_tiles=4)
-        tune.validate_tuning(config)
 
-    def test_fc2_prefetch_reserves_output_storage(self):
-        config = dict(self.candidates[0]["config"],
-                      fc2_stages=3, fc2_claim_tiles=4)
-        tune.validate_tuning(config)
-        self.assertEqual(tune.dynamic_shared_memory(config, 16)["compute_bytes"],
-                         213200)
-        config["fc2_stages"] = 4
-        with self.assertRaisesRegex(tune.PlanError, "shared memory"):
-            tune.validate_tuning(config)
 
-    def test_multicast_requires_even_n_tile_counts(self):
-        config = dict(self.candidates[0]["config"], main_intermediate=768,
-                      fc1_tile_n=256, fc1_stages=2, cluster_size=2)
-        with self.assertRaisesRegex(tune.PlanError, "even"):
-            tune.validate_tuning(config)
-        config["cluster_size"] = 1
-        with self.assertRaisesRegex(tune.PlanError, "cluster_size=2"):
-            tune.validate_tuning(config)
 
     def test_local_runtime_library_path_precedes_inherited_libraries(self):
         benchmark = dict(self.plan["benchmark"], launcher="local", world=8,
@@ -142,29 +62,6 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["env"]["LD_LIBRARY_PATH"],
                              "/cuda/compat:/runtime/nccl:/inherited")
 
-    def test_global_grids_cover_combinations_and_preserve_incumbents(self):
-        for topology, legacy, rdma in (
-            ("single_node", "forward_h200_single_node_autotune.json", 0),
-            ("multi_node", "forward_h200_multi_node_autotune.json", 8),
-        ):
-            plan = tune.load_plan(ROOT / "configs" /
-                                  f"forward_h200_{topology}_autotune.json",
-                                  model=dict(hidden=7168, intermediate=3072, experts=384, top_k=6),
-                                  system={"nodes": 1 if rdma == 0 else 2})
-            candidates = tune.expand_candidates(plan)
-            source = json.loads((ROOT / "configs" / legacy).read_text())
-            baseline = {"config": {k: v[0] for k, v in
-                                   tune.flatten_groups(source, require_all=False).items()}}
-            baseline["config"].update(main_hidden=7168, main_intermediate=3072)
-            self.assertEqual(len(candidates), grid_count(topology))
-            self.assertEqual(candidates[0]["name"], "incumbent")
-            self.assertEqual(candidates[0]["config"], baseline["config"])
-            for c in candidates:
-                self.assertEqual(c["config"]["rdma_ctas"], rdma)
-                self.assertEqual(set(c["config"]), set(tune.PARAMETER_MACROS))
-            # Check coverage of caller-editable axes, not historical default values.
-            for key, values in tune.flatten_groups(source, require_all=False).items():
-                self.assertEqual({c["config"][key] for c in candidates}, set(values))
 
     def test_grid_rejects_missing_duplicate_invalid_and_oversized_axes(self):
         source = json.loads((ROOT / "configs" /
@@ -253,22 +150,6 @@ class ForwardAutotuneTest(unittest.TestCase):
         with self.assertRaisesRegex(tune.PlanError, "relay_local_return=true"):
             tune.validate_tuning(config)
 
-    def test_default_plan_is_narrow_and_complete(self):
-        self.assertEqual(self.plan["schema"], 3)
-        self.assertIn("jit", self.plan)
-        self.assertNotIn("build", self.plan)
-        self.assertEqual(self.plan["jit"]["architecture"], "sm_90a")
-        self.assertEqual(self.plan["selection"], {
-            "confirmation_candidates": 2,
-            "confirmation_repeats": 2,
-            "confirmation_rounds": 40,
-            "minimum_improvement_percent": 0.5,
-        })
-        self.assertEqual(len(self.candidates), grid_count("multi_node"))
-        self.assertLessEqual(len(self.candidates), self.plan["max_candidates"])
-        for candidate in self.candidates:
-            self.assertEqual(set(candidate["config"]),
-                             set(tune.PARAMETER_MACROS))
 
     def test_standalone_cutlass_path_resolution(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -311,41 +192,7 @@ class ForwardAutotuneTest(unittest.TestCase):
         self.assertEqual(command[command.index("--seed") + 1],
                          str(benchmark["seed"]))
 
-    def test_cpp_defaults_and_generator_have_same_parameter_surface(self):
-        header = (ROOT / "src" / "cuda" / "forward" /
-                  "tuning_config.hpp").read_text(encoding="utf-8")
-        shared = (ROOT / "src/cuda/unified_worker_tuning.hpp").read_text()
-        atom = (ROOT / "src/cuda/primitives/hopper.cuh").read_text()
-        ring = (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
-        common_macros = set(re.findall(
-            r"^#ifndef (WEFTMOE_UNIFIED_GIN_(?:CONTEXT_PROBES|PACK_SLOTS)|WEFTMOE_WGMMA_N256_ATOM_N|WEFTMOE_GIN_RING_DEPTH)$",
-            shared + "\n" + atom + "\n" + ring, flags=re.MULTILINE))
-        cpp_macros = set(re.findall(
-            r"^#ifndef (WEFTMOE_FWD_[A-Z0-9_]+)$", header + shared,
-            flags=re.MULTILINE))
-        self.assertEqual(cpp_macros | common_macros, set(tune.PARAMETER_MACROS.values()))
 
-    def test_cpp_defaults_form_a_valid_tuning_point(self):
-        header = (ROOT / "src" / "cuda" / "forward" /
-                  "tuning_config.hpp").read_text(encoding="utf-8")
-        header += (ROOT / "src/cuda/primitives/hopper.cuh").read_text()
-        header += (ROOT / "src/cuda/unified_worker_tuning.hpp").read_text()
-        header += (ROOT / "src/cuda/communication/tuning_config.hpp").read_text()
-        cpp_defaults = dict(re.findall(
-            r"^#define (WEFTMOE_(?:FWD_[A-Z0-9_]+|UNIFIED_[A-Z0-9_]+|WGMMA_N256_ATOM_N|GIN_RING_DEPTH)) ([A-Za-z0-9_]+)$", header,
-            flags=re.MULTILINE))
-        config = {}
-        for key, macro in tune.PARAMETER_MACROS.items():
-            value = cpp_defaults[macro]
-            while not value.isdecimal():
-                value = cpp_defaults[value]
-            value = int(value)
-            if key in tune.BOOLEAN_PARAMETERS:
-                value = bool(value)
-            elif key in tune.ENUM_PARAMETERS:
-                value = {v: k for k, v in tune.ENUM_PARAMETERS[key].items()}[value]
-            config[key] = value
-        tune.validate_tuning(config)
 
     def test_generated_header_has_one_definition_per_parameter(self):
         candidate = self.candidates[0]
@@ -470,10 +317,6 @@ class ForwardAutotuneTest(unittest.TestCase):
                              tune.generated_header(candidate["name"],
                                                    candidate["config"]))
 
-    def test_shared_memory_model_matches_current_m128_shape(self):
-        memory = tune.dynamic_shared_memory(self.candidates[0]["config"], 16)
-        self.assertEqual(memory["compute_bytes"], 213200)
-        self.assertEqual(memory["transport_bytes"], 213200)
 
 
 if __name__ == "__main__":

@@ -12,19 +12,21 @@ struct Schedule {
   bool weights_initialized = false;
 
   __device__ explicit Schedule(unsigned cluster)
-      : block(cluster), epilogue(cluster), dx(cluster), weight_partition(cluster) {}
+      : block(cluster), epilogue(cluster), dx(cluster),
+        weight_partition(cluster) {}
 
   template <unsigned DuTiles, unsigned DxTiles, class Layout>
   __device__ __forceinline__ bool
   next(const BackwardKernelArgs &a, unsigned long long *words,
        const Layout &layout, unsigned mblocks, unsigned clusters,
-       persistent_v3::backward::TileTask &task, unsigned &phase,
-       bool &terminal) {
+       pipeline::backward::TileTask &task, unsigned &phase, bool &terminal) {
     using namespace backward_pipeline_detail;
-    const auto dx_blocks = a.return_ring.depth ? a.return_ring.state->blocks : mblocks;
+    const auto dx_blocks =
+        a.return_ring.depth ? a.return_ring.state->blocks : mblocks;
     const auto du_owner = [&](unsigned index) {
       return a.return_ring.depth && !a.return_ring.canonical
-          ? a.return_ring.du_order[index] : index;
+                 ? a.return_ring.du_order[index]
+                 : index;
     };
     // Batch adjacent N tiles over one gathered dAB M-block. Smaller batches
     // expose N parallelism when the bounded window underfills the M grid.
@@ -34,7 +36,8 @@ struct Schedule {
       if (dx < dx_blocks * dx_groups &&
           weftmoe_pf::backward_return::input_ready(a, dx / dx_groups)) {
         const auto tile = (dx % dx_groups) * dx_tiles;
-        task = {dx / dx_groups, tile, TaskKind::Dx, min(dx_tiles, DxTiles - tile)};
+        task = {dx / dx_groups, tile, TaskKind::Dx,
+                min(dx_tiles, DxTiles - tile)};
         dx += clusters;
         return true;
       }
@@ -58,8 +61,8 @@ struct Schedule {
       }
       if (epilogue < mblocks * kDabEpilogueTasks &&
           ready(du_owner(epilogue / kDabEpilogueTasks), 2U)) {
-        task = {du_owner(epilogue / kDabEpilogueTasks), epilogue % kDabEpilogueTasks,
-                TaskKind::Dab, 1U};
+        task = {du_owner(epilogue / kDabEpilogueTasks),
+                epilogue % kDabEpilogueTasks, TaskKind::Dab, 1U};
         phase = 2U;
         epilogue += clusters;
         return true;
@@ -108,8 +111,10 @@ struct Schedule {
         std::uint64_t work = 0U;
         for (unsigned expert = 0; expert < experts; ++expert)
           work += rows[expert] * (kDw2Pairs + kDw1Pairs);
-        weight = weight_cut(rows, experts, work * weight_partition / partitions);
-        weight_end = weight_cut(rows, experts, work * (weight_partition + 1U) / partitions);
+        weight =
+            weight_cut(rows, experts, work * weight_partition / partitions);
+        weight_end = weight_cut(rows, experts,
+                                work * (weight_partition + 1U) / partitions);
         weights_initialized = true;
       }
       if (weight_task(a, task))
@@ -146,8 +151,7 @@ private:
   }
 
   __device__ __forceinline__ bool
-  weight_task(const BackwardKernelArgs &a,
-              persistent_v3::backward::TileTask &task) {
+  weight_task(const BackwardKernelArgs &a, pipeline::backward::TileTask &task) {
     using namespace backward_pipeline_detail;
     const auto split = a.dispatch.sizes.owned_expert_count * kDw2Pairs;
     while (weight < weight_end) {

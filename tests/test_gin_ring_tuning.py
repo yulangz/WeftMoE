@@ -54,21 +54,6 @@ class GinRingTuningTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("GIN physical ring depth must be 4, 8 or 16", result.stderr)
 
-    def test_frozen_profiles_accept_an_explicit_depth_without_rewriting(self):
-        for model in ("qwen", "flash"):
-            path = ROOT / f"configs/full_cta_all_worker_20260914/{model}.hpp"
-            for depth in (None, 4, 8, 16):
-                expected = depth if depth is not None else 4
-                prefix = (f"#define WEFTMOE_GIN_RING_DEPTH {depth}\n"
-                          if depth is not None else "")
-                source = prefix + f'#include "{path}"\n'
-                source += '#include "cuda/communication/tuning_config.hpp"\n'
-                source += '#include "cuda/forward/tuning_config.hpp"\n'
-                source += '#include "cuda/backward/tuning_config.hpp"\n'
-                source += f"static_assert(WEFTMOE_GIN_RING_DEPTH == {expected});\n"
-                with self.subTest(model=model, depth=depth):
-                    result = self.compile_header(source)
-                    self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

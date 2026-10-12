@@ -13,10 +13,10 @@ from pathlib import Path
 
 
 KERNELS = {
-    "forward_compute_main": {
-        "name": "local_p2p_forward_tma_store_kernel",
-        "template": "ILb0ELb1ELb0ELb1ELj4ELj4EE",
-        "configured_dynamic_shared_bytes": 196832,
+    "pf_local_main": {
+        "name": "weftmoe_pf5local6kernel",
+        "template": "",
+        "configured_dynamic_shared_bytes": 226304,
     },
 }
 ARCHES = ("sm_90a",)

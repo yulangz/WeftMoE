@@ -1,15 +1,12 @@
 #pragma once
 
-#ifndef WEFTMOE_PF_FC2_REGISTER_STORE
-#define WEFTMOE_PF_FC2_REGISTER_STORE 1
-#endif
-
 // Same BF16 rounding and route destinations as the shared-memory epilogue.
 // A four-lane transpose produces aligned 128-bit stores directly from GMMA.
 template <unsigned TileN>
-__device__ __forceinline__ void static_v4_store_fc2_register_tile(
-    const ForwardKernelArgs &a, const float *accum, unsigned valid_rows,
-    unsigned column_base, std::uint64_t mblock) {
+__device__ __forceinline__ void
+static_v4_store_fc2_register_tile(const ForwardKernelArgs &a,
+                                  const float *accum, unsigned valid_rows,
+                                  unsigned column_base, std::uint64_t mblock) {
   static_assert(TileN % 32U == 0U);
   const auto lane = threadIdx.x % 32U;
   const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
@@ -18,8 +15,10 @@ __device__ __forceinline__ void static_v4_store_fc2_register_tile(
     const auto m = row0 + item * 8U;
     if (m >= valid_rows)
       continue;
-    auto *output = static_cast<transport::BFloat16 *>(
-        a.ring.rows[mblock * forward_tuning::kTileM + m].output) + column_base;
+    auto *output =
+        static_cast<transport::BFloat16 *>(
+            a.ring.rows[mblock * forward_tuning::kTileM + m].output) +
+        column_base;
 #pragma unroll
     for (unsigned index = 0U; index < TileN / 8U; index += 4U) {
       std::uint32_t words[4];
@@ -29,7 +28,8 @@ __device__ __forceinline__ void static_v4_store_fc2_register_tile(
         words[j] = float2_to_bf16x2_bits(value[0], value[1]);
       }
       *reinterpret_cast<uint4 *>(output + index * 8U + (lane % 4U) * 8U) =
-          static_v4_transpose_vector(make_uint4(words[0], words[1], words[2], words[3]));
+          static_v4_transpose_vector(
+              make_uint4(words[0], words[1], words[2], words[3]));
     }
   }
   // Retire both math warpgroups' S reads before the caller recycles the slot.
@@ -38,10 +38,8 @@ __device__ __forceinline__ void static_v4_store_fc2_register_tile(
 }
 
 // Included inside forward_compute_detail after the fragment-layout and named
-// barrier helpers.  Keeping this specialization out of the generic epilogue
-// avoids carrying static peer addressing through the dynamic V3 epilogue.
-template <bool Network = false, unsigned TileN = forward_tuning::kFc2TileN,
-          bool RingSchedule = false, unsigned TileRows = 128U,
+// barrier helpers. Both PF and DT use the ring row directory.
+template <unsigned TileN = forward_tuning::kFc2TileN, unsigned TileRows = 128U,
           unsigned MathThreads = kMathThreads, bool FullColumns = false>
 __device__ __forceinline__ void
 static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
@@ -59,20 +57,11 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
   const auto column_lane = threadIdx.x % kRowLanes;
   const auto copy_row = [&](unsigned row) {
     transport::BFloat16 *destination;
-    if constexpr (RingSchedule) {
-      const auto identity =
-          a.ring.rows[mblock * forward_tuning::kTileM + row_offset + row];
-      destination = static_cast<transport::BFloat16 *>(identity.output);
-    } else {
-      const auto &header = weftmoe_pf::route_header(a, canonical_row + row);
-      if constexpr (Network)
-        destination = weftmoe_pf::network_fc2_destination(a, header);
-      else
-        destination =
-            peer_at<transport::BFloat16>(a.peer_bases[header.source_rank],
-                                         a.contribution_offset) +
-            std::uint64_t(header.contribution_row) * a.hidden;
-    }
+
+    const auto identity =
+        a.ring.rows[mblock * forward_tuning::kTileM + row_offset + row];
+    destination = static_cast<transport::BFloat16 *>(identity.output);
+
     destination += column_base;
     for (std::uint32_t column = column_lane * kElements; column < TileN;
          column += kRowLanes * kElements) {
@@ -110,8 +99,7 @@ static_v4_copy_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
                                     physical_barrier<true>(kMathDoneBarrier));
 }
 
-template <class TileMma, bool Network = false,
-          unsigned TileN = forward_tuning::kFc2TileN, bool RingSchedule = false,
+template <class TileMma, unsigned TileN = forward_tuning::kFc2TileN,
           unsigned TileRows = 128U, unsigned MathThreads = kMathThreads,
           bool FullColumns = false>
 __device__ __forceinline__ void
@@ -128,7 +116,6 @@ static_v4_push_fc2_tile(const ForwardKernelArgs &a, transport::BFloat16 *tile,
         __float22bfloat162_rn(
             make_float2(accum[index * 4U + 2U], accum[index * 4U + 3U])));
   }
-  static_v4_copy_fc2_tile<Network, TileN, RingSchedule, TileRows, MathThreads,
-                          FullColumns>(
+  static_v4_copy_fc2_tile<TileN, TileRows, MathThreads, FullColumns>(
       a, tile, canonical_row, valid_rows, column_base, mblock, row_offset);
 }

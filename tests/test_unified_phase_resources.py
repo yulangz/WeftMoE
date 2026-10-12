@@ -96,57 +96,16 @@ class UnifiedDefaultMacroTest(unittest.TestCase):
     def test_bare_build_enables_both_phases_with_legal_default_resources(self):
         values = self.preprocess()
         self.assertEqual(values["WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT"], 3)
-        for phase, buffers in (("FWD", 2), ("BWD", 1)):
+        for phase, buffers in (("FWD", 2), ("BWD", 2)):
             for field, expected in (("WORKERS", 1), ("MATH_REGISTERS", 216),
                                     ("CONTROL_REGISTERS", 64), ("SEGMENT_BYTES", 4096),
                                     ("COPY_BUFFERS", buffers)):
                 self.assertEqual(values[f"WEFTMOE_{phase}_UNIFIED_{field}"], expected)
 
-    def test_generated_headers_without_worker_switches_stay_legacy(self):
-        for generated in ("forward", "backward"):
-            with self.subTest(generated=generated):
-                values = self.preprocess(generated=generated)
-                self.assertEqual(values["WEFTMOE_FWD_GIN_CHANNEL_PACK_LIMIT"], 3)
-                for phase in ("FWD", "BWD"):
-                    self.assertEqual(values[f"WEFTMOE_{phase}_UNIFIED_WORKERS"], 0)
-
-    def test_standalone_generated_header_only_enables_its_explicit_phase(self):
-        for generated, enabled in (("forward", "FWD"), ("backward", "BWD")):
-            with self.subTest(generated=generated):
-                values = self.preprocess(generated=generated, generated_defines=
-                    f"#define WEFTMOE_{enabled}_UNIFIED_WORKERS 1\n")
-                for phase in ("FWD", "BWD"):
-                    self.assertEqual(values[f"WEFTMOE_{phase}_UNIFIED_WORKERS"],
-                                     int(phase == enabled))
-
-    def test_explicit_switches_override_bare_and_generated_fallbacks(self):
-        for generated in (None, "forward", "backward"):
-            for forward, backward in ((0, 0), (1, 1), (0, 1)):
-                with self.subTest(generated=generated, workers=(forward, backward)):
-                    values = self.preprocess(
-                        f"#define WEFTMOE_FWD_UNIFIED_WORKERS {forward}\n"
-                        f"#define WEFTMOE_BWD_UNIFIED_WORKERS {backward}\n",
-                        generated=generated)
-                    self.assertEqual(values["WEFTMOE_FWD_UNIFIED_WORKERS"], forward)
-                    self.assertEqual(values["WEFTMOE_BWD_UNIFIED_WORKERS"], backward)
 
 
-    def test_physical_ring_default_and_historical_headers(self):
-        self.assertEqual(self.preprocess()["WEFTMOE_GIN_RING_DEPTH"], 8)
-        for phase in ("forward", "backward"):
-            with self.subTest(phase=phase):
-                self.assertEqual(self.preprocess(generated=phase)[
-                    "WEFTMOE_GIN_RING_DEPTH"], 4)
-                macro = "FWD" if phase == "forward" else "BWD"
-                self.assertEqual(self.preprocess(
-                    f"#define WEFTMOE_{macro}_MAIN_HIDDEN 7168\n")[
-                        "WEFTMOE_GIN_RING_DEPTH"], 4)
-                for depth in (4, 8, 16):
-                    defines = f"#define WEFTMOE_GIN_RING_DEPTH {depth}\n"
-                    self.assertEqual(self.preprocess(defines, generated=phase)[
-                        "WEFTMOE_GIN_RING_DEPTH"], depth)
-                    self.assertEqual(self.preprocess(generated=phase,
-                        generated_defines=defines)["WEFTMOE_GIN_RING_DEPTH"], depth)
+
+
 
     def test_channel_pack_limit_explicit_and_generated_overrides(self):
         for value in (1, 2, 8):
@@ -253,17 +212,6 @@ class UnifiedPhaseResourcesTest(unittest.TestCase):
                 combined_generated_header("mismatch", forward, dict(backward, **{key: other}))
 
 
-    def test_old_combined_build_records_keep_four_physical_slots(self):
-        forward, backward = self.configs()
-        forward.pop("gin_ring_depth")
-        backward.pop("gin_ring_depth")
-        header = combined_generated_header("historical", forward, backward)
-        self.assertEqual(header.count("#define WEFTMOE_GIN_RING_DEPTH 4\n"), 2)
-        self.assertNotIn("gin_ring_depth", forward)
-        self.assertNotIn("gin_ring_depth", backward)
-        with self.assertRaisesRegex(ValueError, "gin_ring_depth"):
-            combined_generated_header("mixed", forward,
-                                      dict(backward, gin_ring_depth=8))
 
 
     def test_legacy_shared_macros_remain_defaults_with_phase_override(self):

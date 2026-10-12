@@ -3,7 +3,8 @@
 // inlining and code generation while the Forward boundary remains explicit.
 struct RingCheckpointView {
   TrainingCountView counts;
-  std::uint64_t *source_rows = nullptr; // Notify route_dst_row per source route.
+  std::uint64_t *source_rows =
+      nullptr;                   // Notify route_dst_row per source route.
   std::uint64_t *rows = nullptr; // Physical-plan row -> canonical tape row.
   float *gates = nullptr;
   LocalP2pRouteHeader *headers = nullptr;
@@ -101,9 +102,7 @@ struct ForwardKernelArgs {
   std::uint64_t saved_rows = 0;
   std::size_t forward_task_claim_offset;
   std::size_t forward_fc1_done_offset;
-  std::size_t forward_input_groups_offset;
   std::size_t forward_scheduler_offset;
-  std::size_t forward_v3_control_offset;
   std::size_t gin_local_compute_ready_offset;
   std::size_t terminal_epoch_offset;
   std::size_t production_error_records_offset;
@@ -126,8 +125,8 @@ struct ForwardKernelArgs {
   // range before producers are released, avoiding a second epoch array.
   std::size_t forward_reduce_route_count_offset = 0;
   std::size_t forward_reduce_ready_token_offset = 0;
-  // Forward Return has one cross-node transport policy: FULL GIN into the registered receive
-  // plane, followed by per-route readiness publication.
+  // Forward Return has one cross-node transport policy: FULL GIN into the
+  // registered receive plane, followed by per-route readiness publication.
   // Forward keeps one fixed owner per physical GIN context, while the Relay
   // team is runtime-tunable in whole context-sized groups.  Extra Relay CTAs
   // stripe node-local Dispatch and Return M-blocks; only the first group owns
@@ -183,7 +182,8 @@ execution_epoch(const ForwardKernelArgs &a) {
 __device__ __forceinline__ std::uint64_t
 forward_contribution_row(const ForwardKernelArgs &a, std::uint64_t route) {
   return a.forward_compact_return
-      ? a.dispatch.return_global_expert_base[a.dispatch.expert_id[route]] +
-            a.dispatch.local_offset[route]
-      : route;
+             ? a.dispatch
+                       .return_global_expert_base[a.dispatch.expert_id[route]] +
+                   a.dispatch.local_offset[route]
+             : route;
 }

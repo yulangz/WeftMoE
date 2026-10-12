@@ -13,8 +13,8 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
   const auto routes = a.dispatch.sizes.route_count;
   const auto experts = a.dispatch.identity.num_experts;
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto chunks = (routes + kTrainingCountChunkRoutes - 1U) /
-                      kTrainingCountChunkRoutes;
+  const auto chunks =
+      (routes + kTrainingCountChunkRoutes - 1U) / kTrainingCountChunkRoutes;
   auto *prefix = const_cast<std::uint64_t *>(a.checkpoint.counts.chunk_prefix);
   auto *counts = a.ring.source.expert_prefix;
   if (!worker) {
@@ -47,7 +47,8 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
   }
   grid_sync<0U, Threads>(a);
   for (auto expert = worker; expert < experts; expert += workers) {
-    const_cast<std::uint32_t *>(a.dispatch.expert_to_rank)[expert] = expert / owned;
+    const_cast<std::uint32_t *>(a.dispatch.expert_to_rank)[expert] =
+        expert / owned;
     std::uint64_t sum = 0U;
     for (std::uint64_t chunk = 0; chunk < chunks; ++chunk) {
       auto &value = prefix[expert * chunks + chunk];
@@ -65,7 +66,8 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
                           reinterpret_cast<const char *>(a.ring.source_header);
       for (unsigned node = 0; node < a.dispatch.identity.num_nodes; ++node)
         if (node != a.node) {
-          network_put(a, node, base, base, sizeof(static_forward::SourceHeader));
+          network_put(a, node, base, base,
+                      sizeof(static_forward::SourceHeader));
           network_put(a, node, base + offset, base + offset,
                       experts * sizeof(std::uint64_t));
         }
@@ -78,25 +80,29 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
     const_cast<std::uint64_t *>(a.dispatch.source_expert_count)[i] =
         ring::source_metadata(a, i / experts, counts)[i % experts];
   grid_sync<0U, Threads>(a);
-  for (auto destination = worker; destination < a.world; destination += workers) {
+  for (auto destination = worker; destination < a.world;
+       destination += workers) {
     std::uint64_t rows = 0U, tiles = 0U;
     for (unsigned local = 0; local < owned; ++local) {
       const auto expert = destination * owned + local;
       std::uint64_t total = 0U, source_base = rows;
       for (unsigned source = 0; source < a.world; ++source) {
         const auto count =
-            a.dispatch.source_expert_count[std::uint64_t(source) * experts + expert];
+            a.dispatch
+                .source_expert_count[std::uint64_t(source) * experts + expert];
         total += count;
         if (source < a.rank)
           source_base += count;
       }
-      const_cast<std::uint64_t *>(a.checkpoint.counts.expert_source_base)[expert] =
-          source_base;
+      const_cast<std::uint64_t *>(
+          a.checkpoint.counts.expert_source_base)[expert] = source_base;
       if (destination == a.rank) {
-        const_cast<std::uint32_t *>(a.dispatch.owned_expert_ids)[local] = expert;
+        const_cast<std::uint32_t *>(a.dispatch.owned_expert_ids)[local] =
+            expert;
         const_cast<std::uint64_t *>(a.dispatch.expert_row_count)[local] = total;
         const_cast<std::uint64_t *>(a.dispatch.expert_row_prefix)[local] = rows;
-        const_cast<std::uint64_t *>(a.dispatch.mtile_row_offsets)[local] = tiles;
+        const_cast<std::uint64_t *>(a.dispatch.mtile_row_offsets)[local] =
+            tiles;
       }
       rows += total;
       tiles += (total + 127U) / 128U;
@@ -109,9 +115,11 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
       runtime.sizes.incoming_row_count = rows;
       runtime.sizes.mtile_count = tiles;
       runtime.sizes.packet_count = runtime.sizes.fanout_count = 0U;
-      runtime.sizes.outgoing_signal_count = runtime.sizes.incoming_signal_count = 0U;
+      runtime.sizes.outgoing_signal_count =
+          runtime.sizes.incoming_signal_count = 0U;
       for (unsigned source = 0; source < a.world; ++source)
-        runtime.error |= ring::source_metadata(a, source, a.ring.source_header)->error;
+        runtime.error |=
+            ring::source_metadata(a, source, a.ring.source_header)->error;
       runtime.error |= rows > a.max_destination_rows;
     }
   }
@@ -123,10 +131,10 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
 }
 
 template <bool Network>
-__global__ __launch_bounds__(Network && kNetworkWorkerMode == 2U ? 512U : 384U, 1) void notify_kernel(
+__global__ __launch_bounds__(384U, 1) void notify_kernel(
     const __grid_constant__ ForwardKernelArgs a) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
-  constexpr unsigned Threads = Network && kNetworkWorkerMode == 2U ? 512U : 384U;
+  constexpr unsigned Threads = 384U;
   extern __shared__ __align__(1024) unsigned char scratch[];
   programmatic_launch::wait();
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -143,14 +151,12 @@ __global__ __launch_bounds__(Network && kNetworkWorkerMode == 2U ? 512U : 384U, 
       return;
   }
   if constexpr (Network) {
-    if constexpr (Threads == 384U) {
-      if (a.retain_backward_state)
-        ring::prepare<true, true, Threads>(a, scratch);
-      else
-        ring::prepare<true, false, Threads>(a, scratch);
-    } else {
+
+    if (a.retain_backward_state)
+      ring::prepare<true, true, Threads>(a, scratch);
+    else
       ring::prepare<true, false, Threads>(a, scratch);
-    }
+
   } else {
     local::prepare(a, scratch);
   }

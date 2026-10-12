@@ -4,17 +4,16 @@
       128
     ],
     "fc1_tile_n": [
-      128
+      256
     ],
     "fc2_tile_n": [
-      256,
-      128
+      256
     ],
     "tile_k": [
       64
     ],
     "fc1_stages": [
-      4
+      3
     ],
     "fc2_stages": [
       3
@@ -35,7 +34,8 @@
       40
     ],
     "wgmma_wait_group": [
-      0
+      0,
+      1
     ],
     "fc2_store_atom_n": [
       64
@@ -47,7 +47,7 @@
       true
     ],
     "fc2_claim_tiles": [
-      2
+      1
     ],
     "unified_workers": [
       1
@@ -71,8 +71,7 @@
       4096
     ],
     "unified_copy_buffers": [
-      2,
-      1
+      2
     ],
     "unified_split_nvlink": [
       0
@@ -102,21 +101,22 @@
       8
     ],
     "gin_channel_pack_limit": [
-      3,
-      1,
-      2
+      3
     ],
     "gin_ring_depth": [
-      8,
-      4,
-      16
+      8
     ],
     "unified_rdma_ctas": [
       0
     ],
     "gin_receive_rows": [
-      128,
-      32
+      128
+    ],
+    "static_v4_fc1_stages": [
+      3
+    ],
+    "static_v4_fc2_stages": [
+      3
     ]
   },
   "2_transport": {
@@ -136,8 +136,7 @@
       12
     ],
     "local_return_batch_rows": [
-      32,
-      128
+      32
     ],
     "dispatch_publish_batch_rows": [
       32

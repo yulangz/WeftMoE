@@ -2,14 +2,17 @@
 #include "cuda/weftmoe_pf/backward_return_plan.cuh"
 #include "cuda/weftmoe_pf/backward_return_access.cuh"
 #include "cuda/weftmoe_pf/backward_return_hooks.cuh"
-#include "cuda/persistent_v3/backward/compute_kernels.cuh"
+#include "cuda/backward/compute_kernels.cuh"
 
 // Rebuilt for each invocation: routing counts may change even at fixed shape.
 // Capacity was checked when the pool and dispatch handle were constructed.
 __global__ void backward_build_row_directory_kernel(BackwardKernelArgs a) {
-  auto *offsets = peer_at<unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
-  auto *rows = peer_at<unsigned long long>(a.local_base, a.padded_expert_rows_offset);
-  auto *mapping = peer_at<unsigned int>(a.local_base, a.compact_to_padded_offset);
+  auto *offsets =
+      peer_at<unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
+  auto *rows =
+      peer_at<unsigned long long>(a.local_base, a.padded_expert_rows_offset);
+  auto *mapping =
+      peer_at<unsigned int>(a.local_base, a.compact_to_padded_offset);
   if (threadIdx.x == 0U) {
     unsigned long long cursor = 0ULL;
     for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
@@ -23,28 +26,34 @@ __global__ void backward_build_row_directory_kernel(BackwardKernelArgs a) {
   __syncthreads();
   for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
        ++e)
-    for (unsigned long long row = threadIdx.x; row < a.dispatch.expert_row_count[e]; row += blockDim.x)
+    for (unsigned long long row = threadIdx.x;
+         row < a.dispatch.expert_row_count[e]; row += blockDim.x)
       mapping[a.dispatch.expert_row_prefix[e] + row] =
           static_cast<unsigned int>(offsets[e] + row);
 }
 
 __global__ void backward_clear_inactive_gradients_kernel(BackwardKernelArgs a) {
   const auto expert = blockIdx.y;
-  if (a.dispatch.expert_row_count[expert] != 0ULL) return;
+  if (a.dispatch.expert_row_count[expert] != 0ULL)
+    return;
   const auto elements = a.hidden * a.intermediate;
   auto *dw1 = a.dw1 + expert * 2ULL * elements;
   auto *dw2 = a.dw2 + expert * elements;
-  for (auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (auto i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+                threadIdx.x;
        i < 2ULL * elements; i += gridDim.x * blockDim.x) {
     reinterpret_cast<unsigned short *>(dw1)[i] = 0;
-    if (i < elements) reinterpret_cast<unsigned short *>(dw2)[i] = 0;
+    if (i < elements)
+      reinterpret_cast<unsigned short *>(dw2)[i] = 0;
   }
 }
 
-__device__ __forceinline__ void backward_load_row_geometry(BackwardKernelArgs &a) {
+__device__ __forceinline__ void
+backward_load_row_geometry(BackwardKernelArgs &a) {
   __shared__ unsigned long long geometry[2];
   if (threadIdx.x == 0U) {
-    const auto *offsets = peer_at<const unsigned long long>(a.local_base, a.padded_expert_offsets_offset);
+    const auto *offsets = peer_at<const unsigned long long>(
+        a.local_base, a.padded_expert_offsets_offset);
     geometry[0] = offsets[dispatch_sizes(a.dispatch).owned_expert_count];
     unsigned long long active = 0;
     for (unsigned int e = 0; e < dispatch_sizes(a.dispatch).owned_expert_count;
@@ -61,19 +70,17 @@ __device__ __forceinline__ void backward_load_row_geometry(BackwardKernelArgs &a
 __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
   if (blockIdx.x != 0U)
     return;
-  for (std::uint32_t peer = threadIdx.x; peer < a.world;
-       peer += blockDim.x) {
-    auto *setup = peer_at<unsigned long long>(a.peer_bases[peer],
-                                               a.setup_epoch_offset);
+  for (std::uint32_t peer = threadIdx.x; peer < a.world; peer += blockDim.x) {
+    auto *setup =
+        peer_at<unsigned long long>(a.peer_bases[peer], a.setup_epoch_offset);
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(setup[a.rank]);
     published.store(execution_epoch(a), ::cuda::memory_order_release);
   }
   __syncthreads();
-  auto *local_setup = peer_at<unsigned long long>(a.local_base,
-                                                   a.setup_epoch_offset);
-  for (std::uint32_t peer = threadIdx.x; peer < a.world;
-       peer += blockDim.x) {
+  auto *local_setup =
+      peer_at<unsigned long long>(a.local_base, a.setup_epoch_offset);
+  for (std::uint32_t peer = threadIdx.x; peer < a.world; peer += blockDim.x) {
     ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
         published(local_setup[peer]);
     while (published.load(::cuda::memory_order_acquire) != execution_epoch(a))
@@ -89,10 +96,9 @@ __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
   const auto compact_destination_row = a.dispatch.route_dst_row[route];
   const auto token = route / a.dispatch.identity.top_k;
   auto *destination_dr = a.peer_payloads[destination].dr;
-  const auto *source = reinterpret_cast<const uint4 *>(
-      a.dy + token * a.hidden);
-  auto *target = reinterpret_cast<uint4 *>(
-      destination_dr + compact_destination_row * a.hidden);
+  const auto *source = reinterpret_cast<const uint4 *>(a.dy + token * a.hidden);
+  auto *target = reinterpret_cast<uint4 *>(destination_dr +
+                                           compact_destination_row * a.hidden);
   const auto vectors = a.hidden / 8ULL;
   for (std::uint64_t vector = threadIdx.x; vector < vectors;
        vector += blockDim.x)
@@ -100,28 +106,28 @@ __global__ void backward_dispatch_dy_local_kernel(BackwardKernelArgs a) {
   __syncthreads();
   if (threadIdx.x == 0U) {
     __threadfence_system();
-    auto *ready = peer_at<unsigned long long>(
-        a.peer_bases[destination], a.dispatch_ready_offset);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        marker(ready[compact_destination_row]);
+    auto *ready = peer_at<unsigned long long>(a.peer_bases[destination],
+                                              a.dispatch_ready_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> marker(
+        ready[compact_destination_row]);
     marker.store(execution_epoch(a), ::cuda::memory_order_release);
   }
 }
 
 __global__ void backward_wait_for_dispatch_rows_kernel(BackwardKernelArgs a,
-                                                        std::uint64_t rows) {
+                                                       std::uint64_t rows) {
   const auto compact_row = static_cast<std::uint64_t>(blockIdx.x);
   if (compact_row >= rows || threadIdx.x != 0U)
     return;
-  auto *ready = peer_at<unsigned long long>(
-      a.local_base, a.dispatch_ready_offset);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        marker(ready[compact_row]);
+  auto *ready =
+      peer_at<unsigned long long>(a.local_base, a.dispatch_ready_offset);
+  ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> marker(
+      ready[compact_row]);
   // Each fixed row has one producer.  This kernel is only the correctness
   // scaffold's launch boundary; the persistent implementation consumes the
   // same marker directly when it claims a ready tile.
-    while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
-      __nanosleep(backward_tuning::kReduceIdleNanosleep);
+  while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
+    __nanosleep(backward_tuning::kReduceIdleNanosleep);
 }
 
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
@@ -140,8 +146,8 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
       const auto index = padded_row * a.intermediate + column;
       *reinterpret_cast<std::uint32_t *>(u + index) = 0U;
       *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = 0U;
-      *reinterpret_cast<std::uint32_t *>(
-          dab + output_base + a.intermediate + column) = 0U;
+      *reinterpret_cast<std::uint32_t *>(dab + output_base + a.intermediate +
+                                         column) = 0U;
     }
     if (lane == 0U)
       dgate[padded_row] = 0.0F;
@@ -175,28 +181,25 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         sigmoid = 1.0F / denominator;
       } else {
         asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sigmoid) : "f"(denominator));
-        sigmoid = __fmaf_rn(
-            sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
+        sigmoid =
+            __fmaf_rn(sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
       }
       const auto silu = av * sigmoid;
       const auto s = silu * bv;
       const auto ds = gate * duv;
-      const auto silu_derivative =
-          sigmoid * (1.0F + av * (1.0F - sigmoid));
+      const auto silu_derivative = sigmoid * (1.0F + av * (1.0F - sigmoid));
       da_pair |= static_cast<std::uint32_t>(
                      float_to_bf16_bits(ds * bv * silu_derivative))
                  << shift;
-      db_pair |= static_cast<std::uint32_t>(
-                     float_to_bf16_bits(ds * silu))
+      db_pair |= static_cast<std::uint32_t>(float_to_bf16_bits(ds * silu))
                  << shift;
-      gated_u_pair |= static_cast<std::uint32_t>(
-                          float_to_bf16_bits(gate * s))
+      gated_u_pair |= static_cast<std::uint32_t>(float_to_bf16_bits(gate * s))
                       << shift;
       partial = fmaf(duv, s, partial);
     }
     *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = da_pair;
-    *reinterpret_cast<std::uint32_t *>(
-        dab + output_base + a.intermediate + column) = db_pair;
+    *reinterpret_cast<std::uint32_t *>(dab + output_base + a.intermediate +
+                                       column) = db_pair;
     *reinterpret_cast<std::uint32_t *>(u + output_index) = gated_u_pair;
   }
 #pragma unroll
@@ -225,39 +228,38 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_rows(
   if constexpr (RowsPerTask == kWarps) {
     if (warp >= rows)
       return;
-    backward_swiglu_epilogue_warp_row(
-        a, first_padded_row + warp, first_compact_row + warp,
-        warp < valid_rows, lane);
+    backward_swiglu_epilogue_warp_row(a, first_padded_row + warp,
+                                      first_compact_row + warp,
+                                      warp < valid_rows, lane);
   } else {
 #pragma unroll
     for (std::uint32_t local_row = warp; local_row < RowsPerTask;
          local_row += kWarps) {
       if (local_row < rows)
-        backward_swiglu_epilogue_warp_row(
-            a, first_padded_row + local_row, first_compact_row + local_row,
-            local_row < valid_rows, lane);
+        backward_swiglu_epilogue_warp_row(a, first_padded_row + local_row,
+                                          first_compact_row + local_row,
+                                          local_row < valid_rows, lane);
     }
   }
 }
 
 __global__ void backward_return_local_kernel(BackwardKernelArgs a,
-                                              std::uint64_t rows) {
+                                             std::uint64_t rows) {
   const auto compact_row = static_cast<std::uint64_t>(blockIdx.x);
   if (compact_row >= rows)
     return;
-  const auto *compact_to_padded = peer_at<const unsigned int>(
-      a.local_base, a.compact_to_padded_offset);
+  const auto *compact_to_padded =
+      peer_at<const unsigned int>(a.local_base, a.compact_to_padded_offset);
   const auto row = compact_to_padded[compact_row];
-  const auto *headers = peer_at<const LocalP2pRouteHeader>(
-      a.local_base, a.direct_headers_offset);
+  const auto *headers =
+      peer_at<const LocalP2pRouteHeader>(a.local_base, a.direct_headers_offset);
   const auto header = headers[compact_row];
   const auto *dx = a.dx_rows;
   const auto *dgate = a.dgate_rows;
   auto *source_contribution = a.peer_payloads[header.source_rank].contribution;
-  const auto *source = reinterpret_cast<const uint4 *>(
-      dx + row * a.hidden);
-  auto *target = reinterpret_cast<uint4 *>(
-      source_contribution + header.route_index * a.hidden);
+  const auto *source = reinterpret_cast<const uint4 *>(dx + row * a.hidden);
+  auto *target = reinterpret_cast<uint4 *>(source_contribution +
+                                           header.route_index * a.hidden);
   const auto vectors = a.hidden / 8ULL;
   for (std::uint64_t vector = threadIdx.x; vector < vectors;
        vector += blockDim.x)
@@ -269,10 +271,10 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
   __syncthreads();
   if (threadIdx.x == 0U) {
     __threadfence_system();
-    auto *ready = peer_at<unsigned long long>(
-        a.peer_bases[header.source_rank], a.return_ready_offset);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        marker(ready[header.route_index]);
+    auto *ready = peer_at<unsigned long long>(a.peer_bases[header.source_rank],
+                                              a.return_ready_offset);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> marker(
+        ready[header.route_index]);
     marker.store(execution_epoch(a), ::cuda::memory_order_release);
   }
 }
@@ -281,8 +283,8 @@ __global__ void backward_return_local_kernel(BackwardKernelArgs a,
 // One pointer per lane replaces the shared table. Canonical route order,
 // readiness acquire and output packing are identical.
 template <bool Wait = true>
-__device__ __forceinline__ bool backward_reduce_dx_token(
-    const BackwardKernelArgs &a, std::uint64_t token) {
+__device__ __forceinline__ bool
+backward_reduce_dx_token(const BackwardKernelArgs &a, std::uint64_t token) {
   constexpr std::uint32_t kTrainingTopK = 6U;
   // Keep one route pointer per lane. Warp broadcasts preserve canonical
   // top-k order without a separate shared-memory pointer table.
@@ -291,8 +293,8 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
     return false;
   const auto *contribution = a.peer_payloads[a.rank].contribution;
   auto *combined = a.dx;
-  auto *ready = peer_at<unsigned long long>(a.local_base,
-                                             a.return_ready_offset);
+  auto *ready =
+      peer_at<unsigned long long>(a.local_base, a.return_ready_offset);
   const auto route_base = token * a.dispatch.identity.top_k;
   bool available = true;
   unsigned long long source_address = 0ULL;
@@ -300,17 +302,20 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
     const auto position = lane;
     const auto slot = a.dispatch.combine_order[route_base + position];
     const auto route = route_base + slot;
-    const auto row = a.return_ring.depth
-        ? weftmoe_pf::backward_return::contribution_row(a, route) : route;
+    const auto row =
+        a.return_ring.depth
+            ? weftmoe_pf::backward_return::contribution_row(a, route)
+            : route;
     auto *source = contribution + row * a.hidden;
     source_address = reinterpret_cast<unsigned long long>(source);
-    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>
-        marker(ready[route_base + position]);
+    ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system> marker(
+        ready[route_base + position]);
     if constexpr (Wait) {
       while (marker.load(::cuda::memory_order_acquire) != execution_epoch(a))
         __nanosleep(backward_tuning::kReduceIdleNanosleep);
     } else {
-      available = marker.load(::cuda::memory_order_acquire) == execution_epoch(a);
+      available =
+          marker.load(::cuda::memory_order_acquire) == execution_epoch(a);
     }
   }
   if constexpr (!Wait)
@@ -319,45 +324,40 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
   __syncwarp();
 
   auto *output = reinterpret_cast<uint4 *>(combined + token * a.hidden);
-  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL;
-       vector += 32ULL) {
-    float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F,
-                     0.0F, 0.0F, 0.0F, 0.0F};
+  for (std::uint64_t vector = lane; vector < a.hidden / 8ULL; vector += 32ULL) {
+    float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     if (a.dispatch.identity.top_k == kTrainingTopK) {
 #pragma unroll
-      for (std::uint32_t position = 0U; position < kTrainingTopK;
-           ++position) {
+      for (std::uint32_t position = 0U; position < kTrainingTopK; ++position) {
         const auto packed = reinterpret_cast<const uint4 *>(
             __shfl_sync(0xffffffffU, source_address, position))[vector];
-        const unsigned int words[4] = {packed.x, packed.y, packed.z,
-                                       packed.w};
+        const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
         for (std::uint32_t word = 0U; word < 4U; ++word) {
           sums[word * 2U] = __fadd_rn(
               sums[word * 2U],
               bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
-          sums[word * 2U + 1U] = __fadd_rn(
-              sums[word * 2U + 1U],
-              bf16_bits_to_float(
-                  static_cast<std::uint16_t>(words[word] >> 16U)));
+          sums[word * 2U + 1U] =
+              __fadd_rn(sums[word * 2U + 1U],
+                        bf16_bits_to_float(
+                            static_cast<std::uint16_t>(words[word] >> 16U)));
         }
       }
     } else {
-      for (std::uint32_t position = 0U;
-           position < a.dispatch.identity.top_k; ++position) {
+      for (std::uint32_t position = 0U; position < a.dispatch.identity.top_k;
+           ++position) {
         const auto packed = reinterpret_cast<const uint4 *>(
             __shfl_sync(0xffffffffU, source_address, position))[vector];
-        const unsigned int words[4] = {packed.x, packed.y, packed.z,
-                                       packed.w};
+        const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
 #pragma unroll
         for (std::uint32_t word = 0U; word < 4U; ++word) {
           sums[word * 2U] = __fadd_rn(
               sums[word * 2U],
               bf16_bits_to_float(static_cast<std::uint16_t>(words[word])));
-          sums[word * 2U + 1U] = __fadd_rn(
-              sums[word * 2U + 1U],
-              bf16_bits_to_float(
-                  static_cast<std::uint16_t>(words[word] >> 16U)));
+          sums[word * 2U + 1U] =
+              __fadd_rn(sums[word * 2U + 1U],
+                        bf16_bits_to_float(
+                            static_cast<std::uint16_t>(words[word] >> 16U)));
         }
       }
     }
@@ -366,35 +366,37 @@ __device__ __forceinline__ bool backward_reduce_dx_token(
     for (std::uint32_t word = 0U; word < 4U; ++word)
       words[word] =
           static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U])) |
-          (static_cast<unsigned int>(
-               float_to_bf16_bits(sums[word * 2U + 1U]))
+          (static_cast<unsigned int>(float_to_bf16_bits(sums[word * 2U + 1U]))
            << 16U);
     output[vector] = make_uint4(words[0], words[1], words[2], words[3]);
   }
   if (a.return_ring.depth) {
     if (lane < a.dispatch.identity.top_k) {
       const auto route = route_base + lane;
-      a.dgate[route] = a.peer_payloads[a.rank].dgate[
-          weftmoe_pf::backward_return::contribution_row(a, route)];
+      a.dgate[route] =
+          a.peer_payloads[a.rank]
+              .dgate[weftmoe_pf::backward_return::contribution_row(a, route)];
     }
     __syncwarp();
     // Full source ranges retire at the invocation join, not once per token.
     if (lane == 0U && !a.return_ring.canonical) {
       const auto window = token / a.return_ring.shape.tokens;
-      weftmoe_pf::ring::arrive(a.peer_payloads[a.rank].consumed[
-          window % a.return_ring.contribution_depth], 1U);
+      weftmoe_pf::ring::arrive(
+          a.peer_payloads[a.rank]
+              .consumed[window % a.return_ring.contribution_depth],
+          1U);
     }
   }
   return true;
 }
 
 __global__ void backward_reduce_dx_kernel(BackwardKernelArgs a) {
-  constexpr std::uint32_t kWarpsPerCta =
-      backward_tuning::kReduceThreads / 32U;
+  constexpr std::uint32_t kWarpsPerCta = backward_tuning::kReduceThreads / 32U;
   const auto warp = threadIdx.x / 32U;
-  const auto token = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerCta + warp;
+  const auto token =
+      static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerCta + warp;
   backward_reduce_dx_token(a, token);
 }
 
-#include "cuda/persistent_v3/backward/pipeline_kernels.cuh"
-#include "cuda/persistent_v3/backward/unified_kernel.cuh"
+#include "cuda/backward/pipeline_kernels.cuh"
+#include "cuda/backward/unified_kernel.cuh"

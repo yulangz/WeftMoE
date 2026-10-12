@@ -108,8 +108,8 @@ __device__ __forceinline__ void store_fc2(const ForwardKernelArgs &a,
           __float22bfloat162_rn(
               make_float2(accum[i * 4U + 2U], accum[i * 4U + 3U])));
   }
-  static_v4_copy_fc2_tile<false, kN, true, M, kMathThreads>(
-      a, s.output, t.row, t.rows, t.column * kN, t.block, offset);
+  static_v4_copy_fc2_tile<kN, M, kMathThreads>(a, s.output, t.row, t.rows,
+                                               t.column * kN, t.block, offset);
 }
 
 template <unsigned M>

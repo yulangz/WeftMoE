@@ -65,7 +65,7 @@ def make_workload(args, nominal_tokens, rank, device, route_distribution="random
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "v3", "megatron"), required=True)
+    parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"), default="flex",
                         help="Megatron communication backend: NCCL all-to-all or DeepEP")
     parser.add_argument("--deepep-num-sms", type=int, default=20)
@@ -121,14 +121,8 @@ def main():
     if any(not math.isfinite(value) or value < 0
            for value in (args.token_std_fraction, args.route_bias_std)):
         parser.error("distribution standard deviations must be finite and nonnegative")
-    if args.backend == "v3":
-        os.environ["WEFTMOE_DISABLE_STATIC_FORWARD_V4"] = "1"
-        os.environ.pop("WEFTMOE_STATIC_RING_TOKENS", None)
-        os.environ.pop("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS", None)
-    else:
-        os.environ.pop("WEFTMOE_DISABLE_STATIC_FORWARD_V4", None)
-        os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
-        os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
+    os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
+    os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")

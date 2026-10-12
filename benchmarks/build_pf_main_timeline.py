@@ -18,9 +18,7 @@ flags = ["-lineinfo", "-Xptxas=-v,--warn-on-spills",
          "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1",
          "-I" + str(ROOT / ("configs/pf_inference_flash_20261008" if args.local else
                             "configs/pf_network_l132_20261009")),
-         "-DWEFTMOE_COMMUNICATION_PHASES=0", "-DWEFTMOE_PF_COMMUNICATION_COPY=0",
-         "-DWEFTMOE_PF_NETWORK_WORKERS=1", "-DWEFTMOE_PF_BORROW_ALL_CTA=1",
-         "-DWEFTMOE_PF_BORROW_CONTROL_REGISTERS=88", *("-D" + d for d in args.define)]
+         *("-D" + d for d in args.define)]
 env = dict(os.environ, NVCCFLAGS=" ".join(flags),
            WEFTMOE_DEVICE_TIMELINE=str(int(args.timeline)))
 library = output / "libweftmoe.so"

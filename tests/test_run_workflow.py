@@ -66,18 +66,17 @@ class RunWorkflowTest(unittest.TestCase):
                 self.assertEqual(
                     {candidate['config']['gin_ring_depth']
                      for candidate in tune['candidates']},
-                    {8} if nodes == 1 else {4, 8, 16})
+                    {8} if nodes == 1 or phase == 'forward' else {4, 8, 16})
                 if phase == 'forward':
-                    # The all-CTA profile fixes FC2 claiming while the
-                    # multi-node grid also explores the physical ring window.
-                    self.assertEqual(len(tune['candidates']), 8 if nodes == 1 else 144)
+                    # PF varies only the active WGMMA wait policy in this grid.
+                    self.assertEqual(len(tune['candidates']), 2)
                     self.assertEqual(
                         {candidate['config']['fc2_claim_tiles']
-                         for candidate in tune['candidates']}, {2})
+                         for candidate in tune['candidates']}, {1})
                     self.assertEqual((gemm['fc1_tile_n'], gemm['fc2_tile_n'],
                                       gemm['fc1_stages'], gemm['fc2_stages'],
                                       gemm['fc2_claim_tiles']),
-                                     (128, 256, 4, 3, 2))
+                                     (256, 256, 3, 3, 1))
                 else:
                     self.assertEqual(len(tune['candidates']), 12 if nodes == 1 else 36)
                     self.assertEqual((gemm['dab_tile_n'], gemm['dx_tile_n'],

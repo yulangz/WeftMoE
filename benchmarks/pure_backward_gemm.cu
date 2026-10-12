@@ -25,8 +25,8 @@ using BFloat16 = cutlass::bfloat16_t;
 }
 using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 
-#include "cuda/persistent_v3/backward/cluster_task.cuh"
-#include "cuda/persistent_v3/backward/compute_kernels.cuh"
+#include "cuda/backward/cluster_task.cuh"
+#include "cuda/backward/compute_kernels.cuh"
 
 template <int Op>
 __global__ __launch_bounds__(384, 1) void backward_gemm(

@@ -2,7 +2,7 @@
 
 namespace weftmoe_pf::network {
 
-namespace transport = forward_unified_transport::network_ring_transport;
+namespace transport = weftmoe_pf::network_ring_transport;
 using Endpoint = netring::Endpoint;
 
 // Request storage aliases an otherwise unused pull staging buffer in an RDMA
@@ -14,50 +14,6 @@ struct Pending {
 };
 static_assert(kNetworkPending * sizeof(Pending) <= 4096U);
 
-// One warp owns each channel's pack cursor. Reservation is published by the
-// NIC owner only after both remote reader credit and local NIC completion;
-// pack can run ahead of Put without reusing an in-flight TX slot.
-__device__ __noinline__ void pack(const ForwardKernelArgs &a, unsigned worker,
-                                  unsigned workers) {
-  const auto lane = threadIdx.x % 32U;
-  const auto &layout = a.static_network.rings;
-  const auto vectors = unsigned(a.hidden / 8U);
-  const auto *input = peer_at<const uint4>(a.gin_window_base,
-                                         a.static_network.input);
-  bool done;
-  do {
-    done = true;
-    for (unsigned channel = worker; channel < layout.channels(); channel += workers) {
-      auto &state = *peer_at<static_forward::NetworkChannel>(a.gin_window_base,
-          a.static_network.ring_region + layout.state(false, channel));
-      const auto plan = transport::channel_plan<false, false>(a, channel);
-      const auto sequence = __shfl_sync(0xffffffffU,
-          lane == 0U ? ring::acquire(state.tx_packed_head) : 0ULL, 0);
-      if (sequence == state.tx_base + plan.count)
-        continue;
-      done = false;
-      const auto reserved = __shfl_sync(0xffffffffU,
-          lane == 0U ? ring::acquire(state.tx_reserved_head) : 0ULL, 0);
-      if (sequence >= reserved)
-        continue;
-      const auto desc = a.ring.dispatch.packets[
-          plan.begin + sequence - state.tx_base];
-      const auto *tokens = a.ring.source.node_tokens + desc.token_begin;
-      auto *output = peer_at<uint4>(a.gin_window_base,
-          a.static_network.ring_region +
-          layout.dispatch_payload(false, channel, sequence));
-      for (unsigned row = 0U; row < desc.tokens; ++row)
-        for (unsigned v = lane; v < vectors; v += 32U)
-          output[row * vectors + v] = input[tokens[row].token * vectors + v];
-      __threadfence_system();
-      __syncwarp();
-      if (lane == 0U)
-        ring::publish(state.tx_packed_head, sequence + 1U);
-      __syncwarp();
-    }
-  } while (!done);
-}
-
 template <bool Get>
 __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
                                       Pending *pending, unsigned worker) {
@@ -65,7 +21,6 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
     return;
   constexpr unsigned Workers = Get ? kGetWorkers : kPutWorkers;
   Endpoint endpoint(a, (Get ? 0U : kGetWorkers) + worker);
-  const bool pushing = Get && a.static_network.dispatch_push;
   const auto row_bytes = a.hidden * sizeof(weftmoe::transport::BFloat16);
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned issued = 0U, completed = 0U;
@@ -77,14 +32,12 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
     for (unsigned channel = worker; channel < endpoint.layout().channels();
          channel += Workers) {
       auto &state = endpoint.state(!Get, channel);
-      const auto plan = Get ? (pushing
-                                ? transport::channel_plan<false, false>(a, channel)
-                                : transport::channel_plan<false, true>(a, channel))
+      const auto plan = Get ? transport::channel_plan<false, true>(a, channel)
                             : transport::channel_plan<true, false>(a, channel);
-      auto &cursor = Get && !pushing ? state.rx_cursor : state.tx_cursor;
-      const auto base = Get && !pushing ? state.rx_base : state.tx_base;
+      auto &cursor = Get ? state.rx_cursor : state.tx_cursor;
+      const auto base = Get ? state.rx_base : state.tx_base;
       const auto terminal = base + plan.count;
-      if (!Get || pushing) {
+      if (!Get) {
         // Reserve a whole bounded source window independently of GEMM. Both
         // remote retirement and local NIC completion protect each TX slot.
         const auto end = min(terminal, cursor + endpoint.layout().depth);
@@ -92,8 +45,8 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
             a.gin_window, endpoint.credit(!Get, channel));
         while (state.tx_reserve_cursor < end &&
                static_forward::SlotSequence{state.tx_reserve_cursor,
-                   endpoint.layout().depth}.reusable(credit,
-                                                     state.tx_completed_head)) {
+                                            endpoint.layout().depth}
+                   .reusable(credit, state.tx_completed_head)) {
           ++state.tx_reserve_cursor;
           ring::publish<::cuda::thread_scope_system>(state.tx_reserved_head,
                                                      state.tx_reserve_cursor);
@@ -101,9 +54,9 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
         }
       }
       if (cursor == terminal) {
-        if (!Get || pushing)
-          done &= endpoint.gin.readSignal(a.gin_window,
-                      endpoint.credit(!Get, channel)) >= terminal;
+        if (!Get)
+          done &= endpoint.gin.readSignal(
+                      a.gin_window, endpoint.credit(!Get, channel)) >= terminal;
         continue;
       }
       done = false;
@@ -113,45 +66,45 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
       const auto packet = plan.begin + sequence - base;
       unsigned rows;
       if constexpr (Get) {
-        if (pushing) {
-          if (ring::acquire(state.tx_packed_head) <= sequence)
-            continue;
-          rows = a.ring.dispatch.packets[packet].tokens;
-          endpoint.send(false, channel, sequence, rows * row_bytes);
-        } else {
-          auto &slot = endpoint.slot(false, channel, sequence);
-          if (ring::acquire<::cuda::thread_scope_system>(slot.consumed_total) <
-              slot.retire_target)
-            continue;
-          const auto desc = ring::source_metadata(
-              a, plan.source, a.ring.dispatch.packets)[packet];
-          rows = desc.tokens;
-          const auto *tokens = ring::source_metadata(
-              a, plan.source, a.ring.source.node_tokens) + desc.token_begin;
-          const auto destination = a.static_network.ring_region +
-              endpoint.layout().dispatch_payload(true, channel, sequence);
-          slot.retire_target += desc.fanouts;
-          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetStart,
-              GinDispatch, channel, sequence, rows);
-          for (unsigned row = 0U; row < rows; ++row)
-            endpoint.gin.get(ncclTeamWorld(endpoint.gin.comm), endpoint.peer(channel),
-                a.gin_window, a.static_network.input + tokens[row].token * row_bytes,
-                a.gin_window, destination + row * row_bytes, row_bytes);
-          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetIssued,
-              GinDispatch, channel, sequence, rows);
-        }
+
+        auto &slot = endpoint.slot(false, channel, sequence);
+        if (ring::acquire<::cuda::thread_scope_system>(slot.consumed_total) <
+            slot.retire_target)
+          continue;
+        const auto desc = ring::source_metadata(
+            a, plan.source, a.ring.dispatch.packets)[packet];
+        rows = desc.tokens;
+        const auto *tokens =
+            ring::source_metadata(a, plan.source, a.ring.source.node_tokens) +
+            desc.token_begin;
+        const auto destination =
+            a.static_network.ring_region +
+            endpoint.layout().dispatch_payload(true, channel, sequence);
+        slot.retire_target += desc.fanouts;
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetStart,
+                                   GinDispatch, channel, sequence, rows);
+        for (unsigned row = 0U; row < rows; ++row)
+          endpoint.gin.get(
+              ncclTeamWorld(endpoint.gin.comm), endpoint.peer(channel),
+              a.gin_window,
+              a.static_network.input + tokens[row].token * row_bytes,
+              a.gin_window, destination + row * row_bytes, row_bytes);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetIssued,
+                                   GinDispatch, channel, sequence, rows);
+
       } else {
         if (sequence >= state.tx_reserve_cursor)
           continue;
         const auto desc = ring::source_metadata(
             a, plan.source, a.ring.returning.packets)[packet];
         rows = desc.rows;
-        const auto *routes = ring::source_metadata(
-            a, plan.source, a.ring.source.route_order) + desc.route_begin;
+        const auto *routes =
+            ring::source_metadata(a, plan.source, a.ring.source.route_order) +
+            desc.route_begin;
         const auto *experts = ring::source_metadata(
             a, plan.source, a.ring.source.selected_experts);
-        const auto *locations = ring::source_metadata(a, plan.source,
-                                                       a.ring.locations);
+        const auto *locations =
+            ring::source_metadata(a, plan.source, a.ring.locations);
         bool ready = true;
         unsigned previous_index = ~0U;
         std::uint64_t previous_generation = 0U;
@@ -163,12 +116,11 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
                              location.row / local::kM;
           // Reuse only a successful acquire for consecutive rows in this
           // immutable packet; never retain observations across polls.
-          if (a.static_network.deduplicate_return_ready &&
-              index == previous_index && location.generation == previous_generation)
+          if (index == previous_index &&
+              location.generation == previous_generation)
             continue;
           if (ring::acquire<::cuda::thread_scope_system>(
-                  a.ring.return_ready[index]) !=
-              location.generation) {
+                  a.ring.return_ready[index]) != location.generation) {
             ready = false;
             break;
           }
@@ -177,11 +129,11 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
         }
         if (!ready)
           continue;
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
-            GinReturn, channel, sequence, rows);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart, GinReturn,
+                                   channel, sequence, rows);
         endpoint.send(true, channel, sequence, rows * row_bytes);
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnGinPutIssue,
-            GinReturn, channel, sequence, rows);
+                                   GinReturn, channel, sequence, rows);
         // FC2 no longer owns these rows. TX storage remains protected by the
         // independent NIC completion and remote notification-slot credit.
         static_forward::ComputeSlot *previous = nullptr;
@@ -192,7 +144,8 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
                                           locations[route]);
           if (slot != previous) {
             if (count)
-              ring::arrive<::cuda::thread_scope_system>(previous->returned, count);
+              ring::arrive<::cuda::thread_scope_system>(previous->returned,
+                                                        count);
             previous = slot;
             count = 0U;
           }
@@ -218,20 +171,20 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
       endpoint.gin.wait(request.request);
       if constexpr (Get) {
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchLocalCompletion,
-            GinDispatch, request.channel, request.sequence, 0U);
+                                   GinDispatch, request.channel,
+                                   request.sequence, 0U);
       } else {
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnLocalCompletion,
-            GinReturn, request.channel, request.sequence, 0U);
+                                   GinReturn, request.channel, request.sequence,
+                                   0U);
       }
       if constexpr (Get) {
-        if (pushing)
-          endpoint.state(false, request.channel).tx_completed_head =
-              request.sequence + 1U;
-        else {
-          auto &slot = endpoint.slot(false, request.channel, request.sequence);
-          ring::publish<::cuda::thread_scope_system>(slot.visible_generation,
-              request.sequence / endpoint.layout().depth + 1U);
-        }
+
+        auto &slot = endpoint.slot(false, request.channel, request.sequence);
+        ring::publish<::cuda::thread_scope_system>(
+            slot.visible_generation,
+            request.sequence / endpoint.layout().depth + 1U);
+
       } else {
         endpoint.state(true, request.channel).tx_completed_head =
             request.sequence + 1U;
@@ -240,47 +193,43 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
     }
   }
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  atomicAdd(Get ? &status->gin_dispatch_put_count : &status->gin_return_put_count,
+  atomicAdd(Get ? &status->gin_dispatch_put_count
+                : &status->gin_return_put_count,
             packets);
   atomicAdd(Get ? &status->deduplicated_cross_node_payload_bytes
-                : &status->gin_return_payload_bytes, bytes);
+                : &status->gin_return_payload_bytes,
+            bytes);
 }
 
 // Nonblocking block publication shares four workers with Return RX progress.
 // Never wait for a GEMM block while holding up the network's credit path.
 __device__ __forceinline__ bool publish_block(const ForwardKernelArgs &a,
-                                               std::uint64_t block) {
+                                              std::uint64_t block) {
   auto &slot = ring::slot(a, block);
   if (!ring::admitted(a, block) ||
       ring::acquire(slot.fc2_published) < slot.fc2_target)
     return false;
   const auto &desc = a.ring.blocks[block];
-  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady,
-      GinReturn, 0U, block, 0U);
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady, GinReturn,
+                             0U, block, 0U);
   unsigned rails = 0U, local_rows = 0U;
-  if (a.static_network.publication_plan) {
-    local_rows = desc.local_rows;
-    auto sources = unsigned(desc.remote_sources);
-    const auto first = a.ring.source.shape.source_begin(desc.window);
-    while (sources) {
-      const auto source = first + __ffs(sources) - 1U;
-      rails |= 1U << (source % a.local_world_size);
-      sources &= sources - 1U;
-    }
-  } else {
-    for (unsigned m = 0U; m < desc.tile.rows; ++m) {
-      const auto source = a.ring.rows[block * local::kM + m].source;
-      if (source / a.local_world_size == a.node)
-        ++local_rows;
-      else
-        rails |= 1U << (source % a.local_world_size);
-    }
+
+  local_rows = desc.local_rows;
+  auto sources = unsigned(desc.remote_sources);
+  const auto first = a.ring.source.shape.source_begin(desc.window);
+  while (sources) {
+    const auto source = first + __ffs(sources) - 1U;
+    rails |= 1U << (source % a.local_world_size);
+    sources &= sources - 1U;
   }
+
   while (rails) {
     const auto rail = __ffs(rails) - 1U;
     ring::publish<::cuda::thread_scope_system>(
-        ring::peer(a, a.node * a.local_world_size + rail, a.ring.return_ready)[
-            (a.rank % a.local_world_size) * a.ring.depth + desc.slot],
+        ring::peer(
+            a, a.node * a.local_world_size + rail,
+            a.ring.return_ready)[(a.rank % a.local_world_size) * a.ring.depth +
+                                 desc.slot],
         desc.generation);
     rails &= rails - 1U;
   }
@@ -302,34 +251,21 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
     done = block >= a.ring.state->blocks;
     for (unsigned channel = worker; channel < endpoint.layout().channels();
          channel += kProgressWorkers) {
-      if (a.static_network.dispatch_push) {
-        auto &dispatch = endpoint.state(false, channel);
-        const auto incoming = transport::channel_plan<false, true>(a, channel);
-        const auto terminal = dispatch.rx_base + incoming.count;
-        if (dispatch.rx_cursor < terminal) {
-          const auto sequence = dispatch.rx_cursor;
-          const auto desc = ring::source_metadata(a, incoming.source,
-              a.ring.dispatch.packets)[incoming.begin + sequence - dispatch.rx_base];
-          if (endpoint.import_ready(false, channel, sequence, desc.fanouts))
-            ++dispatch.rx_cursor;
-        }
-        endpoint.acknowledge(false, channel);
-        done &= dispatch.acknowledged_head == terminal;
-      }
+
       auto &state = endpoint.state(true, channel);
       const auto plan = transport::channel_plan<true, true>(a, channel);
       const auto terminal = state.rx_base + plan.count;
       if (state.rx_cursor < terminal) {
         const auto sequence = state.rx_cursor;
-        const auto &desc = a.ring.returning.packets[
-            plan.begin + sequence - state.rx_base];
+        const auto &desc =
+            a.ring.returning.packets[plan.begin + sequence - state.rx_base];
         if (endpoint.import_ready(true, channel, sequence, desc.rows)) {
           WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalObserved,
-              SourceRelay, channel, sequence, desc.rows);
+                                     SourceRelay, channel, sequence, desc.rows);
           // Payload goes directly to immutable invocation-sized contribution
           // storage. Only the notification slot is retired here.
           ring::arrive(endpoint.slot(true, channel, sequence).consumed_total,
-                        desc.rows);
+                       desc.rows);
           ++state.rx_cursor;
         }
       }
@@ -351,7 +287,8 @@ struct Copy {
     for (unsigned offset = 0; offset < bytes; offset += 4096U) {
       const auto size = min(4096U, bytes - offset);
       cute::SM90_BULK_COPY_G2S::copy(input + offset,
-          reinterpret_cast<std::uint64_t *>(&full), buffer, size);
+                                     reinterpret_cast<std::uint64_t *>(&full),
+                                     buffer, size);
       full.arrive_and_expect_tx(size);
       full.wait(phase);
       phase ^= 1U;
@@ -363,27 +300,21 @@ struct Copy {
 };
 
 __device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
-                                 unsigned warp, unsigned worker,
-                                 unsigned workers, unsigned char *extra = nullptr,
-                                 local::Barrier *extra_full = nullptr) {
-  constexpr bool Cooperative = WEFTMOE_PF_BORROW_ALL_CTA;
+                                  unsigned warp, unsigned worker,
+                                  unsigned workers) {
   const auto lane = threadIdx.x % 32U;
-  if (lane && !Cooperative)
-    return;
-  Copy copy{extra ? extra : s.pull[warp],
-            extra_full ? *extra_full : s.pull_full[warp]};
+  Copy copy{s.pull[warp], s.pull_full[warp]};
   const auto &r = a.ring;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto bytes = unsigned(a.hidden * 2U);
   auto *output = peer_at<char>(a.local_base, a.canonical_rows_offset);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   const auto publish_row = [&](std::uint64_t block, unsigned m, float gate,
-                                const char *input) {
+                               const char *input) {
     const auto row = ring::row(a, block) + m;
     if (!lane)
       copy(input, output + row * bytes, bytes);
-    if constexpr (Cooperative)
-      __syncwarp();
+    __syncwarp();
     if (!lane) {
       gates[row] = gate;
       const auto valid = r.blocks[block].tile.rows;
@@ -404,9 +335,9 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
       const auto identity = r.rows[row];
       if (identity.source / a.local_world_size != a.node)
         continue;
-      const auto *input = static_cast<const char *>(ncclGetLsaPointer(
-          a.gin_window, a.static_network.input,
-          identity.source % a.local_world_size));
+      const auto *input = static_cast<const char *>(
+          ncclGetLsaPointer(a.gin_window, a.static_network.input,
+                            identity.source % a.local_world_size));
       publish_row(block, m, identity.gate, input + identity.token * bytes);
     }
     const auto stride = r.source.shape.sources *
@@ -418,56 +349,47 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
       while (ring::acquire<::cuda::thread_scope_system>(
                  *packet.visible_generation) != packet.generation) {
       }
-      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayStart,
-          ProxyRelay, worker, window * stride + task, packet.rows);
-      if constexpr (Cooperative) {
-        // Route/metadata loads are warp-wide; only matching routes reach the
-        // lane-0 bulk copier. Packet ownership and exact RX credit stay static.
-        const auto top_k = unsigned(r.source.shape.top_k);
-        for (unsigned first = 0U; first < packet.token_count * top_k; first += 32U) {
-          const auto item = first + lane;
-          const auto token = item / top_k;
-          unsigned route = 0U;
-          bool hit = false;
-          if (token < packet.token_count) {
-            route = packet.tokens[token].token * top_k + item % top_k;
-            hit = unsigned(packet.experts[route]) / owned == a.rank;
-          }
-          unsigned long long block = 0U;
-          unsigned row = 0U;
-          float gate = 0.0f;
-          if (hit) {
-            block = packet.locations[route].block;
-            row = packet.locations[route].row % local::kM;
-            gate = packet.gates[route];
-          }
-          auto hits = __ballot_sync(0xffffffffU, hit);
-          while (hits) {
-            const auto owner = __ffs(hits) - 1U;
-            publish_row(__shfl_sync(0xffffffffU, block, owner),
-                        __shfl_sync(0xffffffffU, row, owner),
-                        __shfl_sync(0xffffffffU, gate, owner),
-                        static_cast<const char *>(packet.payload) +
-                            __shfl_sync(0xffffffffU, token, owner) * bytes);
-            hits &= hits - 1U;
-          }
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayStart, ProxyRelay,
+                                 worker, window * stride + task, packet.rows);
+
+      // Route/metadata loads are warp-wide; only matching routes reach the
+      // lane-0 bulk copier. Packet ownership and exact RX credit stay static.
+      const auto top_k = unsigned(r.source.shape.top_k);
+      for (unsigned first = 0U; first < packet.token_count * top_k;
+           first += 32U) {
+        const auto item = first + lane;
+        const auto token = item / top_k;
+        unsigned route = 0U;
+        bool hit = false;
+        if (token < packet.token_count) {
+          route = packet.tokens[token].token * top_k + item % top_k;
+          hit = unsigned(packet.experts[route]) / owned == a.rank;
         }
-      } else {
-        for (unsigned token = 0U; token < packet.token_count; ++token)
-          for (unsigned k = 0U; k < r.source.shape.top_k; ++k) {
-            const auto route = packet.tokens[token].token * r.source.shape.top_k + k;
-            if (unsigned(packet.experts[route]) / owned != a.rank)
-              continue;
-            const auto &location = packet.locations[route];
-            publish_row(location.block, location.row % local::kM,
-                        packet.gates[route],
-                        static_cast<const char *>(packet.payload) + token * bytes);
-          }
+        unsigned long long block = 0U;
+        unsigned row = 0U;
+        float gate = 0.0f;
+        if (hit) {
+          block = packet.locations[route].block;
+          row = packet.locations[route].row % local::kM;
+          gate = packet.gates[route];
+        }
+        auto hits = __ballot_sync(0xffffffffU, hit);
+        while (hits) {
+          const auto owner = __ffs(hits) - 1U;
+          publish_row(__shfl_sync(0xffffffffU, block, owner),
+                      __shfl_sync(0xffffffffU, row, owner),
+                      __shfl_sync(0xffffffffU, gate, owner),
+                      static_cast<const char *>(packet.payload) +
+                          __shfl_sync(0xffffffffU, token, owner) * bytes);
+          hits &= hits - 1U;
+        }
       }
+
       if (!lane)
-        ring::arrive<::cuda::thread_scope_system>(*packet.consumed_total, packet.rows);
-      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayEnd,
-          ProxyRelay, worker, window * stride + task, packet.rows);
+        ring::arrive<::cuda::thread_scope_system>(*packet.consumed_total,
+                                                  packet.rows);
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayEnd, ProxyRelay,
+                                 worker, window * stride + task, packet.rows);
     }
   }
 }

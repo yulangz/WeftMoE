@@ -8,14 +8,20 @@ inter-node NCCL GIN communication. Routed contributions are reduced in a fixed
 order. Compiled specializations are cached, and tuning results are saved for
 inspection.
 
-The static Forward implementations are named `weftmoe_dt` (single-node decode)
-and `weftmoe_pf` (general prefill/ring pipeline, including multi-node inference
-and retained-state Forward). Their CUDA modules live in `src/cuda/weftmoe_dt/`
-and `src/cuda/weftmoe_pf/`; shared GEMM/worker code lives in `src/cuda/forward/`.
-Runtime selection, tuning/environment names and the V3 fallback are unchanged.
-`weftmoe_pf` targets long sequences on both single- and multi-node systems;
-short multi-node requests retain their existing compatibility path.
+The retained implementations are `weftmoe_pf` (single-/multi-node prefill,
+inference and training) and `weftmoe_dt` (single-node decode). PF inference and
+training share the same main kernel after standalone notify; training additionally
+allocates and writes the activation tape. Current PF backward lives in
+`src/cuda/backward/`; reusable communication lives in `src/cuda/communication/`.
 
+V3, earlier PF kernels, WG3 experiments and their frozen build profiles have
+been removed from `main`. The complete pre-cleanup tree is preserved by tag
+`archive/pre-pf-dt-cleanup-20261012` at commit `565037e`. Historical reports and
+measurement files remain available; their old source paths refer to that tag.
+There is no V3 fallback. Use a PF or DT specialization matching the model shape;
+see [current profiles](configs/README.md).
+
+## Installation
 ## Installation
 
 Build and install from the repository:
@@ -68,8 +74,7 @@ Python-driven benchmark compilation and autotuning are supported; automatic
 tuning on a tensor operator's first call is not.
 
 Without autotuning, the entry point compiles one configuration and runs 30
-measured iterations. The single-node defaults use 24 relay CTAs for forward
-and 32 for backward. A supplied `config` file uses its first candidate values.
+measured iterations. PF uses static compute ownership and the borrowed-warp multi-node pipeline. A supplied `config` file uses its first candidate values.
 With `autotune=True`, it compiles the candidate set, measures each candidate,
 confirms the finalists, and benchmarks the selected configuration at the
 requested token count. An explicit autotune call performs a new measurement;

@@ -1,63 +1,123 @@
 {
-  "base_header": "configs/static_inference_ring_20260924/weftmoe_forward_tuning_generated.hpp",
+  "base_header": "configs/pf_inference_flash_20261008/weftmoe_forward_tuning_generated.hpp",
   "v4": {
-    "network_lanes": 32,
-    "packet_rows": 8,
-    "return_packet_rows": 16,
-    "network_prefill_min_tokens": 2048
+    "network_lanes": 132,
+    "packet_rows": 32,
+    "return_packet_rows": 128,
+    "network_prefill_min_tokens": 0,
+    "local_prefill_streaming": 1,
+    "local_prefill_fast_math": 1
   },
-  "stages": ["ring", "forward", "backward", "backward_return"],
+  "stages": [
+    "ring",
+    "forward",
+    "backward",
+    "backward_return"
+  ],
   "ring": {
     "local": [
-      {"window_tokens": 512, "contribution_windows": 8},
-      {"window_tokens": 1024, "contribution_windows": 4},
-      {"window_tokens": 2048, "contribution_windows": 2},
-      {"window_tokens": 4096, "contribution_windows": 1},
-      {"window_tokens": 2048, "contribution_windows": 4}
+      {
+        "window_tokens": 512,
+        "contribution_windows": 8
+      },
+      {
+        "window_tokens": 1024,
+        "contribution_windows": 4
+      },
+      {
+        "window_tokens": 2048,
+        "contribution_windows": 2
+      },
+      {
+        "window_tokens": 4096,
+        "contribution_windows": 1
+      },
+      {
+        "window_tokens": 2048,
+        "contribution_windows": 4
+      }
     ],
     "network": [
-      {"window_tokens": 768, "contribution_windows": 6},
-      {"window_tokens": 1536, "contribution_windows": 3},
-      {"window_tokens": 4608, "contribution_windows": 1},
-      {"window_tokens": 3072, "contribution_windows": 3}
+      {
+        "window_tokens": 4096,
+        "contribution_windows": 2
+      },
+      {
+        "window_tokens": 768,
+        "contribution_windows": 6
+      },
+      {
+        "window_tokens": 1536,
+        "contribution_windows": 3
+      },
+      {
+        "window_tokens": 4608,
+        "contribution_windows": 1
+      },
+      {
+        "window_tokens": 3072,
+        "contribution_windows": 3
+      }
     ]
   },
   "forward": {
-    "fixed": {
-      "forward": {"static_v4_prefill_min_tokens": 0, "fc2_tile_n": 256},
-      "v4": {"network_prefill_min_tokens": 0}
-    },
     "variants": [
-      {"forward.fc1_tile_n": 256, "forward.tile_k": 128,
-       "forward.fc1_stages": 2, "forward.fc2_stages": 2,
-       "forward.static_v4_fc1_stages": 2, "forward.static_v4_fc2_stages": 2},
-      {"forward.fc1_tile_n": 128, "forward.tile_k": 64,
-       "forward.fc1_stages": 3, "forward.fc2_stages": 2,
-       "forward.static_v4_fc1_stages": 3, "forward.static_v4_fc2_stages": 3}
+      {
+        "forward.fc1_tile_n": 128,
+        "forward.fc2_tile_n": 128
+      },
+      {
+        "forward.static_v4_fc1_stages": 2,
+        "forward.static_v4_fc2_stages": 2
+      }
     ]
   },
   "backward": {
     "variants": [
-      {"backward.dw_tile_m": 256, "backward.dw_tile_n": 128},
-      {"backward.dab_stages": 3, "backward.dx_stages": 3},
-      {"backward.dw1_stages": 2, "backward.dw2_stages": 2}
+      {
+        "backward.dw_tile_m": 256,
+        "backward.dw_tile_n": 128
+      },
+      {
+        "backward.dab_stages": 3,
+        "backward.dx_stages": 3
+      },
+      {
+        "backward.dw1_stages": 2,
+        "backward.dw2_stages": 2
+      }
     ]
   },
   "backward_return": {
     "axes": {
-      "backward.dx_claim_tiles": [2, 4, 8],
-      "backward.return_window_scale": [1, 2]
+      "backward.dx_claim_tiles": [
+        2,
+        4,
+        8
+      ],
+      "backward.return_window_scale": [
+        1,
+        2
+      ]
     }
   },
   "seed": 123,
   "token_std_fraction": 0.1,
   "route_bias_std": 0.5,
-  "screen": {"warmups": 8, "samples": 24},
-  "final": {"warmups": 20, "samples": 60},
+  "screen": {
+    "warmups": 8,
+    "samples": 24
+  },
+  "final": {
+    "warmups": 20,
+    "samples": 60
+  },
   "confirmation_candidates": 2,
   "confirmation_repeats": 2,
   "minimum_improvement_percent": 0.5,
-  "verify_tokens": [256],
+  "verify_tokens": [
+    256
+  ],
   "verify_samples": 2,
   "workspace_limit_bytes": 12884901888,
   "timeout_seconds": 600

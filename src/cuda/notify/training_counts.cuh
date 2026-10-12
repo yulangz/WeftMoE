@@ -94,7 +94,7 @@ __global__ void __launch_bounds__(256)
       }
       rows += count;
       tiles += (count + a.m_tile - 1U) / a.m_tile;
-      padded += persistent_v3::padded_expert_rows(count);
+      padded += pipeline::padded_expert_rows(count);
     }
     atomicMax(&a.status->max_destination_rows, rows);
     if (a.has_workspace_capacity && rows > a.workspace_capacity[destination])

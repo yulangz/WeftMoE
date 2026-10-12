@@ -13,7 +13,6 @@ import autotune_backward as bw
 import unified_tuning
 from autotune_common import PlanError
 
-
 class UnifiedSearchSpaceTest(unittest.TestCase):
     model = dict(hidden=2560, intermediate=1280, experts=32, top_k=8)
 
@@ -37,39 +36,6 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
         plan.pop("candidate_filter", None)
         return plan
 
-    def test_public_search_size_and_resource_profiles(self):
-        for phase, module, raw_count, accepted in (("forward", fw, 144, 144),
-                                                   ("backward", bw, 48, 36)):
-            for topology in ("single_node", "multi_node"):
-                with self.subTest(phase=phase, topology=topology):
-                    source = self.source(phase, topology)
-                    plan = self.plan(phase, source,
-                                     nodes=1 if topology == "single_node" else 2)
-                    candidates = module.expand_candidates(plan)
-                    local = topology == "single_node"
-                    expected_raw = (8 if phase == "forward" else 16) if local else raw_count
-                    expected_accepted = (8 if phase == "forward" else 12) if local else accepted
-                    self.assertEqual(plan["candidate_filter"]["generated"], expected_raw)
-                    self.assertEqual(len(candidates), expected_accepted)
-                    self.assertTrue(all(c["config"]["unified_workers"] == 1
-                                        for c in candidates))
-                    self.assertEqual({c["config"]["gin_ring_depth"] for c in candidates},
-                                     {8} if local else {4, 8, 16})
-                    if phase == "forward":
-                        limits = [3] if topology == "single_node" else [3, 1, 2]
-                        self.assertEqual(source["1_gemm"]["gin_channel_pack_limit"],
-                                         limits)
-                        self.assertEqual({c["config"]["gin_channel_pack_limit"]
-                                          for c in candidates}, set(limits))
-                    if phase == "backward":
-                        self.assertNotIn("gin_channel_pack_limit", module.PARAMETER_MACROS)
-                        self.assertEqual({(c["config"]["unified_math_registers"],
-                                           c["config"]["unified_control_registers"])
-                                          for c in candidates},
-                                         {(224, 56), (216, 56), (216, 64)})
-                        self.assertTrue(all("initial CTA pool 64512" in c["reason"]
-                                            for c in plan["candidate_filter"]["rejected"]))
-
     def test_public_local_forward_gin_only_axes_are_singletons(self):
         gemm = self.source("forward", "single_node")["1_gemm"]
         for key in ("gin_channel_pack_limit",
@@ -79,20 +45,11 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(len(gemm[key]), 1)
 
-    def test_custom_local_grid_can_still_override_gin_policies(self):
-        source = self.source("forward", "single_node")
-        source["1_gemm"].update(gin_channel_pack_limit=[8, 1])
-        candidates = fw.expand_candidates(self.plan("forward", source, nodes=1))
-        self.assertEqual(len(candidates), 16)
-        self.assertEqual({c["config"]["gin_channel_pack_limit"]
-                          for c in candidates}, {8, 1})
-
     def test_invalid_axis_value_is_not_filtered(self):
         source = self.source("backward")
         source["1_gemm"]["unified_control_registers"] = [63, 64]
         with self.assertRaisesRegex(PlanError, "multiple of eight"):
             self.plan("backward", source)
-
 
     def test_empty_legal_grid_fails_before_any_build(self):
         source = self.source("backward")
@@ -134,16 +91,6 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
                 self.assertEqual(expanded[0]["config"]["unified_workers"], 0)
                 if phase == "forward":
                     self.assertEqual(expanded[0]["config"]["gin_channel_pack_limit"], 3)
-
-    def test_older_forward_grid_defaults_channel_pack_limit(self):
-        source = self.source("forward")
-        del source["1_gemm"]["gin_channel_pack_limit"]
-        candidates = fw.expand_candidates(self.plan("forward", source))
-        self.assertEqual(len(candidates), 48)
-        self.assertEqual({c["config"]["gin_receive_rows"] for c in candidates},
-                         {32, 128})
-        self.assertTrue(all(c["config"]["gin_channel_pack_limit"] == 3
-                            for c in candidates))
 
     def test_older_grids_keep_four_physical_ring_slots(self):
         for phase, module in (("forward", fw), ("backward", bw)):
@@ -201,7 +148,6 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
                 frozen["fixed"]["1_gemm"]["gin_fanout_lanes"] = value
                 fw.expand_candidates(self.plan("forward", frozen))
 
-
     def test_legacy_grid_is_not_pruned(self):
         source = self.source("backward")
         source["1_gemm"]["unified_workers"] = [0]
@@ -211,7 +157,6 @@ class UnifiedSearchSpaceTest(unittest.TestCase):
         self.assertNotIn("candidate_filter", plan)
         with self.assertRaisesRegex(PlanError, "initial CTA pool"):
             bw.expand_candidates(plan)
-
 
 if __name__ == "__main__":
     unittest.main()

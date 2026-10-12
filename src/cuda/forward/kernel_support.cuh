@@ -17,8 +17,8 @@ void CUDART_CB publish_stream_completion(void *opaque) {
                 ", actual=" + actual);
 }
 
-void throw_cublas(const char *phase, cublasStatus_t status,
-                  std::uint32_t rank, const char *operation) {
+void throw_cublas(const char *phase, cublasStatus_t status, std::uint32_t rank,
+                  const char *operation) {
   if (status == CUBLAS_STATUS_SUCCESS)
     return;
   transport_error(NotifyErrorCode::CudaFailure, phase, operation, rank,
@@ -26,20 +26,17 @@ void throw_cublas(const char *phase, cublasStatus_t status,
                   std::to_string(static_cast<unsigned int>(status)));
 }
 
-std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b,
-                          const char *field) {
+std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, const char *field) {
   if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a)
     transport_error(NotifyErrorCode::ArithmeticOverflow, "transport-pool-query",
                     field, 0, "uint64 product", "overflow");
   return a * b;
 }
 
-std::uint64_t checked_add(std::uint64_t a, std::uint64_t b,
-                          const char *field) {
+std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, const char *field) {
   if (b > std::numeric_limits<std::uint64_t>::max() - a)
-    transport_error(NotifyErrorCode::ArithmeticOverflow,
-                    "transport-pool-query", field, 0, "uint64 sum",
-                    "overflow");
+    transport_error(NotifyErrorCode::ArithmeticOverflow, "transport-pool-query",
+                    field, 0, "uint64 sum", "overflow");
   return a + b;
 }
 
@@ -61,16 +58,15 @@ void validate_external_cuda_range(const void *pointer,
                     "external-cuda-producer", field, 0,
                     "capacity >= " + std::to_string(required_elements),
                     std::to_string(capacity_elements));
-  const auto required_bytes = checked_size(
-      checked_mul(required_elements, element_bytes, field), field);
-  const auto capacity_bytes = checked_size(
-      checked_mul(capacity_elements, element_bytes, field), field);
+  const auto required_bytes =
+      checked_size(checked_mul(required_elements, element_bytes, field), field);
+  const auto capacity_bytes =
+      checked_size(checked_mul(capacity_elements, element_bytes, field), field);
   if (required_bytes == 0)
     return;
   if (!pointer)
-    transport_error(NotifyErrorCode::InvalidHandle,
-                    "external-cuda-producer", field, 0,
-                    "non-null device allocation", "null");
+    transport_error(NotifyErrorCode::InvalidHandle, "external-cuda-producer",
+                    field, 0, "non-null device allocation", "null");
   cudaPointerAttributes attributes{};
   internal::throw_cuda("external-cuda-producer",
                        cudaPointerGetAttributes(&attributes, pointer), 0, 1,
@@ -78,32 +74,29 @@ void validate_external_cuda_range(const void *pointer,
                        "cudaPointerGetAttributes");
   if (attributes.type != cudaMemoryTypeDevice ||
       attributes.device != static_cast<int>(expected_device))
-    transport_error(NotifyErrorCode::WorkspaceMismatch,
-                    "external-cuda-producer", field, 0,
-                    "device allocation on ordinal=" +
-                        std::to_string(expected_device),
-                    "wrong memory/device");
+    transport_error(
+        NotifyErrorCode::WorkspaceMismatch, "external-cuda-producer", field, 0,
+        "device allocation on ordinal=" + std::to_string(expected_device),
+        "wrong memory/device");
   CUdeviceptr base = 0;
   std::size_t allocation_bytes = 0;
   if (cuMemGetAddressRange(&base, &allocation_bytes,
                            reinterpret_cast<CUdeviceptr>(pointer)) !=
       CUDA_SUCCESS)
-    transport_error(NotifyErrorCode::CudaFailure,
-                    "external-cuda-producer", field, 0,
-                    "queryable CUDA allocation",
+    transport_error(NotifyErrorCode::CudaFailure, "external-cuda-producer",
+                    field, 0, "queryable CUDA allocation",
                     "cuMemGetAddressRange failure");
   const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
   const auto allocation_begin = static_cast<std::uintptr_t>(base);
-  if (begin < allocation_begin ||
-      begin - allocation_begin > allocation_bytes ||
+  if (begin < allocation_begin || begin - allocation_begin > allocation_bytes ||
       capacity_bytes > allocation_bytes - (begin - allocation_begin))
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "external-cuda-producer", field, 0,
                     "declared capacity within allocation", "short range");
 }
 
-std::size_t append(std::size_t &cursor, std::uint64_t count,
-                   std::size_t width, const char *field) {
+std::size_t append(std::size_t &cursor, std::uint64_t count, std::size_t width,
+                   const char *field) {
   if (cursor > std::numeric_limits<std::size_t>::max() - (kAlign - 1U))
     transport_error(NotifyErrorCode::ArithmeticOverflow, "transport-pool-query",
                     field, 0, "alignable offset", "overflow");
@@ -117,15 +110,14 @@ std::size_t append(std::size_t &cursor, std::uint64_t count,
 }
 
 CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
-                              std::uint64_t outer,
-                              std::uint32_t box_outer,
+                              std::uint64_t outer, std::uint32_t box_outer,
                               const char *field,
                               std::uint32_t box_inner = 64U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
       outer > UINT32_MAX || box_outer == 0 || box_inner == 0)
-    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                    "forward-tma-map", field, 0,
-                    "nonzero uint32 dimensions and valid base", "invalid");
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
+                    field, 0, "nonzero uint32 dimensions and valid base",
+                    "invalid");
   CUtensorMap map{};
   const cuuint64_t dims[2] = {inner, outer};
   const cuuint64_t strides[1] = {
@@ -140,8 +132,8 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   if (result != CUDA_SUCCESS) {
     const char *text = nullptr;
     (void)cuGetErrorString(result, &text);
-    transport_error(NotifyErrorCode::CudaFailure, "forward-tma-map", field,
-                    0, "cuTensorMapEncodeTiled success",
+    transport_error(NotifyErrorCode::CudaFailure, "forward-tma-map", field, 0,
+                    "cuTensorMapEncodeTiled success",
                     text ? text : "unknown CUDA driver error");
   }
   return map;
@@ -191,9 +183,9 @@ CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
                                  std::uint32_t box_rows = 64U) {
   if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
       outer > UINT32_MAX)
-    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                    "backward-tma-map", field, 0,
-                    "nonzero uint32 dimensions and valid base", "invalid");
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "backward-tma-map",
+                    field, 0, "nonzero uint32 dimensions and valid base",
+                    "invalid");
   CUtensorMap map{};
   const cuuint64_t dims[2] = {inner, outer};
   const cuuint64_t strides[1] = {
@@ -210,8 +202,8 @@ CUtensorMap make_bf16_tma_map_mn(void *base, std::uint64_t inner,
   if (result != CUDA_SUCCESS) {
     const char *text = nullptr;
     (void)cuGetErrorString(result, &text);
-    transport_error(NotifyErrorCode::CudaFailure, "backward-tma-map", field,
-                    0, "cuTensorMapEncodeTiled success",
+    transport_error(NotifyErrorCode::CudaFailure, "backward-tma-map", field, 0,
+                    "cuTensorMapEncodeTiled success",
                     text ? text : "unknown CUDA driver error");
   }
   return map;
@@ -376,20 +368,19 @@ enum ForwardProgressWord : std::uint32_t {
 #if WEFTMOE_DEBUG_VALIDATE || WEFTMOE_FORWARD_LIGHT_PROGRESS
 void dump_generation_completion(std::ostream &output,
                                 const std::uint64_t *mapped,
-                                std::uint32_t contexts,
-                                const char *prefix) {
+                                std::uint32_t contexts, const char *prefix) {
   const auto word = [&](std::size_t index) {
     return __atomic_load_n(mapped + index, __ATOMIC_ACQUIRE);
   };
   output << ' ' << prefix << ".generation=" << word(0) << ' ' << prefix
          << ".epoch=" << word(1);
   static constexpr const char *kTaskNames[] = {
-      "dispatch", "relay", "fc1", "fc2", "return",
-      "arrival", "reduce", "reserved0", "reserved1"};
+      "dispatch", "relay",  "fc1",       "fc2",      "return",
+      "arrival",  "reduce", "reserved0", "reserved1"};
   for (std::size_t task = 0; task < transport_state::kTaskClassCount; ++task) {
     const auto base = 2ULL + task * 4ULL;
-    output << ' ' << prefix << '.' << kTaskNames[task] << "={expected="
-           << word(base) << ",claimed=" << word(base + 1ULL)
+    output << ' ' << prefix << '.' << kTaskNames[task]
+           << "={expected=" << word(base) << ",claimed=" << word(base + 1ULL)
            << ",completed=" << word(base + 2ULL)
            << ",inflight=" << word(base + 3ULL) << '}';
   }
@@ -403,8 +394,8 @@ void dump_generation_completion(std::ostream &output,
          << ".directory={expected=" << word(kTail + 6ULL)
          << ",ready=" << word(kTail + 7ULL) << "} " << prefix
          << ".bulk_return_barrier={progress=" << word(kTail + 8ULL)
-         << ",compute=" << word(kTail + 9ULL)
-         << ",grid=" << word(kTail + 10ULL) << "} " << prefix
+         << ",compute=" << word(kTail + 9ULL) << ",grid=" << word(kTail + 10ULL)
+         << "} " << prefix
          << ".bulk_return_stage={local_ready=" << word(kTail + 11ULL)
          << ",pack_complete=" << word(kTail + 12ULL)
          << ",contexts_issuing=" << word(kTail + 13ULL) << "} " << prefix
@@ -548,7 +539,6 @@ struct Layout {
   std::size_t backward_padded_expert_offsets = 0;
   std::size_t forward_task_claim = 0;
   std::size_t forward_fc1_done = 0;
-  std::size_t forward_input_groups = 0;
   std::size_t forward_x_arrived_rows = 0;
   // Single-node inference route exchange.  Unlike the generic Notify arena,
   // this metadata is peer mapped with the Forward pool and is rebuilt by the
@@ -576,7 +566,6 @@ struct Layout {
   std::size_t local_notifications = 0;
   unsigned local_notification_ctas = 0;
   std::size_t forward_scheduler = 0;
-  std::size_t forward_v3_control = 0;
   std::size_t gin_sender_done = 0;
   std::size_t forward_completion = 0;
   std::size_t forward_context_completion = 0;
@@ -639,20 +628,18 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 
 bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
   return forward_tuning::kLocalPrefillStreaming &&
-         (forward_tuning::kFc1TileN == 128U || forward_tuning::kFc1TileN == 256U) &&
+         (forward_tuning::kFc1TileN == 128U ||
+          forward_tuning::kFc1TileN == 256U) &&
          forward_tuning::kFc2TileN == forward_tuning::kFc1TileN &&
          forward_tuning::kStaticV4TileK == 64U &&
          !forward_tuning::kStaticV4PrefillEnabled &&
          config.max_hidden_size == forward_tuning::kMainHidden &&
          config.max_intermediate_size == forward_tuning::kMainIntermediate &&
-         config.max_nodes == 1U &&
-         config.static_forward_window_tokens && config.max_tokens_per_rank > 64U;
+         config.max_nodes == 1U && config.static_forward_window_tokens;
 }
 
 bool network_prefill_streaming(const ActivationTransportPoolConfig &config) {
-  return weftmoe_pf::kNetworkWorkerMode && config.max_nodes > 1U &&
-         (!config.enable_backward_state || weftmoe_pf::kNetworkWorkerMode == 1U) &&
-         config.static_forward_window_tokens &&
+  return config.max_nodes > 1U && config.static_forward_window_tokens &&
          forward_tuning::kFc1TileN == forward_tuning::kFc2TileN &&
          forward_tuning::kStaticV4TileK == 64U &&
          !forward_tuning::kStaticV4PrefillEnabled &&
@@ -664,9 +651,10 @@ unsigned contribution_windows(const ActivationTransportPoolConfig &config) {
   // The pull data plane reduces after Return drains. Keep all contributions,
   // but continue to bound Dispatch RX, X/S and Return TX independently.
   return network_prefill_streaming(config)
-      ? static_cast<unsigned>(static_forward::ceil_div(
-            config.max_tokens_per_rank, config.static_forward_window_tokens))
-      : config.static_forward_contribution_windows;
+             ? static_cast<unsigned>(static_forward::ceil_div(
+                   config.max_tokens_per_rank,
+                   config.static_forward_window_tokens))
+             : config.static_forward_contribution_windows;
 }
 
 static_forward::WindowShape
@@ -676,36 +664,37 @@ static_ring_shape(const ActivationTransportPoolConfig &config) {
   auto sources = std::min(local_world, 16U);
   while (local_world % sources)
     --sources;
-  // Merge adjacent source groups only for the experimental WG3 inference
-  // entry. The planner's source mask is 16 bits; node/rail addressing remains
-  // unchanged and a final partial group is handled by WindowShape.
-  if (weftmoe_pf::kNetworkWorkerMode == 2U && network_prefill_streaming(config) &&
-      std::getenv("WEFTMOE_PF_WG3_MERGE_SOURCES"))
-    sources = std::min(16U, config.max_world_size);
   if constexpr (WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP != 0U) {
     sources = WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP;
     if (local_world % sources)
-      throw std::invalid_argument("static source group must divide the local EP team");
+      throw std::invalid_argument(
+          "static source group must divide the local EP team");
   }
   return {config.max_world_size, sources,
-          static_cast<unsigned>(std::min<std::uint64_t>(config.static_forward_window_tokens,
-                                                       config.max_tokens_per_rank)),
+          static_cast<unsigned>(std::min<std::uint64_t>(
+              config.static_forward_window_tokens, config.max_tokens_per_rank)),
           config.max_top_k};
 }
 
-static_forward::SourceMetadataLayout make_source_metadata_layout(
-    const ActivationTransportPoolConfig &config, static_forward::WindowShape shape,
-    static_forward::PacketPartition packets) {
+static_forward::SourceMetadataLayout
+make_source_metadata_layout(const ActivationTransportPoolConfig &config,
+                            static_forward::WindowShape shape,
+                            static_forward::PacketPartition packets) {
   static_forward::SourceMetadataLayout m;
   std::size_t cursor = 0;
-  const auto windows = static_forward::ceil_div(config.max_tokens_per_rank, shape.tokens);
-  const auto experts = std::uint64_t(config.max_world_size) * config.max_owned_experts;
+  const auto windows =
+      static_forward::ceil_div(config.max_tokens_per_rank, shape.tokens);
+  const auto experts =
+      std::uint64_t(config.max_world_size) * config.max_owned_experts;
   const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
                                   "source metadata routes");
-  const auto entries = checked_mul(windows, std::uint64_t(shape.tokens) * config.max_top_k,
-                                   "source window entries");
-  const auto prefixes = std::uint64_t(config.max_nodes) * packets.lanes * (windows + 1U);
-  m.header = append(cursor, 1U, sizeof(static_forward::SourceHeader), "source header");
+  const auto entries =
+      checked_mul(windows, std::uint64_t(shape.tokens) * config.max_top_k,
+                  "source window entries");
+  const auto prefixes =
+      std::uint64_t(config.max_nodes) * packets.lanes * (windows + 1U);
+  m.header =
+      append(cursor, 1U, sizeof(static_forward::SourceHeader), "source header");
   m.gates = append(cursor, routes, sizeof(float), "source gates");
   if (config.enable_backward_state)
     m.tape_rows = append(cursor, routes, sizeof(std::uint64_t),
@@ -714,10 +703,12 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
                            sizeof(std::uint64_t), "source window experts");
   m.node_prefix = append(cursor, windows * (config.max_nodes + 1U),
                          sizeof(std::uint64_t), "source window nodes");
-  m.route_order = append(cursor, entries, sizeof(std::uint64_t), "window routes");
+  m.route_order =
+      append(cursor, entries, sizeof(std::uint64_t), "window routes");
   m.node_tokens = append(cursor, entries, sizeof(static_forward::NodeToken),
                          "node-deduplicated tokens");
-  m.packet_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Dispatch prefixes");
+  m.packet_prefix =
+      append(cursor, prefixes, sizeof(std::uint64_t), "Dispatch prefixes");
   if (config.max_nodes > 1U) {
     const auto channels = config.max_nodes * packets.lanes;
     const auto local_world = config.max_world_size / config.max_nodes;
@@ -727,27 +718,33 @@ static_forward::SourceMetadataLayout make_source_metadata_layout(
         routes, checked_mul(peer_windows, packets.packets(shape.tokens),
                             "Dispatch packet capacity"));
     const auto return_capacity = std::min(
-        routes, checked_mul(peer_windows,
-                            std::max<std::uint64_t>(
-                                static_forward::kNetworkReturnPackets.lanes,
-                                static_forward::kNetworkReturnPackets.packets(
-                                    std::uint64_t(shape.tokens) * config.max_top_k)),
-                            "Return packet capacity"));
-    m.selected = append(cursor, routes, sizeof(std::int32_t), "source selected experts");
+        routes,
+        checked_mul(peer_windows,
+                    std::max<std::uint64_t>(
+                        static_forward::kNetworkReturnPackets.lanes,
+                        static_forward::kNetworkReturnPackets.packets(
+                            std::uint64_t(shape.tokens) * config.max_top_k)),
+                    "Return packet capacity"));
+    m.selected =
+        append(cursor, routes, sizeof(std::int32_t), "source selected experts");
     m.dispatch_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
-                                 "Dispatch channel offsets");
-    m.dispatch_packets = append(cursor, dispatch_capacity, sizeof(static_forward::DispatchPacketPlan),
-                                 "Dispatch packet directory");
-    m.dispatch_consumers = append(cursor, checked_mul(dispatch_capacity, local_world, "packet consumers"),
-                                   sizeof(std::uint32_t), "Dispatch consumers");
-    m.return_prefix = append(cursor, prefixes, sizeof(std::uint64_t), "Return prefixes");
+                                "Dispatch channel offsets");
+    m.dispatch_packets = append(cursor, dispatch_capacity,
+                                sizeof(static_forward::DispatchPacketPlan),
+                                "Dispatch packet directory");
+    m.dispatch_consumers = append(
+        cursor, checked_mul(dispatch_capacity, local_world, "packet consumers"),
+        sizeof(std::uint32_t), "Dispatch consumers");
+    m.return_prefix =
+        append(cursor, prefixes, sizeof(std::uint64_t), "Return prefixes");
     m.return_offsets = append(cursor, channels + 1U, sizeof(std::uint64_t),
-                               "Return channel offsets");
-    m.return_packets = append(cursor, return_capacity, sizeof(static_forward::ReturnPacketPlan),
-                               "Return packet directory");
+                              "Return channel offsets");
+    m.return_packets = append(cursor, return_capacity,
+                              sizeof(static_forward::ReturnPacketPlan),
+                              "Return packet directory");
     m.published_bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
     m.locations = append(cursor, routes, sizeof(static_forward::RouteLocation),
-                          "destination route locations");
+                         "destination route locations");
   }
   m.bytes = (cursor + kAlign - 1U) & ~(kAlign - 1U);
   return m;
@@ -767,14 +764,19 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     const auto metadata = make_source_metadata_layout(config, shape, packets);
     network.source_stride = metadata.bytes;
     network.source_bytes = metadata.published_bytes;
-    network.source = append(cursor, config.max_nodes, metadata.bytes, "ring source replicas");
-    const auto packet = static_forward::packet_bytes(packets.rows, config.max_hidden_size);
+    network.source = append(cursor, config.max_nodes, metadata.bytes,
+                            "ring source replicas");
+    const auto packet =
+        static_forward::packet_bytes(packets.rows, config.max_hidden_size);
     const auto returning = static_forward::packet_bytes(
         static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
     // Each channel reserves a whole worst-case Return window before FC2 can
     // write TX. This capacity depends on B/K/Q/L, not the total token count.
-    const auto window_packets = static_forward::kNetworkReturnPackets.lane_packets(
-        std::uint64_t(config.static_forward_window_tokens) * config.max_top_k, 0U);
+    const auto window_packets =
+        static_forward::kNetworkReturnPackets.lane_packets(
+            std::uint64_t(config.static_forward_window_tokens) *
+                config.max_top_k,
+            0U);
     unsigned minimum_depth = WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH;
     if (network_prefill_streaming(config))
       if (const auto *value = std::getenv("WEFTMOE_PF_MIN_RING_DEPTH")) {
@@ -784,23 +786,13 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
       }
     // Admission reserves a complete worst-case Return window; reducing the
     // heuristic floor must never reduce that correctness bound.
-    const auto depth = static_cast<unsigned>(std::max<std::uint64_t>(
-        minimum_depth, window_packets));
+    const auto depth = static_cast<unsigned>(
+        std::max<std::uint64_t>(minimum_depth, window_packets));
     network.rings = {config.max_nodes, packets.lanes, depth, packet, returning};
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(
         network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
     if (network_prefill_streaming(config)) {
-      network.dispatch_push = weftmoe_pf::kNetworkWorkerMode == 2U &&
-          std::getenv("WEFTMOE_PF_WG3_DISPATCH_PUSH");
-      network.phase_order = weftmoe_pf::kNetworkWorkerMode == 2U &&
-          std::getenv("WEFTMOE_PF_WG3_PHASE_ORDER");
-      network.publication_plan =
-          std::getenv("WEFTMOE_PF_WG3_PUBLICATION_PLAN");
-      network.extra_pull = weftmoe_pf::kNetworkWorkerMode == 2U &&
-          std::getenv("WEFTMOE_PF_WG3_EXTRA_PULL");
-      network.deduplicate_return_ready =
-          std::getenv("WEFTMOE_PF_DEDUPLICATE_RETURN_READY");
       if (const auto *value = std::getenv("WEFTMOE_PF_CREDIT_WINDOWS")) {
         const auto windows = std::stoul(value);
         if (!windows || windows > 8U)
@@ -808,50 +800,23 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         network.rings.depth *= static_cast<unsigned>(windows);
       }
       network.contexts = weftmoe_pf::kNetworkOwners - 1U;
-      network.input = append(
-          cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
-                              "registered pull input"),
-          sizeof(transport::BFloat16), "immutable pull input");
+      network.input =
+          append(cursor,
+                 checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
+                             "registered pull input"),
+                 sizeof(transport::BFloat16), "immutable pull input");
     }
-    network.ring_region = append(cursor, 1U, network.rings.bytes(), "static network rings");
-    const auto contribution_rows = checked_mul(
-        checked_mul(contribution_windows(config),
-                    shape.tokens, "contribution windows"),
-        config.max_top_k, "contribution rows");
-    network.contribution = append(
-        cursor, checked_mul(contribution_rows, config.max_hidden_size,
-                            "registered contribution elements"),
-        sizeof(transport::BFloat16), "registered contribution ring");
-  } else if (config.max_intermediate_size && !config.enable_backward_state) {
-    auto &network = layout.static_forward;
-    const auto experts = checked_mul(config.max_owned_experts,
-                                     config.max_world_size, "V4 experts");
-    const auto routes = checked_mul(config.max_tokens_per_rank,
-                                    config.max_top_k, "V4 source routes");
-    std::size_t source_bytes = 0;
-    append(source_bytes, experts + 2ULL, sizeof(std::uint64_t),
-           "V4 source expert prefixes and error");
-    network.routes = append(source_bytes, routes, sizeof(std::uint32_t),
-                            "V4 expert-ordered source routes");
-    network.gates = append(source_bytes, routes, sizeof(float), "V4 source gates");
-    network.input = append(source_bytes,
-                           checked_mul(config.max_tokens_per_rank,
-                                       config.max_hidden_size, "V4 source input"),
-                           sizeof(transport::BFloat16), "V4 source input");
-    network.source_stride = (source_bytes + kAlign - 1U) & ~(kAlign - 1U);
-    network.source = append(cursor, config.max_nodes, network.source_stride,
-                            "V4 source replicas");
-    network.return_stride = checked_mul(
-        checked_mul(routes, config.max_hidden_size, "V4 Return elements"),
-        sizeof(transport::BFloat16), "V4 Return bytes");
-    network.contexts = static_cast<unsigned>(std::min<std::size_t>(
-        weftmoe_pf::kNetworkContexts,
-        (network.return_stride + weftmoe_pf::kNetworkChunkBytes - 1U) /
-            weftmoe_pf::kNetworkChunkBytes));
-    network.return_tx = append(cursor, config.max_nodes, network.return_stride,
-                               "V4 Return TX");
-    network.return_rx = append(cursor, config.max_nodes, network.return_stride,
-                               "V4 Return RX");
+    network.ring_region =
+        append(cursor, 1U, network.rings.bytes(), "static network rings");
+    const auto contribution_rows =
+        checked_mul(checked_mul(contribution_windows(config), shape.tokens,
+                                "contribution windows"),
+                    config.max_top_k, "contribution rows");
+    network.contribution =
+        append(cursor,
+               checked_mul(contribution_rows, config.max_hidden_size,
+                           "registered contribution elements"),
+               sizeof(transport::BFloat16), "registered contribution ring");
   }
   const auto dense_return_row_bytes =
       checked_mul(config.max_hidden_size, sizeof(transport::BFloat16),
@@ -1004,8 +969,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       config.max_inflight_generations == 0 ||
       config.max_destination_rows_per_rank == 0)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
-                    "transport-pool-query", "capacity", 0,
-                    "all capacities > 0", "zero field");
+                    "transport-pool-query", "capacity", 0, "all capacities > 0",
+                    "zero field");
   if (config.max_intermediate_size != 0 &&
       (config.max_hidden_size != forward_tuning::kMainHidden ||
        config.max_intermediate_size != forward_tuning::kMainIntermediate))
@@ -1018,8 +983,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       (config.max_destination_rows_per_rank > UINT32_MAX ||
        checked_mul(config.max_tokens_per_rank, config.max_top_k,
                    "return route indices") > UINT32_MAX))
-    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "transport-pool-create",
-                    "return row index", 0, "representable as uint32", "overflow");
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig,
+                    "transport-pool-create", "return row index", 0,
+                    "representable as uint32", "overflow");
   Layout layout;
   std::size_t cursor = 0;
   auto &ring = layout.static_ring;
@@ -1029,11 +995,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                   forward_tuning::kMathWarpgroups != 2U ||
                   forward_tuning::kUnifiedCommBase != 288U ||
                   forward_tuning::kUnifiedCommThreads != 96U)
-      throw std::invalid_argument("static ring requires M128 and the 256/32/96 worker partition");
+      throw std::invalid_argument(
+          "static ring requires M128 and the 256/32/96 worker partition");
     if (config.static_forward_contribution_windows == 0U)
       throw std::invalid_argument("static ring requires contribution capacity");
     if (config.max_world_size < config.max_nodes)
-      throw std::invalid_argument("static ring requires at least one rank per node");
+      throw std::invalid_argument(
+          "static ring requires at least one rank per node");
     if (config.enable_socket_fallback ||
         (config.max_nodes > 1U && !config.enable_gin_rdma) ||
         config.max_intermediate_size == 0U)
@@ -1042,72 +1010,84 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     ring.shape = static_ring_shape(config);
     const auto window_blocks = ring.shape.max_mblocks(config.max_owned_experts);
     ring.max_windows = ring.shape.windows(config.max_tokens_per_rank);
-    ring.max_blocks = checked_mul(ring.max_windows, window_blocks,
-                                  "static ring plan blocks");
+    ring.max_blocks =
+        checked_mul(ring.max_windows, window_blocks, "static ring plan blocks");
     if (ring.max_windows > UINT32_MAX ||
         window_blocks > UINT32_MAX / (2ULL * ring.shape.tile_m))
       throw std::invalid_argument("static ring window exceeds device indices");
     ring.depth = static_cast<unsigned>(2U * window_blocks);
     ring.contribution_depth = contribution_windows(config);
-    ring.state = append(cursor, 1, sizeof(static_forward::RingState), "ring state");
-    ring.source_epochs = append(cursor, config.max_world_size,
-                                  sizeof(static_forward::SourceEpoch), "source epochs");
-    ring.source_reserved = append(cursor, config.max_world_size,
-                                    sizeof(std::uint64_t), "source reservation heads");
+    ring.state =
+        append(cursor, 1, sizeof(static_forward::RingState), "ring state");
+    ring.source_epochs =
+        append(cursor, config.max_world_size,
+               sizeof(static_forward::SourceEpoch), "source epochs");
+    ring.source_reserved =
+        append(cursor, config.max_world_size, sizeof(std::uint64_t),
+               "source reservation heads");
     ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
                         "X/S/C slot controls");
     if (config.max_nodes > 1U)
       ring.return_ready = append(
-          cursor, std::uint64_t(config.max_world_size / config.max_nodes) * ring.depth,
+          cursor,
+          std::uint64_t(config.max_world_size / config.max_nodes) * ring.depth,
           sizeof(std::uint64_t), "rail-local C generations");
     ring.contributions = append(cursor, ring.contribution_depth,
-                                 sizeof(static_forward::ContributionSlot),
-                                 "contribution window controls");
-    ring.contribution_ready = append(
-        cursor, std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
-                    config.max_top_k, sizeof(std::uint64_t),
-        "contribution route generations");
+                                sizeof(static_forward::ContributionSlot),
+                                "contribution window controls");
+    ring.contribution_ready =
+        append(cursor,
+               std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
+                   config.max_top_k,
+               sizeof(std::uint64_t), "contribution route generations");
     if (config.max_nodes > 1U)
-      ring.contribution_rows = append(
-          cursor, checked_mul(config.max_tokens_per_rank, config.max_top_k,
-                              "contribution permutation routes"),
-          sizeof(std::uint32_t), "source contribution row permutation");
+      ring.contribution_rows =
+          append(cursor,
+                 checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                             "contribution permutation routes"),
+                 sizeof(std::uint32_t), "source contribution row permutation");
     ring.source = make_source_metadata_layout(config, ring.shape, ring.packets);
     if (config.max_nodes == 1U)
       ring.metadata = append(cursor, 1U, ring.source.bytes, "source metadata");
     ring.window_prefix = append(cursor, ring.max_windows + 1U,
-                                 sizeof(std::uint64_t), "window block prefixes");
-    ring.window_sources = append(cursor, ring.max_windows * ring.shape.sources,
-                                   sizeof(static_forward::WindowSource),
-                                   "window source addresses");
-    ring.expert_rows = append(cursor, ring.max_windows * config.max_owned_experts,
-                               sizeof(std::uint64_t), "window expert rows");
-    ring.expert_blocks = append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
-                                 sizeof(std::uint64_t), "window expert blocks");
-    ring.blocks = append(cursor, ring.max_blocks, sizeof(static_forward::RingBlock),
-                          "immutable compute blocks");
-    ring.rows = append(cursor, checked_mul(ring.max_blocks, ring.shape.tile_m,
-                                           "ring reverse rows"),
-                        sizeof(static_forward::RingRow), "immutable reverse routes");
+                                sizeof(std::uint64_t), "window block prefixes");
+    ring.window_sources =
+        append(cursor, ring.max_windows * ring.shape.sources,
+               sizeof(static_forward::WindowSource), "window source addresses");
+    ring.expert_rows =
+        append(cursor, ring.max_windows * config.max_owned_experts,
+               sizeof(std::uint64_t), "window expert rows");
+    ring.expert_blocks =
+        append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
+               sizeof(std::uint64_t), "window expert blocks");
+    ring.blocks =
+        append(cursor, ring.max_blocks, sizeof(static_forward::RingBlock),
+               "immutable compute blocks");
+    ring.rows = append(
+        cursor,
+        checked_mul(ring.max_blocks, ring.shape.tile_m, "ring reverse rows"),
+        sizeof(static_forward::RingRow), "immutable reverse routes");
     if (config.enable_backward_state)
       ring.tape_rows = append(cursor, ring.max_blocks * ring.shape.tile_m,
                               sizeof(std::uint64_t), "canonical tape rows");
     if (config.max_nodes > 1U)
-      ring.pull_packets = append(
-          cursor, ring.max_windows * ring.shape.sources * ring.packets.packets(ring.shape.tokens),
-          sizeof(static_forward::PullPacket), "immutable remote pull packets");
+      ring.pull_packets = append(cursor,
+                                 ring.max_windows * ring.shape.sources *
+                                     ring.packets.packets(ring.shape.tokens),
+                                 sizeof(static_forward::PullPacket),
+                                 "immutable remote pull packets");
   }
-  const auto activation_rows = ring.depth
-      ? std::uint64_t(ring.depth) * ring.shape.tile_m
-      : config.max_destination_rows_per_rank;
-  const auto routes = checked_mul(config.max_tokens_per_rank, config.max_top_k,
-                                  "max routes");
+  const auto activation_rows =
+      ring.depth ? std::uint64_t(ring.depth) * ring.shape.tile_m
+                 : config.max_destination_rows_per_rank;
+  const auto routes =
+      checked_mul(config.max_tokens_per_rank, config.max_top_k, "max routes");
   const auto links = checked_mul(config.max_nodes, config.channels, "links");
-  const auto ring_slots = checked_mul(
-      checked_mul(config.max_nodes, config.channels, "ring links"),
-      config.ring_slots_per_source_channel, "ring slots");
-  const auto rank_links = checked_mul(config.max_world_size, config.channels,
-                                      "rank links");
+  const auto ring_slots =
+      checked_mul(checked_mul(config.max_nodes, config.channels, "ring links"),
+                  config.ring_slots_per_source_channel, "ring slots");
+  const auto rank_links =
+      checked_mul(config.max_world_size, config.channels, "rank links");
   const auto ingress_slots = checked_mul(
       rank_links, config.ring_slots_per_source_channel, "ingress slots");
   layout.execution_epoch =
@@ -1116,12 +1096,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                         checked_mul(config.max_tokens_per_rank,
                                     config.max_hidden_size, "input elements"),
                         sizeof(transport::BFloat16), "input");
-  layout.ring_headers = append(cursor, ring_slots,
-                               sizeof(transport::TransportSlotHeader),
-                               "ring headers");
+  layout.ring_headers =
+      append(cursor, ring_slots, sizeof(transport::TransportSlotHeader),
+             "ring headers");
   layout.ring_payload = append(
-      cursor, checked_mul(ring_slots, config.max_hidden_size,
-                          "ring payload elements"),
+      cursor,
+      checked_mul(ring_slots, config.max_hidden_size, "ring payload elements"),
       sizeof(transport::BFloat16), "ring payload");
   layout.ring_ready_sequence =
       append(cursor, ring_slots, sizeof(std::uint64_t), "ring ready sequence");
@@ -1129,67 +1109,68 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       append(cursor, links, sizeof(std::uint64_t), "link next sequence");
   layout.link_credits =
       append(cursor, links, sizeof(std::uint32_t), "link credits");
-  layout.ingress_headers = append(cursor, ingress_slots,
-                                  sizeof(LocalP2pRouteHeader),
-                                  "P2P ingress headers");
-  layout.ingress_ready_sequence = append(
-      cursor, ingress_slots, sizeof(std::uint64_t), "P2P ingress ready");
-  layout.ingress_next_sequence = append(
-      cursor, rank_links, sizeof(std::uint64_t), "P2P ingress next");
+  layout.ingress_headers =
+      append(cursor, ingress_slots, sizeof(LocalP2pRouteHeader),
+             "P2P ingress headers");
+  layout.ingress_ready_sequence =
+      append(cursor, ingress_slots, sizeof(std::uint64_t), "P2P ingress ready");
+  layout.ingress_next_sequence =
+      append(cursor, rank_links, sizeof(std::uint64_t), "P2P ingress next");
   layout.ingress_published_sequence = append(
       cursor, rank_links, sizeof(std::uint64_t), "P2P ingress published");
-  layout.ingress_credits = append(cursor, rank_links, sizeof(std::uint32_t),
-                                  "P2P ingress credits");
+  layout.ingress_credits =
+      append(cursor, rank_links, sizeof(std::uint32_t), "P2P ingress credits");
   layout.outgoing_route_sequence = append(
       cursor, rank_links, sizeof(std::uint64_t), "P2P outgoing sequence");
-  layout.direct_route_headers = append(
-      cursor, config.max_destination_rows_per_rank,
-      sizeof(LocalP2pRouteHeader), "P2P direct route headers");
-  layout.return_ready_epoch = append(cursor, routes, sizeof(std::uint64_t),
-                                     "P2P combine ready epoch");
+  layout.direct_route_headers =
+      append(cursor, config.max_destination_rows_per_rank,
+             sizeof(LocalP2pRouteHeader), "P2P direct route headers");
+  layout.return_ready_epoch =
+      append(cursor, routes, sizeof(std::uint64_t), "P2P combine ready epoch");
   // Two pool-private pointer slots follow the world-rank table. They carry the
   // Forward completion-vector pointers without widening the kernel args.
   layout.peer_bases = append(cursor, config.max_world_size + 2ULL,
                              sizeof(void *), "P2P peer base table");
   layout.p2p_barrier_send =
       append(cursor, 2, sizeof(std::uint64_t), "P2P barrier send");
-  layout.p2p_barrier_receive = append(cursor,
-                                      checked_mul(config.max_world_size, 2,
-                                                  "P2P barrier words"),
-                                      sizeof(std::uint64_t),
-                                      "P2P barrier receive");
-  layout.gin_local_compute_ready = append(
-      cursor, config.max_world_size, sizeof(std::uint64_t),
-      "GIN node-local compute ready epoch");
-  layout.terminal_epoch = append(cursor, config.max_world_size,
-                                 sizeof(std::uint64_t),
-                                 "P2P terminal generation epoch");
-  layout.production_error_records = append(
-      cursor, config.max_world_size, sizeof(ProductionStatusRecord),
-      "peer-visible production error records");
-  layout.production_status_matrix = append(
-      cursor, checked_mul(config.max_world_size, 8ULL,
-                          "production terminal status words"),
-      sizeof(std::uint64_t), "production terminal status matrix");
-  layout.packet_claim = append(cursor, routes, sizeof(std::uint32_t),
-                               "packet claim bitmap");
+  layout.p2p_barrier_receive =
+      append(cursor, checked_mul(config.max_world_size, 2, "P2P barrier words"),
+             sizeof(std::uint64_t), "P2P barrier receive");
+  layout.gin_local_compute_ready =
+      append(cursor, config.max_world_size, sizeof(std::uint64_t),
+             "GIN node-local compute ready epoch");
+  layout.terminal_epoch =
+      append(cursor, config.max_world_size, sizeof(std::uint64_t),
+             "P2P terminal generation epoch");
+  layout.production_error_records =
+      append(cursor, config.max_world_size, sizeof(ProductionStatusRecord),
+             "peer-visible production error records");
+  layout.production_status_matrix =
+      append(cursor,
+             checked_mul(config.max_world_size, 8ULL,
+                         "production terminal status words"),
+             sizeof(std::uint64_t), "production terminal status matrix");
+  layout.packet_claim =
+      append(cursor, routes, sizeof(std::uint32_t), "packet claim bitmap");
   layout.canonical_rows = append(
-      cursor, checked_mul(activation_rows,
-                          config.max_hidden_size, "canonical rows"),
+      cursor,
+      checked_mul(activation_rows, config.max_hidden_size, "canonical rows"),
       sizeof(transport::BFloat16), "canonical rows");
   layout.canonical_gates =
-      append(cursor, activation_rows, sizeof(float),
-             "canonical route gates");
+      append(cursor, activation_rows, sizeof(float), "canonical route gates");
   const auto route_elements =
       checked_mul(ring.depth && !local_prefill_streaming(config)
-                                ? std::uint64_t(ring.contribution_depth) *
-                                  ring.shape.tokens * config.max_top_k : routes,
+                      ? std::uint64_t(ring.contribution_depth) *
+                            ring.shape.tokens * config.max_top_k
+                      : routes,
                   config.max_hidden_size, "route elements");
   if (!ring.depth || !config.enable_gin_rdma)
     layout.contribution = append(cursor, route_elements,
                                  sizeof(transport::BFloat16), "contribution");
-  layout.combine_return = ring.depth ? layout.contribution :
-      append(cursor, route_elements, sizeof(transport::BFloat16), "combine return");
+  layout.combine_return =
+      ring.depth ? layout.contribution
+                 : append(cursor, route_elements, sizeof(transport::BFloat16),
+                          "combine return");
   if (config.max_intermediate_size == 0 || config.enable_socket_fallback)
     layout.combined =
         append(cursor,
@@ -1198,36 +1179,37 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                sizeof(transport::BFloat16), "diagnostic combined output");
   if (config.enable_socket_fallback ||
       (config.enable_gin_rdma && config.max_intermediate_size == 0)) {
-    layout.socket_count_matrix = append(
-        cursor, checked_mul(config.max_world_size, config.max_world_size,
-                            "Socket count matrix"),
-        sizeof(std::uint64_t), "Socket count matrix");
+    layout.socket_count_matrix =
+        append(cursor,
+               checked_mul(config.max_world_size, config.max_world_size,
+                           "Socket count matrix"),
+               sizeof(std::uint64_t), "Socket count matrix");
     layout.socket_header_send = append(
         cursor, routes, sizeof(SocketRouteHeader), "Socket send headers");
-    layout.socket_header_receive = append(
-        cursor, config.max_destination_rows_per_rank,
-        sizeof(SocketRouteHeader), "Socket receive headers");
+    layout.socket_header_receive =
+        append(cursor, config.max_destination_rows_per_rank,
+               sizeof(SocketRouteHeader), "Socket receive headers");
     layout.socket_payload_receive = append(
-        cursor, checked_mul(config.max_destination_rows_per_rank,
-                            config.max_hidden_size,
-                            "Socket receive payload elements"),
+        cursor,
+        checked_mul(config.max_destination_rows_per_rank,
+                    config.max_hidden_size, "Socket receive payload elements"),
         sizeof(transport::BFloat16), "Socket receive payload");
   }
   if (config.max_intermediate_size != 0) {
-    const auto forward_elements = checked_mul(
-        activation_rows,
-        config.max_intermediate_size, "forward gated U elements");
+    const auto forward_elements =
+        checked_mul(activation_rows, config.max_intermediate_size,
+                    "forward gated U elements");
     layout.forward_s = append(cursor, forward_elements,
                               sizeof(transport::BFloat16), "forward gated U");
     if (config.enable_backward_state) {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
       // Dispatch must not overwrite the diagnostic's prefilled Return fixture.
-      layout.forward_training_output = append(
-          cursor,
-          checked_mul(config.max_destination_rows_per_rank,
-                      config.max_hidden_size,
-                      "forward training output elements"),
-          sizeof(transport::BFloat16), "forward training output");
+      layout.forward_training_output =
+          append(cursor,
+                 checked_mul(config.max_destination_rows_per_rank,
+                             config.max_hidden_size,
+                             "forward training output elements"),
+                 sizeof(transport::BFloat16), "forward training output");
 #else
       // FC2 becomes ready only after all FC1 N tiles of this M block retire.
       // X is already saved to caller-owned storage, so training can reuse the
@@ -1235,30 +1217,31 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       // for bounded dX output, while saved X and private dR remain separate.
       layout.forward_training_output = layout.canonical_rows;
 #endif
-      layout.backward_padded_capacity_rows = checked_add(
-          config.max_destination_rows_per_rank,
-          checked_mul(config.max_owned_experts, 127ULL,
-                      "backward expert padding rows"),
-          "backward padded row capacity");
+      layout.backward_padded_capacity_rows =
+          checked_add(config.max_destination_rows_per_rank,
+                      checked_mul(config.max_owned_experts, 127ULL,
+                                  "backward expert padding rows"),
+                      "backward padded row capacity");
       if (layout.backward_padded_capacity_rows > UINT32_MAX)
         transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                         "transport-pool-query", "Backward padded directory", 0,
-                        "uint32 row indices", std::to_string(layout.backward_padded_capacity_rows));
-      layout.backward_setup_epoch = append(
-          cursor, config.max_world_size, sizeof(std::uint64_t),
-          "backward setup epochs");
-      layout.backward_dispatch_ready = append(
-          cursor, config.max_destination_rows_per_rank,
-          sizeof(std::uint64_t), "backward dR row-ready epochs");
-      layout.backward_return_ready = append(
-          cursor, routes, sizeof(std::uint64_t),
-          "backward dX route-ready epochs");
-      layout.backward_compact_to_padded = append(
-          cursor, config.max_destination_rows_per_rank,
-          sizeof(std::uint32_t), "backward compact-to-padded rows");
-      layout.backward_padded_expert_rows = append(
-          cursor, config.max_owned_experts, sizeof(std::uint64_t),
-          "backward padded expert rows");
+                        "uint32 row indices",
+                        std::to_string(layout.backward_padded_capacity_rows));
+      layout.backward_setup_epoch =
+          append(cursor, config.max_world_size, sizeof(std::uint64_t),
+                 "backward setup epochs");
+      layout.backward_dispatch_ready =
+          append(cursor, config.max_destination_rows_per_rank,
+                 sizeof(std::uint64_t), "backward dR row-ready epochs");
+      layout.backward_return_ready =
+          append(cursor, routes, sizeof(std::uint64_t),
+                 "backward dX route-ready epochs");
+      layout.backward_compact_to_padded =
+          append(cursor, config.max_destination_rows_per_rank,
+                 sizeof(std::uint32_t), "backward compact-to-padded rows");
+      layout.backward_padded_expert_rows =
+          append(cursor, config.max_owned_experts, sizeof(std::uint64_t),
+                 "backward padded expert rows");
       layout.backward_padded_expert_offsets = append(
           cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
           sizeof(std::uint64_t), "backward padded expert offsets");
@@ -1270,17 +1253,15 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     const auto fc1_ntiles =
         (config.max_intermediate_size + forward_tuning::kFc1TileN - 1ULL) /
         forward_tuning::kFc1TileN;
-    const auto forward_claim_words = checked_mul(
-        max_mblocks, 2ULL + fc1_ntiles,
-        "forward task claims");
+    const auto forward_claim_words =
+        checked_mul(max_mblocks, 2ULL + fc1_ntiles, "forward task claims");
     auto task_claim_words = forward_claim_words;
     if (config.enable_backward_state) {
-      const auto backward_mblocks =
-          (layout.backward_padded_capacity_rows +
-           backward_tuning::kTileM - 1ULL) /
-          backward_tuning::kTileM;
+      const auto backward_mblocks = (layout.backward_padded_capacity_rows +
+                                     backward_tuning::kTileM - 1ULL) /
+                                    backward_tuning::kTileM;
       const auto backward_scheduler =
-          persistent_v3::backward::make_backward_scheduler_layout(
+          pipeline::backward::make_backward_scheduler_layout(
               backward_mblocks,
               static_cast<std::uint32_t>(config.max_hidden_size /
                                          backward_tuning::kDxTileN /
@@ -1292,12 +1273,8 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     layout.forward_task_claim =
         append(cursor, task_claim_words, sizeof(std::uint64_t),
                "forward/backward aliased task claims");
-    layout.forward_fc1_done = append(cursor, max_mblocks,
-                                     sizeof(std::uint64_t),
+    layout.forward_fc1_done = append(cursor, max_mblocks, sizeof(std::uint64_t),
                                      "forward FC1 done tiles");
-    layout.forward_input_groups =
-        append(cursor, max_mblocks, sizeof(persistent_v3::ForwardInputGroup),
-               "forward destination-local input readiness groups");
     // A destination tile is produced concurrently by every node-local rail.
     // Keep one row counter per local-rank/rail instead of issuing contended
     // system-scope atomics from several GPUs into one peer word. The consumer
@@ -1309,9 +1286,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                checked_mul(max_mblocks, config.max_world_size,
                            "forward exact X M-tile rail counters"),
                sizeof(std::uint64_t), "forward exact X M-tile arrived rows");
-    const auto fused_experts = checked_mul(
-        config.max_owned_experts, config.max_world_size,
-        "single-node inference experts");
+    const auto fused_experts =
+        checked_mul(config.max_owned_experts, config.max_world_size,
+                    "single-node inference experts");
     layout.fused_route_expert =
         append(cursor, routes, sizeof(std::uint32_t), "fused route experts");
     layout.fused_route_local_offset = append(
@@ -1324,75 +1301,79 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         append(cursor, routes, sizeof(std::uint32_t), "fused route M tiles");
     layout.fused_combine_order =
         append(cursor, routes, sizeof(std::uint32_t), "fused combine order");
-    layout.fused_local_expert_count = append(
-        cursor, fused_experts, sizeof(std::uint64_t),
-        "fused local expert counts");
-    layout.fused_source_expert_count = append(
-        cursor, fused_experts, sizeof(std::uint64_t),
-        "fused global expert totals");
+    layout.fused_local_expert_count =
+        append(cursor, fused_experts, sizeof(std::uint64_t),
+               "fused local expert counts");
+    layout.fused_source_expert_count =
+        append(cursor, fused_experts, sizeof(std::uint64_t),
+               "fused global expert totals");
     layout.fused_source_routes = append(
         cursor,
-        checked_mul(
-            checked_mul(config.max_owned_experts, config.max_world_size,
-                        "fused source route expert/rank planes"),
-            checked_mul(config.max_tokens_per_rank, config.max_top_k,
-                        "fused source routes per rank"),
-            "fused source route table"),
+        checked_mul(checked_mul(config.max_owned_experts, config.max_world_size,
+                                "fused source route expert/rank planes"),
+                    checked_mul(config.max_tokens_per_rank, config.max_top_k,
+                                "fused source routes per rank"),
+                    "fused source route table"),
         // Active worlds may be smaller than the pool capacity. Provision a
         // route+gate record whenever one token window could use the local
         // fast path, independently of the capacity's source-group count.
         ring.depth && config.max_tokens_per_rank <= ring.shape.tokens
-            ? sizeof(static_forward::SourceRoute) : sizeof(std::uint32_t),
+            ? sizeof(static_forward::SourceRoute)
+            : sizeof(std::uint32_t),
         "fused source route table");
-    layout.fused_source_gates = ring.depth
-        ? (config.max_nodes == 1U ? ring.metadata + ring.source.gates : 0U)
-        : append(cursor, routes, sizeof(float), "fused source route gates");
-    layout.fused_owned_expert_ids = append(
-        cursor, config.max_owned_experts, sizeof(std::uint32_t),
-        "fused owned expert ids");
-    layout.fused_expert_row_count = append(
-        cursor, config.max_owned_experts, sizeof(std::uint64_t),
-        "fused owned expert row counts");
+    layout.fused_source_gates =
+        ring.depth
+            ? (config.max_nodes == 1U ? ring.metadata + ring.source.gates : 0U)
+            : append(cursor, routes, sizeof(float), "fused source route gates");
+    layout.fused_owned_expert_ids =
+        append(cursor, config.max_owned_experts, sizeof(std::uint32_t),
+               "fused owned expert ids");
+    layout.fused_expert_row_count =
+        append(cursor, config.max_owned_experts, sizeof(std::uint64_t),
+               "fused owned expert row counts");
     layout.fused_expert_row_prefix = append(
         cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
         sizeof(std::uint64_t), "fused owned expert row prefixes");
     layout.fused_mtile_offsets = append(
         cursor, static_cast<std::uint64_t>(config.max_owned_experts) + 1ULL,
         sizeof(std::uint64_t), "fused owned expert M-tile offsets");
-    layout.fused_mtile_rows = append(
-        cursor, max_mblocks, sizeof(std::uint32_t),
-        "fused expected M-tile rows");
+    layout.fused_mtile_rows = append(cursor, max_mblocks, sizeof(std::uint32_t),
+                                     "fused expected M-tile rows");
     layout.fused_dispatch_runtime = append(
         cursor, 1, sizeof(DeviceDispatchRuntime), "fused dispatch runtime");
     layout.forward_reduce_route_count =
         append(cursor, config.max_tokens_per_rank, sizeof(std::uint32_t),
                "forward reduce ready route counts");
-    layout.forward_reduce_ready_token = append(
-        cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
-        "forward reduce ready token queue");
-    layout.forward_return_rows = append(
-        cursor, checked_add(config.max_destination_rows_per_rank,
-            checked_add(config.max_destination_rows_per_rank /
-                            persistent_v3::kReturnReadyBlockRows,
-                        1ULL + config.max_world_size, "return ready blocks"),
-            "return rows and ready blocks"),
-        sizeof(std::uint32_t), "forward return row queues");
+    layout.forward_reduce_ready_token =
+        append(cursor, config.max_tokens_per_rank, sizeof(std::uint64_t),
+               "forward reduce ready token queue");
+    layout.forward_return_rows =
+        append(cursor,
+               checked_add(config.max_destination_rows_per_rank,
+                           checked_add(config.max_destination_rows_per_rank /
+                                           communication::kReturnReadyBlockRows,
+                                       1ULL + config.max_world_size,
+                                       "return ready blocks"),
+                           "return rows and ready blocks"),
+               sizeof(std::uint32_t), "forward return row queues");
     layout.local_notification_ctas = std::max(
         std::max(forward_tuning::kRelayCtas, forward_tuning::kRemoteRelayCtas) +
-            persistent_v3::kRdmaCtaCount,
+            pipeline::kRdmaCtaCount,
         backward_tuning::kRelayCtas + backward_tuning::kRdmaCtas);
-    if constexpr (forward_tuning::kUnifiedWorkers || backward_tuning::kUnifiedWorkers) {
+    if constexpr (forward_tuning::kUnifiedWorkers ||
+                  backward_tuning::kUnifiedWorkers) {
       int device = 0, sms = 0;
       if (cudaGetDevice(&device) != cudaSuccess ||
-          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount,
+                                 device) != cudaSuccess)
         transport_error(NotifyErrorCode::BackendUnavailable,
                         "transport-pool-query", "SM count", 0,
                         "available CUDA device", "device query failed");
-      layout.local_notification_ctas = std::max(
-          layout.local_notification_ctas, static_cast<unsigned>(sms));
-      layout.gin_sender_done = append(
-          cursor, layout.local_notification_ctas, sizeof(unsigned),
-          "unified GIN sender completion flags");
+      layout.local_notification_ctas =
+          std::max(layout.local_notification_ctas, static_cast<unsigned>(sms));
+      layout.gin_sender_done =
+          append(cursor, layout.local_notification_ctas, sizeof(unsigned),
+                 "unified GIN sender completion flags");
     }
     layout.local_notifications = append(
         cursor,
@@ -1400,14 +1381,11 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
             layout.local_notification_ctas,
         sizeof(communication::NotificationChannel), "local notification rings");
     layout.forward_return_queues = append(cursor, 1ULL + config.max_world_size,
-                                          sizeof(persistent_v3::ReturnRowQueue),
+                                          sizeof(communication::ReturnRowQueue),
                                           "per-peer return queue controls");
     layout.forward_scheduler =
         append(cursor, 4 + config.max_world_size * 32ULL, sizeof(std::uint64_t),
                "forward scheduler");
-    layout.forward_v3_control =
-        append(cursor, 1, sizeof(persistent_v3::ForwardPipelineControl),
-               "forward V3 persistent control plane");
     layout.forward_completion =
         append(cursor, 1, sizeof(transport_state::GenerationCompletionVector),
                "forward generation completion vector");
@@ -1456,14 +1434,13 @@ struct PoolSlot {
   unsigned long long backward_capture_id = 0;
   cudaEvent_t forward_output_ready = nullptr;
   cudaEvent_t forward_complete = nullptr;
-  // GIN Forward uses compile-time-isolated transport and compute kernels.
-  // Per-slot non-blocking streams allow both persistent grids to remain
-  // resident without serializing independent generations in the pool.
-  cudaStream_t forward_transport_stream = nullptr;
-  cudaStream_t forward_compute_stream = nullptr;
-  cudaEvent_t forward_roles_ready = nullptr;
-  cudaEvent_t forward_transport_done = nullptr;
-  cudaEvent_t forward_compute_done = nullptr;
+  // PF backward uses a communication stream and a completion join stream.
+  // These streams belong to the reusable workspace, not individual calls.
+  cudaStream_t backward_transport_stream = nullptr;
+  cudaStream_t backward_compute_stream = nullptr;
+  cudaEvent_t backward_roles_ready = nullptr;
+  cudaEvent_t backward_join_transport = nullptr;
+  cudaEvent_t backward_join_compute = nullptr;
   cudaEvent_t backward_start = nullptr;
   cudaEvent_t backward_compute_start = nullptr;
   cudaEvent_t backward_compute_done = nullptr;
@@ -1548,21 +1525,20 @@ struct GinResources {
   }
 };
 
-template <typename T>
-T *at(void *base, std::size_t offset) {
+template <typename T> T *at(void *base, std::size_t offset) {
   return reinterpret_cast<T *>(static_cast<unsigned char *>(base) + offset);
 }
-template <typename T>
-const T *at(const void *base, std::size_t offset) {
-  return reinterpret_cast<const T *>(
-      static_cast<const unsigned char *>(base) + offset);
+template <typename T> const T *at(const void *base, std::size_t offset) {
+  return reinterpret_cast<const T *>(static_cast<const unsigned char *>(base) +
+                                     offset);
 }
 
 #if WEFTMOE_DEVICE_TIMELINE
-profiling::DeviceTimelineContext make_timeline_context(
-    void *allocation, const TimelineAllocationLayout &layout,
-    std::uint32_t max_ctas, std::uint32_t rank,
-    profiling::TimelinePhase phase, std::uint64_t generation) {
+profiling::DeviceTimelineContext
+make_timeline_context(void *allocation, const TimelineAllocationLayout &layout,
+                      std::uint32_t max_ctas, std::uint32_t rank,
+                      profiling::TimelinePhase phase,
+                      std::uint64_t generation) {
   profiling::DeviceTimelineContext context;
   context.records =
       at<profiling::DeviceTimelineRecord>(allocation, layout.records);
@@ -1580,23 +1556,22 @@ void reset_timeline(const char *phase, void *allocation,
                     const TimelineAllocationLayout &layout,
                     std::uint32_t max_ctas, cudaStream_t stream,
                     std::uint32_t rank, std::uint32_t world,
-                    std::uint64_t generation,
-                    const NcclSession &session) {
+                    std::uint64_t generation, const NcclSession &session) {
   const auto reset_bytes = checked_size(
       checked_mul(max_ctas, sizeof(std::uint32_t), "timeline count reset"),
       "timeline count reset");
-  internal::throw_cuda(
-      phase,
-      cudaMemsetAsync(at<void>(allocation, layout.counts), 0, reset_bytes,
-                      stream),
-      rank, world, session.session().identity(), generation,
-      ExchangeKind::ExpertCounts, "reset device timeline counts");
-  internal::throw_cuda(
-      phase,
-      cudaMemsetAsync(at<void>(allocation, layout.overflow), 0, reset_bytes,
-                      stream),
-      rank, world, session.session().identity(), generation,
-      ExchangeKind::ExpertCounts, "reset device timeline overflow");
+  internal::throw_cuda(phase,
+                       cudaMemsetAsync(at<void>(allocation, layout.counts), 0,
+                                       reset_bytes, stream),
+                       rank, world, session.session().identity(), generation,
+                       ExchangeKind::ExpertCounts,
+                       "reset device timeline counts");
+  internal::throw_cuda(phase,
+                       cudaMemsetAsync(at<void>(allocation, layout.overflow), 0,
+                                       reset_bytes, stream),
+                       rank, world, session.session().identity(), generation,
+                       ExchangeKind::ExpertCounts,
+                       "reset device timeline overflow");
 }
 #endif
 
@@ -1650,22 +1625,22 @@ struct ActivationPoolState {
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.forward_complete)
         (void)cudaEventDestroy(slot.forward_complete);
-      if (slot.forward_roles_ready)
+      if (slot.backward_roles_ready)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
-      if (slot.forward_roles_ready)
-        (void)cudaEventDestroy(slot.forward_roles_ready);
-      if (slot.forward_transport_done)
+      if (slot.backward_roles_ready)
+        (void)cudaEventDestroy(slot.backward_roles_ready);
+      if (slot.backward_join_transport)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
-      if (slot.forward_transport_done)
-        (void)cudaEventDestroy(slot.forward_transport_done);
-      if (slot.forward_compute_done)
+      if (slot.backward_join_transport)
+        (void)cudaEventDestroy(slot.backward_join_transport);
+      if (slot.backward_join_compute)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
-      if (slot.forward_compute_done)
-        (void)cudaEventDestroy(slot.forward_compute_done);
+      if (slot.backward_join_compute)
+        (void)cudaEventDestroy(slot.backward_join_compute);
       const cudaEvent_t backward_events[] = {
-          slot.backward_start,         slot.backward_compute_start,
-          slot.backward_compute_done,  slot.backward_transport_done,
-          slot.backward_reduce_done,   slot.backward_late_compute_done,
+          slot.backward_start,        slot.backward_compute_start,
+          slot.backward_compute_done, slot.backward_transport_done,
+          slot.backward_reduce_done,  slot.backward_late_compute_done,
           slot.backward_complete};
       for (const auto event : backward_events) {
         if (event)
@@ -1673,10 +1648,10 @@ struct ActivationPoolState {
         if (event)
           (void)cudaEventDestroy(event);
       }
-      if (slot.forward_transport_stream)
-        (void)cudaStreamDestroy(slot.forward_transport_stream);
-      if (slot.forward_compute_stream)
-        (void)cudaStreamDestroy(slot.forward_compute_stream);
+      if (slot.backward_transport_stream)
+        (void)cudaStreamDestroy(slot.backward_transport_stream);
+      if (slot.backward_compute_stream)
+        (void)cudaStreamDestroy(slot.backward_compute_stream);
       if (slot.dispatch_complete)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.dispatch_complete)
@@ -1749,7 +1724,7 @@ struct SlotLease {
     if (slot.epoch != epoch)
       return;
     slot.state = (!complete || quarantined) ? SlotState::Quarantined
-                                           : SlotState::Available;
+                                            : SlotState::Available;
     slot.completion_recorded = false;
   }
 };
@@ -1763,9 +1738,9 @@ struct SlotFailureGuard {
   }
 };
 
-std::shared_ptr<SlotLease> acquire_slot(
-    const std::shared_ptr<ActivationPoolState> &pool, std::uint64_t generation,
-    std::uint32_t rank) {
+std::shared_ptr<SlotLease>
+acquire_slot(const std::shared_ptr<ActivationPoolState> &pool,
+             std::uint64_t generation, std::uint32_t rank) {
   std::lock_guard<std::mutex> lock(pool->mutex);
   const auto i = static_cast<std::size_t>(
       generation % static_cast<std::uint64_t>(pool->slots.size()));
@@ -1789,5 +1764,5 @@ std::shared_ptr<SlotLease> acquire_slot(
           std::to_string(i) + ", actual=busy/quarantined");
 }
 #include "cuda/forward/support/fallback_kernels.cuh"
-#include "cuda/forward/support/transport_kernels.cuh"
 #include "cuda/forward/support/fixture_kernels.cuh"
+#include "cuda/forward/support/transport_kernels.cuh"

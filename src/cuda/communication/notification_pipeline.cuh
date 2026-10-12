@@ -1,7 +1,5 @@
 #pragma once
 
-#include "cuda/persistent_v3/forward/reduce_queue.cuh"
-
 // Private launch-contract adapter. Receive handlers touch only local memory.
 namespace local_notification_detail {
 using Kind = communication::NotificationKind;
@@ -37,9 +35,10 @@ template <class Args> __global__ void reset(Args a) {
 
 // Each CTA consumes its matching incoming channels. The default permits
 // cooperating consumers via CAS. Exclusive ownership removes that arbitration;
-// callers must keep exactly one complete receive warp live until channels drain.
-// A transient activemask is not an ownership mask under independent thread
-// scheduling: subsets of the same warp would otherwise elect extra consumers.
+// callers must keep exactly one complete receive warp live until channels
+// drain. A transient activemask is not an ownership mask under independent
+// thread scheduling: subsets of the same warp would otherwise elect extra
+// consumers.
 template <class Args, bool SingleConsumer = false>
 __device__ __forceinline__ bool progress(const Args &a,
                                          unsigned peer = UINT32_MAX) {
@@ -64,13 +63,13 @@ __device__ __forceinline__ bool progress(const Args &a,
       auto &slot = state.slots[seq % kDepth];
       if (::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
               slot.ready)
-                  .load(::cuda::memory_order_acquire) >= seq / kDepth + 1) {
+              .load(::cuda::memory_order_acquire) >= seq / kDepth + 1) {
         bool claimed = true;
         if constexpr (SingleConsumer)
           head.store(seq + 1, ::cuda::memory_order_relaxed);
         else
           claimed = head.compare_exchange_strong(seq, seq + 1,
-                                                   ::cuda::memory_order_relaxed);
+                                                 ::cuda::memory_order_relaxed);
         if (claimed) {
           selected = p;
           break;
@@ -356,24 +355,4 @@ __device__ __forceinline__ void drain(const Args &a,
   }
 }
 
-template <> struct Receiver<ForwardKernelArgs> {
-  __device__ static void publish_dispatch(const ForwardKernelArgs &a,
-                                          unsigned long long tile,
-                                          unsigned peer) {
-    const auto group = __match_any_sync(
-        __activemask(), tile * communication::kLocalPeers + peer);
-    if (threadIdx.x % 32 == unsigned(__ffs(group) - 1)) {
-      auto *arrived = peer_at<unsigned long long>(
-          a.peer_bases[a.node * a.local_world_size + peer],
-          a.x_arrived_rows_offset);
-      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_system>(
-          arrived[tile * a.local_world_size + a.rank % a.local_world_size])
-          .fetch_add(__popc(group), ::cuda::memory_order_release);
-    }
-  }
-  __device__ static void apply(const ForwardKernelArgs &a,
-                               unsigned long long row) {
-    forward_reduce_detail::publish_ready_route(a, row, 2U);
-  }
-};
 } // namespace local_notification_detail

@@ -244,23 +244,15 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
              "Forward requires cluster_size=2 for TMA multicast")
     _require(config["fc2_tma_store"],
              "Forward requires the FC2 TMA-store epilogue")
-    static_a = max(config["static_v4_fc1_stages"], config["static_v4_fc2_stages"]) * config["tile_m"] * config["tile_k"]
+    if not config["static_v4_prefill_min_tokens"]:
+        unified_tuning.require_resources(
+            config["fc1_tile_n"] == config["fc2_tile_n"] and
+            config["fc1_tile_n"] in (128, 256) and config["tile_k"] == 64 and
+            config["static_v4_fc1_stages"] == config["static_v4_fc2_stages"],
+            "PF requires equal N128/256, K64 and a shared FC1/FC2 stage ring")
     unified_tuning.require_resources(
-        config["fc2_claim_tiles"] > 1 or
-        gemm_storage_bytes(config, static_v4=True) // 2 - static_a >=
-        config["tile_m"] * config["fc2_tile_n"],
-        "V4 epilogue must fit in private staging beyond every multicast A stage")
-    unified_tuning.require_resources(
-        dynamic_shared_memory(config, 16)["compute_bytes"] <= 227 * 1024,
-        "GEMM input/output staging exceeds Hopper shared memory")
-    if config["unified_workers"]:
-        unified_tuning.require_resources(unified_tuning.shared_memory_upper_bound(
-            config, dynamic_shared_memory(config, 16)["compute_bytes"],
-            phase="forward") <= 227 * 1024,
-            "unified compute and communication staging exceed Hopper shared memory")
-    _require((config["main_intermediate"] // config["fc1_tile_n"]) % 2 == 0
-             and (config["main_hidden"] // config["fc2_tile_n"]) % 2 == 0,
-             "cluster multicast requires even FC1 and FC2 N-tile counts")
+        dynamic_shared_memory(config, 16)["compute_bytes"] + 1024 <= 227 * 1024,
+        "PF/DT shared memory exceeds Hopper CTA capacity")
 
     # Two-host GIN owns eight physical contexts. One-node NVLink has no RDMA
     # owner and tunes Relay independently in small four-CTA increments.
@@ -635,23 +627,14 @@ def gemm_storage_bytes(config: Mapping[str, Any], *, static_v4: bool) -> int:
 
 
 def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
-    gemm_bytes = gemm_storage_bytes(config, static_v4=False)
-    static_gemm_bytes = gemm_storage_bytes(config, static_v4=True)
-    barriers = 3 * config["fc1_stages"] + 2 * config["fc2_stages"]
-    static_barriers = (2 * config["static_v4_fc1_stages"] +
-                       2 * config["static_v4_fc2_stages"])
-    control_bytes = barriers * 8 + world * 4
-    static_control_bytes = static_barriers * 8 + world * 4
-    row_streams = max(config["local_dispatch_tma_warps"],
-                      config["relay_tma_warps"], config["relay_scatter_warps"])
-    transport_rows = row_streams * config["main_hidden"] * 2
-    return {
-        "compute_bytes": max(gemm_bytes + control_bytes,
-                             static_gemm_bytes + static_control_bytes),
-        "generic_compute_bytes": gemm_bytes + control_bytes,
-        "static_v4_compute_bytes": static_gemm_bytes + static_control_bytes,
-        "transport_bytes": max(gemm_bytes, transport_rows) + control_bytes,
-    }
+    if config["static_v4_prefill_min_tokens"]:
+        # Both M16/M64 DT variants are compiled; account for the larger one.
+        stages = config.get("v4", {}).get("decode_stages", 3)
+        payload = 3 * 1024 + stages * (64 + 128) * 64 * 2 + 64 * 128 * 2 + 3 * 4096
+        size = (payload + (2 * stages + 3) * 8 + 1023) // 1024 * 1024
+    else:
+        size = v4_tuning.local_streaming_shared_bytes(config)
+    return {"compute_bytes": size, "transport_bytes": 0}
 
 
 def inspect_forward_kernel(binary: Path, log_path: Path,
@@ -667,15 +650,9 @@ def inspect_forward_kernel(binary: Path, log_path: Path,
     functions = []
     lines = completed.stdout.splitlines()
     unified = bool(config["unified_workers"])
-    kernel_names = ("unified_forward_kernel", "weftmoe_pf6kernel") if unified else (
-        "local_p2p_forward_tma_store_kernel",
-        "local_p2p_forward_compute_kernel",
-    )
-    if "v4" in config and config["static_v4_prefill_min_tokens"]:
-        kernel_names += ("weftmoe_dt6kernel",)
-    local_streaming = config.get("v4", {}).get("local_prefill_streaming", 0)
-    if local_streaming:
-        kernel_names += ("weftmoe_pf5local6kernel",)
+    local_streaming = config.get("v4", {}).get("local_prefill_streaming", 1)
+    kernel_names = (("weftmoe_dt6kernel",) if config["static_v4_prefill_min_tokens"]
+                    else ("weftmoe_pf5local6kernel", "weftmoe_pf7network6kernel"))
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
     for index, line in enumerate(lines[:-1]):
@@ -726,7 +703,6 @@ def _sanitized_environment() -> dict[str, str]:
         "WEFTMOE_P2P_BENCH_TOKENS",
         "WEFTMOE_FORWARD_BENCH_ROUNDS",
         "WEFTMOE_FORWARD_BENCH_GENERATION_BASE",
-        "WEFTMOE_DISABLE_STATIC_FORWARD_V4",
         "WEFTMOE_DISABLE_SINGLE_NODE_INFERENCE",
         "WEFTMOE_BENCH_ALLOCATE_TENSORS",
         "WEFTMOE_BENCH_HIDDEN",
@@ -887,6 +863,8 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                     elapsed_seconds=suite["elapsed_seconds"])
     command = launcher_command(binary, benchmark, rounds=rounds)
     run_environment = dict(environment)
+    run_environment.setdefault("WEFTMOE_STATIC_RING_TOKENS", "4096")
+    run_environment.setdefault("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS", "2")
     run_environment["WEFTMOE_P2P_BENCH_TOKENS"] = str(
         int(benchmark["tokens_per_rank"]))
     run_environment["WEFTMOE_P2P_TOP_K"] = str(int(benchmark["top_k"]))

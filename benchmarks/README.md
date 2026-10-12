@@ -1,5 +1,9 @@
 # Benchmarks
 
+Historical V3/earlier-PF measurements are retained. Reproduce their removed
+kernels and build profiles from tag `archive/pre-pf-dt-cleanup-20261012`.
+Current operator benchmarks accept PF/DT, not the deleted V3 backend.
+
 Use [tools/run.py](../tools/run.py) to benchmark FWD or BWD with an explicit
 configuration, or to autotune before benchmarking. Native CUDA checks and rank
 launchers are maintained in [tests](../tests).

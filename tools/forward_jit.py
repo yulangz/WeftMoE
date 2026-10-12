@@ -76,8 +76,6 @@ HOST_SOURCES = (
 CUDA_SOURCES = (
     "src/cuda/device_notify.cu",
     "src/cuda/activation_transport.cu",
-    "src/cuda/forward_transport.cu",
-    "src/cuda/persistent_v3/kernel_entry.cu",
     "src/transport/nccl_count_exchange.cu",
 )
 
@@ -644,8 +642,6 @@ class SpecializedJitCompiler:
             commands.append([
                 str(self.nvcc), *self.cuda_library_flags,
                 *specialization_flags,
-                *(["-diag-suppress=177"]
-                  if source == "src/cuda/forward_transport.cu" else []),
                 "-c", source, "-o", str(output),
             ])
         test_object = objects / _object_name(TEST_SOURCE)

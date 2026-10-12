@@ -88,7 +88,7 @@ def reference(x, routes, gates, w1, w2):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "dt", "v3", "megamoe"), required=True)
+    parser.add_argument("--backend", choices=("pf", "dt", "megamoe"), required=True)
     parser.add_argument("--deepgemm-package", type=Path)
     capacity = parser.add_mutually_exclusive_group()
     capacity.add_argument("--megamoe-buffer-mib", type=float,
@@ -132,11 +132,9 @@ def main():
                               or args.forward_cache or args.profile_device):
         parser.error("--graph-replays requires PF/DT, --token-std-fraction 0, no cache/profile flags")
     if args.backend in ("pf", "dt"):
-        os.environ.pop("WEFTMOE_DISABLE_STATIC_FORWARD_V4", None)
         os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
         os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
     else:
-        os.environ["WEFTMOE_DISABLE_STATIC_FORWARD_V4"] = "1"
         os.environ.pop("WEFTMOE_STATIC_RING_TOKENS", None)
         os.environ.pop("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS", None)
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

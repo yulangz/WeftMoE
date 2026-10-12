@@ -602,6 +602,8 @@ def benchmark_candidate(candidate: Mapping[str, Any], binary: Path,
                         environment: Mapping[str, str], *, rounds: int,
                         suffix: str = "tune") -> dict[str, Any]:
     run_environment = dict(environment)
+    run_environment.setdefault("WEFTMOE_STATIC_RING_TOKENS", "4096")
+    run_environment.setdefault("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS", "2")
     if "experts" in benchmark:
         run_environment["WEFTMOE_BENCH_EXPERTS"] = str(benchmark["experts"])
     run_environment["WEFTMOE_BACKWARD_ROUNDS"] = str(rounds)
@@ -661,6 +663,8 @@ def preflight_candidate(candidate: Mapping[str, Any], binary: Path,
         "--top-k", str(int(benchmark["top_k"])),
     ]
     run_environment = dict(environment)
+    run_environment.setdefault("WEFTMOE_STATIC_RING_TOKENS", "4096")
+    run_environment.setdefault("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS", "2")
     nccl_lib_dir = benchmark.get("runtime_library_path", benchmark.get("nccl_lib_dir"))
     if nccl_lib_dir:
         prior = run_environment.get("LD_LIBRARY_PATH", "")

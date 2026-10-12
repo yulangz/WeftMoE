@@ -35,7 +35,7 @@ for i, variant in enumerate(variants):
            "--nodes", str(args.nodes), "--output", str(out), "--master-port", str(args.port + i),
            "--benchmark", str(benchmark)]
     for env in ("WEFTMOE_PF_MIN_RING_DEPTH=2", "WEFTMOE_PF_CREDIT_WINDOWS=2",
-                "WEFTMOE_PF_WG3_PUBLICATION_PLAN=1", "WEFTMOE_PF_DEDUPLICATE_RETURN_READY=1",
+
                 f"NCCL_DEBUG_FILE={out / label}.nccl.%h.%p.log"):
         cli += ["--env", env]
     cli += ["--", "--backend", "pf", "--hidden", "4096", "--intermediate", "2048",
