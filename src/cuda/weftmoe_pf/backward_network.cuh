@@ -30,6 +30,12 @@ __device__ __forceinline__ auto *canonical_rows(const BackwardKernelArgs &a) {
   return peer_at<CanonicalRow>(a.local_base, a.direct_headers_offset);
 }
 
+__device__ __forceinline__ unsigned ordered_block(const BackwardKernelArgs &a,
+                                                  unsigned position) {
+  return unsigned(backward_pipeline_detail::scheduler_words(
+      a)[directory_layout(a).phase + position]);
+}
+
 __device__ __forceinline__ unsigned
 network_blocks(const BackwardKernelArgs &a) {
   return unsigned(
@@ -63,14 +69,15 @@ struct NetworkSchedule {
         const auto columns = phase == Phase::Du   ? kDuTiles
                              : phase == Phase::Dx ? kDxTiles
                                                   : 2U;
-        const auto block = begin + linear / columns;
+        const auto position = begin + linear / columns;
+        const auto block = ordered_block(a, position);
         const auto desc = directory(a)[block];
         t = {desc.expert,
              block,
              linear % columns,
              desc.valid_rows,
-             block % depth * kM,
-             block / depth + 1U,
+             position % depth * kM,
+             position / depth + 1U,
              phase};
         index += gridDim.x;
         return true;
@@ -136,10 +143,16 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
          source < identity.source; ++source)
       ordinal -= unsigned(
           ring::source_count(f, source, window, desc.tile.expert, false));
-    canonical_rows(a)[f.checkpoint.rows[row]] = {
+    const auto saved = f.checkpoint.rows[row];
+    canonical_rows(a)[saved] = {
         identity.source,
         ring::window_source(f, desc.window, identity.source).row_base +
             prefix[f.rank * owned + desc.tile.expert] + ordinal};
+    const auto block = peer_at<const unsigned>(
+                           a.local_base, a.compact_to_padded_offset)[saved] /
+                       kM;
+    atomicMax(words + layout.phase + block,
+              (static_cast<unsigned long long>(desc.window) << 32U) | block);
   }
   for (auto peer = tid; peer < f.static_network.rings.nodes; peer += stride) {
     if (peer == f.node)
@@ -158,6 +171,32 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
       rows += counts[expert];
     state.backward_rows += rows;
   }
+}
+
+// The key is (last required source window, canonical block). Sort only this
+// static task permutation; saved rows and GEMM reduction order stay unchanged.
+// Ping-pong through the old phase/DU-counter arrays, without new storage.
+__global__ void merge_order(const unsigned long long *input,
+                            unsigned long long *output, std::uint64_t count,
+                            std::uint64_t width) {
+  const auto index = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count)
+    return;
+  const auto begin = index / (2U * width) * (2U * width);
+  const auto middle = min(begin + width, count);
+  const auto end = min(middle + width, count);
+  const auto other = index < middle ? middle : begin;
+  auto first = other, last = index < middle ? end : middle;
+  const auto key = input[index];
+  while (first < last) {
+    const auto probe = (first + last) / 2U;
+    if (input[probe] < key)
+      first = probe + 1U;
+    else
+      last = probe;
+  }
+  output[begin + index - (index < middle ? begin : middle) + first - other] =
+      key;
 }
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
@@ -225,9 +264,11 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
   netring::Endpoint endpoint(f, kGetWorkers + worker);
   const auto depth = network_depth(f);
   const auto bytes = f.hidden * 2U;
-  for (auto block = worker; block < network_blocks(a); block += kPutWorkers) {
-    auto &slot = f.ring.slots[block % depth];
-    const auto generation = block / depth + 1U;
+  for (auto position = worker; position < network_blocks(a);
+       position += kPutWorkers) {
+    const auto block = ordered_block(a, position);
+    auto &slot = f.ring.slots[position % depth];
+    const auto generation = position / depth + 1U;
     while (ring::acquire(slot.fc2_done) <
            std::uint64_t(generation) * kDxTiles) {
     }
@@ -244,7 +285,7 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
       if (node != f.node) {
         const auto channel = endpoint.layout().channel(node, f.node, 0U);
         const auto control = endpoint.control(true, channel, 0U);
-        const auto source_row = std::uint64_t(block % depth) * kM + row;
+        const auto source_row = std::uint64_t(position % depth) * kM + row;
         endpoint.gin.put(
             ncclTeamWorld(endpoint.gin.comm), identity.source, f.gin_window,
             f.static_network.contribution + identity.contribution * bytes,

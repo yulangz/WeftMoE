@@ -136,8 +136,10 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
     mapping[a.dispatch.expert_row_prefix[expert] + row] =
         unsigned(padded + row);
   if constexpr (Network) {
-    // Network M-block tails are not canonical expert tails. Clear only the
-    // canonical dW padding here; the physical dX input tail is cleared in math.
+    for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
+         block += stride)
+      words[layout.phase + padded / kM + block] = padded / kM + block;
+    // Initialize canonical cache padding before the dW phase.
     const auto tail = (kM - rows % kM) % kM;
     for (auto v = std::uint64_t(tid); v < tail * a.intermediate; v += stride) {
       reinterpret_cast<unsigned short *>(

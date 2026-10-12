@@ -3,6 +3,87 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M4：按预计到达顺序排静态任务
+
+M3 消除了逐窗口 padding，但 expert-major 的第一个 canonical M-block
+可能跨多个 RX 窗口，导致 math 等待尚未到达的行。M4 在 main 前按
+`(该块最后需要的物理窗口, canonical block ID)` 排列任务；仍是静态分配，
+没有运行时领任务或抢占队列。main 及 return 使用相同排列的 position
+决定 TX slot/generation，cache 地址和 dW 仍使用原 canonical block ID。
+因此不改变 saved-row 顺序、GEMM 的 K 顺序和 dW 归约顺序。
+
+排序用 GPU merge pass，复用不再使用的旧 phase/DU-counter 数组，
+不增加持久空间或临时分配；多次小 kernel 的开销包含在完整周期中。
+这是静态的到达顺序估计，并不保证每块实际最早 ready。
+
+双机 Flash、相同随机 trace、1620 MHz 请求、完整 FWD+BWD wall p50：
+
+| 候选 | 8K / ms | 20K / ms |
+|---|---:|---:|
+| 本轮修改前 `b151d93` | 34.563 | 86.551 |
+| M3 `b5d1cc4` | 33.238 | 81.522 |
+| M4 首测 `ready_order_perf` | 32.836 | 80.201 |
+| M4 复测 `ready_order_repeat` | 33.224 | 80.450 |
+| M4 最终构建 `ready_final_perf` | 32.855 | 80.808 |
+
+M4 两次 BWD host API 边界 p50 分别为 20.394/50.456、20.439/50.733 ms；
+M3 为 21.113/51.841 ms。BWD 有一致改善，但完整周期的 8K 增益较小，
+不能只引用最快一轮。首测有一次 1485 MHz 观测落在 20K sample 2；
+复测四次 1500–1590 MHz 观测均不在计时区间。所有样本保留，
+两轮 workload hash 与 M3 完全一致。
+
+最终构建 BWD host p50 为 20.503/51.030 ms；三次 1560–1605 MHz
+观测均在计时区间之外。相对本轮前，完整周期下降 4.9%/6.6%，
+BWD host 边界下降 8.6%/10.0%。相对旧 PF 的本轮复测 33.502/80.921 ms，
+最终完整周期仅快 1.9%/0.1%；20K 仍应称基本持平，不能宣称大幅领先。
+
+单机最终构建回归也保留全部结果，而不是只引用 M3 较快的一轮：
+
+| EP8 完整周期 | 8K / ms | 20K / ms |
+|---|---:|---:|
+| 本轮前 `b151d93` | 25.236 | 64.490 |
+| M3 较早 `canonical_local_perf` | 25.213 | 62.569 |
+| M4 `ready_final_local` | 25.443 | 63.426 |
+| M4 `ready_final_local_repeat` | 25.191 | 67.370 |
+| M3 同场对照 `ready_local_control` | 24.963 | 64.660 |
+
+最后两轮 M4 的 BWD host p50 为 17.127/44.014、17.138/48.078 ms；
+M3 同场为 16.968/45.113 ms。三轮 trace hash 一致，M4 首轮一次
+1590 MHz 观测在计时外，第二轮 SM 频率观测全为 1620 MHz；
+M3 对照一次 1560 MHz 观测落在 20K sample 0。计时内未观测到 HBM
+频率下降，测试间隙也未发现其他 GPU 进程，但采样不能排除瞬时干扰。
+单机 BWD 的 SASS 指令流在 M3/M4 **逐条相同**（含被调用函数 9368 条，
+归一化指令 SHA256 `c4af9d4119c1e67638ffd838777f20eef754e446ff8e1cf328e9ecc693def397`）。
+M4 排序仅用于多机；这些结果不足以把单机的差异归因于排序，也不足以
+确认本轮单机 20K 相对 `b151d93` 的稳定收益。波动来源尚未完全定位。
+
+`wave128_phases` 与 `ready_order_phases` 的独立诊断（warmup=1、sample=2）
+显示，最终 dW 完成最晚 rank 的首次 dQ 开始时间，相对 main 入口：
+
+| 规模 / sample | 原静态顺序 / ms | 到达顺序 / ms |
+|---|---:|---:|
+| 8K / 0 | 0.798 | 0.022 |
+| 8K / 1 | 1.101 | 0.038 |
+| 20K / 0 | 0.827 | 0.040 |
+| 20K / 1 | 1.278 | 0.159 |
+
+这些是 GPU 阶段时间，不含 main 前的排序；诊断 trace 不等同于性能表
+的八个样本，不能把各 rank 的阶段最大值相加。return/reduce 仍与 dW
+折叠，没有放宽所有本地 dX 必须先于任何 dW 的约束。
+
+M4 编译器报告：单机/多机 BWD 主 kernel 均为 0/0 B spill store/load，
+pull/Get/receive 也为零；return helper 为 8/8 B。这不代表整个程序
+没有 local memory 访问，也不代表整个 FWD/BWD 都零 spill。
+没有 C7507/C7512/C7518，math 分支没有 accumulator store-to-local。
+
+保留构建为 `bwd_ready_final`（相对 `bwd_canonical_ready_order` 仅格式整理）。
+数值检查覆盖双机 129/8K/20K、每规模两轮变化路由、512-token 窗口；
+另测 8K/20K 的 bias=8 热点，普通/热点两组最大 relative L2
+分别为 0.000734 / 0.000275。
+最终构建 `ready_final_lifetime` 通过三份 live tape、变化长度/热点、
+权重更新、workspace 释放重建、两层 graph/offload。
+现有 Python 回归 117 tests / 470 subtests 通过，未增加细粒度单元测试。
+
 ## M3：消除窗口 padding 和修复寄存器分工
 
 本轮改动的简要说明（详细消融和最终测量见本节末尾）：
@@ -90,7 +171,7 @@ return 流水候选频率采样全部 1620 MHz；其结果仍不支持保留此�
 `build/pf_backward_20261012/*_spills/` 和
 `build/pf_backward_20261012/results/`。
 
-### 保留版复测
+### M3 阶段复测（M4 之前）
 
 最终 artifact 为 `bwd_canonical_final`：184/136、wave=128、同步 fragment
 return、原 wait<0> K-loop。相同 trace 的完整 FWD+BWD wall p50：
@@ -132,7 +213,8 @@ output/dX/dr/dW1/dW2 全部通过原容差；热点最大 relative L2 为 0.0002
 kernel-entry 回归通过。现有 Python 回归 117 tests / 470 subtests 通过，
 没有新增单元测试或更改误差阈值。DT 代码未改，此轮未重跑其性能。
 
-后面的 M1/M2 章节保留当时的实现和测量过程；当前多机协议以本节为准。
+后面的 M1/M2 章节保留当时的实现和测量过程；当前多机协议以本节及
+前述 M4 静态任务排列为准。
 
 ## 设计与里程碑
 

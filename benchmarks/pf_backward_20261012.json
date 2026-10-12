@@ -148,5 +148,64 @@
       "python_subtests": 470
     }
   },
-  "status": "M3 removes repeated communication-window GEMM padding and fixes role register allocation. Single node improves over old PF; two-node complete-cycle performance is approximately tied with old PF, not a claimed universal speedup."
+  "static_ready_order_m4": {
+    "before_commit": "b5d1cc4",
+    "artifact": "build/pf_main_timeline/bwd_ready_final",
+    "order": "Sort canonical M-blocks by last required physical RX window, then block ID; no dynamic claims or changes to saved-row/GEMM reduction order",
+    "additional_persistent_payload_bytes": 0,
+    "two_node_ep16_full_ms": {
+      "ready_order_perf": [32.8357915, 80.2006495],
+      "ready_order_repeat": [33.223929, 80.449921],
+      "ready_final_perf": [32.854529, 80.8082805]
+    },
+    "two_node_ep16_backward_host_boundary_ms": {
+      "ready_order_perf": [20.3937165, 50.4560445],
+      "ready_order_repeat": [20.4385685, 50.7327535],
+      "ready_final_perf": [20.503247, 51.0304045]
+    },
+    "workload_hash_match": true,
+    "clock_caveats": {
+      "ready_order_perf": "One 1485 MHz observation during 20K sample 2; all samples retained",
+      "ready_order_repeat": "Four 1500-1590 MHz observations, all outside timed intervals",
+      "ready_final_perf": "Three 1560-1605 MHz observations, all outside timed intervals",
+      "ready_final_local": "One 1590 MHz observation outside timed intervals",
+      "ready_final_local_repeat": "All observed SM clocks 1620 MHz",
+      "ready_local_control": "M3 control: one 1560 MHz observation during 20K sample 0"
+    },
+    "single_node_ep8_full_ms": {
+      "ready_final_local": [25.4427525, 63.425868],
+      "ready_final_local_repeat": [25.1914365, 67.3698875],
+      "ready_local_control_m3": [24.9629625, 64.6600715]
+    },
+    "single_node_ep8_backward_host_boundary_ms": {
+      "ready_final_local": [17.127152, 44.0141115],
+      "ready_final_local_repeat": [17.1376775, 48.0778805],
+      "ready_local_control_m3": [16.967564, 45.1133905]
+    },
+    "single_node_caveat": "Substantial 20K run-to-run variation, also observed in same-session M3 control. M3/M4 local BWD SASS instructions are identical (9368 including callees). No stable EP8 20K gain over b151d93 claimed; cause of variance not fully isolated.",
+    "compiler_spill_store_load_bytes": {
+      "single_node_kernel": [0, 0],
+      "two_node_kernel": [0, 0],
+      "network_return": [8, 8],
+      "network_pull_get_receive": [0, 0]
+    },
+    "diagnostic_critical_rank_first_du_ms": {
+      "scope": "GPU time relative to main start on last-dW-finishing rank; warmup1/sample2, not the eight-sample performance trace; excludes preparation/sorting",
+      "before_8k": [0.798, 1.101],
+      "after_8k": [0.022, 0.038],
+      "before_20k": [0.827, 1.278],
+      "after_20k": [0.040, 0.159]
+    },
+    "verification": {
+      "two_node": "ready_order_verify: tokens129/8192/20480, two changing-route calls each, window512",
+      "max_relative_l2": 0.0007335633272305131,
+      "hot_routes": "ready_order_hot: tokens8192/20480, two changing-route calls each, bias8, window512",
+      "hot_routes_max_relative_l2": 0.0002749997074715793,
+      "lifetime": "ready_final_lifetime: three live tapes, moving hotspots/lengths, weight refresh, workspace release/recreate, two-layer graph/offload",
+      "local_sass_identical_to_m3": "c4af9d4119c1e67638ffd838777f20eef754e446ff8e1cf328e9ecc693def397",
+      "python_tests": 117,
+      "python_subtests": 470
+    }
+  },
+  "status": "M3 removes communication-window GEMM padding and fixes role register allocation. M4 reduces first-GEMM blocking with static readiness ordering. Final EP16 cycle improves 4.9%/6.6% over b151d93, but is only 1.9%/0.1% faster than old PF: no claimed substantial 20K lead."
 }

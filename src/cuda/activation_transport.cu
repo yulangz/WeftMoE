@@ -6476,6 +6476,26 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       weftmoe_pf::backward_stream::
           prepare_network<<<compute_ctas, 256, 0, transport_stream>>>(pf_args,
                                                                       args);
+      const auto blocks =
+          ActivationTransportBridge::padded_received_rows(retained.dispatch) /
+          backward_tuning::kTileM;
+      auto *words = at<unsigned long long>(slot.device, args.scheduler_offset);
+      auto *order = words + scheduler_layout.phase;
+      auto *scratch = words + scheduler_layout.du_completed;
+      for (std::uint64_t width = 1U; width < blocks; width *= 2U) {
+        weftmoe_pf::backward_stream::
+            merge_order<<<(blocks + 255U) / 256U, 256, 0, transport_stream>>>(
+                order, scratch, blocks, width);
+        std::swap(order, scratch);
+      }
+      if (order != words + scheduler_layout.phase)
+        internal::throw_cuda(
+            "backward-plan",
+            cudaMemcpyAsync(words + scheduler_layout.phase, order,
+                            blocks * sizeof(unsigned long long),
+                            cudaMemcpyDeviceToDevice, transport_stream),
+            identity.rank, identity.world, "backward", identity.generation,
+            ExchangeKind::ExpertCounts, "publish static PF Backward order");
     } else {
       weftmoe_pf::backward_stream::prepare<false>
           <<<dim3(128U, view.sizes.owned_expert_count), 256, 0,
