@@ -7,8 +7,10 @@ namespace weftmoe_pf::network {
 
 constexpr std::size_t kSharedBytes = sizeof(local::Shared);
 
+template <bool Backward = false, unsigned Fc1Tiles = local::kFc1Tiles,
+          unsigned Fc2Tiles = local::kFc2Tiles, class Storage>
 __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
-                                        local::Shared &s) {
+                                        Storage &s) {
   const auto warp = (threadIdx.x - 288U) / 32U;
   const auto role =
       warp == 0U && blockIdx.x < kNetworkOwners ? blockIdx.x : ~0U;
@@ -16,11 +18,11 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
   if (role < kGetWorkers) {
     transfer<true>(a, pending, role);
   } else if (role < kGetWorkers + kPutWorkers) {
-    transfer<false>(a, pending, role - kGetWorkers);
+    transfer<false, Backward>(a, pending, role - kGetWorkers);
   } else if (role < kNetworkOwners - 1U) {
-    progress(a, role - kGetWorkers - kPutWorkers);
+    progress<Backward>(a, role - kGetWorkers - kPutWorkers);
   } else if (role == kNetworkOwners - 1U) {
-    ring::admit<true>(a, local::kFc1Tiles, local::kFc2Tiles);
+    ring::admit<true>(a, Fc1Tiles, Fc2Tiles);
   } else {
     const auto worker = blockIdx.x < kNetworkOwners
                             ? 2U * blockIdx.x + warp - 1U

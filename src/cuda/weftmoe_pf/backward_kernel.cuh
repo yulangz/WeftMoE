@@ -1,6 +1,6 @@
 #pragma once
 
-namespace weftmoe_pf::backward_local {
+namespace weftmoe_pf::backward_stream {
 
 constexpr unsigned kM = 128U, kK = 64U;
 constexpr unsigned kStages = backward_tuning::kDabStages;
@@ -10,7 +10,11 @@ constexpr unsigned kN = kDuN > kDxN ? kDuN : kDxN;
 constexpr unsigned kDuTiles = backward_tuning::kMainIntermediate / kDuN;
 constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 constexpr bool kEnabled = backward_tuning::kActivationClusterN == 2U &&
-                          backward_tuning::kActivationTileK == kK;
+                          backward_tuning::kActivationTileK == kK &&
+                          backward_tuning::kUnifiedWorkers &&
+                          backward_tuning::kUnifiedThreads == 384U &&
+                          backward_tuning::kUnifiedCommBase == 288U &&
+                          backward_tuning::kUnifiedCommThreads == 96U;
 
 // Independent producer/math streams share only operand-stage barriers. The
 // activation epilogue never aliases these stages; dW reuses the arena after
@@ -82,6 +86,7 @@ struct Schedule {
   }
 };
 
+template <bool Network = false>
 __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
   const auto expert = blockIdx.y;
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -92,25 +97,43 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
       kDxTiles / backward_tuning::kActivationClusterN,
       a.scheduler_expert_capacity);
   const auto rows = a.dispatch.expert_row_count[expert];
-  const auto padded = f.ring.expert_blocks[expert] * kM;
+  const auto padded =
+      Network ? peer_at<const unsigned long long>(
+                    a.local_base, a.padded_expert_offsets_offset)[expert]
+              : f.ring.expert_blocks[expert] * kM;
   if (!tid) {
-    peer_at<unsigned long long>(
-        a.local_base, a.padded_expert_offsets_offset)[expert] = padded;
-    peer_at<unsigned long long>(a.local_base,
-                                a.padded_expert_rows_offset)[expert] =
-        (f.ring.expert_blocks[expert + 1U] - f.ring.expert_blocks[expert]) * kM;
+    if constexpr (!Network) {
+      peer_at<unsigned long long>(
+          a.local_base, a.padded_expert_offsets_offset)[expert] = padded;
+      peer_at<unsigned long long>(a.local_base,
+                                  a.padded_expert_rows_offset)[expert] =
+          (f.ring.expert_blocks[expert + 1U] - f.ring.expert_blocks[expert]) *
+          kM;
+      if (expert + 1U == a.dispatch.sizes.owned_expert_count)
+        peer_at<unsigned long long>(
+            a.local_base, a.padded_expert_offsets_offset)[expert + 1U] =
+            f.ring.expert_blocks[expert + 1U] * kM;
+    }
     words[layout.dw_reduction_rows + expert] =
         (rows + backward_tuning::kTileK - 1U) / backward_tuning::kTileK *
         backward_tuning::kTileK;
-    if (expert + 1U == a.dispatch.sizes.owned_expert_count)
-      peer_at<unsigned long long>(a.local_base,
-                                  a.padded_expert_offsets_offset)[expert + 1U] =
-          f.ring.expert_blocks[expert + 1U] * kM;
   }
   auto *mapping = peer_at<unsigned>(a.local_base, a.compact_to_padded_offset);
   for (auto row = std::uint64_t(tid); row < rows; row += stride)
     mapping[a.dispatch.expert_row_prefix[expert] + row] =
         unsigned(padded + row);
+  if constexpr (Network) {
+    // Network M-block tails are not canonical expert tails. Clear only the
+    // canonical dW padding here; the physical dX input tail is cleared in math.
+    const auto tail = (kM - rows % kM) % kM;
+    for (auto v = std::uint64_t(tid); v < tail * a.intermediate; v += stride) {
+      reinterpret_cast<unsigned short *>(
+          a.recomputed_u)[(padded + rows) * a.intermediate + v] = 0U;
+      auto *dab = reinterpret_cast<unsigned short *>(a.dab) +
+                  (padded + rows) * 2U * a.intermediate;
+      dab[v] = dab[tail * a.intermediate + v] = 0U;
+    }
+  }
   if (!rows) {
     const auto elements = a.hidden * a.intermediate;
     auto *dw1 =
@@ -123,32 +146,45 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
     }
   }
   if (!expert) {
-    for (auto i = tid; i < f.ring.depth; i += stride)
-      f.ring.slots[i] = {};
+    if constexpr (!Network)
+      for (auto i = tid; i < f.ring.depth; i += stride)
+        f.ring.slots[i] = {};
     if (!tid) {
       if (a.runtime_epoch)
         ++*a.runtime_epoch;
       words[layout.completed_dw1_tiles] = words[layout.completed_dw2_tiles] =
           0ULL;
+      words[layout.completed_dx_tiles] = 0ULL;
       backward_pipeline_detail::initialize_status(a);
     }
   }
 }
 
+} // namespace weftmoe_pf::backward_stream
+
+#include "cuda/weftmoe_pf/backward_network.cuh"
+
+namespace weftmoe_pf::backward_stream {
+
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+template <bool Network>
 __device__ __forceinline__ void
 produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
         const CUtensorMap &dab, const CUtensorMap &w2, const CUtensorMap &w1) {
-  Schedule schedule(f);
+  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
+  Scheduler schedule(f);
   Task t;
   unsigned stage = 0U, phase = 0U;
   while (schedule.next(t)) {
     if (t.phase == Phase::Swiglu)
       continue;
     const bool dx = t.phase == Phase::Dx;
-    auto &slot = f.ring.slots[t.block % f.ring.depth];
+    auto &slot = f.ring.slots[t.row / kM];
     if (cute::elect_one_sync()) {
-      const auto &ready = dx ? slot.returned : slot.x_full;
+      if constexpr (Network)
+        while (!ring::admitted(f, t.block)) {
+        }
+      const auto &ready = dx ? slot.activation_ready : slot.x_full;
       while (ring::acquire(ready) <
              std::uint64_t(t.generation) * (dx ? 2U : kM)) {
       }
@@ -181,7 +217,7 @@ produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
   }
 }
 
-template <unsigned N, bool Dx>
+template <unsigned N, bool Dx, bool Network>
 __device__ __forceinline__ void
 gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
      const Task &t, unsigned &stage, unsigned &phase) {
@@ -272,25 +308,29 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   backward_unified_compute_detail::UnifiedComputeSynchronization<
       true>::math_sync(256U, 0U);
   if (!threadIdx.x) {
-    auto &slot = f.ring.slots[t.block % f.ring.depth];
+    auto &slot = f.ring.slots[t.row / kM];
     ring::arrive(Dx ? slot.fc2_done : slot.fc1_done, 1U);
+    if constexpr (Dx && Network)
+      ring::arrive(slot.fc2_published, 1U);
   }
 }
 
+template <bool Network>
 __device__ __forceinline__ void
 compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
-  Schedule schedule(f);
+  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
+  Scheduler schedule(f);
   Task t;
   unsigned stage = 0U, phase = 0U;
   const auto *mapping =
       peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
   while (schedule.next(t)) {
     if (t.phase == Phase::Du) {
-      gemm<kDuN, false>(f, a, s, t, stage, phase);
+      gemm<kDuN, false, Network>(f, a, s, t, stage, phase);
     } else if (t.phase == Phase::Dx) {
-      gemm<kDxN, true>(f, a, s, t, stage, phase);
+      gemm<kDxN, true, Network>(f, a, s, t, stage, phase);
     } else {
-      auto &slot = f.ring.slots[t.block % f.ring.depth];
+      auto &slot = f.ring.slots[t.row / kM];
       if (!threadIdx.x)
         while (ring::acquire(slot.fc1_done) <
                std::uint64_t(t.generation) * kDuTiles) {
@@ -303,8 +343,9 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
         const bool valid = row < t.rows;
         const auto saved = valid ? f.checkpoint.rows[t.block * kM + row] : 0U;
         const auto padded = valid ? mapping[saved] : t.block * kM + row;
-        backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
-                                          threadIdx.x % 32U);
+        if (!Network || valid)
+          backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
+                                            threadIdx.x % 32U);
         __syncwarp();
         const auto lane = threadIdx.x % 32U;
         auto *out = reinterpret_cast<uint4 *>(
@@ -313,17 +354,20 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
             a.dab + std::uint64_t(padded) * 2U * a.intermediate);
         for (unsigned column = lane; column < 2U * a.intermediate / 8U;
              column += 32U)
-          out[column] = in[column];
+          out[column] = valid ? in[column] : make_uint4(0U, 0U, 0U, 0U);
         if (valid && !lane) {
           const auto identity = f.ring.rows[t.block * kM + row];
-          a.peer_payloads[identity.source].dgate[identity.route] =
-              a.dgate_rows[padded];
+          if constexpr (Network)
+            *gradient_output(f, identity) = a.dgate_rows[padded];
+          else
+            a.peer_payloads[identity.source].dgate[identity.route] =
+                a.dgate_rows[padded];
         }
       }
       __threadfence_system();
       Sync::math_sync(256U, 0U);
       if (!threadIdx.x) {
-        ring::arrive(slot.returned, 1U);
+        ring::arrive(slot.activation_ready, 1U);
         atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                        ->fc1_complete_clock,
                   device_globaltimer_ns());
@@ -334,14 +378,40 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
 
 // Keep the register domains disjoint across the phase transition. A common
 // outer join can make ptxas discard setmaxnreg for the N256 accumulators.
+template <bool Network>
 __device__ __noinline__ void
-begin_weights(const ForwardKernelArgs &f, unsigned char *storage,
+begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
+              unsigned char *storage,
               backward_unified_compute_detail::SharedState &state) {
-  grid_sync<0U, 384U>(f);
-  backward_unified_compute_detail::initialize_compute<
-      backward_unified_detail::kStorageTileN>(storage, state);
-  __syncthreads();
-  cute::cluster_sync();
+  if constexpr (Network) {
+    // Only compute joins here. Return owners keep their disjoint communication
+    // arena alive and can drain dX/dr while the static dW stream executes.
+    using Sync =
+        backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
+    Sync::cta_sync();
+    backward_unified_compute_detail::initialize_compute<
+        backward_unified_detail::kStorageTileN>(storage, state);
+    Sync::cta_sync();
+    if (!threadIdx.x) {
+      const auto layout = pipeline::backward::make_backward_scheduler_layout(
+          a.scheduler_mblock_capacity, kDxTiles / 2U,
+          a.scheduler_expert_capacity);
+      auto *word = backward_pipeline_detail::scheduler_words(a) +
+                   layout.completed_dx_tiles;
+      ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device> done(
+          *word);
+      done.fetch_add(1ULL, ::cuda::memory_order_acq_rel);
+      while (done.load(::cuda::memory_order_acquire) != gridDim.x) {
+      }
+    }
+    Sync::cta_sync();
+  } else {
+    grid_sync<0U, 384U>(f);
+    backward_unified_compute_detail::initialize_compute<
+        backward_unified_detail::kStorageTileN>(storage, state);
+    __syncthreads();
+    cute::cluster_sync();
+  }
   if (!threadIdx.x)
     atomicMax(&peer_at<TransportDeviceStatus>(f.local_base, f.status_offset)
                    ->fc2_complete_clock,
@@ -354,6 +424,7 @@ __device__ __noinline__ void finish() {
 }
 #endif
 
+template <bool Network = false>
 __global__ __launch_bounds__(384U, 1) void kernel(
     const __grid_constant__ ForwardKernelArgs f,
     const __grid_constant__ BackwardKernelArgs a,
@@ -385,6 +456,12 @@ __global__ __launch_bounds__(384U, 1) void kernel(
     }
     for (auto &barrier : s.pull_full)
       barrier.init(1U);
+    if constexpr (Network) {
+      auto &comm =
+          *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
+      for (auto &barrier : comm.pull_full)
+        barrier.init(1U);
+    }
     cutlass::arch::fence_barrier_init();
   }
   __syncthreads();
@@ -392,8 +469,8 @@ __global__ __launch_bounds__(384U, 1) void kernel(
   if (threadIdx.x < 256U) {
     cutlass::arch::warpgroup_reg_alloc<
         backward_tuning::kUnifiedMathRegisters>();
-    compute(f, a, s);
-    begin_weights(f, storage, state);
+    compute<Network>(f, a, s);
+    begin_weights<Network>(f, a, storage, state);
     backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
         state};
     backward_unified_compute_detail::run_compute<
@@ -406,8 +483,8 @@ __global__ __launch_bounds__(384U, 1) void kernel(
     cutlass::arch::warpgroup_reg_dealloc<
         backward_tuning::kUnifiedControlRegisters>();
     if (threadIdx.x < 288U) {
-      produce(f, s, dy_map, dab_map, w2_map, w1_map);
-      begin_weights(f, storage, state);
+      produce<Network>(f, s, dy_map, dab_map, w2_map, w1_map);
+      begin_weights<Network>(f, a, storage, state);
       backward_unified_compute_detail::UnifiedComputeSynchronization<false>
           sync{state};
       backward_unified_compute_detail::run_compute<
@@ -417,26 +494,33 @@ __global__ __launch_bounds__(384U, 1) void kernel(
           geometry, storage, state, sync);
       finish();
     } else {
-      if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
-        local::pull<kDxTiles, true>(f, s);
-      begin_weights(f, storage, state);
-      auto *status =
-          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-      rank_barrier<288U, 96U>(f);
-      if (threadIdx.x == 288U)
-        atomicMax(&status->return_complete_clock, device_globaltimer_ns());
-      if (threadIdx.x == 288U)
-        atomicMin(&status->backward_reduce_start_clock,
-                  device_globaltimer_ns());
-      local::combine<false, 288U, 96U>(f);
-      if (threadIdx.x == 288U)
-        atomicMax(&status->backward_reduce_complete_clock,
-                  device_globaltimer_ns());
-      rank_barrier<288U, 96U>(f);
+      if constexpr (Network) {
+        auto &comm =
+            *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
+        network::workers<true, kDuTiles, kDxTiles>(f, comm);
+        finish_network(f, a);
+      } else {
+        if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
+          local::pull<kDxTiles, true>(f, s);
+        begin_weights<false>(f, a, storage, state);
+        auto *status =
+            peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+        rank_barrier<288U, 96U>(f);
+        if (threadIdx.x == 288U)
+          atomicMax(&status->return_complete_clock, device_globaltimer_ns());
+        if (threadIdx.x == 288U)
+          atomicMin(&status->backward_reduce_start_clock,
+                    device_globaltimer_ns());
+        local::combine<false, 288U, 96U>(f);
+        if (threadIdx.x == 288U)
+          atomicMax(&status->backward_reduce_complete_clock,
+                    device_globaltimer_ns());
+        rank_barrier<288U, 96U>(f);
+      }
       finish();
     }
   }
 #endif
 }
 
-} // namespace weftmoe_pf::backward_local
+} // namespace weftmoe_pf::backward_stream

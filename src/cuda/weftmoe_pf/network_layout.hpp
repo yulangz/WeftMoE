@@ -23,6 +23,7 @@ struct NetworkLayout {
   std::size_t source_stride = 0;
   std::size_t input = 0;
   std::size_t contribution = 0; // Source-owned, expert-ordered window ring.
+  std::size_t gradient_tx = 0, gradient_contribution = 0;
   static_forward::NetworkRings rings{};
   std::size_t ring_region = 0;
   std::size_t source_bytes =

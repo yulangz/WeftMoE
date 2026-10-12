@@ -817,6 +817,13 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
                checked_mul(contribution_rows, config.max_hidden_size,
                            "registered contribution elements"),
                sizeof(transport::BFloat16), "registered contribution ring");
+    network.gradient_tx = append(
+        cursor,
+        network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
+        sizeof(float), "PF Backward router-gradient TX ring");
+    network.gradient_contribution =
+        append(cursor, contribution_rows, sizeof(float),
+               "PF Backward router-gradient contributions");
   }
   const auto dense_return_row_bytes =
       checked_mul(config.max_hidden_size, sizeof(transport::BFloat16),

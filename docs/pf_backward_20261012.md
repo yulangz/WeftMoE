@@ -9,7 +9,7 @@
   contribution；producer/math 独立重放静态 dQ/SwiGLU/dX 任务流。
   dX epilogue 从 accumulator 直接 128-bit 写回。所有本地 dX 完成后
   math 开始静态 dW，通信 warp 进行 source reduce。
-- [ ] M2 多机：复用当前借用 warp 的按节点去重、逐 token Get、机内 pull、
+- [x] M2 多机协议/正确性：复用当前借用 warp 的按节点去重、逐 token Get、机内 pull、
   直接 TX contribution/Put return。路由计划来自 FWD tape，不再重新
   counts notify。RX fanout、TX NIC completion 和远端 credit 分开退休。
 - [ ] M3 优化与回归：分别测 dQ/dX/dW 参数、缓存写出和激活融合；覆盖随机
@@ -106,4 +106,32 @@ FWD 的 immutable route/packet plan 可复用，但物理 RX/TX 地址必须按
 dr 使用独立小型 FP32 TX/contribution 平面与 GIN 完成信号；dX 和 dr
 分别 acquire 成功后才返还 packet credit，TX 仍保留本地 NIC completion。
 通信共享内存必须与 dW arena 分离，否则为了复用 arena 而等待所有
-Return 结束，会让 dW 与 Return 串行。上述多机实现尚未完成。
+Return 结束，会让 dW 与 Return 串行。
+
+M2 已实现。`backward_kernel.cuh` 共享单机/多机 dQ/SwiGLU/dX/dW 数学流程；
+`backward_network.cuh` 只负责窗口任务流、地址重绑定、dr 地址和终止协议。
+源 contribution、compute block 与 NIC packet generation 均单调前进。
+每次 BWD 重新绑定 RX/TX/本地 contribution 地址，但不重新交换路由计数、
+不重新分配通信池。结束时将共享 compute counters 归一到 FWD 的 N-tile
+单位，下一次 FWD 可继续使用同一套 slot。
+
+dr 为每 route 一个 FP32，新增 registered TX/contribution 小平面，不改
+原有 BF16 dX/FWD payload 的行 stride。每包 dX、dr 各自 Put+weak signal；
+接收方 acquire 两个信号后才 acknowledge。独立 flush request 保护本地
+NIC 对两份 TX 的读取。FWD 不发 dr Put，也不推进 dr signal。
+
+通信 staging 与 dW arena 分开；384-thread CTA 中仍为 256 math、32 TMA
+producer、96 communication。保留 64 Get / 48 Put / 19 progress / 1 admit
+的借用 warp 分配。compute-only grid completion 保证全部本地 dX 完成
+后才执行 dW；通信继续 return/reduce，与 dW 并行，不加入该 compute join。
+
+双机验证：129/8K/20K 各三轮变化路由通过完整 Torch 校验；另外，首个
+协议候选通过 8K/20K bias=8 的热点/空专家、512-token window 回绕。
+流程按节点数参数化，目前硬件只验证两节点、每节点 8 GPU。
+
+性能仍待优化：相同 2048-token window，首版完整周期为
+33.712/85.982 ms，慢于旧 PF。仅将 window 放大到 4096，得到
+32.271/80.742 ms；此时实际路由的 M128 padding 仍为约 14.2%/10.7%。
+放大窗口同时增大持久 ring 容量，因此不将它悄悄改为默认配置。
+下一步先尝试跳过没有有效行的 WGMMA warpgroup，保持相同 2048 window
+和同步计数，检查能否减少 padding 的计算代价。

@@ -37,5 +37,12 @@
     "python_tests": 117,
     "python_subtests": 470
   },
-  "status": "M1 single-node complete; M2 new multi-node backward not yet enabled"
+  "two_node_ep16_new_backward": {
+    "m2_perf_window2048": [33.7120965, 85.981711],
+    "m2_window4096": [32.271035, 80.7416315],
+    "m2_window4096_padding_fraction": [0.1420296819805955, 0.10672923060040773],
+    "generation_verification": {"tokens": [129, 8192, 20480], "steps_each": 3, "ring_tokens": 512},
+    "hot_route_verification": {"tokens": [8192, 20480], "steps_each": 2, "ring_tokens": 512, "route_bias_std": 8, "max_relative_l2": 0.0002749997074715793}
+  },
+  "status": "M1 and M2 correctness complete; multi-node performance tuning in progress"
 }

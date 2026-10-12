@@ -22,19 +22,20 @@ def run(command, **kwargs):
 
 def function_name(symbol):
     tail = symbol.rsplit("$", 1)[-1]
-    match = re.search(r"weftmoe_pf(?:7network|4ring|5local|14backward_local)(\d+)(\w+)", tail)
+    match = re.search(r"weftmoe_pf(?:7network|4ring|5local|15backward_stream)(\d+)(\w+)", tail)
     if not match:
         return tail
     name = match[2][:int(match[1])]
     if name == "transfer":
-        name += "_get" if "ILb1EE" in tail else "_put"
+        name += "_get" if "transferILb1E" in tail else "_put"
     return name
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", required=True, type=Path)
-    parser.add_argument("--kernel", choices=("local", "network", "backward_local"), default="network")
+    parser.add_argument("--kernel", choices=("local", "network", "backward_stream"), default="network")
+    parser.add_argument("--backward-network", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,8 @@ def main():
                       size=int(m[3], 0), section=int(m[4]), symbol=m[5])
                  for m in pattern.finditer(symbols)]
     key = f"weftmoe_pf{len(args.kernel)}{args.kernel}6kernel"
+    if args.kernel == "backward_stream":
+        key += "ILb1EE" if args.backward_network else "ILb0EE"
     kernel, = (f for f in functions if key in f["symbol"] and "$" not in f["symbol"])
     functions = sorted((f for f in functions if f["section"] == kernel["section"]),
                        key=lambda f: f["begin"])

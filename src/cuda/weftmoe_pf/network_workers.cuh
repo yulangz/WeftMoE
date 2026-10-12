@@ -14,7 +14,7 @@ struct Pending {
 };
 static_assert(kNetworkPending * sizeof(Pending) <= 4096U);
 
-template <bool Get>
+template <bool Get, bool Backward = false>
 __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
                                       Pending *pending, unsigned worker) {
   if (threadIdx.x % 32U)
@@ -131,7 +131,7 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
           continue;
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart, GinReturn,
                                    channel, sequence, rows);
-        endpoint.send(true, channel, sequence, rows * row_bytes);
+        endpoint.send<Backward>(true, channel, sequence, rows * row_bytes);
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnGinPutIssue,
                                    GinReturn, channel, sequence, rows);
         // FC2 no longer owns these rows. TX storage remains protected by the
@@ -238,6 +238,7 @@ __device__ __forceinline__ bool publish_block(const ForwardKernelArgs &a,
   return true;
 }
 
+template <bool Backward = false>
 __device__ __noinline__ void progress(const ForwardKernelArgs &a,
                                       unsigned worker) {
   if (threadIdx.x % 32U)
@@ -259,7 +260,8 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
         const auto sequence = state.rx_cursor;
         const auto &desc =
             a.ring.returning.packets[plan.begin + sequence - state.rx_base];
-        if (endpoint.import_ready(true, channel, sequence, desc.rows)) {
+        if (endpoint.import_ready<Backward>(true, channel, sequence,
+                                            desc.rows)) {
           WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalObserved,
                                      SourceRelay, channel, sequence, desc.rows);
           // Payload goes directly to immutable invocation-sized contribution
@@ -299,7 +301,8 @@ struct Copy {
   }
 };
 
-__device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
+template <class Storage>
+__device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
                                   unsigned warp, unsigned worker,
                                   unsigned workers) {
   const auto lane = threadIdx.x % 32U;

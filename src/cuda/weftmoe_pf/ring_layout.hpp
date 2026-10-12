@@ -33,6 +33,9 @@ struct alignas(64) NetworkSlot {
   std::uint64_t visible_generation = 0;
   std::uint64_t consumed_total = 0;
   std::uint64_t retire_target = 0;
+  // Backward-only scalar payload. Forward does not advance this sequence.
+  std::uint64_t gradient_signal = 0;
+  std::uint64_t gradient_target = 0;
 };
 static_assert(sizeof(NetworkSlot) == 64U);
 

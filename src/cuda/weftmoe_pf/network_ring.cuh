@@ -9,8 +9,8 @@ struct Endpoint {
   ncclGin gin;
 
   __device__ Endpoint(const ForwardKernelArgs &args, unsigned context)
-      : a(args), gin(args.gin_dev_comm, context,
-                     NCCL_GIN_RESOURCE_SHARING_THREAD) {}
+      : a(args),
+        gin(args.gin_dev_comm, context, NCCL_GIN_RESOURCE_SHARING_THREAD) {}
 
   __device__ const static_forward::NetworkRings &layout() const {
     return a.static_network.rings;
@@ -71,12 +71,14 @@ struct Endpoint {
 
   __device__ bool can_send(bool returning, unsigned channel,
                            std::uint64_t sequence) const {
-    const auto consumed = gin.readSignal(a.gin_window, credit(returning, channel));
+    const auto consumed =
+        gin.readSignal(a.gin_window, credit(returning, channel));
     if (sequence >= layout().depth &&
         !communication::reached(consumed, sequence - layout().depth + 1U, 64U))
       return false;
     if (sequence >= layout().depth &&
-        sequence - layout().depth >= state(returning, channel).tx_completed_head)
+        sequence - layout().depth >=
+            state(returning, channel).tx_completed_head)
       complete_sends(returning, channel);
     // Reservation never runs beyond tx_cursor + depth: a previous occupant
     // is already issued and the completed head now covers its local read.
@@ -86,6 +88,7 @@ struct Endpoint {
 
   // The caller has completed its TX writes, including all asynchronous copies.
   // Reuse waits for remote consumed credit AND an explicit local flush.
+  template <bool Backward = false>
   __device__ void send(bool returning, unsigned channel, std::uint64_t sequence,
                        std::size_t bytes) {
     const auto remote = remote_channel(channel);
@@ -95,17 +98,16 @@ struct Endpoint {
       const auto directory = a.node * layout().lanes + channel % layout().lanes;
       const auto begin = ring::source_metadata(
           a, source, a.ring.returning.channel_offsets)[directory];
-      const auto &packet =
-          ring::source_metadata(a, source, a.ring.returning.packets)[
-              begin + sequence - state(true, channel).tx_base];
+      const auto &packet = ring::source_metadata(
+          a, source, a.ring.returning.packets)[begin + sequence -
+                                               state(true, channel).tx_base];
       destination = return_tx::destination(a, source, packet);
     } else {
       destination = a.static_network.ring_region +
                     layout().dispatch_payload(true, remote, sequence);
     }
     gin.put(ncclTeamWorld(gin.comm), peer(channel), a.gin_window, destination,
-            a.gin_window,
-            tx_payload(returning, channel, sequence), bytes,
+            a.gin_window, tx_payload(returning, channel, sequence), bytes,
             // Each slot imports its own bundled Put. No consumer relies on
             // this signal to order other packets on the same context.
             ncclGin_WeakVASignalAdd{
@@ -113,14 +115,36 @@ struct Endpoint {
                 control(returning, remote, sequence) +
                     offsetof(static_forward::NetworkSlot, ready_signal),
                 1U},
-            ncclGin_None{},
-            ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_block,
-            ::cuda::thread_scope_system);
+            ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+            ::cuda::thread_scope_block, ::cuda::thread_scope_system);
+    if constexpr (Backward) {
+      const auto row_bytes = a.hidden * sizeof(transport::BFloat16);
+      const auto source_row =
+          (tx_payload(true, channel, sequence) - a.static_network.ring_region -
+           layout().return_payload(0U, 0U)) /
+          row_bytes;
+      const auto destination_row =
+          (destination - a.static_network.contribution) / row_bytes;
+      gin.put(ncclTeamWorld(gin.comm), peer(channel), a.gin_window,
+              a.static_network.gradient_contribution +
+                  destination_row * sizeof(float),
+              a.gin_window,
+              a.static_network.gradient_tx + source_row * sizeof(float),
+              bytes / row_bytes * sizeof(float),
+              ncclGin_WeakVASignalAdd{
+                  a.gin_window,
+                  control(true, remote, sequence) +
+                      offsetof(static_forward::NetworkSlot, gradient_signal),
+                  1U},
+              ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+              ::cuda::thread_scope_block, ::cuda::thread_scope_system);
+    }
   }
 
   // readSignal acquires NIC payload visibility before the rail publishes the
   // generation to ordinary GPU/peer readers. A generic load is not a
   // substitute.
+  template <bool Backward = false>
   __device__ bool import_ready(bool returning, unsigned channel,
                                std::uint64_t sequence,
                                const std::uint32_t &expected) {
@@ -130,8 +154,17 @@ struct Endpoint {
                                                   ready_signal)) < generation)
       return false;
     auto &s = slot(returning, channel, sequence);
+    if constexpr (Backward) {
+      if (gin.readSignal(a.gin_window, control(true, channel, sequence) +
+                                           offsetof(static_forward::NetworkSlot,
+                                                    gradient_signal)) <
+          s.gradient_target + 1U)
+        return false;
+      ++s.gradient_target;
+    }
     s.retire_target += expected;
-    ring::publish<::cuda::thread_scope_system>(s.visible_generation, generation);
+    ring::publish<::cuda::thread_scope_system>(s.visible_generation,
+                                               generation);
     return true;
   }
 
@@ -152,8 +185,7 @@ struct Endpoint {
     if (head != c.acknowledged_head) {
       gin.signal(ncclTeamWorld(gin.comm), peer(channel),
                  ncclGin_StrongVASignalAdd{
-                     a.gin_window,
-                     credit(returning, remote_channel(channel)),
+                     a.gin_window, credit(returning, remote_channel(channel)),
                      head - c.acknowledged_head},
                  ncclCoopThread{}, ncclGin_None{}, ::cuda::thread_scope_thread,
                  ::cuda::thread_scope_system);
@@ -167,7 +199,8 @@ struct Endpoint {
       return state(returning, channel).acknowledged_head == terminal;
     complete_sends(returning, channel);
     return communication::reached(
-        gin.readSignal(a.gin_window, credit(returning, channel)), terminal, 64U);
+        gin.readSignal(a.gin_window, credit(returning, channel)), terminal,
+        64U);
   }
 };
 
@@ -186,11 +219,15 @@ static __global__ void initialize(ncclDevComm_t dev, ncclWindow_t window,
               layout.ring_region + r.control(returning, channel, index);
           gin.resetSignal(window, offset + offsetof(static_forward::NetworkSlot,
                                                     ready_signal));
+          if (returning)
+            gin.resetSignal(window,
+                            offset + offsetof(static_forward::NetworkSlot,
+                                              gradient_signal));
           if (index == 0U)
-            gin.resetSignal(
-                window, layout.ring_region + r.state(returning, channel) +
-                            offsetof(static_forward::NetworkChannel,
-                                     credit_signal));
+            gin.resetSignal(window, layout.ring_region +
+                                        r.state(returning, channel) +
+                                        offsetof(static_forward::NetworkChannel,
+                                                 credit_signal));
         }
       }
     }
