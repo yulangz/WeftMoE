@@ -1,5 +1,74 @@
 {
   "base_commit": "1cfb423",
+  "spill_l2_m7_m8": {
+    "baseline_commit": "4bcc72a",
+    "retained_commit": "b5f7e60",
+    "experiment_branch": "experiment/pf-l2-swizzle-20261012",
+    "experiment_commits": {"wave_panels": "116c357", "local_expert_panels": "f97bba7"},
+    "tokens_per_rank": [8192, 20480],
+    "warmups": 4,
+    "samples": 16,
+    "prime_trace": true,
+    "ring_window_tokens": 2048,
+    "ring_depth": 2,
+    "requested_sm_clock_mhz": 1620,
+    "raw_directory": "build/pf_spill_l2_20261012/results",
+    "timing": "Full training FWD+BWD+release+synchronize wall p50; per-call packing and cache allocation included, initial persistent pool excluded",
+    "spill_store_load_bytes": {
+      "original_184_136": [20, 44],
+      "geometry_reference_rejected": [20, 44],
+      "uniform_cursor_rejected": [32, 60],
+      "retained_192_120": [0, 0],
+      "candidate_200_104": [0, 0]
+    },
+    "ep16_register_screen_full_ms": {
+      "base0": [32.947346, 77.8936285],
+      "r192_0": [33.048997, 77.845143],
+      "r200_0": [33.112695, 77.993254]
+    },
+    "ep16_register_confirmation": {
+      "aggregation": "mean of two run-level slowest-rank p50s, not a pooled median",
+      "old_labels": ["base0", "base_reverse"],
+      "new_labels": ["r192_0", "network_retained"],
+      "old_full_ms": [33.01602375, 77.77997225],
+      "new_full_ms": [32.92745675, 78.01366725],
+      "old_bwd_host_ms": [20.4340785, 48.97515625],
+      "new_bwd_host_ms": [20.4532815, 49.0695495],
+      "conclusion": "within 0.31 percent end-to-end; no confirmed speedup"
+    },
+    "ep16_l2_screen_full_ms": {
+      "l2_base0": [33.0539385, 77.433329],
+      "dw4_0": [32.881698, 77.516435],
+      "dw1_0": [32.9561105, 77.9810895],
+      "act4_0": [32.94637, 77.724099],
+      "act2_0": [33.360961, 78.1897105],
+      "fwd4_0": [34.2127755, 80.627557],
+      "fwd2_0": [34.249249, 81.3315025]
+    },
+    "ep8_l2_screen_full_ms": {
+      "local_base0": [24.9216685, 61.4944355],
+      "local_dw4_0": [25.1341635, 62.1813965],
+      "local_act4_0": [31.090307, 79.6903655],
+      "local_expert4_0": [25.4205175, 70.131598],
+      "local_fwd4_0": [26.0971405, 70.1432065]
+    },
+    "ep8_retained_full_ms": [24.833442, 61.584961],
+    "ep8_retained_bwd_host_ms": [16.8096775, 43.115437],
+    "l2_selection": "Keep original tile order; ablation code retained only on experiment branch",
+    "correctness": {
+      "retained_tokens": [129, 8192, 20480],
+      "changing_route_calls_per_shape": 2,
+      "retained_ep8_max_relative_l2": 0.0008383619715459645,
+      "retained_ep16_max_relative_l2": 0.0007335633272305131,
+      "width4_candidates": "EP8 and EP16, 129 tokens, two calls each",
+      "local_expert4": "EP8, 129/8192/20480 tokens, two calls each",
+      "narrower_candidates": "Performance screening only, not retained production paths",
+      "host_tests_passed": 17,
+      "python_tests_passed": 117,
+      "python_subtests_passed": 470
+    },
+    "clocks": "1620 MHz requested; sampled timing intervals include occasional throttling and unsampled intervals. All measurements retained; sampled HBM 3201 MHz. See per-run clocks and docs for counts."
+  },
   "shape": {"hidden": 4096, "intermediate": 2048, "experts": 256, "top_k": 6},
   "workload": "variable_tokens_random_routes",
   "seed": 123,

@@ -3,6 +3,91 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+本轮保留：多机 main spill **20/44 B → 0/0 B**，完整周期差异约 ±0.3%，
+性能基本持平；L2 分组消融没有确认收益，不改变生产路径的 tile 顺序。
+
+## M8：L2 tile-order swizzle 消融（不启用）
+
+**保留结论：只采用 M7 的零 spill 配额，不改变原来的 tile 顺序。**
+本轮 N-panel swizzle 没有确认端到端收益；没有把无收益的开关和分支
+留在保留版。消融实现保存在 `experiment/pf-l2-swizzle-20261012`：
+`116c357` 是全 wave 分组，`f97bba7` 补充单机 expert 内分组。
+这不是“所有 L2 swizzle 都无效”的结论，仅覆盖下面的 shape 和排列。
+
+这里改的是 CTA/tile 的访问顺序，不是 shared-memory swizzle 或张量布局。
+基线使用 M7 的 192/120；FWD 原本已有 N-group=16，在 Flash 的 FC1/FC2
+各 16 个 N tiles 时等价于扫完整个 N。分别改变三个位置，其余不动：
+
+- FWD：FC1/FC2 共用的 N panel 从 16 缩到 4 或 2，仍在同一个 expert 内。
+- dU/dX：在 wave 内按 N-panel=4/2 扫 M-block；单机另外试了仅在当前
+  expert 与 wave 的交集内分组，避免反复扫过多个 expert 的权重。
+- dW1/dW2：在 cluster-pair 网格上使用 N-panel=4/1；重排整个 pair，
+  不拆开 multicast 的两个 CTA，奇数维度的 singleton tail 留在原位。
+
+没有改变 K 维累加顺序、dX 优先于 dW 的约束、network canonical 到达
+顺序表、ring slot/generation 或完成计数。所有候选的 local/network
+BWD main 和 pull/return/receive helper 均为 0/0 B spill，没有
+C7507/C7512/C7518，因而下面的回退不能归因于新出现的 main spill。
+
+统一使用 H4096/I2048/E256/top6、每 rank 8K/20K 附近正态波动 10%、
+route bias std=0.5、seed=123，B2048/D2，完整 prime trace 后
+4 warmups / 16 samples。同拓扑候选的逐 rank workload hash 和 native
+工作区容量一致。表格是**完整训练 FWD+BWD+释放+同步**的 rank-max
+wall p50（ms），包括每调用权重重排和缓存申请，不包括初次持久池准备；
+不是独立 GEMM 或 main-kernel event 时间。
+
+双机 EP16：
+
+| 单项变化 | 8K | 20K |
+|---|---:|---:|
+| 原 tile 顺序，192/120 | 33.054 | 77.433 |
+| dW N-panel=4 | 32.882 | 77.516 |
+| dW N-panel=1 | 32.956 | 77.981 |
+| dU/dX N-panel=4 | 32.946 | 77.724 |
+| dU/dX N-panel=2 | 33.361 | 78.190 |
+| FWD N-panel=4 | 34.213 | 80.628 |
+| FWD N-panel=2 | 34.249 | 81.332 |
+
+BWD 的小幅差异没有构成稳定收益；FWD N-panel=4/2 分别回退约
+3.5%/4.1% 和 3.6%/5.0%（8K/20K），不启用。
+
+单机 EP8（不是两机 EP8）：
+
+| 单项变化 | 8K | 20K |
+|---|---:|---:|
+| 原 tile 顺序 | 24.922 | 61.494 |
+| dW N-panel=4 | 25.134 | 62.181 |
+| dU/dX 全 wave N-panel=4 | 31.090 | 79.690 |
+| dU/dX expert 内 N-panel=4 | 25.421 | 70.132 |
+| FWD N-panel=4 | 26.097 | 70.143 |
+
+全 wave 的 dU/dX 分组打散了原来的 expert-major 访问顺序，产生约
+25%/30% 的回退。限制在 expert 内后明显恢复，但仍比基线慢约
+2%/14%，所以也不保留。这个对照支持“不能跨 expert 盲目缩窄 panel”，
+并没有证明 expert 内分组已经是最优实现。
+N-panel 还会改变一个 M-block 完成全部 N tiles 的时序，不能只按
+理论缓存复用判断 fused ring pipeline 的收益。本轮没有采集 L2 hit-rate
+或 HBM 流量计数器，不把回退单独归因于 cache miss 或某个通信阶段。
+
+正确性：保留配额在 EP8/EP16 均通过 129/8K/20K 每规模两次变化路由的
+output/dX/dr/dW1/dW2 检查，最大 relative L2 为 0.000838/0.000734。
+N-panel=4 的三个独立消融也均通过 EP8/EP16 的 129-token 两次检查；
+expert 内版本额外通过 EP8 的 8K/20K 两次检查。更窄分组仅作性能初筛，
+不作为已验证的生产配置。已有 host 测试 17/17、Python 117 tests /
+470 subtests 通过；只扩展已有 cluster-pair 覆盖检查，没有新增测试函数。
+
+两机均设置 SM 1620 MHz；这些 swizzle 测量中，多机少量计时内采样
+出现 1425–1605 MHz，单机采到的计时点均为 1620 MHz。部分区间没有
+采样点，不能称全程严格恒频；HBM 采样均为 3201 MHz，未丢弃任何样本。
+亚 1% 的差异不包装成性能收益。
+
+复现源码见上述实验提交，编译入口为
+`benchmarks/build_pf_main_timeline.py LABEL --define NAME=VALUE`，独立宏为
+`WEFTMOE_PF_FORWARD_N_GROUP`、`WEFTMOE_PF_BWD_ACTIVATION_N_GROUP`、
+`WEFTMOE_PF_BWD_DW_N_GROUP`，实验默认值分别为 16/0/0。
+编译产物在 `build/pf_main_timeline/bwd_l2_*`，原始 trace/计时/时钟/
+manifest 在 `build/pf_spill_l2_20261012/results`；`local_*` 标签为单机。
+
 ## M7：消除 GDAKI-only 主 kernel 的标量 spill
 
 结论：多机 math/control 寄存器配额从 **184/136 改为 192/120**。
@@ -42,6 +127,27 @@ atomic fallback 的 LDL/STL，不能将这些静态指令全部算成实际 spil
 
 192/120 通过双机 129/8K/20K、每个规模两次变化路由的完整数值验证，
 output/dX/dr/dW1/dW2 最大 relative L2 为 0.000734。
+
+完成 L2 消融后，再按“保留版 → 原版”反向复测，与最初的
+“原版 → 192/120”组成两组对照。以下是两轮 rank-max p50 的均值，
+不是把各轮原始样本合在一起重新取 p50（ms）：
+
+| 口径 / 配额 | 8K | 20K |
+|---|---:|---:|
+| 完整周期，184/136 | 33.016 | 77.780 |
+| 完整周期，192/120 | 32.927 | 78.014 |
+| BWD host 边界，184/136 | 20.434 | 48.975 |
+| BWD host 边界，192/120 | 20.453 | 49.070 |
+
+完整周期变化 -0.27%/+0.30%，BWD host 边界变化 +0.09%/+0.19%，
+结论仍是基本持平，而不是零 spill 带来了可观加速。
+保留版最终单机 EP8 完整周期为 **24.833 / 61.585 ms**，
+BWD host 边界为 16.810 / 43.115 ms；单机算术路径和寄存器配额未改。
+两组双机对照中，旧/新分别观测到 4/2 个低于 1620 MHz 的计时点，
+范围分别为 1455–1590 / 1440–1590 MHz。最终单机观测到
+1575/1560 MHz 两个点；均保留。其他采到的计时点为 1620 MHz，
+HBM 为 3201 MHz，仍有未采到时钟点的短区间。
+
 编译/SASS 位于 `build/pf_main_timeline/bwd_spill_*` 和
 `build/pf_spill_l2_20261012/audit_r192`，本轮逐 rank 日志、时钟与 manifest
 位于 `build/pf_spill_l2_20261012/results`。
