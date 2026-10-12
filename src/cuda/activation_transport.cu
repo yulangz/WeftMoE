@@ -6726,6 +6726,14 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 << s.backward_return_send_complete_clock
                 << " return_receive_complete="
                 << s.backward_return_receive_complete_clock
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+                << " du_gemm_complete=" << s.before_combine_complete_clock
+                << " du_service_ns=" << s.fc1_tasks_done
+                << " dx_service_ns=" << s.fc2_tasks_done
+                << " swiglu_service_ns=" << s.synthetic_ticks
+                << " du_ready_wait_ns=" << s.dispatch_put_ticks
+                << " dx_ready_wait_ns=" << s.relay_ticks
+#endif
 #if __has_include(<nccl_device.h>)
                 << " gin_contexts="
                 << (use_gin ? args.gin_dev_comm.ginContextCount : 0)

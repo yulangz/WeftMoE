@@ -252,6 +252,12 @@ __device__ __noinline__ void pull_canonical(const ForwardKernelArgs &f,
         }
         __syncwarp();
       });
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING) || defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
+  if (!lane)
+    atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                   ->dispatch_complete_clock,
+              device_globaltimer_ns());
+#endif
 }
 
 // Consecutive rows to one source/contribution interval become one Put. An

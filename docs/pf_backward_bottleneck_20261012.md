@@ -84,6 +84,28 @@ cuBLAS，禁用降精度归约；完整输出校验和重复运行逐位一致�
 的有效算力落差。但均衡与热点、普通输出与通信 epilogue 不同，不能把差值
 直接当作某个同步环节的精确耗时。
 
+### 补测真实热点专家行数
+
+`export_training_gemm_rows.py` 从完整基线日志重建 CUDA 路由随机流，
+逐 rank 验证 workload SHA256，并检查全部 timed-step 的收到行数。
+按“最热 rank 收到行数”的下中位数选择一个代表步骤，不按性能挑样本。
+每个专家的真实行数通过 `.rows` 文件传入 `pure_backward_gemm`；
+DU/DX 按 M128 补齐，dW 按 K64 补齐，padding 输入为零，有效 FLOPs
+只计真实行数。cuBLAS 对照是 CUDA Graph 内的逐专家 GEMM，不是 TE
+grouped GEMM。两个实现都预分配，完整输出和逐位重复检查通过。
+
+| EP / tokens | 代表最热 rank 行数 | 四 GEMM ms：PF / cuBLAS | PF dU / dX / dW1 / dW2 TFLOPS |
+|---|---:|---:|---|
+| EP8 / 8K | 64637 | 10.538 / 10.032 | 656.0 / 662.3 / 662.7 / 463.9 |
+| EP8 / 20K | 164439 | 25.162 / 23.518 | 685.3 / 688.0 / 689.9 / 539.0 |
+| EP16 / 8K | 78801 | 12.107 / 11.389 | 676.8 / 682.9 / 707.1 / 520.0 |
+| EP16 / 20K | 198734 | 28.821 / 27.417 | 690.9 / 691.4 / 728.7 / 641.4 |
+
+这里 dW 仍使用旧的 4-pair chunk。热点负载暴露出均衡测试看不到的
+dW2 效率损失，不能笼统说“四个 GEMM 都没有问题”。下一步用同一行数
+重放 1-pair chunk；与生产的静态排程消融相互印证。该组全部 30 次计时
+前后 NVML 采样为 1620 MHz，原始数据在 `gemm_ragged/results`。
+
 ## 纯通信替身
 
 `WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC` 只供诊断。保留生产 Dispatch、
@@ -101,6 +123,18 @@ Dispatch 与 Return 仍重叠，不将同一段时间称为两个独立单向带
 `--report-communication` 在计时外按实际路由统计 node 去重 Dispatch rows、
 远端 contribution rows 和 off-rank expert rows，用于计算实际 payload。
 
+按每个计时样本计算有效 payload / 全阶段设备时间，再取 p50：
+
+| 口径 | 8K GB/s | 20K GB/s |
+|---|---:|---:|
+| EP8，off-rank Dispatch + Return，每 GPU 平均 | 185.3 | 159.7 |
+| EP16，RDMA Dispatch + Return 累计发送，每 NIC 平均 | 28.46 | 27.57 |
+
+第一行把 off-rank expert rows 的输入和输出各计一次；第二行 Dispatch
+按目的节点去重，Return 按实际专家 contribution 计数，包含每行 4B dGate。
+这是全流程均摊的有效载荷速率，不是网卡瞬时峰值，也不是分别隔离出的
+Dispatch / Return 带宽。不能由它直接断言链路硬件只有这些带宽。
+
 单机/双机均通过 129/8K/20K、每规模两次变化路由的 identity 检查：
 `dX == BF16(top_k * FP32(dY))` 逐位相等，dGate 全零。
 此模式的 dW 没有计算，不能拿它报告训练性能或梯度正确性。
@@ -114,3 +148,50 @@ Dispatch 与 Return 仍重叠，不将同一段时间称为两个独立单向带
   同时活跃专家数量与输入复用的影响，不引入共享领用队列。
 - 单机 activation expert wave / 小 wave：不改 N tile 顺序，仅缩短
   dU→SwiGLU→dX 的数据存活范围；全局 dX 完成后才执行 dW 的约束不变。
+
+## 第一轮数据流优化（完整周期，ms）
+
+| 候选 | EP8 8K | EP8 20K | EP16 8K | EP16 20K |
+|---|---:|---:|---:|---:|
+| 原基线 | 25.048 | 62.929 | 32.838 | 77.460 |
+| dW 每 cluster 静态轮转 1 个 N-pair chunk | 23.081 | 58.387 | 30.912 | 73.234 |
+| dW 每 cluster 轮转 4 个 chunk | 23.532 | 60.589 | 31.142 | 74.574 |
+| 仅单机 activation wave 限为 128 M-block | 24.767 | 57.987 | — | — |
+| 轮转 1 + 单机 wave128 | 23.071 | 53.871 | 同轮转 1 | 同轮转 1 |
+| 上行再加 dU epilogue 融合 SwiGLU | 22.797 | 53.933 | 30.249 | 72.592 |
+| 轮转 1 + wave128 + K128/两级流水 | 22.980 | 54.092 | — | — |
+
+轮转分配仍是静态所有权，无共享任务队列；不改变任何 GEMM 的 K 归约
+顺序。小 wave 缩短中间数据存活范围，并非缩小专家的完整 dW reduction。
+按专家边界截 wave 的候选为 28.955 / 61.231 ms，8K 明显回退，淘汰。
+轮转 1/4 均通过单/双机 129/8K/20K 的完整梯度校验；wave128 通过单机
+同样校验。上述收益不简单相加，例如融合 SwiGLU 与 wave128 在 20K 上
+重叠，组合后没有继续改善。
+
+融合版保留原 BF16 dU 精度边界，再从寄存器内的 BF16 dU 计算 SwiGLU。
+首版网络 math 出现 spill，压紧 dU 的寄存器存活期后主 kernel 恢复零 spill。
+修正版 `packed_verify_ep8/16` 均通过 129/8K/20K、每规模两次变动路由的
+完整梯度校验。当前本地 dY 与 dAB ring 仍复用地址，因此必须等全部 dU
+N-tile 消费完 dY 后，再把 canonical dAB 写入 ring，不能提前覆盖。
+
+以上是单轮候选，未作为最终达标结果；仍需反序复测和默认实现确认。
+
+## CTA 服务时间诊断
+
+`WEFTMOE_PF_BWD_TASK_TIMING` 只用于诊断：累计每个 CTA 的任务服务时间，
+除以 132 个 CTA，再逐步取 rank-max、最后取 p50。它包括 TMA 等待及
+epilogue，不是纯 WGMMA 时间，也不等于关键路径；各列不可相加。
+`task_probe_reset_ep8/16` 在每次 BWD prepare 明确清零计数，避免 FWD
+复用状态字段带来的残留。
+
+| 平均 CTA 服务/等待（ms） | EP8 8K | EP8 20K | EP16 8K | EP16 20K |
+|---|---:|---:|---:|---:|
+| dU GEMM + epilogue | 2.404 | 6.181 | 3.354 | 7.122 |
+| dX GEMM + epilogue | 3.861 | 13.157 | 4.789 | 13.319 |
+| SwiGLU + dAB gather | 1.787 | 4.499 | 1.896 | 5.083 |
+| producer 等待 dU 输入 ready | 0.930 | 2.489 | 1.569 | 2.007 |
+| producer 等待 dX 输入 ready | 0.235 | 0.284 | 1.242 | 3.286 |
+
+下一轮针对静态 dW 仍经过任务邮箱/cluster join，以及 SwiGLU/gather 的
+向量化与重复 GM 读取做消融。缓存局部性目前是由排程消融支持的解释，
+还没有采集 L2 miss 硬件计数器，不将其写成已测量的因果结论。

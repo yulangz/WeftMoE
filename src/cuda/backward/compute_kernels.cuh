@@ -352,7 +352,8 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
 // DeepGEMM's persistent block loop without weakening Q_DX > Q_DAB priority.
 template <std::uint32_t TileM, std::uint32_t TileN,
           std::uint32_t StorageTileN = TileN,
-          class Synchronization = FullCtaComputeSynchronization>
+          class Synchronization = FullCtaComputeSynchronization,
+          bool Continuous = false>
 __device__ __forceinline__ void
 run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
                 const CUtensorMap &output_store_map, std::uint32_t first_tile,
@@ -491,12 +492,14 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
       }
     }
   }
-  Synchronization::cta_sync();
-  // A following activation task may reuse the dW output staging area. Keep
-  // stores pipelined within this range, then drain before the cluster rejoins.
-  if (threadIdx.x < (TileM / 128U) * (TileN / 64U))
-    asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
-  Synchronization::cta_sync();
+  if constexpr (!Continuous) {
+    Synchronization::cta_sync();
+    // An activation task may reuse this arena. A weights-only stream instead
+    // retains the arena and drains its last store when the stream terminates.
+    if (threadIdx.x < (TileM / 128U) * (TileN / 64U))
+      asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+    Synchronization::cta_sync();
+  }
   pipeline += tile_count * iterations;
 }
 #endif

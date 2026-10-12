@@ -55,9 +55,9 @@ def main():
                 "profile_sha256": hashlib.sha256(args.profile.read_bytes()).hexdigest(),
                 "binary_sha256": hashlib.sha256((directory / "pure_gemm").read_bytes()).hexdigest(),
                 "command": command,
-                "scope": "Static paired tasks, balanced M, preallocated tensors; no routing, activation or communication",
+                "scope": "Static paired tasks, balanced or rows-file expert extents, preallocated tensors; no routing, activation or communication",
                 "timing": "CUDA Graph replay; 2 s spaced joint warmup; 30 alternating event samples, one conditioning call and 50 ms cooldown; NVML clocks before/after each sample",
-                "cublas": "strided batched BF16/FP32/BF16; reduced-precision reduction disabled"}
+                "cublas": "balanced: strided batched; rows-file: graph of per-expert GEMMs; BF16/FP32/BF16, reduced-precision reduction disabled"}
     (directory / "provenance.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(directory / "pure_gemm")
 

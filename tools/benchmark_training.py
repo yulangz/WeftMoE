@@ -185,6 +185,8 @@ def main():
         ]).cuda()
         dist.all_reduce(incoming, op=dist.ReduceOp.SUM)
         expert_rows = incoming.cpu()
+        if communication is not None:
+            communication["expert_rows_per_step"] = expert_rows[args.warmups:].tolist()
         incoming = expert_rows.reshape(len(batches), world, owned).sum(dim=-1)
         max_tokens = max(max(workload["tokens"]) for workload in workloads)
         window_padding = None

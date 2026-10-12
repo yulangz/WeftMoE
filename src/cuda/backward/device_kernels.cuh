@@ -130,9 +130,13 @@ __global__ void backward_wait_for_dispatch_rows_kernel(BackwardKernelArgs a,
     __nanosleep(backward_tuning::kReduceIdleNanosleep);
 }
 
+#include "cuda/backward/swiglu.cuh"
+
+template <bool Stage = false, unsigned VectorWords = 1U>
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
     const BackwardKernelArgs &a, std::uint64_t padded_row,
-    std::uint64_t compact_row, bool row_is_valid, std::uint32_t lane) {
+    std::uint64_t compact_row, bool row_is_valid, std::uint32_t lane,
+    transport::BFloat16 *staging = nullptr) {
   auto *u = a.recomputed_u;
   const auto *ab = a.saved_ab;
   const auto *gates = a.saved_gates;
@@ -140,6 +144,50 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
   auto *dgate = a.dgate_rows;
   const auto b_base = a.saved_rows * a.intermediate;
   const auto output_base = padded_row * 2ULL * a.intermediate;
+  static_assert(VectorWords == 1U || VectorWords == 4U);
+  if constexpr (VectorWords == 4U) {
+    float partial = 0.0F;
+    const auto gate = row_is_valid ? gates[compact_row] : 0.0F;
+    for (std::uint64_t column = 8ULL * lane; column < a.intermediate;
+         column += 256U) {
+      uint4 da{}, db{}, activation{};
+      if (row_is_valid) {
+        const auto output_index = padded_row * a.intermediate + column;
+        const auto input_index = compact_row * a.intermediate + column;
+        const auto av = *reinterpret_cast<const uint4 *>(ab + input_index);
+        const auto bv = *reinterpret_cast<const uint4 *>(ab + b_base + input_index);
+        const auto du = *reinterpret_cast<const uint4 *>(u + output_index);
+        const unsigned as[4] = {av.x, av.y, av.z, av.w};
+        const unsigned bs[4] = {bv.x, bv.y, bv.z, bv.w};
+        const unsigned ds[4] = {du.x, du.y, du.z, du.w};
+        unsigned das[4], dbs[4], us[4];
+#pragma unroll
+        for (unsigned word = 0U; word < 4U; ++word) {
+          const auto result = backward_swiglu_pair(as[word], bs[word], ds[word],
+                                                    gate, partial);
+          das[word] = result.da;
+          dbs[word] = result.db;
+          us[word] = result.u;
+        }
+        da = make_uint4(das[0], das[1], das[2], das[3]);
+        db = make_uint4(dbs[0], dbs[1], dbs[2], dbs[3]);
+        activation = make_uint4(us[0], us[1], us[2], us[3]);
+      }
+      *reinterpret_cast<uint4 *>(dab + output_base + column) = da;
+      *reinterpret_cast<uint4 *>(dab + output_base + a.intermediate + column) = db;
+      *reinterpret_cast<uint4 *>(u + padded_row * a.intermediate + column) = activation;
+      if constexpr (Stage) {
+        *reinterpret_cast<uint4 *>(staging + column) = da;
+        *reinterpret_cast<uint4 *>(staging + a.intermediate + column) = db;
+      }
+    }
+#pragma unroll
+    for (unsigned stride = 16U; stride; stride >>= 1U)
+      partial += __shfl_down_sync(0xffffffffU, partial, stride);
+    if (!lane)
+      dgate[padded_row] = partial;
+    return;
+  }
   if (!row_is_valid) {
     for (std::uint64_t column = 2ULL * lane; column < a.intermediate;
          column += 64U) {
@@ -148,6 +196,10 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
       *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = 0U;
       *reinterpret_cast<std::uint32_t *>(dab + output_base + a.intermediate +
                                          column) = 0U;
+      if constexpr (Stage) {
+        *reinterpret_cast<unsigned *>(staging + column) = 0U;
+        *reinterpret_cast<unsigned *>(staging + a.intermediate + column) = 0U;
+      }
     }
     if (lane == 0U)
       dgate[padded_row] = 0.0F;
@@ -166,41 +218,15 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         *reinterpret_cast<const std::uint32_t *>(ab + b_base + input_index);
     const auto du_pair =
         *reinterpret_cast<const std::uint32_t *>(u + output_index);
-    std::uint32_t da_pair = 0U;
-    std::uint32_t db_pair = 0U;
-    std::uint32_t gated_u_pair = 0U;
-#pragma unroll
-    for (std::uint32_t element = 0U; element < 2U; ++element) {
-      const auto shift = element * 16U;
-      const auto av = __uint_as_float((a_pair >> shift) << 16U);
-      const auto bv = __uint_as_float((b_pair >> shift) << 16U);
-      const auto duv = __uint_as_float((du_pair >> shift) << 16U);
-      const float denominator = 1.0F + __expf(-av);
-      float sigmoid;
-      if (!(denominator < 0x1p126f)) {
-        sigmoid = 1.0F / denominator;
-      } else {
-        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sigmoid) : "f"(denominator));
-        sigmoid =
-            __fmaf_rn(sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
-      }
-      const auto silu = av * sigmoid;
-      const auto s = silu * bv;
-      const auto ds = gate * duv;
-      const auto silu_derivative = sigmoid * (1.0F + av * (1.0F - sigmoid));
-      da_pair |= static_cast<std::uint32_t>(
-                     float_to_bf16_bits(ds * bv * silu_derivative))
-                 << shift;
-      db_pair |= static_cast<std::uint32_t>(float_to_bf16_bits(ds * silu))
-                 << shift;
-      gated_u_pair |= static_cast<std::uint32_t>(float_to_bf16_bits(gate * s))
-                      << shift;
-      partial = fmaf(duv, s, partial);
-    }
-    *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = da_pair;
+    const auto result = backward_swiglu_pair(a_pair, b_pair, du_pair, gate, partial);
+    *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = result.da;
     *reinterpret_cast<std::uint32_t *>(dab + output_base + a.intermediate +
-                                       column) = db_pair;
-    *reinterpret_cast<std::uint32_t *>(u + output_index) = gated_u_pair;
+                                       column) = result.db;
+    *reinterpret_cast<std::uint32_t *>(u + output_index) = result.u;
+    if constexpr (Stage) {
+      *reinterpret_cast<unsigned *>(staging + column) = result.da;
+      *reinterpret_cast<unsigned *>(staging + a.intermediate + column) = result.db;
+    }
   }
 #pragma unroll
   for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U)

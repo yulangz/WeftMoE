@@ -23,6 +23,21 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 0
 #endif
+#ifndef WEFTMOE_PF_BWD_GATHER_BATCH
+#define WEFTMOE_PF_BWD_GATHER_BATCH 1
+#endif
+#ifndef WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS
+#define WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS 1
+#endif
+#ifndef WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING
+#define WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING 0
+#endif
+#ifndef WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP
+#define WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP 0
+#endif
+#ifndef WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE
+#define WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE 0
+#endif
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -188,6 +203,12 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
           0ULL;
       words[layout.completed_dx_tiles] = 0ULL;
       backward_pipeline_detail::initialize_status(a);
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+      auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      status->before_combine_complete_clock = 0ULL;
+      status->fc1_tasks_done = status->fc2_tasks_done = 0ULL;
+      status->synthetic_ticks = status->dispatch_put_ticks = status->relay_ticks = 0ULL;
+#endif
     }
   }
 }
@@ -195,6 +216,7 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 } // namespace weftmoe_pf::backward_stream
 
 #include "cuda/weftmoe_pf/backward_network.cuh"
+#include "cuda/weftmoe_pf/backward_epilogue.cuh"
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
 #include "../../../benchmarks/pf_backward_identity.cuh"
 #endif
@@ -216,6 +238,9 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       continue;
     const bool dx = t.phase == Phase::Dx;
     auto &slot = f.ring.slots[t.row / kM];
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+    const auto ready_begin = device_globaltimer_ns();
+#endif
     if (cute::elect_one_sync()) {
       if constexpr (Network) {
         if (!dx) {
@@ -243,6 +268,13 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       asm volatile("fence.proxy.async.global;" ::: "memory");
     }
     __syncwarp();
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+    if (threadIdx.x == 256U) {
+      auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      atomicAdd(dx ? &status->relay_ticks : &status->dispatch_put_ticks,
+                device_globaltimer_ns() - ready_begin);
+    }
+#endif
     const auto reduction = dx ? 2U * f.intermediate : f.hidden;
     const auto input_row =
         Network ? (dx ? t.block * kM : directory(a)[t.block].compact_row)
@@ -272,6 +304,9 @@ template <unsigned N, bool Dx, bool Network>
 __device__ __forceinline__ void
 gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
      const Task &t, unsigned &stage, unsigned &phase) {
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+  const auto task_begin = device_globaltimer_ns();
+#endif
   constexpr auto MajorA = hopper::Major::K, MajorB = hopper::Major::MN;
   using Mma =
       typename hopper::BF16MMASelector<N, MajorA, MajorB, kK, 128U>::type;
@@ -321,11 +356,36 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
         checkpoint.save(s.a[stage] + atom * kM * 64U + half * 64U,
                         checkpoint_rows, k + atom * 64U, f.hidden,
                         f.saved_x_map);
-    cute::warpgroup_wait<0>();
-    backward_compute_detail::release_stage(s.empty[stage]);
+    if constexpr (WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP == 0) {
+      cute::warpgroup_wait<0>();
+      backward_compute_detail::release_stage(s.empty[stage]);
+    } else if (k) {
+      static_assert(kStages >= 2U);
+      cute::warpgroup_wait<1>();
+      backward_compute_detail::release_stage(s.empty[(stage + kStages - 1U) % kStages]);
+    }
     stage = (stage + 1U) % kStages;
     phase ^= stage == 0U;
   }
+#if WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP != 0
+  cute::warpgroup_wait<0>();
+  backward_compute_detail::release_stage(s.empty[(stage + kStages - 1U) % kStages]);
+#endif
+#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
+  if constexpr (!Dx) {
+    // dU was BF16 before SwiGLU in the unfused path. Compact it before loading
+    // G/U so the epilogue does not keep 128 FP32 accumulators live alongside
+    // its activation vectors. This is a compiler fence, not a device barrier.
+    unsigned packed[Mma::kNumAccum / 2U];
+#pragma unroll
+    for (unsigned i = 0U; i < Mma::kNumAccum / 2U; ++i) {
+      packed[i] = float2_to_bf16x2_bits(accum[2U * i], accum[2U * i + 1U]);
+      asm volatile("" : "+r"(packed[i]) : : "memory");
+    }
+    store_swiglu<N, Network>(f, a, t, packed);
+  } else
+#endif
+  {
   const auto lane = threadIdx.x % 32U;
   const auto row0 = threadIdx.x / 32U * 16U + lane / 4U;
   const auto *mapping =
@@ -360,13 +420,23 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
               make_uint4(bits[0], bits[1], bits[2], bits[3]));
     }
   }
-  if constexpr (Dx)
-    __threadfence_system();
-  else
+  }
+  if constexpr (Dx) {
+    if constexpr (Network || !WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
+      __threadfence_system();
+  } else {
     __threadfence();
+  }
   backward_unified_compute_detail::UnifiedComputeSynchronization<
       true>::math_sync(256U, 0U);
   if (!threadIdx.x) {
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    atomicAdd(Dx ? &status->fc2_tasks_done : &status->fc1_tasks_done,
+              device_globaltimer_ns() - task_begin);
+    if constexpr (!Dx)
+      atomicMax(&status->before_combine_complete_clock, device_globaltimer_ns());
+#endif
     auto &slot = f.ring.slots[t.row / kM];
     ring::arrive(Dx ? slot.fc2_done : slot.fc1_done, 1U);
     if constexpr (Dx && Network)
@@ -398,6 +468,9 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
       using Sync =
           backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
       Sync::math_sync(256U, 0U);
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+      const auto task_begin = device_globaltimer_ns();
+#endif
       for (unsigned row = t.column * 64U + threadIdx.x / 32U;
            row < (t.column + 1U) * 64U; row += 8U) {
         const bool valid = row < t.rows;
@@ -407,32 +480,71 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
                   : 0U;
         const auto padded =
             Network || !valid ? t.block * kM + row : mapping[saved];
-        backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
-                                          threadIdx.x % 32U);
-        __syncwarp();
         const auto lane = threadIdx.x % 32U;
-        if constexpr (!Network) {
+        float gate_gradient = 0.0F;
+#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
+        for (unsigned tile = lane; tile < kDuTiles; tile += 32U)
+          gate_gradient += a.dgate_rows[std::uint64_t(padded) * kDuTiles + tile];
+#pragma unroll
+        for (unsigned stride = 16U; stride; stride >>= 1U)
+          gate_gradient += __shfl_down_sync(0xffffffffU, gate_gradient, stride);
+#else
+        backward_swiglu_epilogue_warp_row<
+            !Network && WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING,
+            WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS>(
+            a, padded, saved, valid, lane,
+            Network ? nullptr : a.dx_rows +
+                                    std::uint64_t(t.row + row) * a.activation_stride);
+        __syncwarp();
+        if (!lane)
+          gate_gradient = a.dgate_rows[padded];
+#endif
+        if constexpr (!Network &&
+#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
+                      true
+#else
+                      !WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING
+#endif
+        ) {
           auto *out = reinterpret_cast<uint4 *>(
               a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
           const auto *in = reinterpret_cast<const uint4 *>(
               a.dab + std::uint64_t(padded) * 2U * a.intermediate);
+          constexpr unsigned Batch = WEFTMOE_PF_BWD_GATHER_BATCH;
           for (unsigned column = lane; column < 2U * a.intermediate / 8U;
-               column += 32U)
-            out[column] = valid ? in[column] : make_uint4(0U, 0U, 0U, 0U);
+               column += 32U * Batch) {
+            uint4 values[Batch];
+#pragma unroll
+            for (unsigned i = 0U; i < Batch; ++i)
+              if (column + 32U * i < 2U * a.intermediate / 8U)
+                values[i] = valid ? in[column + 32U * i] : make_uint4(0U, 0U, 0U, 0U);
+#pragma unroll
+            for (unsigned i = 0U; i < Batch; ++i)
+              if (column + 32U * i < 2U * a.intermediate / 8U)
+                out[column + 32U * i] = values[i];
+          }
         }
         if (valid && !lane) {
           if constexpr (Network)
-            *gradient_output(f, a, t, row) = a.dgate_rows[padded];
+            *gradient_output(f, a, t, row) = gate_gradient;
           else {
             const auto identity = f.ring.rows[t.block * kM + row];
             a.peer_payloads[identity.source].dgate[identity.route] =
-                a.dgate_rows[padded];
+                gate_gradient;
           }
         }
       }
-      __threadfence_system();
+      if constexpr (Network || !WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
+        __threadfence_system();
+      else
+        __threadfence();
       Sync::math_sync(256U, 0U);
       if (!threadIdx.x) {
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+        atomicAdd(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                       ->synthetic_ticks,
+                  device_globaltimer_ns() - task_begin);
+#endif
         ring::arrive(slot.activation_ready, 1U);
         atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
                        ->fc1_complete_clock,
@@ -471,6 +583,10 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     }
     Sync::cta_sync();
   } else {
+    // Local ring credits retire dY/dAB reads, not remote contribution stores.
+    // Drain every writer once before the grid hands publication to Return.
+    if constexpr (WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
+      __threadfence_system();
     grid_sync<0U, 384U>(f);
     backward_unified_compute_detail::initialize_compute<
         backward_unified_detail::kStorageTileN>(storage, state);

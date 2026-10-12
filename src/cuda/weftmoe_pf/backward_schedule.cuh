@@ -4,6 +4,9 @@ namespace weftmoe_pf::backward {
 #ifndef WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
 #define WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM 0
 #endif
+#ifndef WEFTMOE_PF_BWD_DW_SHORT_ROWS
+#define WEFTMOE_PF_BWD_DW_SHORT_ROWS 0
+#endif
 
 // Canonical dU/SwiGLU/dX stays on one cluster when the source range fits.
 // Bounded source windows use a separate, window-major dX N-pair domain.
@@ -113,6 +116,30 @@ struct Schedule {
     const auto experts = a.dispatch.sizes.owned_expert_count;
 #if WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM > 0
     {
+#if WEFTMOE_PF_BWD_DW_SHORT_ROWS > 0
+      // Small-K experts amortize mailbox/TMA-store latency with four pairs;
+      // long reductions expose every pair to the full static cluster grid.
+      while (weight < 2U * experts) {
+        const bool first = weight < experts;
+        const auto expert = first ? weight : weight - experts;
+        const auto pairs = first ? kDw2Pairs : kDw1Pairs;
+        const auto shift = rows[expert] <= WEFTMOE_PF_BWD_DW_SHORT_ROWS ? 2U : 0U;
+        const auto claim = 1U << shift;
+        const auto chunks = (pairs + claim - 1U) >> shift;
+        if (weight_partition < chunks) {
+          const auto tile = weight_partition << shift;
+          weight_partition += clusters;
+          if (a.dispatch.expert_row_count[expert]) {
+            task = {expert, tile, first ? TaskKind::Dw2 : TaskKind::Dw1,
+                    min(claim, pairs - tile)};
+            return true;
+          }
+        } else {
+          weight_partition -= chunks;
+          ++weight;
+        }
+      }
+#else
       constexpr unsigned claim = WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM;
       constexpr auto chunks2 = (kDw2Pairs + claim - 1U) / claim;
       constexpr auto chunks1 = (kDw1Pairs + claim - 1U) / claim;
@@ -130,6 +157,7 @@ struct Schedule {
           return true;
         }
       }
+#endif
       terminal = true;
       return false;
     }

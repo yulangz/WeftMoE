@@ -7,6 +7,10 @@
 // Both kernel layouts use this scheduler and the same arithmetic routines.
 namespace backward_unified_compute_detail {
 
+#ifndef WEFTMOE_PF_BWD_DW_STATIC_PIPELINE
+#define WEFTMOE_PF_BWD_DW_STATIC_PIPELINE 0
+#endif
+
 inline constexpr std::uint32_t kComputeThreads =
     backward_compute_detail::kMathThreads + 32U;
 inline constexpr std::uint32_t kComputeBarrier = 3U;
@@ -159,11 +163,13 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
                                      backward_tuning::kActivationClusterN;
   constexpr std::uint32_t kDwStoreIssuers =
       (backward_tuning::kDwTileM / 128U) * (DwTileN / 64U);
-  auto &task_kind_shared = state.task_kind;
-  auto &task_owner_shared = state.task_owner;
-  auto &task_tile_shared = state.task_tile;
-  auto &task_count_shared = state.task_count;
-  auto &phase_shared = state.phase;
+  constexpr bool independent = WeightsOnly && WEFTMOE_PF_BWD_DW_STATIC_PIPELINE;
+  unsigned kind_local, owner_local, tile_local, count_local, phase_local;
+  auto &task_kind_shared = independent ? kind_local : state.task_kind;
+  auto &task_owner_shared = independent ? owner_local : state.task_owner;
+  auto &task_tile_shared = independent ? tile_local : state.task_tile;
+  auto &task_count_shared = independent ? count_local : state.task_count;
+  auto &phase_shared = independent ? phase_local : state.phase;
   std::uint32_t activation_pipeline = 0U;
   std::uint32_t dw_pipeline = 0U;
   auto *words = scheduler_words(a);
@@ -177,9 +183,14 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
   const auto cluster_rank = cluster.block_rank();
   weftmoe_pf::backward::Schedule schedule(blockIdx.x / 2U);
 
+  // Every role traverses the same immutable weights-only schedule. Operand
+  // stage credits protect both local and multicast consumers across tasks.
+  if constexpr (independent)
+    synchronization.cluster_sync();
+
   while (true) {
-    if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
-        cluster_rank == 0U) {
+    if (independent || (Synchronization::kMathEnabled && threadIdx.x == 0U &&
+                        cluster_rank == 0U)) {
       TileTask task{};
       phase_shared = 0U;
       bool claimed = false;
@@ -202,16 +213,18 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
     }
     // This join drains the previous task before either CTA reads the new
     // claim. Each CTA then keeps its own mailbox copy until the next join.
-    synchronization.cluster_sync();
-    if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
-        cluster_rank != 0U) {
-      task_kind_shared = *cluster.map_shared_rank(&task_kind_shared, 0U);
-      task_owner_shared = *cluster.map_shared_rank(&task_owner_shared, 0U);
-      task_tile_shared = *cluster.map_shared_rank(&task_tile_shared, 0U);
-      task_count_shared = *cluster.map_shared_rank(&task_count_shared, 0U);
-      phase_shared = *cluster.map_shared_rank(&phase_shared, 0U);
+    if constexpr (!independent) {
+      synchronization.cluster_sync();
+      if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
+          cluster_rank != 0U) {
+        task_kind_shared = *cluster.map_shared_rank(&task_kind_shared, 0U);
+        task_owner_shared = *cluster.map_shared_rank(&task_owner_shared, 0U);
+        task_tile_shared = *cluster.map_shared_rank(&task_tile_shared, 0U);
+        task_count_shared = *cluster.map_shared_rank(&task_count_shared, 0U);
+        phase_shared = *cluster.map_shared_rank(&phase_shared, 0U);
+      }
+      synchronization.mailbox_read_done();
     }
-    synchronization.mailbox_read_done();
     if (task_kind_shared == kTerminalTask) {
       if (threadIdx.x < kDwStoreIssuers)
         asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
@@ -405,7 +418,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       const auto compact_reduction_start =
           static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[owner]);
       backward_compute_detail::run_mn_mn_chunk<
-          backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization>(
+          backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization,
+          independent>(
           dr_mn_map, u_mn_map, dw2_store_map, task_tile_shared,
           task_count_shared, kDw2MTiles, kDw2NTiles, compact_reduction_start,
           static_cast<std::uint32_t>(padded_offsets[owner]), reduction_rows,
@@ -438,7 +452,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       const auto compact_reduction_start =
           static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[owner]);
       backward_compute_detail::run_mn_mn_chunk<
-          backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization>(
+          backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization,
+          independent>(
           dab_mn_map, x_mn_map, dw1_store_map, task_tile_shared,
           task_count_shared, kDw1MTiles, kDw1NTiles,
           static_cast<std::uint32_t>(padded_offsets[owner]),
@@ -466,7 +481,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
     }
     // The next iteration joins the cluster. Only a local join is needed
     // here to protect this CTA's mailbox from its leader's next claim.
-    Synchronization::cta_sync();
+    if constexpr (!independent)
+      Synchronization::cta_sync();
   }
 }
 #endif
