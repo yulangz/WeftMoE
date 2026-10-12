@@ -43,7 +43,7 @@ template <int Op, bool Math>
 __device__ __forceinline__ void gemm_tasks(
     const CUtensorMap &am, const CUtensorMap &bm, const CUtensorMap &om,
     int M, int N, int K, int groups, const unsigned *prefix,
-    unsigned char *storage) {
+    unsigned char *storage, transport::BFloat16 *output) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   using namespace backward_compute_detail;
   constexpr bool Dw = Op >= 2;
@@ -74,7 +74,7 @@ __device__ __forceinline__ void gemm_tasks(
       const auto reduction = prefix ? prefix[expert + 1] - start : K;
       run_mn_mn_chunk<tile_m, tile_n, storage_n, DiagnosticSynchronization<Math>>(
           am, bm, om, first, count, mt, nt, start, start, reduction, N,
-          expert * M, storage, pipeline);
+          expert * M, storage, pipeline, output);
       cute::cluster_sync();
     }
   } else {
@@ -114,10 +114,10 @@ __global__ __launch_bounds__(384, 1) void backward_gemm(
   cute::cluster_sync();
   if (threadIdx.x < 256) {
     cutlass::arch::warpgroup_reg_alloc<WEFTMOE_GEMM_MATH_REGISTERS>();
-    gemm_tasks<Op, true>(am, bm, om, M, N, K, groups, prefix, storage);
+    gemm_tasks<Op, true>(am, bm, om, M, N, K, groups, prefix, storage, output);
   } else {
     cutlass::arch::warpgroup_reg_dealloc<504 - 2 * WEFTMOE_GEMM_MATH_REGISTERS>();
-    gemm_tasks<Op, false>(am, bm, om, M, N, K, groups, prefix, storage);
+    gemm_tasks<Op, false>(am, bm, om, M, N, K, groups, prefix, storage, output);
   }
 #endif
 }

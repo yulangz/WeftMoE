@@ -7,6 +7,12 @@ namespace weftmoe_pf::backward {
 #ifndef WEFTMOE_PF_BWD_DW_SHORT_ROWS
 #define WEFTMOE_PF_BWD_DW_SHORT_ROWS 0
 #endif
+#ifndef WEFTMOE_PF_BWD_DW1_CLAIM
+#define WEFTMOE_PF_BWD_DW1_CLAIM WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
+#endif
+#ifndef WEFTMOE_PF_BWD_DW2_CLAIM
+#define WEFTMOE_PF_BWD_DW2_CLAIM WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
+#endif
 
 // Canonical dU/SwiGLU/dX stays on one cluster when the source range fits.
 // Bounded source windows use a separate, window-major dX N-pair domain.
@@ -140,13 +146,15 @@ struct Schedule {
         }
       }
 #else
-      constexpr unsigned claim = WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM;
-      constexpr auto chunks2 = (kDw2Pairs + claim - 1U) / claim;
-      constexpr auto chunks1 = (kDw1Pairs + claim - 1U) / claim;
+      constexpr unsigned claim2 = WEFTMOE_PF_BWD_DW2_CLAIM;
+      constexpr unsigned claim1 = WEFTMOE_PF_BWD_DW1_CLAIM;
+      constexpr auto chunks2 = (kDw2Pairs + claim2 - 1U) / claim2;
+      constexpr auto chunks1 = (kDw1Pairs + claim1 - 1U) / claim1;
       while (weight_partition < experts * (chunks2 + chunks1)) {
         const auto index = weight_partition;
         weight_partition += clusters;
         const bool first = index < experts * chunks2;
+        const auto claim = first ? claim2 : claim1;
         const auto chunks = first ? chunks2 : chunks1;
         const auto relative = first ? index : index - experts * chunks2;
         const auto expert = relative / chunks;

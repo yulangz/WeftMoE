@@ -6192,7 +6192,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     pf_args.output = static_cast<transport::BFloat16 *>(data.dx->data);
     args.activation_stride = std::max<std::uint64_t>(
         config.hidden_size, 2ULL * config.intermediate_size);
-    if (use_gin) {
+    if (use_gin || weftmoe_pf::backward_stream::kCanonicalLocal) {
       dab_map = make_bf16_tma_map(
           args.dab, 2ULL * config.intermediate_size, data.padded_rows, 128U,
           "PF Backward canonical dAB", 64U);
@@ -6598,7 +6598,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto launch_result =
       pf_stream
           ? cudaLaunchKernelEx(&launch, stream_kernel, pf_args, args,
-                               use_gin ? peer_workspace.buffer->dr_map
+                               use_gin || weftmoe_pf::backward_stream::kCanonicalLocal
+                                       ? peer_workspace.buffer->dr_map
                                        : slot.forward_x_map,
                                dab_map,
                                retained.weights.impl_->backward_w2_map,

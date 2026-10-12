@@ -36,6 +36,7 @@ def main():
                "-lineinfo", "-Xptxas=-v,--warn-on-spills",
                *("-D" + value for value in args.define),
                "--threads", str(args.jobs), "-I" + str(root / "src"),
+               "-I" + str(args.profile.resolve().parent),
                "-include", str(directory / "tuning.hpp"),
                "-I" + os.environ.get("CUTLASS_INCLUDE_DIR", "/opt/cutlass/include"),
                "-I" + str(directory), str(benchmark), "-lcuda", "-lcublas",

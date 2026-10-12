@@ -14,8 +14,9 @@ __device__ __forceinline__ void store_swiglu(
     const auto row = row0 + item * 8U;
     const bool valid = row < t.rows;
     const auto saved = valid ? (Network ? directory(a)[t.block].compact_row + row
-                                       : f.checkpoint.rows[t.block * kM + row]) : 0U;
-    const auto padded = Network || !valid ? t.block * kM + row : mapping[saved];
+                                       : kCanonicalLocal ? compact_local_row(f, a, t) + row
+                                                         : f.checkpoint.rows[t.block * kM + row]) : 0U;
+    const auto padded = Network || kCanonicalLocal || !valid ? t.block * kM + row : mapping[saved];
     const auto gate = valid ? a.saved_gates[saved] : 0.0F;
     float partial = 0.0F;
 #pragma unroll

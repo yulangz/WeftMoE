@@ -424,7 +424,8 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
           task_count_shared, kDw2MTiles, kDw2NTiles, compact_reduction_start,
           static_cast<std::uint32_t>(padded_offsets[owner]), reduction_rows,
           static_cast<std::uint32_t>(a.intermediate),
-          owner * static_cast<std::uint32_t>(a.hidden), storage, dw_pipeline);
+          owner * static_cast<std::uint32_t>(a.hidden), storage, dw_pipeline,
+          a.dw2);
       const auto last = pipeline::backward::cluster_tile(
           task_tile_shared + task_count_shared - 1U, cluster_rank, kDw2MTiles,
           kDw2NTiles);
@@ -460,7 +461,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
           compact_reduction_start, reduction_rows,
           static_cast<std::uint32_t>(a.hidden),
           owner * static_cast<std::uint32_t>(2ULL * a.intermediate), storage,
-          dw_pipeline);
+          dw_pipeline, a.dw1);
       const auto last = pipeline::backward::cluster_tile(
           task_tile_shared + task_count_shared - 1U, cluster_rank, kDw1MTiles,
           kDw1NTiles);

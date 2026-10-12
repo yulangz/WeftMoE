@@ -38,6 +38,10 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE
 #define WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE 0
 #endif
+#ifndef WEFTMOE_PF_BWD_CANONICAL_LOCAL
+#define WEFTMOE_PF_BWD_CANONICAL_LOCAL 0
+#endif
+constexpr bool kCanonicalLocal = WEFTMOE_PF_BWD_CANONICAL_LOCAL;
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -167,6 +171,10 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
   for (auto row = std::uint64_t(tid); row < rows; row += stride)
     mapping[a.dispatch.expert_row_prefix[expert] + row] =
         unsigned(padded + row);
+  if constexpr (!Network && kCanonicalLocal)
+    for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
+         block += stride)
+      words[layout.dispatch_arrived + padded / kM + block] = 0ULL;
   if constexpr (Network) {
     for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
          block += stride)
@@ -216,6 +224,7 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 } // namespace weftmoe_pf::backward_stream
 
 #include "cuda/weftmoe_pf/backward_network.cuh"
+#include "cuda/weftmoe_pf/backward_local.cuh"
 #include "cuda/weftmoe_pf/backward_epilogue.cuh"
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
 #include "../../../benchmarks/pf_backward_identity.cuh"
@@ -242,7 +251,7 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     const auto ready_begin = device_globaltimer_ns();
 #endif
     if (cute::elect_one_sync()) {
-      if constexpr (Network) {
+      if constexpr (Network || kCanonicalLocal) {
         if (!dx) {
           const auto *ready = backward_pipeline_detail::scheduler_words(a) +
                               directory_layout(a).dispatch_arrived;
@@ -252,7 +261,7 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
         } else {
           while (ring::acquire(slot.activation_ready) <
                      std::uint64_t(t.generation) * 2U ||
-                 ring::acquire(slot.returned) < t.generation - 1U) {
+                 (Network && ring::acquire(slot.returned) < t.generation - 1U)) {
           }
         }
       } else {
@@ -278,7 +287,8 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     const auto reduction = dx ? 2U * f.intermediate : f.hidden;
     const auto input_row =
         Network ? (dx ? t.block * kM : directory(a)[t.block].compact_row)
-                : t.row;
+                : kCanonicalLocal ? (dx ? t.block * kM : compact_local_row(f, a, t))
+                                  : t.row;
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
@@ -318,7 +328,8 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   float accum[Mma::kNumAccum] = {};
   const auto reduction = Dx ? 2U * f.intermediate : f.hidden;
   const bool checkpoint_owner =
-      !Dx && !Network && t.column / 2U == t.block % (kDuTiles / 2U);
+      !Dx && !Network && !kCanonicalLocal &&
+      t.column / 2U == t.block % (kDuTiles / 2U);
   const auto half = (t.column % 2U) * 64U;
   const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
   forward_compute_detail::StaticV4XCheckpoint<64U, 64U> checkpoint;
@@ -398,12 +409,13 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     transport::BFloat16 *output;
     if constexpr (Dx)
       output = Network ? dx_output(f, a, t, row)
-                       : static_cast<transport::BFloat16 *>(
-                             f.ring.rows[t.block * kM + row].output);
+                       : kCanonicalLocal ? local_dx_output(f, a, t, row)
+                                         : static_cast<transport::BFloat16 *>(
+                                               f.ring.rows[t.block * kM + row].output);
     else
       output = a.recomputed_u +
                std::uint64_t(
-                   Network ? t.block * kM + row
+                   Network || kCanonicalLocal ? t.block * kM + row
                            : mapping[f.checkpoint.rows[t.block * kM + row]]) *
                    a.intermediate;
     output += t.column * N;
@@ -476,10 +488,11 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
         const bool valid = row < t.rows;
         const auto saved =
             valid ? (Network ? directory(a)[t.block].compact_row + row
-                             : f.checkpoint.rows[t.block * kM + row])
+                             : kCanonicalLocal ? compact_local_row(f, a, t) + row
+                                               : f.checkpoint.rows[t.block * kM + row])
                   : 0U;
         const auto padded =
-            Network || !valid ? t.block * kM + row : mapping[saved];
+            Network || kCanonicalLocal || !valid ? t.block * kM + row : mapping[saved];
         const auto lane = threadIdx.x % 32U;
         float gate_gradient = 0.0F;
 #if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
@@ -490,7 +503,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
           gate_gradient += __shfl_down_sync(0xffffffffU, gate_gradient, stride);
 #else
         backward_swiglu_epilogue_warp_row<
-            !Network && WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING,
+            !Network && !kCanonicalLocal && WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING,
             WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS>(
             a, padded, saved, valid, lane,
             Network ? nullptr : a.dx_rows +
@@ -499,7 +512,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
         if (!lane)
           gate_gradient = a.dgate_rows[padded];
 #endif
-        if constexpr (!Network &&
+        if constexpr (!Network && !kCanonicalLocal &&
 #if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
                       true
 #else
@@ -527,7 +540,11 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
         if (valid && !lane) {
           if constexpr (Network)
             *gradient_output(f, a, t, row) = gate_gradient;
-          else {
+          else if constexpr (kCanonicalLocal) {
+            const auto identity = f.checkpoint.headers[saved];
+            a.peer_payloads[identity.source_rank].dgate[identity.route_index] =
+                gate_gradient;
+          } else {
             const auto identity = f.ring.rows[t.block * kM + row];
             a.peer_payloads[identity.source].dgate[identity.route] =
                 gate_gradient;
@@ -692,8 +709,12 @@ __global__ __launch_bounds__(384U, 1) void kernel(
         network_workers(f, a, comm);
         finish_network(f, a);
       } else {
-        if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
-          local::pull<kDxTiles, true>(f, s);
+        if ((threadIdx.x - 288U) / 32U < local::kPullWarps) {
+          if constexpr (kCanonicalLocal)
+            pull_local_canonical(f, a, s);
+          else
+            local::pull<kDxTiles, true>(f, s);
+        }
         begin_weights<false>(f, a, storage, state);
         auto *status =
             peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
