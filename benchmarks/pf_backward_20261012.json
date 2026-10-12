@@ -61,5 +61,32 @@
     "new": [12.3283535, 29.6796055]
   },
   "lifetime_caveat": "Initial M1/M2 measurements use immediate FWD+BWD. Multi-tape regression revealed shared physical plan reuse; final results must rebuild from each tape's immutable counts/routes.",
-  "status": "M1/M2 implemented; validating multi-tape lifetime fix and final performance"
+  "final_source_commit": "27ba2b5",
+  "final_artifact": "build/pf_main_timeline/bwd_tape_plan",
+  "final_single_node_ep8_window2048": {
+    "new": [25.236215, 64.4898965],
+    "workload_hash_match": true,
+    "clock_caveat": "One 1590 MHz observation, outside timed intervals"
+  },
+  "final_two_node_ep16_window2048": {
+    "baseline_repeat": [33.5140995, 81.03524],
+    "new": [34.5632975, 86.5512],
+    "workload_hash_match": true,
+    "clock_caveat": "New: one 1530 MHz sample during 20K timed sample 0. Old repeat: one 1515 MHz observation outside timed intervals. All samples retained."
+  },
+  "final_two_node_ep16_window4096": {
+    "new": [33.7325935, 81.760933],
+    "clock_caveat": "One 1605 MHz sample during 20K timed sample 5; one 1530 MHz observation outside timed intervals",
+    "comparison_caveat": "Old PF was not repeated at window4096. TensorRuntime multi-node default was already 4096; no default changed. Benchmarks explicitly set min ring depth 2 and credit windows 2."
+  },
+  "final_verification": {
+    "single_node_ep8": {"tokens": [1, 129, 8192, 20480], "steps_each": 2, "ring_tokens": 512, "max_relative_l2": 0.001417555962689221},
+    "two_node_ep16": {"tokens": [129, 8192, 20480], "steps_each": 2, "ring_tokens": 512, "max_relative_l2": 0.0007335633272305131},
+    "multiple_live_tapes": "EP8/EP16 H4096/I2048/E32/top6: three tapes, moving hotspots, shorter batch, in-place weight refresh, workspace release and two-layer inference graph switch",
+    "dt_unchanged": "EP2/EP4/EP8 E256 top6, tokens 1/64, numerical and graph checks passed",
+    "pf_inference": "EP8/EP16 E256 top6, tokens 8192/20480, numerical and PF kernel entry checks passed, checkpoint disabled",
+    "python_tests": 117,
+    "python_subtests": 470
+  },
+  "status": "M1/M2 and multi-tape lifetime correctness complete; same-window2048 multi-node performance remains below old PF"
 }

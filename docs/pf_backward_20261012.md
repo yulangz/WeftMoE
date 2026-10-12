@@ -205,3 +205,54 @@ D2D 拷贝；网络 BWD 不再自己重复实现 RX/TX 地址重绑定。准备�
 收尾同步：return/reduce 可以在 dW 期间执行，但保护下一次调用复用
 metadata 的最后一道 rank/network barrier 移到完整 CTA/cluster 的 dW
 结束之后。不增加 barrier 数量，也不把 return/reduce 与 dW 串行化。
+
+## 生命周期修复后的最终测量
+
+代码 `27ba2b5`，artifact `build/pf_main_timeline/bwd_tape_plan`。
+以下均包含每次 BWD 的物理计划重建，仍采用开头的完整周期口径、
+2048-token window、4 warmups / 8 samples；新旧 workload hash 相同。
+
+| 实现 | 单机 EP8 8K / 20K (ms) | 双机 EP16 8K / 20K (ms) |
+|---|---:|---:|
+| 旧 PF BWD | 26.483 / 68.624 | 33.514 / 81.035（复测） |
+| 新 PF BWD | 25.236 / 64.490 | 34.563 / 86.551 |
+| Megatron moe_act 缓存口径 | 24.792 / 59.548 | 33.288 / 87.202 |
+
+单机比旧 PF 快 4.7%/6.0%；相同 2048 窗口的双机仍慢 3.1%/6.8%。Megatron 行是
+本轮前段测得的相同 workload，不是新做一轮框架训练，也不是 V3。
+此处旧 PF 指本分支起点 `main@1cfb423` 的 BWD，**未重新测 V3**。
+不能宣称多机性能优化目标已经完成。
+
+修复版另外测了 4096-token window：**33.733/81.761 ms**，比新版
+2048 window 快 2.4%/5.5%。它接近旧 PF 的 2048 window 数字，但没有
+复测旧 PF 的 4096 window，不能宣称同配置已追平。该版本比本轮
+Megatron 8K 慢约 1.3%、20K 快约 6.2%；这些短测不代表框架端到端。
+相对新版 2048 window 仍多占约 2.35 GiB/卡，持久池总量仍低于旧 PF
+2048 window。此轮没有修改缺省容量：TensorRuntime 本来就是单机
+2048、双机 4096；表内 2048 是 benchmark 显式选择的对照值，而非
+双机 API 缺省值。所有这些测量均显式设 `WEFTMOE_PF_MIN_RING_DEPTH=2`
+和 `WEFTMOE_PF_CREDIT_WINDOWS=2`。
+
+设置时钟为 1620 MHz；新双机在 20K timed sample 0 观察到一次 1530 MHz，
+旧双机复测有一次 1515 MHz、但不落在测量区间内。单机新版本有一次
+1590 MHz，同样不在测量区间内。保留全部样本，不按频率删除样本。
+频率只是间隔采样，不等于证明间隔内无瞬时降频。
+4096 window 在 20K timed sample 5 观察到一次 1605 MHz，另有一次
+1530 MHz 位于测量区间外；同样未删样本。
+
+相同 2048 window，双机 rank 0 的持久 compute+GIN 容量：旧版为
+8518.7/12133.2 MiB，新版为 5650.1/8516.6 MiB，约减少 2.8/3.5 GiB。
+这不是总峰值显存（不包括当次的 Torch tape/dW/scratch）。主要来源是
+复用 FWD contribution/dY-dAB ring，以及不再保留完整 dX 临时数据。
+
+最终回归：EP8 的 1/129/8K/20K 与 EP16 的 129/8K/20K，各两次变化
+路由，完整 output/dX/dr/dW1/dW2 检查通过；EP8/EP16 的 8K/20K
+纯推理通过数值及 PF kernel 路径检查。多 tape、训练到推理共卡切换、
+DT EP2/4/8 与 Python 回归见上文。未测三节点以上，也未在完整 AReaL
+或 Megatron 模型中跑训练 step，不将算子级结果等同于端到端训练收益。
+
+仍待完成的性能工作：在不增加全尺寸激活暂存的前提下，减少多机
+window/expert 的 M padding 与阶段尾部空转；进一步消融 dQ/dX 的
+N tile 与 operand pipeline；解决 setmaxnreg 被忽略及阶段切换 spill。
+这些只是后续方向，尚未证明有效。没有保留失败的尾块分支，也没有
+改动 DT 或推理的缺省调参。
