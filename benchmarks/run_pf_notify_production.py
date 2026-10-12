@@ -12,6 +12,7 @@ parser.add_argument("phase", choices=("verify", "skew", "verify-inference", "ver
                                      "performance", "trace", "inference", "graph", "sweep", "cycle"))
 parser.add_argument("--nodes", type=int, choices=(1, 2), required=True)
 parser.add_argument("--port", type=int, required=True)
+parser.add_argument("--tag", default="")
 args = parser.parse_args()
 out = ROOT / "build/pf_notify_production/results"
 old = (EXPERIMENTS / "warp-budget-20261011/build/local_warp_budget/pull2" if args.nodes == 1
@@ -24,6 +25,8 @@ if args.phase == "sweep":
     variants = ("b2048", "b8192", "b4096", "b8192", "b2048", "b4096")
 for i, variant in enumerate(variants):
     label = f"{args.phase}_n{args.nodes}_{i}_{variant}"
+    if args.tag:
+        label += "_" + args.tag
     inference = args.phase in ("inference", "graph", "verify-inference", "verify-graph")
     benchmark = ROOT / ("benchmarks/torchrun_megamoe_prefill.py" if inference
                         else "tools/benchmark_training.py")

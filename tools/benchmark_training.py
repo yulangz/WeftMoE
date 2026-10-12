@@ -179,7 +179,7 @@ def main():
                 dist.all_reduce(counts)
                 padded = ((counts + 127) // 128 * 128).reshape(
                     len(batches), nodes, windows, world, owned).sum((1, 2, 4))
-                assert torch.equal(counts.sum((1, 2)), expert_rows)
+                assert torch.equal(counts.sum((1, 2)).cpu(), expert_rows)
             window_padding = dict(actual_rows=incoming[args.warmups:].tolist(),
                                   m128_rows=padded[args.warmups:].tolist())
         max_rows = int(incoming.max()) + owned * 128
