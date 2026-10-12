@@ -49,6 +49,7 @@ struct alignas(64) NetworkChannel {
   std::uint64_t tx_completed_head;
   std::uint64_t acknowledged_head;
   std::uint64_t credit_signal;
+  std::uint64_t tx_packed_head;
 };
 static_assert(sizeof(NetworkChannel) == 128U);
 

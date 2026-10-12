@@ -172,6 +172,9 @@ public:
   wave_view(DeviceDispatchConsumerLease &consumer);
   static bool fused_inference_routes(const DeviceDispatchHandle &dispatch);
   static TrainingCountView training_counts(const DeviceDispatchHandle &dispatch);
+  static bool deferred_training_notify(const DeviceDispatchHandle &dispatch);
+  static void finish_training_notify(const DeviceDispatchHandle &dispatch,
+                                     DeviceDispatchConsumerLease &consumer);
   // Host-visible Notify freezes the exact sum of per-expert M128 extents.
   static std::uint64_t padded_received_rows(const DeviceDispatchHandle &dispatch);
   static const std::int32_t *

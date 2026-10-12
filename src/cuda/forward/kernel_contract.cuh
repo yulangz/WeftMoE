@@ -22,6 +22,7 @@ struct ForwardKernelArgs {
   std::size_t source_input_offset = 0;
   std::size_t fused_source_gates_offset = 0;
   bool fused_inference_routes = false;
+  bool training_counts_ready = false;
   const transport::BFloat16 *input;
   const float *gates;
   const transport::BFloat16 *w1;

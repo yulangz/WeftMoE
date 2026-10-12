@@ -113,10 +113,6 @@ class Runtime {
     fused_inference_ =
         !training &&
         std::getenv("WEFTMOE_DISABLE_SINGLE_NODE_INFERENCE") == nullptr;
-    notify_pool_ = make_device_notify_resource_pool(
-        base_, execution_,
-        {config_, max_tokens, 8192, max_saved, 4,
-         fused_inference_, training_ring});
     if (!WEFTMOE_ENABLE_GIN_RDMA && nodes != 1)
       throw std::invalid_argument(
           "this build sets WEFTMOE_ENABLE_GIN_RDMA=0 and supports a "
@@ -144,6 +140,11 @@ class Runtime {
     capacity.enable_gin_rdma =
         WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
     pool_ = prepare_activation_transport_pool(base_.session(), execution_, capacity);
+    deferred_training_notify_ = training_ring && pool_.separates_forward_notify();
+    notify_pool_ = make_device_notify_resource_pool(
+        base_, execution_,
+        {config_, max_tokens, 8192, max_saved, 4,
+         fused_inference_, training_ring, deferred_training_notify_});
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (WEFTMOE_ENABLE_GIN_RDMA && nodes > 1)
       gin_ = std::make_unique<GinRdmaForwardMegaKernel>(base_, execution_, pool_);
@@ -224,6 +225,17 @@ class Runtime {
     result["fc2_us"] = timings.fc2_us;
     result["return_us"] = timings.combine_return_us;
     result["reduce_us"] = timings.reduce_us;
+    result["completion_tail_us"] = timings.total_us - timings.route_exchange_us -
+                                    timings.combine_return_us;
+    const auto &audit = tape->forward.audit();
+    result["communication_copy"] = audit.communication_copy;
+    result["dispatch_payload_bytes"] = audit.gin_dispatch_payload_bytes;
+    result["return_payload_bytes"] = audit.gin_return_payload_bytes;
+    result["max_active_clusters"] = audit.max_active_clusters;
+    result["fc1_tasks"] = audit.fc1_tasks;
+    result["fc2_tasks"] = audit.fc2_tasks;
+    result["dispatch_packets"] = audit.gin_dispatch_put_count;
+    result["return_packets"] = audit.gin_return_put_count;
     return result;
   }
 
@@ -280,14 +292,22 @@ class Runtime {
             rank_ * (config_.num_experts / config_.topology.world_size), hidden_, intermediate_,
             binding(packed_w1));
       }
-      // Mini Notify already supplies the exact tape size. Prepare inputs and
-      // saved tensors under one allocation agreement before entering main.
+      // Output/weights do not depend on the plan. Only a deferred training
+      // tape needs the exact row count produced by standalone PF notify.
       tape->output = empty({tokens, hidden_}, "bfloat16");
       ForwardTensorBuffers buffers;
       buffers.output = binding(tape->output);
-      fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc,
-                                           buffers, allocator());
+      if (!deferred_training_notify_)
+        fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc,
+                                             buffers, allocator());
     });
+    if (deferred_training_notify_)
+      fc.tensor_factory = [&] {
+        ForwardTensorBuffers buffers;
+        buffers.output = binding(tape->output);
+        return prepare_forward_tensors(tape->dispatch, execution_, fc,
+                                       buffers, allocator());
+      };
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
@@ -336,6 +356,7 @@ class Runtime {
     result["gin_bytes"] = p.gin_registered_bytes;
     result["notify_bytes"] = n.device_bytes;
     result["notify_slots_in_use"] = n.slots_in_use;
+    result["separate_forward_notify"] = pool_.separates_forward_notify();
     return result;
   }
 
@@ -549,7 +570,7 @@ class Runtime {
   }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
-  bool training_, fused_inference_ = false;
+  bool training_, fused_inference_ = false, deferred_training_notify_ = false;
   cudaStream_t stream_;
   cudaEvent_t input_ready_ = nullptr;
   RuntimeConfig config_;

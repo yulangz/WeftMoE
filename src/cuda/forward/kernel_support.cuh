@@ -651,7 +651,8 @@ bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
 
 bool network_prefill_streaming(const ActivationTransportPoolConfig &config) {
   return weftmoe_pf::kNetworkWorkerMode && config.max_nodes > 1U &&
-         !config.enable_backward_state && config.static_forward_window_tokens &&
+         (!config.enable_backward_state || weftmoe_pf::kNetworkWorkerMode == 1U) &&
+         config.static_forward_window_tokens &&
          forward_tuning::kFc1TileN == forward_tuning::kFc2TileN &&
          forward_tuning::kStaticV4TileK == 64U &&
          !forward_tuning::kStaticV4PrefillEnabled &&
@@ -675,6 +676,12 @@ static_ring_shape(const ActivationTransportPoolConfig &config) {
   auto sources = std::min(local_world, 16U);
   while (local_world % sources)
     --sources;
+  // Merge adjacent source groups only for the experimental WG3 inference
+  // entry. The planner's source mask is 16 bits; node/rail addressing remains
+  // unchanged and a final partial group is handled by WindowShape.
+  if (weftmoe_pf::kNetworkWorkerMode == 2U && network_prefill_streaming(config) &&
+      std::getenv("WEFTMOE_PF_WG3_MERGE_SOURCES"))
+    sources = std::min(16U, config.max_world_size);
   if constexpr (WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP != 0U) {
     sources = WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP;
     if (local_world % sources)
@@ -768,13 +775,38 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     // write TX. This capacity depends on B/K/Q/L, not the total token count.
     const auto window_packets = static_forward::kNetworkReturnPackets.lane_packets(
         std::uint64_t(config.static_forward_window_tokens) * config.max_top_k, 0U);
+    unsigned minimum_depth = WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH;
+    if (network_prefill_streaming(config))
+      if (const auto *value = std::getenv("WEFTMOE_PF_MIN_RING_DEPTH")) {
+        minimum_depth = static_cast<unsigned>(std::stoul(value));
+        if (!minimum_depth)
+          throw std::invalid_argument("PF minimum ring depth must be positive");
+      }
+    // Admission reserves a complete worst-case Return window; reducing the
+    // heuristic floor must never reduce that correctness bound.
     const auto depth = static_cast<unsigned>(std::max<std::uint64_t>(
-        WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH, window_packets));
+        minimum_depth, window_packets));
     network.rings = {config.max_nodes, packets.lanes, depth, packet, returning};
     network.ring_workers = static_cast<unsigned>(std::min<std::uint64_t>(
         network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
     if (network_prefill_streaming(config)) {
+      network.dispatch_push = weftmoe_pf::kNetworkWorkerMode == 2U &&
+          std::getenv("WEFTMOE_PF_WG3_DISPATCH_PUSH");
+      network.phase_order = weftmoe_pf::kNetworkWorkerMode == 2U &&
+          std::getenv("WEFTMOE_PF_WG3_PHASE_ORDER");
+      network.publication_plan =
+          std::getenv("WEFTMOE_PF_WG3_PUBLICATION_PLAN");
+      network.extra_pull = weftmoe_pf::kNetworkWorkerMode == 2U &&
+          std::getenv("WEFTMOE_PF_WG3_EXTRA_PULL");
+      network.deduplicate_return_ready =
+          std::getenv("WEFTMOE_PF_DEDUPLICATE_RETURN_READY");
+      if (const auto *value = std::getenv("WEFTMOE_PF_CREDIT_WINDOWS")) {
+        const auto windows = std::stoul(value);
+        if (!windows || windows > 8U)
+          throw std::invalid_argument("PF credit windows must be in [1, 8]");
+        network.rings.depth *= static_cast<unsigned>(windows);
+      }
       network.contexts = weftmoe_pf::kNetworkOwners - 1U;
       network.input = append(
           cursor, checked_mul(config.max_tokens_per_rank, config.max_hidden_size,

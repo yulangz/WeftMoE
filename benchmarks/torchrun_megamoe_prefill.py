@@ -304,9 +304,11 @@ def main():
         stage_kernels = {}
         if stage_probe is not None:
             stage_probe.stop()
-            split = "WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY" in os.environ
+            production_split = runtime.native.usage().get("separate_forward_notify", False)
+            split = production_split or "WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY" in os.environ
             for label, name, count in (
-                ("notify", "local::inference_notify_kernel", args.samples if split else 0),
+                ("notify", "weftmoe_pf::notify_kernel" if production_split else
+                 "local::inference_notify_kernel", args.samples if split else 0),
                 ("main", "weftmoe_pf::local::kernel", args.samples),
                 ("mini_notify", "training_count_notify_kernel", 0),
             ):

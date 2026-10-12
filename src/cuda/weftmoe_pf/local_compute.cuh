@@ -48,7 +48,8 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
   }
 }
 
-template <class Scheduler = Schedule, bool Network = false, class Matrix = Mma>
+template <class Scheduler = Schedule, bool Network = false, class Matrix = Mma,
+          unsigned WaitGroup = forward_tuning::kWgmmaWaitGroup>
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
                                         const CUtensorMap &output_map) {
   using Mma = Matrix;
@@ -113,13 +114,27 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       if (checkpoint_owner) {
         // The A-ready acquire also publishes Pull's logical-to-saved rows.
         // Reuse this GEMM load; do not add another global read of X.
-        if (k == 0U)
+        if (k == 0U) {
           checkpoint.prepare(a, t.block, checkpoint_rows, checkpoint_begin);
+          if constexpr (Network)
+            if (threadIdx.x < checkpoint_rows) {
+              const auto physical = t.block * kM + checkpoint_begin + threadIdx.x;
+              const auto &row = a.ring.rows[physical];
+              const auto saved = a.checkpoint.rows[physical];
+              a.checkpoint.gates[saved] = row.gate;
+              a.checkpoint.headers[saved] = {
+                  transport::kActivationTransportSchemaVersion, row.source,
+                  a.rank, 0U, a.dispatch.identity.generation, execution_epoch(a),
+                  row.route, row.route, row.token, saved,
+                  a.rank * a.dispatch.sizes.owned_expert_count + t.expert,
+                  unsigned(row.route % a.dispatch.identity.top_k)};
+            }
+        }
         checkpoint.save(s.a[stage] + checkpoint_begin * kK, checkpoint_rows,
                         k, a.hidden, a.saved_x_map);
       }
       const auto lane = threadIdx.x & 31U;
-      if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
+      if constexpr (WaitGroup == 1U) {
         if (k != 0U) {
           cute::warpgroup_wait<1>();
           if (lane < 2U)
@@ -134,7 +149,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       stage = stage + 1U == kStages ? 0U : stage + 1U;
       phase ^= stage == 0U;
     }
-    if constexpr (forward_tuning::kWgmmaWaitGroup == 1U) {
+    if constexpr (WaitGroup == 1U) {
       cute::warpgroup_wait<0>();
       const auto lane = threadIdx.x & 31U;
       if (lane < 2U)

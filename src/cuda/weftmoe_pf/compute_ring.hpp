@@ -30,8 +30,11 @@ struct RingBlock {
   WindowMblock tile;
   std::uint32_t window;
   std::uint32_t slot;
+  std::uint16_t local_rows;
+  std::uint16_t remote_sources;
   std::uint64_t generation;
 };
+static_assert(sizeof(RingBlock) == 32U);
 
 // Single-window source metadata is pushed together, avoiding a peer gate
 // read while the destination constructs its immutable reverse rows.

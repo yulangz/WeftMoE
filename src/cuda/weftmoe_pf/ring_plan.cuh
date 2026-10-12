@@ -157,7 +157,7 @@ __device__ __forceinline__ void build_blocks(const ForwardKernelArgs &a,
          static_forward::block_rows(r.expert_rows[window * owned + expert], b,
                                     r.source.shape.tile_m)},
         static_cast<unsigned>(window), static_cast<unsigned>(seq % r.depth),
-        seq / r.depth + 1U};
+        0U, 0U, seq / r.depth + 1U};
   }
 }
 
@@ -274,6 +274,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       channel.tx_cursor = channel.tx_base;
       channel.tx_reserve_cursor = channel.tx_reserved_head = channel.tx_base;
       channel.tx_completed_head = channel.tx_base;
+      channel.tx_packed_head = channel.tx_base;
       channel.rx_cursor = channel.consume_cursor = channel.rx_base;
       channel.acknowledged_head = channel.rx_base;
     }
@@ -537,12 +538,14 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
               tape_row;
           // These are immutable route metadata, independent of X arrival.
           // Publish them with the plan, leaving payload issuers only the copy.
-          a.checkpoint.gates[tape_row] = gate;
-          a.checkpoint.headers[tape_row] = {
+          if (a.checkpoint.gates) {
+            a.checkpoint.gates[tape_row] = gate;
+            a.checkpoint.headers[tape_row] = {
               transport::kActivationTransportSchemaVersion, source, a.rank, 0U,
               a.dispatch.identity.generation, execution_epoch(a), route, route,
               route / p.shape.top_k, tape_row, a.rank * owned + expert,
-              unsigned(route % p.shape.top_k)};
+                unsigned(route % p.shape.top_k)};
+          }
         }
         if constexpr (Network) {
           const auto block = r.window_prefix[w] + prefix[expert] +
@@ -556,6 +559,31 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       }
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+    if constexpr (Network) {
+      // The source identity is immutable. Compress publication destinations
+      // while this CTA still owns the complete row table, instead of making
+      // a single progress lane rescan M128 rows on the Return critical path.
+      for (auto b = std::uint64_t(tid / 32U);
+           a.static_network.publication_plan &&
+               b < prefix[expert + 1U] - prefix[expert]; b += Threads / 32U) {
+        const auto block = r.window_prefix[w] + prefix[expert] + b;
+        auto &desc = r.blocks[block];
+        unsigned local_rows = 0U, remote_sources = 0U;
+        for (unsigned m = tid % 32U; m < desc.tile.rows; m += 32U) {
+          const auto source = r.rows[block * p.shape.tile_m + m].source;
+          if (source / a.local_world_size == a.node)
+            ++local_rows;
+          else
+            remote_sources |= 1U << (source - first);
+        }
+        local_rows = __reduce_add_sync(0xffffffffU, local_rows);
+        remote_sources = __reduce_or_sync(0xffffffffU, remote_sources);
+        if (tid % 32U == 0U) {
+          desc.local_rows = static_cast<std::uint16_t>(local_rows);
+          desc.remote_sources = static_cast<std::uint16_t>(remote_sources);
+        }
+      }
+    }
   }
   grid_sync<0U, Threads>(a);
   if constexpr (Network)

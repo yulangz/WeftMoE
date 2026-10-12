@@ -3,6 +3,11 @@
 #include "cuda/weftmoe_pf/local_compute.cuh"
 
 namespace weftmoe_pf::local {
+#ifndef WEFTMOE_PF_LOCAL_PULL_WARPS
+#define WEFTMOE_PF_LOCAL_PULL_WARPS 2
+#endif
+constexpr unsigned kPullWarps = WEFTMOE_PF_LOCAL_PULL_WARPS;
+static_assert(kPullWarps > 0U && kPullWarps <= 3U);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
 
 __device__ __forceinline__ void geometry(const ForwardKernelArgs &a) {
@@ -50,7 +55,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned expert = 0U, begin = 0U, phase = 0U, peer_rows = 0U;
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
-  for (unsigned linear = blockIdx.x * 3U + warp;; linear += gridDim.x * 3U) {
+  for (unsigned linear = blockIdx.x * kPullWarps + warp;;
+       linear += gridDim.x * kPullWarps) {
     while (expert < owned && linear >= begin + a.ring.expert_rows[expert])
       begin += a.ring.expert_rows[expert++];
     if (expert == owned)
@@ -195,28 +201,9 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
   }
 }
 
-#endif
-
-__global__ __launch_bounds__(kThreads, 1) void kernel(
-    const __grid_constant__ ForwardKernelArgs a,
-    const __grid_constant__ CUtensorMap x_map,
-    const __grid_constant__ CUtensorMap s_map,
-    const __grid_constant__ CUtensorMap w1_map,
-    const __grid_constant__ CUtensorMap w2_map,
-    const __grid_constant__ CUtensorMap output_map) {
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
-  extern __shared__ __align__(1024) unsigned char storage[];
-  auto &s = *reinterpret_cast<Shared *>(storage);
-  programmatic_launch::wait();
-  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+__device__ __forceinline__ void prepare(const ForwardKernelArgs &a,
+                                       unsigned char *storage) {
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
-    *status = {};
-    status->start_clock = device_globaltimer_ns();
-    status->route_exchange_start_clock = status->start_clock;
-    status->fc1_start_clock = ~0ULL;
-    status->dispatch_blocks_done = ~0ULL;
-    status->relay_blocks_done = ~0ULL;
-    status->reduced_tokens = ~0ULL;
     const_cast<DeviceDispatchRuntime *>(a.dispatch.runtime)->error = 0U;
     if (a.runtime_epoch)
       ++*a.runtime_epoch;
@@ -237,6 +224,24 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     route_exchange<false>(a, storage);
   }
   geometry(a);
+}
+
+#endif
+
+__global__ __launch_bounds__(kThreads, 1) void kernel(
+    const __grid_constant__ ForwardKernelArgs a,
+    const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ CUtensorMap s_map,
+    const __grid_constant__ CUtensorMap w1_map,
+    const __grid_constant__ CUtensorMap w2_map,
+    const __grid_constant__ CUtensorMap output_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+  extern __shared__ __align__(1024) unsigned char storage[];
+  auto &s = *reinterpret_cast<Shared *>(storage);
+  programmatic_launch::wait();
+  // Notify initialized the ring/status on this stream. Its clock includes the
+  // planner and launch gap (and the optional training allocation boundary).
+  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (threadIdx.x == kMathThreads) {
     for (unsigned stage = 0; stage < kStages; ++stage) {
       s.full[stage].init(1U);
@@ -257,7 +262,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     before_combine<kMathThreads>(a);
   } else if (threadIdx.x < kMathThreads + 32U) {
     produce(a, s, x_map, s_map, w1_map, w2_map);
-  } else {
+  } else if (threadIdx.x < kMathThreads + 32U * (1U + kPullWarps)) {
     pull(a, s);
   }
   collective_scope_sync<kThreads, kCollectiveJoinBarrier>();

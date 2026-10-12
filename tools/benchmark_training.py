@@ -90,6 +90,8 @@ def main():
                         help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
     parser.add_argument("--trace-stage-kernels", action="store_true",
                         help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
+    parser.add_argument("--report-window-padding", action="store_true",
+                        help="Estimate PF M128 padding for the default node-group windows, outside timing")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -159,6 +161,27 @@ def main():
         expert_rows = incoming.cpu()
         incoming = expert_rows.reshape(len(batches), world, owned).sum(dim=-1)
         max_tokens = max(max(workload["tokens"]) for workload in workloads)
+        window_padding = None
+        if args.report_window_padding:
+            local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+            nodes = world // local_world
+            if nodes == 1:
+                padded = (expert_rows + 127) // 128 * 128
+                padded = padded.reshape(len(batches), world, owned).sum(-1)
+            else:
+                windows = math.ceil(max_tokens / args.ring_tokens)
+                counts = torch.zeros(len(batches), nodes, windows, args.experts, dtype=torch.int64)
+                for step, (routes, _) in enumerate(batches):
+                    for window, chunk in enumerate(routes.split(args.ring_tokens)):
+                        counts[step, rank // local_world, window] = torch.bincount(
+                            chunk.flatten().long(), minlength=args.experts)
+                counts = counts.cuda()
+                dist.all_reduce(counts)
+                padded = ((counts + 127) // 128 * 128).reshape(
+                    len(batches), nodes, windows, world, owned).sum((1, 2, 4))
+                assert torch.equal(counts.sum((1, 2)), expert_rows)
+            window_padding = dict(actual_rows=incoming[args.warmups:].tolist(),
+                                  m128_rows=padded[args.warmups:].tolist())
         max_rows = int(incoming.max()) + owned * 128
         if args.backend == "megatron":
             from benchmarks.megatron_training_backend import MegatronTrainingBackend
@@ -251,7 +274,8 @@ def main():
             kernel_probe.stop()
             stage_kernels = {}
             local = world == int(os.environ.get("LOCAL_WORLD_SIZE", world))
-            split_notify = bool(os.environ.get("WEFTMOE_PF_SPLIT_NOTIFY"))
+            split_notify = runtime.native.usage().get("separate_forward_notify",
+                bool(os.environ.get("WEFTMOE_PF_SPLIT_NOTIFY")))
             for label, name in (("mini_notify", "training_count_notify_kernel"),
                                 ("standalone_notify", "weftmoe_pf::notify_kernel"),
                                 ("weight_repack", "interleave_forward_w1_kernel"),
@@ -327,6 +351,7 @@ def main():
                     map(max, zip(*ready_per_rank))) if args.forward_only else None),
                 per_rank_forward_ready_us=ready_per_rank,
                 per_rank_stage_profiles=profiles_per_rank,
+                window_padding=window_padding,
                 per_rank_allocator_delta=allocator_per_rank,
                 per_rank_stage_kernel_us=kernels_per_rank,
                 forward_ready_timing_scope=("eager training forward + device synchronize; checkpoint still live"

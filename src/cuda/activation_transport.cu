@@ -72,6 +72,7 @@ namespace {
 #if WEFTMOE_PF_NETWORK_WORKERS
 #include "cuda/weftmoe_pf/network_kernel.cuh"
 #endif
+#include "cuda/weftmoe_pf/split_notify.cuh"
 
 #include "cuda/backward/device_kernels.cuh"
 
@@ -2410,6 +2411,13 @@ void ActivationTransportResourcePool::retire_peer_mappings() {
     state.peer_mappings->close();
 }
 
+bool ActivationTransportResourcePool::separates_forward_notify() const {
+  return impl_ && forward_tuning::kUnifiedWorkers &&
+      std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr &&
+      (local_prefill_streaming(impl_->state->config) ||
+       network_prefill_streaming(impl_->state->config));
+}
+
 ActivationTransportPoolUsage ActivationTransportResourcePool::usage() const {
   if (!impl_ || !impl_->state)
     transport_error(NotifyErrorCode::InvalidHandle, "transport-pool-usage",
@@ -4523,6 +4531,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   const bool training_ring = state->layout.static_ring.depth &&
                              config.retain_backward_state;
   const auto training_counts = ActivationTransportBridge::training_counts(dispatch);
+  const bool split_notify = ActivationTransportBridge::deferred_training_notify(dispatch);
   const bool static_v4_candidate =
       forward_tuning::kUnifiedWorkers &&
       (!use_gin || fused_inference_routes || training_ring) &&
@@ -4532,6 +4541,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       local_prefill_streaming(state->config);
   const bool network_prefill = static_v4_candidate &&
       network_prefill_streaming(state->config);
+  const bool standalone_notify = local_prefill || network_prefill;
   if (state->layout.static_ring.depth &&
       (!static_v4_candidate || (!fused_inference_routes && !training_ring)))
     throw std::invalid_argument("ring workspace requires static Forward");
@@ -4576,6 +4586,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   const auto prepare_storage = [&] {
     if (config.tensors)
       tensors = config.tensors;
+    else if (config.tensor_factory)
+      tensors = config.tensor_factory();
     else
       tensors = prepare_forward_tensors(dispatch, backend->execution, config);
     if (!tensors)
@@ -5219,9 +5231,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.forward_fc1_locality_group4_end =
           static_cast<std::uint8_t>(locality_group4_end);
       auto forward_main_compute_ctas = args.forward_compute_cta_count;
+      const auto network_ctas = network_prefill && weftmoe_pf::kNetworkWorkerMode == 2U
+          ? std::max({weftmoe_pf::kGetWorkers, weftmoe_pf::kPutWorkers,
+                      weftmoe_pf::kProgressWorkers})
+          : std::max(args.static_network.contexts,
+                     2U * args.static_network.ring_workers + 1U);
       if (args.ring.depth && use_gin &&
-          forward_main_compute_ctas < std::max(args.static_network.contexts,
-                                              2U * args.static_network.ring_workers + 1U))
+          forward_main_compute_ctas < network_ctas)
         throw std::invalid_argument("static network ring requires CTAs for copy and compute progress");
       const auto prefill_min = use_gin
           ? forward_tuning::kStaticV4NetworkPrefillMinTokens
@@ -5407,6 +5423,37 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 "V4 unified resident grid", id.calling_rank,
                 std::to_string(forward_main_compute_ctas) + " resident CTAs",
                 std::to_string(max_active_clusters) + " resident clusters");
+          if (standalone_notify) {
+            args.training_counts_ready = !split_notify;
+            const auto notify = network_prefill ? weftmoe_pf::notify_kernel<true>
+                                                : weftmoe_pf::notify_kernel<false>;
+            constexpr std::size_t notify_smem = 64U * 1024U;
+            int notify_clusters = 0;
+            auto error = backend->prepare_unified_launch<>(
+                reinterpret_cast<const void *>(notify), notify_smem,
+                forward_main_compute_ctas, threads, forward_tuning::kClusterSize,
+                pdl, false, &notify_clusters);
+            if (error == cudaSuccess &&
+                unsigned(notify_clusters) * forward_tuning::kClusterSize <
+                    forward_main_compute_ctas)
+              error = cudaErrorLaunchOutOfResources;
+            internal::throw_cuda(
+                "split-pf-notify", error, id.calling_rank, id.world_size,
+                backend->session.session().identity(), id.generation,
+                ExchangeKind::ExpertCounts, "prepare standalone resident planner");
+            auto notify_launch = launch;
+            notify_launch.blockDim = dim3(threads);
+            notify_launch.dynamicSmemBytes = notify_smem;
+            internal::throw_cuda(
+                "split-pf-notify", cudaLaunchKernelEx(&notify_launch, notify, args),
+                id.calling_rank, id.world_size,
+                backend->session.session().identity(), id.generation,
+                ExchangeKind::ExpertCounts, "launch standalone PF planner");
+            if (split_notify) {
+              ActivationTransportBridge::finish_training_notify(dispatch, consumer);
+              view.sizes = args.dispatch.sizes = dispatch.sizes();
+            }
+          }
           if (allocate_training_tape) {
             try {
               state->forward_tensor_preparation->run([&] {
@@ -5416,12 +5463,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                 bind_storage();
               });
             } catch (const TensorPreparationFailure &) {
-              // Allocation agreement joined every rank without advancing
-              // device ring epochs or bases. Preserve this lease for retry.
-              failure_guard.committed = true;
+              // A standalone planner has already advanced device epochs.
+              failure_guard.committed = !standalone_notify;
               throw;
             }
-            // Physical planning runs in the same main entry as inference.
           }
           if (decode)
             launch_forward = cudaLaunchKernelEx(
@@ -5750,6 +5795,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #endif
 
   auto result = std::make_shared<DeviceForwardHandle::Impl>();
+#if WEFTMOE_PF_NETWORK_WORKERS
+  result->audit.communication_copy =
+      network_prefill && WEFTMOE_PF_COMMUNICATION_COPY;
+#endif
   result->slot = lease;
   result->workspace_index = lease->index;
   result->tensors = tensors;

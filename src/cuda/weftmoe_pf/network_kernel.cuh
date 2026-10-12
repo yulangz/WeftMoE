@@ -2,14 +2,24 @@
 
 #include "cuda/weftmoe_pf/network_schedule.cuh"
 #include "cuda/weftmoe_pf/network_workers.cuh"
+#include "cuda/weftmoe_pf/communication_copy.cuh"
+
+#ifndef WEFTMOE_PF_COMMUNICATION_COPY
+#define WEFTMOE_PF_COMMUNICATION_COPY 1
+#endif
 
 namespace weftmoe_pf::network {
 
+struct alignas(1024) ExtraShared {
+  unsigned char pull[4096];
+  local::Barrier full;
+  Pending requests[2U * kNetworkPending];
+};
 constexpr std::size_t kSharedBytes = sizeof(local::Shared) +
-    (kThreads == 512U ? (8U * sizeof(Pending) + 1023U) / 1024U * 1024U : 0U);
+    (kThreads == 512U ? sizeof(ExtraShared) : 0U);
 
 __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
-                                        local::Shared &s, Pending *requests) {
+                                        local::Shared &s, ExtraShared *extra) {
   const auto warp = (threadIdx.x - 288U) / 32U;
   unsigned role = ~0U;
   if constexpr (kThreads == 384U) {
@@ -26,18 +36,25 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
         role = kGetWorkers + kPutWorkers + blockIdx.x;
       else if (network_warp == 3U && blockIdx.x == 0U)
         role = kNetworkOwners - 1U;
-      else
+      else if (network_warp == 3U && a.static_network.dispatch_push) {
+        pack(a, blockIdx.x - 1U, gridDim.x - 1U);
+        return;
+      } else if (network_warp == 0U && a.static_network.extra_pull) {
+        pull(a, s, 0U, gridDim.x * 3U + blockIdx.x - kGetWorkers,
+             gridDim.x * 4U - kGetWorkers, extra->pull, &extra->full);
+        return;
+      } else
         return;
     }
   }
   // Separate request slots for Get and Put when WG3 puts both on one CTA.
   // WG3 requests use the epilogue-independent control arena below.
   if (role < kGetWorkers) {
-    auto *pending = kThreads == 512U ? requests
+    auto *pending = kThreads == 512U ? extra->requests
                                     : reinterpret_cast<Pending *>(s.pull[0]);
     transfer<true>(a, pending, role);
   } else if (role < kGetWorkers + kPutWorkers) {
-    auto *pending = kThreads == 512U ? requests + 4U
+    auto *pending = kThreads == 512U ? extra->requests + kNetworkPending
                                     : reinterpret_cast<Pending *>(s.pull[0]);
     transfer<false>(a, pending, role - kGetWorkers);
   } else if (role < kNetworkOwners - 1U) {
@@ -47,14 +64,16 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
   } else {
     unsigned worker, count;
     if constexpr (kThreads == 384U) {
-      // The first 29 CTAs retain two of their three original pull warps.
+      // Each network owner borrows one pull warp and its private staging.
+      // With 132 owners all CTAs retain exactly two pull workers.
       worker = blockIdx.x < kNetworkOwners
           ? 2U * blockIdx.x + warp - 1U
           : 3U * blockIdx.x - kNetworkOwners + warp;
       count = gridDim.x * 3U - kNetworkOwners;
     } else {
       worker = blockIdx.x * 3U + warp;
-      count = gridDim.x * 3U;
+      count = gridDim.x * 3U +
+          (a.static_network.extra_pull ? gridDim.x - kGetWorkers : 0U);
     }
     pull(a, s, warp, worker, count);
   }
@@ -70,16 +89,10 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
   extern __shared__ __align__(1024) unsigned char storage[];
   auto &s = *reinterpret_cast<local::Shared *>(storage);
+  auto *extra = reinterpret_cast<ExtraShared *>(storage + sizeof(local::Shared));
   programmatic_launch::wait();
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  if (blockIdx.x == 0U && threadIdx.x == 0U) {
-    *status = {};
-    status->start_clock = device_globaltimer_ns();
-    status->route_exchange_start_clock = status->start_clock;
-  }
-  ring::prepare<true, false, kThreads>(a, storage);
-  if (blockIdx.x == 0U && threadIdx.x == 0U)
-    status->route_exchange_complete_clock = device_globaltimer_ns();
+  // The standalone planner owns route publication, ring setup and status.
   if (threadIdx.x == 256U) {
     for (unsigned stage = 0U; stage < local::kStages; ++stage) {
       s.full[stage].init(1U);
@@ -87,25 +100,39 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     }
     for (auto &barrier : s.pull_full)
       barrier.init(1U);
+    if constexpr (kThreads == 512U)
+      extra->full.init(1U);
     cutlass::arch::fence_barrier_init();
   }
-  if (threadIdx.x >= 256U)
+  if (threadIdx.x >= 384U)
     cutlass::arch::warpgroup_reg_dealloc<Resources::kUnifiedControlRegisters>();
+  else if (threadIdx.x >= 256U)
+    cutlass::arch::warpgroup_reg_dealloc<Resources::kUnifiedProducerRegisters>();
   __syncthreads();
   cute::cluster_sync();
   if (!a.dispatch.runtime->error) {
     if (threadIdx.x < 256U) {
       cutlass::arch::warpgroup_reg_alloc<Resources::kUnifiedMathRegisters>();
-      local::compute<Schedule, true, Mma>(a, s, output_map);
+      if constexpr (WEFTMOE_PF_COMMUNICATION_COPY)
+        communication_copy(a);
+      else
+        local::compute<Schedule, true, Mma,
+            kThreads == 512U ? WEFTMOE_PF_WG3_WAIT_GROUP
+                            : forward_tuning::kWgmmaWaitGroup>(a, s, output_map);
     } else if (threadIdx.x < 288U) {
-      local::produce<Schedule, true>(a, s, x_map, s_map, w1_map, w2_map);
+      if constexpr (!WEFTMOE_PF_COMMUNICATION_COPY)
+        local::produce<Schedule, true>(a, s, x_map, s_map, w1_map, w2_map);
     } else {
-      workers(a, s, reinterpret_cast<Pending *>(storage + sizeof(local::Shared)));
+      workers(a, s, extra);
     }
   }
   // Return RX is source-local, but local experts can still be writing this
   // source's contribution from another GPU. Join every local writer as well.
   rank_barrier<0U, kThreads, true, true, true>(a);
+  if (blockIdx.x == 0U && threadIdx.x == 0U) {
+    status->relay_blocks_done = status->route_exchange_complete_clock;
+    status->return_complete_clock = device_globaltimer_ns();
+  }
   if (threadIdx.x < 256U && !a.dispatch.runtime->error)
     local::combine<true>(a);
   grid_sync<0U, kThreads>(a);

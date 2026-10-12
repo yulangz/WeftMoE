@@ -111,6 +111,8 @@ class ActivationTransportResourcePool {
 public:
   ActivationTransportResourcePool() = default;
   ActivationTransportPoolUsage usage() const;
+  // Whether this compiled PF entry plans in a separate Forward kernel.
+  bool separates_forward_notify() const;
   // Terminal phase boundary: first quiesce all users and discard captured
   // graphs on every rank, then retire imports, then collectively agree before
   // destroying any exporting pool. No further execution may use this pool.
@@ -191,6 +193,8 @@ struct ForwardMegaKernelConfig {
   // must be provided together; training and the legacy split paths reject them.
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
+  // Eager split planning knows the exact tape extent only inside run().
+  std::function<ForwardTensorStorage()> tensor_factory{};
 };
 
 class ForwardWeightLease {
@@ -258,6 +262,7 @@ struct ForwardMegaKernelAudit {
   std::uint64_t activation_d2h_bytes = 0;
   std::uint64_t activation_h2d_bytes = 0;
   std::uint64_t workspace_bytes = 0;
+  bool communication_copy = false;
 };
 
 class DeviceForwardHandle {

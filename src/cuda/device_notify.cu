@@ -1364,6 +1364,7 @@ struct WorkspaceState {
   bool single_kernel = false;
   bool unstable_inference_rows = false;
   bool training_counts = false;
+  bool defer_training_notify = false;
   // Host-visible Notify supplies an exact immutable snapshot. Enqueue-only
   // replay refreshes device counts without refreshing that host snapshot.
   bool replay_counts = false;
@@ -1428,6 +1429,7 @@ struct CudaNotifyPoolAllocation {
   CudaNotifyWorkspacePlan max_plan;
   bool unstable_inference_rows = false;
   bool training_counts = false;
+  bool defer_training_notify = false;
   bool owns_communication = false;
   std::shared_ptr<NotifyCommunication> communication;
   std::shared_ptr<internal::CudaAllocation> route;
@@ -2504,7 +2506,7 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
     const CudaNotifyWorkspacePlan &max_plan,
     const CudaExecution &execution,
     std::uint32_t max_inflight_consumers,
-    bool unstable_inference_rows, bool training_counts) {
+    bool unstable_inference_rows, bool training_counts, bool defer_training_notify) {
   if (!execution)
     invalid("phase=device-pool-allocate, field=execution, rank=n/a, "
             "expected=valid, actual=empty");
@@ -2513,6 +2515,7 @@ std::shared_ptr<CudaNotifyPoolAllocation> DeviceNotifyPoolBridge::allocate(
   result->max_plan = max_plan;
   result->unstable_inference_rows = unstable_inference_rows;
   result->training_counts = training_counts;
+  result->defer_training_notify = defer_training_notify;
   result->route = std::make_shared<CudaAllocation>();
   result->workspace = std::make_shared<CudaAllocation>();
   result->receive = std::make_shared<ReceiveMetadata>();
@@ -2806,6 +2809,7 @@ CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
   state->communication = allocation->communication;
   state->unstable_inference_rows = allocation->unstable_inference_rows;
   state->training_counts = allocation->training_counts;
+  state->defer_training_notify = allocation->defer_training_notify;
   state->slot_lease = std::move(slot_lease);
   auto impl = std::make_shared<CudaNotifyWorkspace::Impl>();
   impl->state = std::move(state);
@@ -4125,7 +4129,8 @@ DeviceDispatchHandle DeviceNotifyPoolBridge::run_single(
   state->single_kernel = true;
   const auto owned = config.num_experts / config.topology.world_size;
   bool fused_forward_notify =
-      state->unstable_inference_rows &&
+      (state->unstable_inference_rows ||
+       (state->training_counts && state->defer_training_notify)) &&
       std::getenv("WEFTMOE_DISABLE_STATIC_FORWARD_V4") == nullptr &&
       owned * config.topology.world_size == config.num_experts;
   for (std::uint32_t expert = 0;
@@ -4486,7 +4491,42 @@ ActivationTransportBridge::wave_view(DeviceDispatchConsumerLease &consumer) {
 
 bool ActivationTransportBridge::fused_inference_routes(
     const DeviceDispatchHandle &dispatch) {
-  return dispatch.impl_ && dispatch.impl_->fused_forward_notify;
+  return dispatch.impl_ && dispatch.impl_->fused_forward_notify &&
+         !dispatch.impl_->workspace->training_counts;
+}
+
+bool ActivationTransportBridge::deferred_training_notify(
+    const DeviceDispatchHandle &dispatch) {
+  return dispatch.impl_->fused_forward_notify &&
+         dispatch.impl_->workspace->training_counts;
+}
+
+void ActivationTransportBridge::finish_training_notify(
+    const DeviceDispatchHandle &dispatch, DeviceDispatchConsumerLease &consumer) {
+  // A deferred handle has not published immutable training metadata yet.
+  auto &impl = const_cast<DeviceDispatchHandle::Impl &>(*dispatch.impl_);
+  const auto &state = *impl.workspace;
+  const auto exec = internal::checked_execution_state(impl.execution);
+  DeviceDispatchRuntime runtime{};
+  internal::throw_cuda(
+      "split-pf-notify",
+      cudaMemcpyAsync(&runtime,
+                      at<void>(state.allocation->device_ptr, state.device_layout.runtime),
+                      sizeof(runtime), cudaMemcpyDeviceToHost, exec->stream),
+      impl.identity.calling_rank, impl.identity.world_size,
+      impl.context.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts, "download planned tape extent");
+  internal::throw_cuda(
+      "split-pf-notify", cudaStreamSynchronize(exec->stream),
+      impl.identity.calling_rank, impl.identity.world_size,
+      impl.context.session().identity(), impl.identity.generation,
+      ExchangeKind::ExpertCounts, "finish standalone PF planning");
+  if (runtime.error)
+    throw std::runtime_error("standalone PF notify rejected routes");
+  impl.sizes = runtime.sizes;
+  impl.padded_compute_rows = runtime.sizes.mtile_count * 128U;
+  impl.fused_forward_notify = false;
+  consumer.impl_->sizes = impl.sizes;
 }
 
 TrainingCountView ActivationTransportBridge::training_counts(

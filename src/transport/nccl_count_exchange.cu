@@ -2036,7 +2036,8 @@ DeviceNotifyResourcePool make_device_notify_resource_pool(
   for (auto &slot : impl->slots) {
     slot.notify = DeviceNotifyPoolBridge::allocate(
         impl->max_plan, execution, config.max_inflight_consumers,
-        config.enable_unstable_inference_rows, config.enable_training_counts);
+        config.enable_unstable_inference_rows, config.enable_training_counts,
+        config.defer_training_notify);
     // The pool has one execution stream. Its count exchange is serialized by
     // device barriers, independent of which metadata slot each rank retains.
     if (&slot == &impl->slots.front())
