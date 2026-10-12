@@ -3,6 +3,49 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M7：消除 GDAKI-only 主 kernel 的标量 spill
+
+结论：多机 math/control 寄存器配额从 **184/136 改为 192/120**。
+主 kernel 的 ptxas spill store/load 从 **20/44 B 降至 0/0 B**，
+stack frame 从 8 B 降至 0 B；pull/return/receive helper 均为 0/0 B。
+没有 C7507/C7512/C7518。单机仍使用 208/88，GEMM 几何、流水级数、
+CTA 数、shared memory 和通信协议不变。
+
+原因不是 WGMMA accumulator 整块溢出。SASS 对应的是跨 GEMM 存活的
+静态调度游标，以及阶段收尾使用的 CTA 编号；GDAKI-only 裁剪改变了
+整段代码的寄存器分配，使原来的 184 配额出现少量标量栈保存。
+每个 math thread 多给 8 个寄存器，每个 control thread 少给 16 个，
+总预算仍为 `256*192 + 128*120 = 384*168 = 64512`，不改变驻留数。
+192 配额的 SASS 中原来的 R1-relative spill 消失；仍可看到通用地址
+atomic fallback 的 LDL/STL，不能将这些静态指令全部算成实际 spill。
+
+两个未保留的尝试：让 row geometry 返回 shared-memory 引用，仍为
+20/44 B；给调度游标增加 warp-uniform shuffle，反而变成 32/60 B。
+最终只保留配额调整，不添加 shuffle 或额外 shared-memory 状态。
+
+沿用 M6 的随机长度/热点路由、完整 prime trace、4 warmups / 16 samples，
+双机 EP16 Flash、B2048/D2。首轮完整 FWD+BWD wall p50（ms）：
+
+| math/control | main spill store/load | 8K | 20K |
+|---|---:|---:|---:|
+| 184/136（本轮基线） | 20/44 B | 32.947 | 77.894 |
+| 192/120 | 0/0 B | 33.049 | 77.845 |
+| 200/104 | 0/0 B | 33.113 | 77.993 |
+
+三个版本 workload hash 和 native 工作区容量一致。首轮基本持平，不能
+把消除少量标量 spill 宣称成端到端加速，也没有理由继续挤压通信配额到
+104。BWD host API 边界分别为 20.377/49.070、20.484/49.096、
+20.517/48.785 ms；不是独立 CUDA-event kernel 时间。
+时钟均请求 1620 MHz；192/120 的 20K 计时内观测到 1440/1590 MHz，
+200/104 观测到 1605 MHz，基线采到的计时点均为 1620 MHz。
+不剔除任何样本；采到的 HBM 均为 3201 MHz，部分区间无采样点。
+
+192/120 通过双机 129/8K/20K、每个规模两次变化路由的完整数值验证，
+output/dX/dr/dW1/dW2 最大 relative L2 为 0.000734。
+编译/SASS 位于 `build/pf_main_timeline/bwd_spill_*` 和
+`build/pf_spill_l2_20261012/audit_r192`，本轮逐 rank 日志、时钟与 manifest
+位于 `build/pf_spill_l2_20261012/results`。
+
 ## M6：原生库仅保留 GDAKI 后端
 
 按部署硬件约束，在项目统一的 `communication/nccl_device.cuh` 入口关闭

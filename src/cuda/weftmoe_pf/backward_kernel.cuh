@@ -10,7 +10,8 @@ constexpr unsigned kN = kDuN > kDxN ? kDuN : kDxN;
 constexpr unsigned kDuTiles = backward_tuning::kMainIntermediate / kDuN;
 constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS
-#define WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS 184
+// GDAKI-only code keeps the activation cursors in registers at 192/120.
+#define WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS 192
 #endif
 #ifndef WEFTMOE_PF_BWD_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_WAVE_BLOCKS 128
