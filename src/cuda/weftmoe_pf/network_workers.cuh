@@ -295,13 +295,11 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
     return;
   Endpoint endpoint(a, kGetWorkers + kPutWorkers + worker);
   std::uint64_t block = worker;
-  bool rx_published = false;
   bool done;
   do {
     if (block < a.ring.state->blocks && publish_block(a, block))
       block += kProgressWorkers;
     done = block >= a.ring.state->blocks;
-    bool received = true;
     for (unsigned channel = worker; channel < endpoint.layout().channels();
          channel += kProgressWorkers) {
       if (a.static_network.dispatch_push) {
@@ -337,15 +335,7 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
       }
       endpoint.acknowledge(true, channel);
       done &= state.rx_cursor == terminal;
-      received &= state.rx_cursor == terminal;
     }
-    if constexpr (WEFTMOE_PF_EARLY_REDUCE)
-      if (received && !rx_published) {
-        // Acquired payloads precede this release chain. Outgoing block
-        // publication and credit retirement may continue during Reduce.
-        ring::arrive(a.ring.state->return_rx_done, 1U);
-        rx_published = true;
-      }
   } while (!done);
 }
 

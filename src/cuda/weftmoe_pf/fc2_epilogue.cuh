@@ -1,7 +1,7 @@
 #pragma once
 
 #ifndef WEFTMOE_PF_FC2_REGISTER_STORE
-#define WEFTMOE_PF_FC2_REGISTER_STORE 0
+#define WEFTMOE_PF_FC2_REGISTER_STORE 1
 #endif
 
 // Same BF16 rounding and route destinations as the shared-memory epilogue.

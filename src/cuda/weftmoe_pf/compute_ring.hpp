@@ -67,7 +67,6 @@ struct RingState {
   std::uint64_t blocks;
   std::uint64_t rows;
   std::uint64_t admitted_windows;
-  std::uint64_t return_rx_done;
 };
 
 struct SourceEpoch {

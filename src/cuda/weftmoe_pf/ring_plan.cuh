@@ -208,7 +208,6 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     r.source_header->epoch = {p.tokens, r.state->source_base};
     r.source_header->error = 0U;
     r.state->admitted_windows = 0U;
-    r.state->return_rx_done = 0U;
     if (a.runtime_epoch)
       ++*a.runtime_epoch;
   }
