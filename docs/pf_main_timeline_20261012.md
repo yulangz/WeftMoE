@@ -134,3 +134,28 @@ reduce 后用独立 CTA barrier 汇合 math/control，再进入原有完整 grid
 
 机器可读的全部轮次、hash、workspace、验证、频率偏离与timeline摘要见
 [pf_main_timeline_20261012.json](../benchmarks/pf_main_timeline_20261012.json)。本轮的“旧版”均为优化前的PF，不是V3或Megatron；没有重测其它实现。
+
+## main 代码清理回归（2026-10-12）
+
+`main` 先快进到 `565037e`，以 tag `archive/pre-pf-dt-cleanup-20261012` 保存完整旧树，再提交清理版本 `956f21c`。净删除约 1.85 万行：移除 V3、历史 PF、WG3/旧通信实验分支、旧配置和对应测试；当前 PF BWD 所需的共享代码迁到 `backward/`、`communication/`，没有删除 BWD。保留当前单/多机 PF、训练缓存和稳定 DT，历史性能记录不改写。旧报告中的路径与开关在上述 tag 下复现。
+
+这轮只清理，不调 GEMM 参数、不改变缓存/通信协议。正式计时无并行编译；SM 固定 1620 MHz，十次性能运行共有 3984 条 GPU 时钟观测，均为 1620，采样无失败。PF 使用相同 seed123、10% token 波动和随机路由；warm8/sample24，每步最慢 rank 的 p50。缓存 FWD 包含当前权重准备、notify、申请、main、同步，以 tape 仍存活的 cache-ready 时间为准。推理复用准备好的权重；固定工作区均已预热。
+
+| PF（ms，清理前 → 后） | 8K | 20K |
+|---|---:|---:|
+| 单机 EP8 推理 | 6.816 → 6.899 | 16.654 → 16.622 |
+| 单机 EP8 缓存 FWD | 8.211 → 8.152 | 18.179 → 18.193 |
+| 双机 EP16 推理 | 10.207 → 10.232 | 22.839 → 22.512 |
+| 双机 EP16 缓存 FWD | 11.597 → 11.670 | 24.955 → 25.085 |
+
+DT 为单机 EP8、同一 Flash shape，固定 tokens/pool64，CUDA Graph 每次20次调用；表中是设备事件除以20后的每调用时间，不与上表 eager 时间混用。清理前 DT artifact 带有历史 T256 容量消融，但本轮全部 <=64，使用相同的原版 DT 算术与 epilogue。
+
+| DT（µs，清理前 → 后） | 1 token | 8 tokens | 32 tokens | 64 tokens |
+|---|---:|---:|---:|---:|
+| EP8 | 125.056 → 124.578 | 297.476 → 298.006 | 485.126 → 481.298 | 688.818 → 687.866 |
+
+全部配对 workload hash 一致。PF 差异 −1.43%～+1.22%，DT 差异 −0.79%～+0.18%，未观察到明显回退；这是单轮成对回归，不作为新的优化收益宣称，也没有重新测量 BWD 延迟。
+
+验证：Python 117/117、Host 17/17、16个公共头、34项退役 API 编译拒绝检查通过；PF 单机/多机、DT、CUDA 测试程序均重新构建。EP8/EP16 的 8K/20K 各检查两组变化路由的 output/dX/dGate/dW1/dW2，最大 relative L2 分别为 1.16275e−4 / 1.09794e−4。DT EP4 检查 1/8/32/64，EP2/E32 检查 1/64 并确认 M16/M64 两种入口及 Graph replay；native Forward benchmark EP2/T512 也通过。没有增加逐函数符号名测试。
+
+构建、运行命令、二进制 SHA256、逐样本时间、工作负载 hash 和校验汇总见 [pf_dt_cleanup_20261012.json](../benchmarks/pf_dt_cleanup_20261012.json)。原始运行日志与时钟采样保存在 `build/pf_cleanup/results`；清理前 PF artifact 分别是 `local_final` / `fc2_register`，清理后是 `cleanup_final_local` / `cleanup_final_network` / `cleanup_final_dt`。
