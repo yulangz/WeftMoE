@@ -17,6 +17,7 @@ struct BackwardPeerWorkspace {
     std::size_t table = 0, partitions = 0;
     CUtensorMap dr_map{}, dr_mn_map{};
     unsigned return_depth = 0;
+    bool external_contribution = false;
   };
 
   CollectiveTensorPreparation preparation;
@@ -154,20 +155,23 @@ struct BackwardPeerWorkspace {
 
   std::shared_ptr<Buffer> allocate(std::uint64_t rows, std::uint64_t routes,
                                   std::uint64_t hidden,
-                                  const static_forward::ComputeRingLayout *ring) {
+                                  const static_forward::ComputeRingLayout *ring,
+                                  bool external_contribution = false) {
     auto result = std::make_shared<Buffer>();
     result->row_capacity = rows;
     result->route_capacity = routes;
     result->hidden = hidden;
     result->return_depth = ring ? ring->depth : 0U;
+    result->external_contribution = external_contribution;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
     append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
                                 "Backward dR elements"),
             sizeof(transport::BFloat16), "Backward compact dR");
-    result->descriptor.contribution = append(
-        cursor, checked_mul(routes, hidden, "Backward contribution elements"),
-        sizeof(transport::BFloat16), "Backward source contributions");
+    if (!external_contribution)
+      result->descriptor.contribution = append(
+          cursor, checked_mul(routes, hidden, "Backward contribution elements"),
+          sizeof(transport::BFloat16), "Backward source contributions");
     result->descriptor.dgate =
         append(cursor, routes, sizeof(float), "Backward source dGate");
     if (ring) {
@@ -193,19 +197,22 @@ struct BackwardPeerWorkspace {
 
   void prepare(std::uint64_t next_generation, std::uint64_t rows,
                 std::uint64_t routes, std::uint64_t hidden,
-                const static_forward::ComputeRingLayout *ring = nullptr) {
+                const static_forward::ComputeRingLayout *ring = nullptr,
+                bool external_contribution = false) {
     // A retained Notify plan is immutable. Repeating that Backward needs no
     // allocation, address exchange or host collective.
     const auto depth = ring ? ring->depth : 0U;
     if (ring)
       routes = std::uint64_t(ring->shape.tokens) * ring->contribution_depth *
                ring->shape.top_k;
-    if (buffer && generation == next_generation && buffer->return_depth == depth)
+    if (buffer && generation == next_generation && buffer->return_depth == depth &&
+        buffer->external_contribution == external_contribution)
       return;
     generation = 0;
     std::shared_ptr<Buffer> next;
     const bool bindings_changed = preparation.run_with_change([&] {
       if (buffer && buffer->hidden == hidden && buffer->return_depth == depth &&
+          buffer->external_contribution == external_contribution &&
           rows <= buffer->row_capacity &&
           routes <= buffer->route_capacity) {
         next = buffer;
@@ -217,7 +224,8 @@ struct BackwardPeerWorkspace {
                                              "Backward grown row capacity"))
             : initial_rows;
         next = allocate(std::max(rows, reserved),
-                        ring ? routes : std::max(routes, max_routes), hidden, ring);
+                        ring ? routes : std::max(routes, max_routes), hidden, ring,
+                        external_contribution);
       }
       // Preserve the logical TMA bounds, including zero fill of tail tiles.
       // The descriptor may change without replacing or remapping the storage.

@@ -22,7 +22,7 @@ def run(command, **kwargs):
 
 def function_name(symbol):
     tail = symbol.rsplit("$", 1)[-1]
-    match = re.search(r"weftmoe_pf(?:7network|4ring|5local)(\d+)(\w+)", tail)
+    match = re.search(r"weftmoe_pf(?:7network|4ring|5local|14backward_local)(\d+)(\w+)", tail)
     if not match:
         return tail
     name = match[2][:int(match[1])]
@@ -34,7 +34,7 @@ def function_name(symbol):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", required=True, type=Path)
-    parser.add_argument("--kernel", choices=("local", "network"), default="network")
+    parser.add_argument("--kernel", choices=("local", "network", "backward_local"), default="network")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)

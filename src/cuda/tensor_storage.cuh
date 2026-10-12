@@ -157,6 +157,8 @@ struct BackwardTensorStorage::Impl {
   std::size_t u_offset, dab_offset, dx_rows_offset, dgate_rows_offset;
   std::size_t gathered_dab_offset = 0;
   unsigned return_depth = 0;
+  unsigned pf_depth = 0;
+  std::size_t pf_dab_offset = 0;
   std::uint64_t gather_rows = 0;
   bool private_gather = false;
   CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{}, u_store_map{},
@@ -167,7 +169,7 @@ struct BackwardTensorStorage::Impl {
   make(const DeviceDispatchHandle &, const CudaExecution &,
        const BackwardMegaKernelConfig &, const BackwardTensorBuffers &,
        const CudaTensorAllocator &, unsigned return_depth = 0,
-       unsigned clusters = 0);
+       unsigned clusters = 0, unsigned pf_depth = 0);
 };
 
 ForwardTensorStorage prepare_forward_tensors(
@@ -227,7 +229,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
     const DeviceDispatchHandle &dispatch, const CudaExecution &execution,
     const BackwardMegaKernelConfig &config,
     const BackwardTensorBuffers &bindings, const CudaTensorAllocator &allocator,
-    unsigned return_depth, unsigned clusters) {
+    unsigned return_depth, unsigned clusters, unsigned pf_depth) {
   using namespace tensor_storage_detail;
   if (!dispatch || !execution || !config.hidden_size ||
       !config.intermediate_size)
@@ -235,6 +237,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
         "prepare Backward tensors requires Notify and a model shape");
   auto state = std::make_shared<BackwardTensorStorage::Impl>(execution);
   state->return_depth = return_depth;
+  state->pf_depth = pf_depth;
   state->tokens = dispatch.identity().num_tokens;
   state->top_k = dispatch.identity().top_k;
   state->experts = dispatch.sizes().owned_expert_count;
@@ -278,7 +281,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   state->u_offset = append(cursor, intermediate_elements, 2U, "Backward U");
   state->dab_offset = append(cursor, intermediate_elements, 4U, "Backward dAB");
   state->dx_rows_offset = 0;
-  if (!return_depth)
+  if (!return_depth && !pf_depth)
     state->dx_rows_offset = append(
         cursor,
         checked_mul(state->padded_rows, state->hidden, "Backward dX rows"), 2U,
@@ -295,10 +298,20 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
                4U, "Backward dX input staging");
   state->dgate_rows_offset =
       append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
+  if (pf_depth && 2U * state->intermediate > state->hidden)
+    state->pf_dab_offset = append(
+        cursor, std::uint64_t(pf_depth) * backward_tuning::kTileM *
+                    state->intermediate,
+        4U, "PF Backward dAB ring");
   state->workspace = make(cursor);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
   auto *base = state->workspace->data;
-  if (!return_depth)
+  if (pf_depth && 2U * state->intermediate > state->hidden)
+    state->dab_map = make_bf16_tma_map(
+        at<void>(base, state->pf_dab_offset), 2ULL * state->intermediate,
+        std::uint64_t(pf_depth) * backward_tuning::kTileM,
+        backward_tuning::kTileM, "PF Backward dAB ring", 64U);
+  else if (!return_depth && !pf_depth)
     state->dab_map = make_bf16_tma_map(
         at<void>(base, state->dab_offset), 2ULL * state->intermediate,
         state->padded_rows, backward_tuning::kActivationTileM,
@@ -312,7 +325,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   state->u_store_map = make_bf16_tma_store_map(
       at<void>(base, state->u_offset), state->intermediate, state->padded_rows,
       "Backward dU output", 0ULL, backward_tuning::kActivationTileM);
-  if (!return_depth)
+  if (!return_depth && !pf_depth)
     state->dx_store_map = make_bf16_tma_store_map(
         at<void>(base, state->dx_rows_offset), state->hidden,
         state->padded_rows, "Backward dX output", 0ULL,

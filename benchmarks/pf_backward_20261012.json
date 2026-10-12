@@ -1,0 +1,41 @@
+{
+  "base_commit": "1cfb423",
+  "shape": {"hidden": 4096, "intermediate": 2048, "experts": 256, "top_k": 6},
+  "workload": "variable_tokens_random_routes",
+  "seed": 123,
+  "token_std_fraction": 0.1,
+  "route_bias_std": 0.5,
+  "warmups": 4,
+  "samples": 8,
+  "prime_trace": true,
+  "requested_sm_clock_mhz": 1620,
+  "metric": "slowest-rank eager forward+backward+release+device synchronize p50 ms",
+  "timing": "Includes per-call weight packing and tape allocation; excludes input generation and initial persistent workspace allocation",
+  "raw_directory": "build/pf_backward_20261012/results",
+  "single_node_ep8": {
+    "baseline_local": [26.4829555, 68.6237125],
+    "megatron_local": [24.791987, 59.548028],
+    "m1_initial_perf": [29.1116035, 63.670901],
+    "m1_windows_perf": [25.1156685, 60.8837835],
+    "m1_prepared_perf": [24.9560515, 64.0169485],
+    "m1_final_perf": [25.2091185, 62.164202],
+    "m1_final_repeat": [25.192544, 62.1781735]
+  },
+  "two_node_ep16_old_backward_only": {
+    "baseline_network": [32.6678875, 78.5314285],
+    "megatron_network": [33.288278, 87.2022895]
+  },
+  "clock_caveats": {
+    "baseline_network": "1455/1470 MHz observations overlapped timed intervals",
+    "m1_prepared_perf": "One 1560 MHz observation",
+    "m1_final_perf": "One 1590 MHz observation overlapped 20K sample 4",
+    "m1_final_repeat": "One 1485 MHz observation; unfiltered samples retained"
+  },
+  "verification": {
+    "m1_final_verify": {"tokens": [1, 129, 8192, 20480], "steps_each": 2, "ring_tokens": 512, "max_relative_l2": 0.001417555962689221},
+    "m1_prepared_verify": {"tokens": [129, 8192, 20480], "steps_each": 2, "ring_tokens": 512, "route_bias_std": 8},
+    "python_tests": 117,
+    "python_subtests": 470
+  },
+  "status": "M1 single-node complete; M2 new multi-node backward not yet enabled"
+}

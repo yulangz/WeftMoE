@@ -53,6 +53,7 @@ struct BackwardKernelArgs {
   transport::BFloat16 *recomputed_u = nullptr;
   transport::BFloat16 *dab = nullptr;
   transport::BFloat16 *dx_rows = nullptr;
+  std::uint64_t activation_stride = 0;
   float *dgate_rows = nullptr;
   float *dgate = nullptr;
   backward_detail::ReturnRingView return_ring;

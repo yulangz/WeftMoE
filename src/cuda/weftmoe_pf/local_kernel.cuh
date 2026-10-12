@@ -49,7 +49,8 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a) {
   grid_sync(a);
 }
 
-__device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
+template <unsigned ReadTiles = kFc1Tiles, bool WaitFc2 = false, class Storage>
+__device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
   const auto warp = (threadIdx.x - kMathThreads - 32U) / 32U;
   const auto lane = threadIdx.x & 31U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -69,8 +70,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
       const auto block = logical / kM, generation = block / a.ring.depth + 1U;
       const auto row = block % a.ring.depth * kM + logical % kM;
       auto &slot = a.ring.slots[block % a.ring.depth];
-      while (ring::acquire(slot.fc1_done) <
-             std::uint64_t(generation - 1U) * kFc1Tiles) {
+      while (ring::acquire(WaitFc2 ? slot.fc2_done : slot.fc1_done) <
+             std::uint64_t(generation - 1U) * ReadTiles) {
       }
       const auto route = source_routes(a, a.rank, source, expert)[ordinal];
       const auto token = route / a.dispatch.identity.top_k;
@@ -132,18 +133,20 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared &s) {
   }
 }
 
-template <bool Network = false>
+template <bool Network = false, unsigned BaseThread = 0U,
+          unsigned Threads = kMathThreads>
 __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
   const auto *input = Network
       ? peer_at<const uint4>(a.gin_window_base, a.static_network.contribution)
       : peer_at<const uint4>(a.local_base, a.contribution_offset);
   auto *output = reinterpret_cast<uint4 *>(a.output);
   constexpr unsigned vectors = forward_tuning::kMainHidden / 8U;
-  constexpr unsigned warps = kMathThreads / 32U;
+  constexpr unsigned warps = Threads / 32U;
   constexpr unsigned batch = 4U;
   const auto lane = threadIdx.x % 32U;
   const auto top_k = a.dispatch.identity.top_k;
-  for (auto token = std::uint64_t(blockIdx.x) * warps + threadIdx.x / 32U;
+  for (auto token = std::uint64_t(blockIdx.x) * warps +
+                    (threadIdx.x - BaseThread) / 32U;
        token < a.dispatch.identity.num_tokens; token += gridDim.x * warps) {
     // Keep the usual top-k directory in warp registers. Four independent
     // 16B vectors overlap global loads without changing each element's
@@ -192,8 +195,8 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
               float2_to_bf16x2_bits(sum[vector][3].x, sum[vector][3].y)};
     }
   }
-  collective_scope_sync<kMathThreads, 7U>();
-  if (threadIdx.x == 0U) {
+  collective_scope_sync<Threads, 7U>();
+  if (threadIdx.x == BaseThread) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicMax(&status->reduce_blocks_done, device_globaltimer_ns());

@@ -1,0 +1,442 @@
+#pragma once
+
+namespace weftmoe_pf::backward_local {
+
+constexpr unsigned kM = 128U, kK = 64U;
+constexpr unsigned kStages = backward_tuning::kDabStages;
+constexpr unsigned kDuN = backward_tuning::kDabTileN;
+constexpr unsigned kDxN = backward_tuning::kDxTileN;
+constexpr unsigned kN = kDuN > kDxN ? kDuN : kDxN;
+constexpr unsigned kDuTiles = backward_tuning::kMainIntermediate / kDuN;
+constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
+constexpr bool kEnabled = backward_tuning::kActivationClusterN == 2U &&
+                          backward_tuning::kActivationTileK == kK;
+
+// Independent producer/math streams share only operand-stage barriers. The
+// activation epilogue never aliases these stages; dW reuses the arena after
+// the entire activation grid has drained.
+struct Shared {
+  alignas(1024) transport::BFloat16 a[kStages][kM * kK];
+  alignas(1024) transport::BFloat16 b[kStages][kN * kK];
+  alignas(1024) unsigned char pull[local::kPullWarps][4096];
+  local::Barrier full[kStages], empty[kStages];
+  local::Barrier pull_full[local::kPullWarps];
+};
+constexpr auto kDwBytes = backward_compute_detail::dynamic_shared_bytes<
+    backward_unified_detail::kStorageTileN>();
+constexpr auto kSharedBytes = sizeof(Shared) > kDwBytes ? sizeof(Shared)
+                                                        : kDwBytes;
+
+enum class Phase : unsigned { Du, Swiglu, Dx };
+struct Task {
+  unsigned expert, block, column, rows, row, generation;
+  Phase phase;
+};
+
+struct Schedule {
+  const ForwardKernelArgs &a;
+  unsigned expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
+
+  __device__ explicit Schedule(const ForwardKernelArgs &args) : a(args) {}
+
+  __device__ __forceinline__ bool next(Task &t) {
+    const auto all_blocks = unsigned(a.ring.state->blocks);
+    while (begin < all_blocks) {
+      if (end == begin)
+        end = min(all_blocks, begin + a.ring.depth);
+      const auto blocks = end - begin;
+      const auto du = blocks * kDuTiles;
+      const auto epilogue = blocks * 2U;
+      const auto total = du + epilogue + blocks * kDxTiles;
+      if (index < total) {
+        const auto phase = index < du              ? Phase::Du
+                           : index < du + epilogue ? Phase::Swiglu
+                                                   : Phase::Dx;
+        const auto linear = index - (phase == Phase::Du       ? 0U
+                                     : phase == Phase::Swiglu ? du
+                                                              : du + epilogue);
+        const auto columns = phase == Phase::Du   ? kDuTiles
+                             : phase == Phase::Dx ? kDxTiles
+                                                  : 2U;
+        const auto block = begin + linear / columns;
+        if (block < a.ring.expert_blocks[expert])
+          expert = 0U;
+        while (block >= a.ring.expert_blocks[expert + 1U])
+          ++expert;
+        const auto expert_begin = unsigned(a.ring.expert_blocks[expert]);
+        t = {expert,
+             block,
+             linear % columns,
+             min(kM, unsigned(a.ring.expert_rows[expert]) -
+                         (block - expert_begin) * kM),
+             block % a.ring.depth * kM,
+             block / a.ring.depth + 1U,
+             phase};
+        index += gridDim.x;
+        return true;
+      }
+      index -= total;
+      begin = end;
+    }
+    return false;
+  }
+};
+
+__global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
+  const auto expert = blockIdx.y;
+  const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto stride = gridDim.x * blockDim.x;
+  auto *words = backward_pipeline_detail::scheduler_words(a);
+  const auto layout = pipeline::backward::make_backward_scheduler_layout(
+      a.scheduler_mblock_capacity,
+      kDxTiles / backward_tuning::kActivationClusterN,
+      a.scheduler_expert_capacity);
+  const auto rows = a.dispatch.expert_row_count[expert];
+  const auto padded = f.ring.expert_blocks[expert] * kM;
+  if (!tid) {
+    peer_at<unsigned long long>(
+        a.local_base, a.padded_expert_offsets_offset)[expert] = padded;
+    peer_at<unsigned long long>(a.local_base,
+                                a.padded_expert_rows_offset)[expert] =
+        (f.ring.expert_blocks[expert + 1U] - f.ring.expert_blocks[expert]) * kM;
+    words[layout.dw_reduction_rows + expert] =
+        (rows + backward_tuning::kTileK - 1U) / backward_tuning::kTileK *
+        backward_tuning::kTileK;
+    if (expert + 1U == a.dispatch.sizes.owned_expert_count)
+      peer_at<unsigned long long>(a.local_base,
+                                  a.padded_expert_offsets_offset)[expert + 1U] =
+          f.ring.expert_blocks[expert + 1U] * kM;
+  }
+  auto *mapping = peer_at<unsigned>(a.local_base, a.compact_to_padded_offset);
+  for (auto row = std::uint64_t(tid); row < rows; row += stride)
+    mapping[a.dispatch.expert_row_prefix[expert] + row] =
+        unsigned(padded + row);
+  if (!rows) {
+    const auto elements = a.hidden * a.intermediate;
+    auto *dw1 =
+        reinterpret_cast<unsigned short *>(a.dw1 + expert * 2U * elements);
+    auto *dw2 = reinterpret_cast<unsigned short *>(a.dw2 + expert * elements);
+    for (auto i = std::uint64_t(tid); i < 2U * elements; i += stride) {
+      dw1[i] = 0U;
+      if (i < elements)
+        dw2[i] = 0U;
+    }
+  }
+  if (!expert) {
+    for (auto i = tid; i < f.ring.depth; i += stride)
+      f.ring.slots[i] = {};
+    if (!tid) {
+      if (a.runtime_epoch)
+        ++*a.runtime_epoch;
+      words[layout.completed_dw1_tiles] = words[layout.completed_dw2_tiles] =
+          0ULL;
+      backward_pipeline_detail::initialize_status(a);
+    }
+  }
+}
+
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+__device__ __forceinline__ void
+produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
+        const CUtensorMap &dab, const CUtensorMap &w2, const CUtensorMap &w1) {
+  Schedule schedule(f);
+  Task t;
+  unsigned stage = 0U, phase = 0U;
+  while (schedule.next(t)) {
+    if (t.phase == Phase::Swiglu)
+      continue;
+    const bool dx = t.phase == Phase::Dx;
+    auto &slot = f.ring.slots[t.block % f.ring.depth];
+    if (cute::elect_one_sync()) {
+      const auto &ready = dx ? slot.returned : slot.x_full;
+      while (ring::acquire(ready) <
+             std::uint64_t(t.generation) * (dx ? 2U : kM)) {
+      }
+      if (!dx)
+        while (ring::acquire(slot.fc2_done) <
+               std::uint64_t(t.generation - 1U) * kDxTiles) {
+        }
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+    }
+    __syncwarp();
+    const auto reduction = dx ? 2U * f.intermediate : f.hidden;
+    for (unsigned k = 0U; k < reduction; k += kK) {
+      s.empty[stage].wait(phase ^ 1U);
+      if (cute::elect_one_sync()) {
+        hopper::tma_load<kK, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
+                                       s.a[stage], k, t.row, 2U);
+        if (dx)
+          hopper::tma_load<kDxN, kK, 128U>(
+              &w1, &s.full[stage], s.b[stage], t.column * kDxN,
+              t.expert * unsigned(2U * f.intermediate) + k);
+        else
+          hopper::tma_load<kDuN, kK, 128U>(&w2, &s.full[stage], s.b[stage],
+                                           t.column * kDuN,
+                                           t.expert * unsigned(f.hidden) + k);
+        s.full[stage].arrive_and_expect_tx((kM + (dx ? kDxN : kDuN)) * kK * 2U);
+      }
+      stage = (stage + 1U) % kStages;
+      phase ^= stage == 0U;
+    }
+  }
+}
+
+template <unsigned N, bool Dx>
+__device__ __forceinline__ void
+gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
+     const Task &t, unsigned &stage, unsigned &phase) {
+  constexpr auto MajorA = hopper::Major::K, MajorB = hopper::Major::MN;
+  using Mma =
+      typename hopper::BF16MMASelector<N, MajorA, MajorB, kK, 128U>::type;
+  auto da = hopper::make_gmma_desc<MajorA, kM, kK, 128U>(
+      s.a[0], threadIdx.x / 128U * 64U, 0U);
+  auto db = hopper::make_gmma_desc<MajorB, N, kK, 128U>(s.b[0], 0U, 0U);
+  const auto abase = __shfl_sync(0xffffffffU, da.reg32_[0], 0U);
+  const auto bbase = __shfl_sync(0xffffffffU, db.reg32_[0], 0U);
+  float accum[Mma::kNumAccum] = {};
+  const auto reduction = Dx ? 2U * f.intermediate : f.hidden;
+  const bool checkpoint_owner =
+      !Dx && t.column / 2U == t.block % (kDuTiles / 2U);
+  const auto half = (t.column % 2U) * 64U;
+  const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
+  forward_compute_detail::StaticV4XCheckpoint<kK, 64U> checkpoint;
+  for (unsigned k = 0U; k < reduction; k += kK) {
+    s.full[stage].wait(phase);
+    if (k == 0U && checkpoint_owner)
+      checkpoint.prepare(f, t.block, checkpoint_rows, half);
+    if (k == 0U && !threadIdx.x) {
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      atomicMin(Dx ? &status->relay_blocks_done : &status->fc1_start_clock,
+                device_globaltimer_ns());
+    }
+#pragma unroll
+    for (auto &value : accum)
+      cute::warpgroup_fence_operand(value);
+    cute::warpgroup_arrive();
+#pragma unroll
+    for (unsigned atom = 0U; atom < kK; atom += Mma::K) {
+      da.reg32_[0] = hopper::advance_gmma_desc_lo<MajorA, kM, kK, 128U,
+                                                  transport::BFloat16>(
+          abase + stage * kM * kK / 8U, 0U, atom);
+      db.reg32_[0] = hopper::advance_gmma_desc_lo<MajorB, N, kK, 128U,
+                                                  transport::BFloat16>(
+          bbase + stage * kN * kK / 8U, 0U, atom);
+      Mma::wgmma(da, db, accum, k != 0U || atom != 0U);
+    }
+    cute::warpgroup_commit_batch();
+#pragma unroll
+    for (auto &value : accum)
+      cute::warpgroup_fence_operand(value);
+    if (checkpoint_owner)
+      checkpoint.save(s.a[stage] + half * kK, checkpoint_rows, k, f.hidden,
+                      f.saved_x_map);
+    cute::warpgroup_wait<0>();
+    backward_compute_detail::release_stage(s.empty[stage]);
+    stage = (stage + 1U) % kStages;
+    phase ^= stage == 0U;
+  }
+  const auto lane = threadIdx.x % 32U;
+  const auto row0 = threadIdx.x / 32U * 16U + lane / 4U;
+  const auto *mapping =
+      peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
+#pragma unroll
+  for (unsigned item = 0U; item < 2U; ++item) {
+    const auto row = row0 + item * 8U;
+    if (row >= t.rows)
+      continue;
+    auto *output =
+        Dx ? static_cast<transport::BFloat16 *>(
+                 f.ring.rows[t.block * kM + row].output)
+           : a.recomputed_u +
+                 std::uint64_t(mapping[f.checkpoint.rows[t.block * kM + row]]) *
+                     a.intermediate;
+    output += t.column * N;
+#pragma unroll
+    for (unsigned index = 0U; index < N / 8U; index += 4U) {
+      std::uint32_t bits[4];
+#pragma unroll
+      for (unsigned j = 0U; j < 4U; ++j) {
+        const auto *value = accum + (index + j) * 4U + item * 2U;
+        bits[j] = float2_to_bf16x2_bits(value[0], value[1]);
+      }
+      *reinterpret_cast<uint4 *>(output + index * 8U + lane % 4U * 8U) =
+          forward_compute_detail::static_v4_transpose_vector(
+              make_uint4(bits[0], bits[1], bits[2], bits[3]));
+    }
+  }
+  if constexpr (Dx)
+    __threadfence_system();
+  else
+    __threadfence();
+  backward_unified_compute_detail::UnifiedComputeSynchronization<
+      true>::math_sync(256U, 0U);
+  if (!threadIdx.x) {
+    auto &slot = f.ring.slots[t.block % f.ring.depth];
+    ring::arrive(Dx ? slot.fc2_done : slot.fc1_done, 1U);
+  }
+}
+
+__device__ __forceinline__ void
+compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
+  Schedule schedule(f);
+  Task t;
+  unsigned stage = 0U, phase = 0U;
+  const auto *mapping =
+      peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
+  while (schedule.next(t)) {
+    if (t.phase == Phase::Du) {
+      gemm<kDuN, false>(f, a, s, t, stage, phase);
+    } else if (t.phase == Phase::Dx) {
+      gemm<kDxN, true>(f, a, s, t, stage, phase);
+    } else {
+      auto &slot = f.ring.slots[t.block % f.ring.depth];
+      if (!threadIdx.x)
+        while (ring::acquire(slot.fc1_done) <
+               std::uint64_t(t.generation) * kDuTiles) {
+        }
+      using Sync =
+          backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
+      Sync::math_sync(256U, 0U);
+      for (unsigned row = t.column * 64U + threadIdx.x / 32U;
+           row < (t.column + 1U) * 64U; row += 8U) {
+        const bool valid = row < t.rows;
+        const auto saved = valid ? f.checkpoint.rows[t.block * kM + row] : 0U;
+        const auto padded = valid ? mapping[saved] : t.block * kM + row;
+        backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
+                                          threadIdx.x % 32U);
+        __syncwarp();
+        const auto lane = threadIdx.x % 32U;
+        auto *out = reinterpret_cast<uint4 *>(
+            a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
+        const auto *in = reinterpret_cast<const uint4 *>(
+            a.dab + std::uint64_t(padded) * 2U * a.intermediate);
+        for (unsigned column = lane; column < 2U * a.intermediate / 8U;
+             column += 32U)
+          out[column] = in[column];
+        if (valid && !lane) {
+          const auto identity = f.ring.rows[t.block * kM + row];
+          a.peer_payloads[identity.source].dgate[identity.route] =
+              a.dgate_rows[padded];
+        }
+      }
+      __threadfence_system();
+      Sync::math_sync(256U, 0U);
+      if (!threadIdx.x) {
+        ring::arrive(slot.returned, 1U);
+        atomicMax(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                       ->fc1_complete_clock,
+                  device_globaltimer_ns());
+      }
+    }
+  }
+}
+
+// Keep the register domains disjoint across the phase transition. A common
+// outer join can make ptxas discard setmaxnreg for the N256 accumulators.
+__device__ __noinline__ void
+begin_weights(const ForwardKernelArgs &f, unsigned char *storage,
+              backward_unified_compute_detail::SharedState &state) {
+  grid_sync<0U, 384U>(f);
+  backward_unified_compute_detail::initialize_compute<
+      backward_unified_detail::kStorageTileN>(storage, state);
+  __syncthreads();
+  cute::cluster_sync();
+  if (!threadIdx.x)
+    atomicMax(&peer_at<TransportDeviceStatus>(f.local_base, f.status_offset)
+                   ->fc2_complete_clock,
+              device_globaltimer_ns());
+}
+
+__device__ __noinline__ void finish() {
+  __syncthreads();
+  cute::cluster_sync();
+}
+#endif
+
+__global__ __launch_bounds__(384U, 1) void kernel(
+    const __grid_constant__ ForwardKernelArgs f,
+    const __grid_constant__ BackwardKernelArgs a,
+    const __grid_constant__ CUtensorMap dy_map,
+    const __grid_constant__ CUtensorMap dab_map,
+    const __grid_constant__ CUtensorMap w2_map,
+    const __grid_constant__ CUtensorMap w1_map,
+    const __grid_constant__ CUtensorMap dr_mn_map,
+    const __grid_constant__ CUtensorMap u_mn_map,
+    const __grid_constant__ CUtensorMap dab_mn_map,
+    const __grid_constant__ CUtensorMap x_mn_map,
+    const __grid_constant__ CUtensorMap u_store_map,
+    const __grid_constant__ CUtensorMap dx_store_map,
+    const __grid_constant__ CUtensorMap dw2_store_map,
+    const __grid_constant__ CUtensorMap dw1_store_map) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+  extern __shared__ __align__(1024) unsigned char storage[];
+  auto &s = *reinterpret_cast<Shared *>(storage);
+  __shared__ backward_unified_compute_detail::SharedState state;
+  const auto geometry = backward_unified_compute_detail::load_row_geometry(a);
+  if (!blockIdx.x && !threadIdx.x)
+    peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->start_clock =
+        device_globaltimer_ns();
+  if (threadIdx.x == 256U) {
+    const auto readers = cute::block_rank_in_cluster() == 0U ? 16U : 8U;
+    for (unsigned i = 0U; i < kStages; ++i) {
+      s.full[i].init(1U);
+      s.empty[i].init(readers);
+    }
+    for (auto &barrier : s.pull_full)
+      barrier.init(1U);
+    cutlass::arch::fence_barrier_init();
+  }
+  __syncthreads();
+  cute::cluster_sync();
+  if (threadIdx.x < 256U) {
+    cutlass::arch::warpgroup_reg_alloc<
+        backward_tuning::kUnifiedMathRegisters>();
+    compute(f, a, s);
+    begin_weights(f, storage, state);
+    backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
+        state};
+    backward_unified_compute_detail::run_compute<
+        kDuN, kDxN, backward_tuning::kDwTileN, true>(
+        a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
+        x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
+        geometry, storage, state, sync);
+    finish();
+  } else {
+    cutlass::arch::warpgroup_reg_dealloc<
+        backward_tuning::kUnifiedControlRegisters>();
+    if (threadIdx.x < 288U) {
+      produce(f, s, dy_map, dab_map, w2_map, w1_map);
+      begin_weights(f, storage, state);
+      backward_unified_compute_detail::UnifiedComputeSynchronization<false>
+          sync{state};
+      backward_unified_compute_detail::run_compute<
+          kDuN, kDxN, backward_tuning::kDwTileN, true>(
+          a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
+          x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
+          geometry, storage, state, sync);
+      finish();
+    } else {
+      if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
+        local::pull<kDxTiles, true>(f, s);
+      begin_weights(f, storage, state);
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      rank_barrier<288U, 96U>(f);
+      if (threadIdx.x == 288U)
+        atomicMax(&status->return_complete_clock, device_globaltimer_ns());
+      if (threadIdx.x == 288U)
+        atomicMin(&status->backward_reduce_start_clock,
+                  device_globaltimer_ns());
+      local::combine<false, 288U, 96U>(f);
+      if (threadIdx.x == 288U)
+        atomicMax(&status->backward_reduce_complete_clock,
+                  device_globaltimer_ns());
+      rank_barrier<288U, 96U>(f);
+      finish();
+    }
+  }
+#endif
+}
+
+} // namespace weftmoe_pf::backward_local

@@ -132,6 +132,7 @@ __device__ __forceinline__ void initialize_compute(unsigned char *storage,
 }
 
 template <std::uint32_t DabTileN, std::uint32_t DxTileN, std::uint32_t DwTileN,
+          bool WeightsOnly = false,
           class Synchronization>
 __device__ __forceinline__ void
 run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
@@ -184,7 +185,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
       bool claimed = false;
       bool terminal = false;
 
-      claimed = schedule.next<kDuTiles, kDxTiles>(
+      claimed = schedule.next<kDuTiles, kDxTiles, WeightsOnly>(
           a, words, layout, geometry.mblocks, gridDim.x / 2U, task,
           phase_shared, terminal);
 
@@ -225,164 +226,176 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_map,
 
     const auto owner = task_owner_shared;
     const auto tile = task_tile_shared;
-    const bool activation_chain =
-        geometry.mblocks >= gridDim.x / 2U &&
-        task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dab);
-    if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dab)) {
-      const auto descriptor = descriptors[owner];
-      if (phase_shared == 1U) {
-        if (Synchronization::kMathEnabled && threadIdx.x == 0U)
-          atomicMin(&status->fc1_start_clock, device_globaltimer_ns());
-        const auto count = activation_chain ? kDuTiles : 1U;
-        for (unsigned offset = 0U; offset < count; ++offset) {
-          backward_compute_detail::run_k_mn_tile_tma_store<
-              DabTileN, kStorageTileN, Synchronization>(
-              dr_map, w2_map, u_store_map, descriptor.compact_row,
-              descriptor.expert * static_cast<std::uint32_t>(a.hidden),
-              static_cast<std::uint32_t>(a.hidden), descriptor.padded_row,
-              (tile + offset) * backward_tuning::kActivationClusterN * DabTileN,
-              storage, activation_pipeline);
-          // A queue entry covers one complete cluster task. Publish it only
-          // after both CTAs have stored their disjoint output regions.
+    if constexpr (!WeightsOnly) {
+      const bool activation_chain =
+          geometry.mblocks >= gridDim.x / 2U &&
+          task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dab);
+      if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dab)) {
+        const auto descriptor = descriptors[owner];
+        if (phase_shared == 1U) {
+          if (Synchronization::kMathEnabled && threadIdx.x == 0U)
+            atomicMin(&status->fc1_start_clock, device_globaltimer_ns());
+          const auto count = activation_chain ? kDuTiles : 1U;
+          for (unsigned offset = 0U; offset < count; ++offset) {
+            backward_compute_detail::run_k_mn_tile_tma_store<
+                DabTileN, kStorageTileN, Synchronization>(
+                dr_map, w2_map, u_store_map, descriptor.compact_row,
+                descriptor.expert * static_cast<std::uint32_t>(a.hidden),
+                static_cast<std::uint32_t>(a.hidden), descriptor.padded_row,
+                (tile + offset) * backward_tuning::kActivationClusterN *
+                    DabTileN,
+                storage, activation_pipeline);
+            // A queue entry covers one complete cluster task. Publish it only
+            // after both CTAs have stored their disjoint output regions.
+            synchronization.cluster_sync();
+            if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
+                cluster_rank == 0U) {
+              ::cuda::atomic_ref<unsigned long long,
+                                 ::cuda::thread_scope_device>
+                  completed(words[layout.du_completed + owner]);
+              const auto done =
+                  completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) +
+                  1ULL;
+              if (done == kDuTiles) {
+                ::cuda::atomic_ref<unsigned long long,
+                                   ::cuda::thread_scope_device>
+                    phase(words[layout.phase + owner]);
+                phase.store(2ULL, ::cuda::memory_order_release);
+              }
+            }
+          }
+        }
+        if (phase_shared == 2U || activation_chain) {
+          const bool whole_block = activation_chain || task_count_shared > 1U;
+          const auto rows_per_task =
+              whole_block ? kDabRowsPerMblock : kDabRowsPerTask;
+          const auto first_row = tile * rows_per_task;
+          const auto task_rows = kDabRowsPerMblock - first_row < rows_per_task
+                                     ? kDabRowsPerMblock - first_row
+                                     : rows_per_task;
+          const auto first_half = (task_rows + 1U) / 2U;
+          const auto local_row = first_row + cluster_rank * first_half;
+          const auto rows =
+              cluster_rank == 0U ? first_half : task_rows - first_half;
+          const auto valid_rows =
+              descriptor.valid_rows > local_row
+                  ? (descriptor.valid_rows - local_row < rows
+                         ? descriptor.valid_rows - local_row
+                         : rows)
+                  : 0U;
+          if constexpr (Synchronization::kMathEnabled)
+            backward_swiglu_epilogue_warp_rows<kDabRowsPerMblock / 2U,
+                                               Synchronization::kWorkWarps>(
+                a,
+                static_cast<std::uint64_t>(descriptor.padded_row) + local_row,
+                static_cast<std::uint64_t>(descriptor.compact_row) + local_row,
+                valid_rows, rows);
+          __threadfence();
           synchronization.cluster_sync();
+          if constexpr (Synchronization::kMathEnabled)
+            if (a.return_ring.depth && !a.return_ring.canonical)
+              weftmoe_pf::backward_return::publish_input(
+                  a, descriptor.compact_row + local_row, valid_rows);
           if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
               cluster_rank == 0U) {
             ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                completed(words[layout.du_completed + owner]);
+                completed(words[layout.dab_completed + owner]);
+            const auto epilogue_count =
+                activation_chain ? kDabEpilogueTasks : task_count_shared;
             const auto done =
-                completed.fetch_add(1ULL, ::cuda::memory_order_acq_rel) + 1ULL;
-            if (done == kDuTiles) {
+                completed.fetch_add(epilogue_count,
+                                    ::cuda::memory_order_acq_rel) +
+                epilogue_count;
+            if (done == kDabEpilogueTasks) {
               ::cuda::atomic_ref<unsigned long long,
                                  ::cuda::thread_scope_device>
                   phase(words[layout.phase + owner]);
-              phase.store(2ULL, ::cuda::memory_order_release);
+              phase.store(3ULL, ::cuda::memory_order_release);
+
+              atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
             }
           }
         }
       }
-      if (phase_shared == 2U || activation_chain) {
-        const bool whole_block = activation_chain || task_count_shared > 1U;
-        const auto rows_per_task =
-            whole_block ? kDabRowsPerMblock : kDabRowsPerTask;
-        const auto first_row = tile * rows_per_task;
-        const auto task_rows = kDabRowsPerMblock - first_row < rows_per_task
-                                   ? kDabRowsPerMblock - first_row
-                                   : rows_per_task;
-        const auto first_half = (task_rows + 1U) / 2U;
-        const auto local_row = first_row + cluster_rank * first_half;
-        const auto rows =
-            cluster_rank == 0U ? first_half : task_rows - first_half;
-        const auto valid_rows = descriptor.valid_rows > local_row
-                                    ? (descriptor.valid_rows - local_row < rows
-                                           ? descriptor.valid_rows - local_row
-                                           : rows)
-                                    : 0U;
-        if constexpr (Synchronization::kMathEnabled)
-          backward_swiglu_epilogue_warp_rows<kDabRowsPerMblock / 2U,
-                                             Synchronization::kWorkWarps>(
-              a, static_cast<std::uint64_t>(descriptor.padded_row) + local_row,
-              static_cast<std::uint64_t>(descriptor.compact_row) + local_row,
-              valid_rows, rows);
-        __threadfence();
+      if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx) ||
+          (activation_chain &&
+           (!a.return_ring.depth || a.return_ring.canonical))) {
+        BackwardMblockDescriptor descriptor{};
+        unsigned input_row;
+        if (a.return_ring.depth) {
+          descriptor.expert = a.return_ring.blocks[owner].expert;
+          descriptor.padded_row =
+              (owner % a.return_ring.depth) * backward_tuning::kTileM;
+          input_row = a.return_ring.canonical
+                          ? descriptors[owner].padded_row
+                          : weftmoe_pf::backward_return::gather_row();
+          if (!a.return_ring.canonical)
+            weftmoe_pf::backward_return::gather(a, owner, cluster_rank,
+                                                synchronization);
+        } else {
+          descriptor = descriptors[owner];
+          input_row = descriptor.padded_row;
+        }
+        const auto dx_count = activation_chain ? kDxTiles : task_count_shared;
+        if (Synchronization::kMathEnabled && threadIdx.x == 0U)
+          atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
+        // All N tiles of this owner were published together. Each original
+        // GEMM still drains its store before the next one reuses the arena.
+        for (std::uint32_t offset = 0U; offset < dx_count; ++offset) {
+          // CTA 0 multicasts into the peer arena. Wait for both CTAs' previous
+          // stores before allowing either producer to reuse that arena.
+          if (offset != 0U)
+            synchronization.cluster_sync();
+          backward_compute_detail::run_k_mn_tile_tma_store<
+              DxTileN, kStorageTileN, Synchronization>(
+              dab_map, w1_map, dx_store_map, input_row,
+              descriptor.expert *
+                  static_cast<std::uint32_t>(2ULL * a.intermediate),
+              static_cast<std::uint32_t>(2ULL * a.intermediate),
+              descriptor.padded_row,
+              (tile + offset) * backward_tuning::kActivationClusterN * DxTileN,
+              storage, activation_pipeline,
+              weftmoe_pf::backward_return::Output{a, owner});
+        }
+        if (a.use_gin || a.return_ring.depth)
+          __threadfence_system();
+        else
+          __threadfence();
         synchronization.cluster_sync();
-        if constexpr (Synchronization::kMathEnabled)
-          if (a.return_ring.depth && !a.return_ring.canonical)
-            weftmoe_pf::backward_return::publish_input(
-                a, descriptor.compact_row + local_row, valid_rows);
         if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
             cluster_rank == 0U) {
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-              completed(words[layout.dab_completed + owner]);
-          const auto epilogue_count =
-              activation_chain ? kDabEpilogueTasks : task_count_shared;
-          const auto done = completed.fetch_add(epilogue_count,
-                                                ::cuda::memory_order_acq_rel) +
-                            epilogue_count;
-          if (done == kDabEpilogueTasks) {
+          if (a.return_ring.depth) {
+            weftmoe_pf::ring::arrive(a.return_ring.blocks[owner].ready,
+                                     dx_count);
+          } else {
             ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-                phase(words[layout.phase + owner]);
-            phase.store(3ULL, ::cuda::memory_order_release);
-
-            atomicMax(&status->fc1_complete_clock, device_globaltimer_ns());
+                owner_completed(words[layout.dx_completed + owner]);
+            const auto owner_done =
+                owner_completed.fetch_add(dx_count,
+                                          ::cuda::memory_order_acq_rel) +
+                dx_count;
+            if (owner_done == kDxTiles) {
+              owner_completed.store(
+                  weftmoe::cuda::pipeline::backward::backward_dx_ready_value(
+                      kDxTiles),
+                  ::cuda::memory_order_release);
+            }
           }
+          auto *counter = reinterpret_cast<PaddedCounter *>(
+              words + layout.completed_dx_tiles);
+          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
+              completed(counter->value);
+          const auto done =
+              completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) +
+              dx_count;
+          const auto blocks = a.return_ring.depth ? a.return_ring.state->blocks
+                                                  : geometry.mblocks;
+          if (done == blocks * kDxTiles)
+            atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
         }
       }
     }
-    if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dx) ||
-        (activation_chain &&
-         (!a.return_ring.depth || a.return_ring.canonical))) {
-      BackwardMblockDescriptor descriptor{};
-      unsigned input_row;
-      if (a.return_ring.depth) {
-        descriptor.expert = a.return_ring.blocks[owner].expert;
-        descriptor.padded_row =
-            (owner % a.return_ring.depth) * backward_tuning::kTileM;
-        input_row = a.return_ring.canonical
-                        ? descriptors[owner].padded_row
-                        : weftmoe_pf::backward_return::gather_row();
-        if (!a.return_ring.canonical)
-          weftmoe_pf::backward_return::gather(a, owner, cluster_rank,
-                                              synchronization);
-      } else {
-        descriptor = descriptors[owner];
-        input_row = descriptor.padded_row;
-      }
-      const auto dx_count = activation_chain ? kDxTiles : task_count_shared;
-      if (Synchronization::kMathEnabled && threadIdx.x == 0U)
-        atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-      // All N tiles of this owner were published together. Each original
-      // GEMM still drains its store before the next one reuses the arena.
-      for (std::uint32_t offset = 0U; offset < dx_count; ++offset) {
-        // CTA 0 multicasts into the peer arena. Wait for both CTAs' previous
-        // stores before allowing either producer to reuse that arena.
-        if (offset != 0U)
-          synchronization.cluster_sync();
-        backward_compute_detail::run_k_mn_tile_tma_store<DxTileN, kStorageTileN,
-                                                         Synchronization>(
-            dab_map, w1_map, dx_store_map, input_row,
-            descriptor.expert *
-                static_cast<std::uint32_t>(2ULL * a.intermediate),
-            static_cast<std::uint32_t>(2ULL * a.intermediate),
-            descriptor.padded_row,
-            (tile + offset) * backward_tuning::kActivationClusterN * DxTileN,
-            storage, activation_pipeline,
-            weftmoe_pf::backward_return::Output{a, owner});
-      }
-      if (a.use_gin || a.return_ring.depth)
-        __threadfence_system();
-      else
-        __threadfence();
-      synchronization.cluster_sync();
-      if (Synchronization::kMathEnabled && threadIdx.x == 0U &&
-          cluster_rank == 0U) {
-        if (a.return_ring.depth) {
-          weftmoe_pf::ring::arrive(a.return_ring.blocks[owner].ready, dx_count);
-        } else {
-          ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-              owner_completed(words[layout.dx_completed + owner]);
-          const auto owner_done = owner_completed.fetch_add(
-                                      dx_count, ::cuda::memory_order_acq_rel) +
-                                  dx_count;
-          if (owner_done == kDxTiles) {
-            owner_completed.store(
-                weftmoe::cuda::pipeline::backward::backward_dx_ready_value(
-                    kDxTiles),
-                ::cuda::memory_order_release);
-          }
-        }
-        auto *counter = reinterpret_cast<PaddedCounter *>(
-            words + layout.completed_dx_tiles);
-        ::cuda::atomic_ref<unsigned long long, ::cuda::thread_scope_device>
-            completed(counter->value);
-        const auto done =
-            completed.fetch_add(dx_count, ::cuda::memory_order_acq_rel) +
-            dx_count;
-        const auto blocks = a.return_ring.depth ? a.return_ring.state->blocks
-                                                : geometry.mblocks;
-        if (done == blocks * kDxTiles)
-          atomicMax(&status->fc2_complete_clock, device_globaltimer_ns());
-      }
-    } else if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dw2)) {
+    if (task_kind_shared == static_cast<std::uint32_t>(TaskKind::Dw2)) {
       if (Synchronization::kMathEnabled && threadIdx.x == 0U)
         atomicMin(&status->backward_dw2_start_clock, device_globaltimer_ns());
       const auto *padded_offsets = peer_at<const unsigned long long>(
