@@ -6192,7 +6192,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     pf_args.output = static_cast<transport::BFloat16 *>(data.dx->data);
     args.activation_stride = std::max<std::uint64_t>(
         config.hidden_size, 2ULL * config.intermediate_size);
-    if (use_gin || weftmoe_pf::backward_stream::kCanonicalLocal) {
+    if (use_gin) {
       dab_map = make_bf16_tma_map(
           args.dab, 2ULL * config.intermediate_size, data.padded_rows, 128U,
           "PF Backward canonical dAB", 64U);
@@ -6598,8 +6598,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto launch_result =
       pf_stream
           ? cudaLaunchKernelEx(&launch, stream_kernel, pf_args, args,
-                               use_gin || weftmoe_pf::backward_stream::kCanonicalLocal
-                                       ? peer_workspace.buffer->dr_map
+                               use_gin ? peer_workspace.buffer->dr_map
                                        : slot.forward_x_map,
                                dab_map,
                                retained.weights.impl_->backward_w2_map,
@@ -6705,41 +6704,40 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                                        bool pending) {
       std::ostringstream record;
       record << "BACKWARD_STATUS rank=" << identity.rank
-                << " epoch=" << backward_epoch << " pending=" << pending
-                << " return_puts=" << s.gin_return_put_count
-                << " return_bytes=" << s.gin_return_payload_bytes
-                << " start=" << s.start_clock
-                << " du_start=" << s.fc1_start_clock
-                << " du_complete=" << s.fc1_complete_clock
-                << " dx_start=" << s.relay_blocks_done
-                << " dispatch_complete=" << s.dispatch_complete_clock
-                << " dx_complete=" << s.fc2_complete_clock
-                << " return_complete=" << s.return_complete_clock
-                << " dw2_start=" << s.backward_dw2_start_clock
-                << " dw2_complete=" << s.backward_dw2_complete_clock
-                << " dw1_start=" << s.backward_dw1_start_clock
-                << " dw1_complete=" << s.backward_dw1_complete_clock
-                << " reduce_start=" << s.backward_reduce_start_clock
-                << " reduce_complete=" << s.backward_reduce_complete_clock
-                << " sender_complete=" << s.backward_sender_complete_clock
-                << " transport_complete=" << s.backward_transport_complete_clock
-                << " return_send_complete="
-                << s.backward_return_send_complete_clock
-                << " return_receive_complete="
-                << s.backward_return_receive_complete_clock
+             << " epoch=" << backward_epoch << " pending=" << pending
+             << " return_puts=" << s.gin_return_put_count
+             << " return_bytes=" << s.gin_return_payload_bytes
+             << " start=" << s.start_clock << " du_start=" << s.fc1_start_clock
+             << " du_complete=" << s.fc1_complete_clock
+             << " dx_start=" << s.relay_blocks_done
+             << " dispatch_complete=" << s.dispatch_complete_clock
+             << " dx_complete=" << s.fc2_complete_clock
+             << " return_complete=" << s.return_complete_clock
+             << " dw2_start=" << s.backward_dw2_start_clock
+             << " dw2_complete=" << s.backward_dw2_complete_clock
+             << " dw1_start=" << s.backward_dw1_start_clock
+             << " dw1_complete=" << s.backward_dw1_complete_clock
+             << " reduce_start=" << s.backward_reduce_start_clock
+             << " reduce_complete=" << s.backward_reduce_complete_clock
+             << " sender_complete=" << s.backward_sender_complete_clock
+             << " transport_complete=" << s.backward_transport_complete_clock
+             << " return_send_complete="
+             << s.backward_return_send_complete_clock
+             << " return_receive_complete="
+             << s.backward_return_receive_complete_clock
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
-                << " du_gemm_complete=" << s.before_combine_complete_clock
-                << " du_service_ns=" << s.fc1_tasks_done
-                << " dx_service_ns=" << s.fc2_tasks_done
-                << " swiglu_service_ns=" << s.synthetic_ticks
-                << " du_ready_wait_ns=" << s.dispatch_put_ticks
-                << " dx_ready_wait_ns=" << s.relay_ticks
+             << " du_gemm_complete=" << s.before_combine_complete_clock
+             << " du_service_ns=" << s.fc1_tasks_done
+             << " dx_service_ns=" << s.fc2_tasks_done
+             << " swiglu_service_ns=" << s.synthetic_ticks
+             << " du_ready_wait_ns=" << s.dispatch_put_ticks
+             << " dx_ready_wait_ns=" << s.relay_ticks
 #endif
 #if __has_include(<nccl_device.h>)
-                << " gin_contexts="
-                << (use_gin ? args.gin_dev_comm.ginContextCount : 0)
+             << " gin_contexts="
+             << (use_gin ? args.gin_dev_comm.ginContextCount : 0)
 #endif
-                << " gin_workers=" << args.gin_total_ctas << std::endl;
+             << " gin_workers=" << args.gin_total_ctas << std::endl;
       std::cerr << record.str();
     };
     if (diagnostic_progress) {

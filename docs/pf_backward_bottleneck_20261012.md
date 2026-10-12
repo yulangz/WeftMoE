@@ -273,3 +273,43 @@ headers，通过了完整梯度和上述多 tape 生命周期检查；其初筛�
 此时最好初测仍未覆盖全部目标。接着消融 dW 的寄存器向量写出：它省下
 TMA store 的 shared tile，允许四级 operand 流水。这是资源置换实验，
 不预设 vector store 一定比 TMA store 快，也不将编译成功当作性能收益。
+
+## 第四轮：dW shared memory 与本地写回同步
+
+基座为 claim4/1 + SwiGLU 128-bit + 寄存器直写 dAB ring，local128 /
+network64。完整周期 ms：
+
+| 改动 | EP8 8K | EP8 20K | EP16 8K | EP16 20K |
+|---|---:|---:|---:|---:|
+| 基座，dW TMA store / 三级 | 21.458 | 51.777 | 28.318 | 67.868 |
+| dW 寄存器 128-bit store / 三级 | 21.645 | 51.242 | 28.230 | 67.856 |
+| dW 寄存器 128-bit store / 四级 | 21.443 | 51.185 | 28.627 | 68.759 |
+| 本地 system fence 移到 activation 阶段边界 | 21.131 | 50.634 | 不变 | 不变 |
+
+三个 dW store/stages 候选主 kernel、pull/return helper 都没有 spill。
+四级再加 wait1 出现 C7511/C7517（主 kernel），没有作为保留候选。
+两种 vector-store 候选都通过单/双机 129/8K/20K 两轮完整梯度检查。
+
+纯 GEMM 的四级 vector store（同样 C1、相同热点 rows）确有小幅提高：
+
+| EP / tokens | dW1 TFLOPS | dW2 TFLOPS |
+|---|---:|---:|
+| EP8 / 8K | 631.5 | 628.6 |
+| EP8 / 20K | 690.5 | 692.9 |
+| EP16 / 8K | 692.9 | 689.0 |
+| EP16 / 20K | 715.2 | 731.1 |
+
+但完整周期没有稳定收益，尤其双机回退，最终仍保留 TMA store / 三级。
+这也说明纯 GEMM 改善不能直接外推到含通信、activation 的持续主 kernel。
+原始数据在 `gemm_dwvec_s4`，完整输出和逐位重复校验通过。
+
+本地 fence 合并不改变 RX/TX credit：本地 contribution 不在逐 tile
+发布后立刻 reduce；所有写者先执行一次 system fence，再由 grid/rank
+barrier 发布阶段完成。SwiGLU→dX 的本地缓存依赖仍有 device fence。
+网络仍逐 tile 完成 system fence，保护 NIC 读取与有界 TX 复用。
+
+实验源码保存在 `experiment/pf-bottleneck-20261012@cd84d9e`。
+保留版删除 canonical-local、融合 SwiGLU、wait1、额外 gather batching、
+独立 dW mailbox/pipeline 和 dW vector-store 分支；不新增持久 buffer。
+dW 分块复用已有 `dw1_claim_tiles` / `dw2_claim_tiles` 调参项，并加入
+2-pair 候选；移除已无作用的 `dw_partition_rounds` 调参项。

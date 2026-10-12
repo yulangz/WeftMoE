@@ -15,33 +15,11 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #define WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS 192
 #endif
 #ifndef WEFTMOE_PF_BWD_WAVE_BLOCKS
-#define WEFTMOE_PF_BWD_WAVE_BLOCKS 128
-#endif
-#ifndef WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES
-#define WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES 0
+#define WEFTMOE_PF_BWD_WAVE_BLOCKS 64
 #endif
 #ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
-#define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 0
+#define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 128
 #endif
-#ifndef WEFTMOE_PF_BWD_GATHER_BATCH
-#define WEFTMOE_PF_BWD_GATHER_BATCH 1
-#endif
-#ifndef WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS
-#define WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS 1
-#endif
-#ifndef WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING
-#define WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING 0
-#endif
-#ifndef WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP
-#define WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP 0
-#endif
-#ifndef WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE
-#define WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE 0
-#endif
-#ifndef WEFTMOE_PF_BWD_CANONICAL_LOCAL
-#define WEFTMOE_PF_BWD_CANONICAL_LOCAL 0
-#endif
-constexpr bool kCanonicalLocal = WEFTMOE_PF_BWD_CANONICAL_LOCAL;
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -79,7 +57,6 @@ struct Task {
 struct Schedule {
   const ForwardKernelArgs &a;
   unsigned expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
-  unsigned wave_expert = 0U;
 
   __device__ Schedule(const ForwardKernelArgs &args, const BackwardKernelArgs &)
       : a(args) {}
@@ -87,16 +64,10 @@ struct Schedule {
   __device__ __forceinline__ bool next(Task &t) {
     const auto all_blocks = unsigned(a.ring.state->blocks);
     while (begin < all_blocks) {
-      if (end == begin) {
-        end = min(all_blocks, begin + a.ring.depth);
-        if constexpr (WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS > 0)
-          end = min(end, begin + WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS);
-        if constexpr (WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES) {
-          while (begin >= a.ring.expert_blocks[wave_expert + 1U])
-            ++wave_expert;
-          end = min(end, unsigned(a.ring.expert_blocks[wave_expert + 1U]));
-        }
-      }
+      if (end == begin)
+        end = min(all_blocks,
+                  begin + min(a.ring.depth,
+                              unsigned(WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS)));
       const auto blocks = end - begin;
       const auto du = blocks * kDuTiles;
       const auto epilogue = blocks * 2U;
@@ -171,10 +142,6 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
   for (auto row = std::uint64_t(tid); row < rows; row += stride)
     mapping[a.dispatch.expert_row_prefix[expert] + row] =
         unsigned(padded + row);
-  if constexpr (!Network && kCanonicalLocal)
-    for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
-         block += stride)
-      words[layout.dispatch_arrived + padded / kM + block] = 0ULL;
   if constexpr (Network) {
     for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
          block += stride)
@@ -212,10 +179,12 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
       words[layout.completed_dx_tiles] = 0ULL;
       backward_pipeline_detail::initialize_status(a);
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
-      auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       status->before_combine_complete_clock = 0ULL;
       status->fc1_tasks_done = status->fc2_tasks_done = 0ULL;
-      status->synthetic_ticks = status->dispatch_put_ticks = status->relay_ticks = 0ULL;
+      status->synthetic_ticks = status->dispatch_put_ticks =
+          status->relay_ticks = 0ULL;
 #endif
     }
   }
@@ -224,8 +193,6 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 } // namespace weftmoe_pf::backward_stream
 
 #include "cuda/weftmoe_pf/backward_network.cuh"
-#include "cuda/weftmoe_pf/backward_local.cuh"
-#include "cuda/weftmoe_pf/backward_epilogue.cuh"
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
 #include "../../../benchmarks/pf_backward_identity.cuh"
 #endif
@@ -251,7 +218,7 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     const auto ready_begin = device_globaltimer_ns();
 #endif
     if (cute::elect_one_sync()) {
-      if constexpr (Network || kCanonicalLocal) {
+      if constexpr (Network) {
         if (!dx) {
           const auto *ready = backward_pipeline_detail::scheduler_words(a) +
                               directory_layout(a).dispatch_arrived;
@@ -261,7 +228,7 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
         } else {
           while (ring::acquire(slot.activation_ready) <
                      std::uint64_t(t.generation) * 2U ||
-                 (Network && ring::acquire(slot.returned) < t.generation - 1U)) {
+                 ring::acquire(slot.returned) < t.generation - 1U) {
           }
         }
       } else {
@@ -279,7 +246,8 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     __syncwarp();
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
     if (threadIdx.x == 256U) {
-      auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+      auto *status =
+          peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
       atomicAdd(dx ? &status->relay_ticks : &status->dispatch_put_ticks,
                 device_globaltimer_ns() - ready_begin);
     }
@@ -287,8 +255,7 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     const auto reduction = dx ? 2U * f.intermediate : f.hidden;
     const auto input_row =
         Network ? (dx ? t.block * kM : directory(a)[t.block].compact_row)
-                : kCanonicalLocal ? (dx ? t.block * kM : compact_local_row(f, a, t))
-                                  : t.row;
+                : t.row;
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
@@ -328,8 +295,7 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   float accum[Mma::kNumAccum] = {};
   const auto reduction = Dx ? 2U * f.intermediate : f.hidden;
   const bool checkpoint_owner =
-      !Dx && !Network && !kCanonicalLocal &&
-      t.column / 2U == t.block % (kDuTiles / 2U);
+      !Dx && !Network && t.column / 2U == t.block % (kDuTiles / 2U);
   const auto half = (t.column % 2U) * 64U;
   const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
   forward_compute_detail::StaticV4XCheckpoint<64U, 64U> checkpoint;
@@ -367,36 +333,11 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
         checkpoint.save(s.a[stage] + atom * kM * 64U + half * 64U,
                         checkpoint_rows, k + atom * 64U, f.hidden,
                         f.saved_x_map);
-    if constexpr (WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP == 0) {
-      cute::warpgroup_wait<0>();
-      backward_compute_detail::release_stage(s.empty[stage]);
-    } else if (k) {
-      static_assert(kStages >= 2U);
-      cute::warpgroup_wait<1>();
-      backward_compute_detail::release_stage(s.empty[(stage + kStages - 1U) % kStages]);
-    }
+    cute::warpgroup_wait<0>();
+    backward_compute_detail::release_stage(s.empty[stage]);
     stage = (stage + 1U) % kStages;
     phase ^= stage == 0U;
   }
-#if WEFTMOE_PF_BWD_ACTIVATION_WAIT_GROUP != 0
-  cute::warpgroup_wait<0>();
-  backward_compute_detail::release_stage(s.empty[(stage + kStages - 1U) % kStages]);
-#endif
-#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
-  if constexpr (!Dx) {
-    // dU was BF16 before SwiGLU in the unfused path. Compact it before loading
-    // G/U so the epilogue does not keep 128 FP32 accumulators live alongside
-    // its activation vectors. This is a compiler fence, not a device barrier.
-    unsigned packed[Mma::kNumAccum / 2U];
-#pragma unroll
-    for (unsigned i = 0U; i < Mma::kNumAccum / 2U; ++i) {
-      packed[i] = float2_to_bf16x2_bits(accum[2U * i], accum[2U * i + 1U]);
-      asm volatile("" : "+r"(packed[i]) : : "memory");
-    }
-    store_swiglu<N, Network>(f, a, t, packed);
-  } else
-#endif
-  {
   const auto lane = threadIdx.x % 32U;
   const auto row0 = threadIdx.x / 32U * 16U + lane / 4U;
   const auto *mapping =
@@ -409,13 +350,12 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     transport::BFloat16 *output;
     if constexpr (Dx)
       output = Network ? dx_output(f, a, t, row)
-                       : kCanonicalLocal ? local_dx_output(f, a, t, row)
-                                         : static_cast<transport::BFloat16 *>(
-                                               f.ring.rows[t.block * kM + row].output);
+                       : static_cast<transport::BFloat16 *>(
+                             f.ring.rows[t.block * kM + row].output);
     else
       output = a.recomputed_u +
                std::uint64_t(
-                   Network || kCanonicalLocal ? t.block * kM + row
+                   Network ? t.block * kM + row
                            : mapping[f.checkpoint.rows[t.block * kM + row]]) *
                    a.intermediate;
     output += t.column * N;
@@ -432,9 +372,8 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
               make_uint4(bits[0], bits[1], bits[2], bits[3]));
     }
   }
-  }
   if constexpr (Dx) {
-    if constexpr (Network || !WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
+    if constexpr (Network)
       __threadfence_system();
   } else {
     __threadfence();
@@ -443,11 +382,13 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       true>::math_sync(256U, 0U);
   if (!threadIdx.x) {
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
-    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    auto *status =
+        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicAdd(Dx ? &status->fc2_tasks_done : &status->fc1_tasks_done,
               device_globaltimer_ns() - task_begin);
     if constexpr (!Dx)
-      atomicMax(&status->before_combine_complete_clock, device_globaltimer_ns());
+      atomicMax(&status->before_combine_complete_clock,
+                device_globaltimer_ns());
 #endif
     auto &slot = f.ring.slots[t.row / kM];
     ring::arrive(Dx ? slot.fc2_done : slot.fc1_done, 1U);
@@ -488,70 +429,30 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
         const bool valid = row < t.rows;
         const auto saved =
             valid ? (Network ? directory(a)[t.block].compact_row + row
-                             : kCanonicalLocal ? compact_local_row(f, a, t) + row
-                                               : f.checkpoint.rows[t.block * kM + row])
+                             : f.checkpoint.rows[t.block * kM + row])
                   : 0U;
         const auto padded =
-            Network || kCanonicalLocal || !valid ? t.block * kM + row : mapping[saved];
-        const auto lane = threadIdx.x % 32U;
-        float gate_gradient = 0.0F;
-#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
-        for (unsigned tile = lane; tile < kDuTiles; tile += 32U)
-          gate_gradient += a.dgate_rows[std::uint64_t(padded) * kDuTiles + tile];
-#pragma unroll
-        for (unsigned stride = 16U; stride; stride >>= 1U)
-          gate_gradient += __shfl_down_sync(0xffffffffU, gate_gradient, stride);
-#else
-        backward_swiglu_epilogue_warp_row<
-            !Network && !kCanonicalLocal && WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING,
-            WEFTMOE_PF_BWD_SWIGLU_VECTOR_WORDS>(
-            a, padded, saved, valid, lane,
-            Network ? nullptr : a.dx_rows +
-                                    std::uint64_t(t.row + row) * a.activation_stride);
+            Network || !valid ? t.block * kM + row : mapping[saved];
+        // All dU N tiles have retired above. The local dY ring can now
+        // receive dAB directly from registers, alongside the dW1 cache.
+        backward_swiglu_epilogue_warp_row<!Network, 4U>(
+            a, padded, saved, valid, threadIdx.x % 32U,
+            Network
+                ? nullptr
+                : a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
         __syncwarp();
-        if (!lane)
-          gate_gradient = a.dgate_rows[padded];
-#endif
-        if constexpr (!Network && !kCanonicalLocal &&
-#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
-                      true
-#else
-                      !WEFTMOE_PF_BWD_SWIGLU_DIRECT_RING
-#endif
-        ) {
-          auto *out = reinterpret_cast<uint4 *>(
-              a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
-          const auto *in = reinterpret_cast<const uint4 *>(
-              a.dab + std::uint64_t(padded) * 2U * a.intermediate);
-          constexpr unsigned Batch = WEFTMOE_PF_BWD_GATHER_BATCH;
-          for (unsigned column = lane; column < 2U * a.intermediate / 8U;
-               column += 32U * Batch) {
-            uint4 values[Batch];
-#pragma unroll
-            for (unsigned i = 0U; i < Batch; ++i)
-              if (column + 32U * i < 2U * a.intermediate / 8U)
-                values[i] = valid ? in[column + 32U * i] : make_uint4(0U, 0U, 0U, 0U);
-#pragma unroll
-            for (unsigned i = 0U; i < Batch; ++i)
-              if (column + 32U * i < 2U * a.intermediate / 8U)
-                out[column + 32U * i] = values[i];
-          }
-        }
+        const auto lane = threadIdx.x % 32U;
         if (valid && !lane) {
           if constexpr (Network)
-            *gradient_output(f, a, t, row) = gate_gradient;
-          else if constexpr (kCanonicalLocal) {
-            const auto identity = f.checkpoint.headers[saved];
-            a.peer_payloads[identity.source_rank].dgate[identity.route_index] =
-                gate_gradient;
-          } else {
+            *gradient_output(f, a, t, row) = a.dgate_rows[padded];
+          else {
             const auto identity = f.ring.rows[t.block * kM + row];
             a.peer_payloads[identity.source].dgate[identity.route] =
-                gate_gradient;
+                a.dgate_rows[padded];
           }
         }
       }
-      if constexpr (Network || !WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
+      if constexpr (Network)
         __threadfence_system();
       else
         __threadfence();
@@ -600,10 +501,9 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     }
     Sync::cta_sync();
   } else {
-    // Local ring credits retire dY/dAB reads, not remote contribution stores.
-    // Drain every writer once before the grid hands publication to Return.
-    if constexpr (WEFTMOE_PF_BWD_DEFER_LOCAL_RETURN_FENCE)
-      __threadfence_system();
+    // Local slot credits retire input reads, not peer contribution stores.
+    // Every writer drains once before the grid/rank handoff to Reduce.
+    __threadfence_system();
     grid_sync<0U, 384U>(f);
     backward_unified_compute_detail::initialize_compute<
         backward_unified_detail::kStorageTileN>(storage, state);
@@ -709,12 +609,8 @@ __global__ __launch_bounds__(384U, 1) void kernel(
         network_workers(f, a, comm);
         finish_network(f, a);
       } else {
-        if ((threadIdx.x - 288U) / 32U < local::kPullWarps) {
-          if constexpr (kCanonicalLocal)
-            pull_local_canonical(f, a, s);
-          else
-            local::pull<kDxTiles, true>(f, s);
-        }
+        if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
+          local::pull<kDxTiles, true>(f, s);
         begin_weights<false>(f, a, storage, state);
         auto *status =
             peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);

@@ -19,6 +19,9 @@
   },
   "backward": {
     "variants": [
+      {"backward.dw1_claim_tiles": 1, "backward.dw2_claim_tiles": 1},
+      {"backward.dw1_claim_tiles": 2, "backward.dw2_claim_tiles": 2},
+      {"backward.dw1_claim_tiles": 4, "backward.dw2_claim_tiles": 2},
       {"backward.dw_tile_m": 256, "backward.dw_tile_n": 128},
       {"backward.dw_tile_n": 128},
       {"backward.dw1_stages": 2, "backward.dw2_stages": 2},

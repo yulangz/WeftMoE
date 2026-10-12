@@ -1,27 +1,12 @@
 #pragma once
 
 namespace weftmoe_pf::backward {
-#ifndef WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
-#define WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM 0
-#endif
-#ifndef WEFTMOE_PF_BWD_DW_SHORT_ROWS
-#define WEFTMOE_PF_BWD_DW_SHORT_ROWS 0
-#endif
-#ifndef WEFTMOE_PF_BWD_DW1_CLAIM
-#define WEFTMOE_PF_BWD_DW1_CLAIM WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
-#endif
-#ifndef WEFTMOE_PF_BWD_DW2_CLAIM
-#define WEFTMOE_PF_BWD_DW2_CLAIM WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
-#endif
-
 // Canonical dU/SwiGLU/dX stays on one cluster when the source range fits.
 // Bounded source windows use a separate, window-major dX N-pair domain.
 // Both have immutable static ownership, without a shared claim queue.
 struct Schedule {
   unsigned block, epilogue, dx;
-  unsigned weight = 0U, weight_end = 0U;
   unsigned weight_partition;
-  bool weights_initialized = false;
 
   __device__ explicit Schedule(unsigned cluster)
       : block(cluster), epilogue(cluster), dx(cluster),
@@ -118,76 +103,28 @@ struct Schedule {
       if (completed != std::uint64_t(dx_blocks) * DxTiles)
         return false;
     }
-    const auto *rows = words + layout.dw_reduction_rows;
+    // A small, fixed chunk keeps each hot expert active across the grid.
+    // dW1/dW2 have different output domains and independently tuned chunk
+    // sizes.
+    constexpr auto claim2 = backward_tuning::kDw2ClaimTiles;
+    constexpr auto claim1 = backward_tuning::kDw1ClaimTiles;
+    constexpr auto chunks2 = (kDw2Pairs + claim2 - 1U) / claim2;
+    constexpr auto chunks1 = (kDw1Pairs + claim1 - 1U) / claim1;
     const auto experts = a.dispatch.sizes.owned_expert_count;
-#if WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM > 0
-    {
-#if WEFTMOE_PF_BWD_DW_SHORT_ROWS > 0
-      // Small-K experts amortize mailbox/TMA-store latency with four pairs;
-      // long reductions expose every pair to the full static cluster grid.
-      while (weight < 2U * experts) {
-        const bool first = weight < experts;
-        const auto expert = first ? weight : weight - experts;
-        const auto pairs = first ? kDw2Pairs : kDw1Pairs;
-        const auto shift = rows[expert] <= WEFTMOE_PF_BWD_DW_SHORT_ROWS ? 2U : 0U;
-        const auto claim = 1U << shift;
-        const auto chunks = (pairs + claim - 1U) >> shift;
-        if (weight_partition < chunks) {
-          const auto tile = weight_partition << shift;
-          weight_partition += clusters;
-          if (a.dispatch.expert_row_count[expert]) {
-            task = {expert, tile, first ? TaskKind::Dw2 : TaskKind::Dw1,
-                    min(claim, pairs - tile)};
-            return true;
-          }
-        } else {
-          weight_partition -= chunks;
-          ++weight;
-        }
-      }
-#else
-      constexpr unsigned claim2 = WEFTMOE_PF_BWD_DW2_CLAIM;
-      constexpr unsigned claim1 = WEFTMOE_PF_BWD_DW1_CLAIM;
-      constexpr auto chunks2 = (kDw2Pairs + claim2 - 1U) / claim2;
-      constexpr auto chunks1 = (kDw1Pairs + claim1 - 1U) / claim1;
-      while (weight_partition < experts * (chunks2 + chunks1)) {
-        const auto index = weight_partition;
-        weight_partition += clusters;
-        const bool first = index < experts * chunks2;
-        const auto claim = first ? claim2 : claim1;
-        const auto chunks = first ? chunks2 : chunks1;
-        const auto relative = first ? index : index - experts * chunks2;
-        const auto expert = relative / chunks;
-        const auto tile = relative % chunks * claim;
-        if (a.dispatch.expert_row_count[expert]) {
-          task = {expert, tile, first ? TaskKind::Dw2 : TaskKind::Dw1,
-                  min(claim, (first ? kDw2Pairs : kDw1Pairs) - tile)};
-          return true;
-        }
-      }
-#endif
-      terminal = true;
-      return false;
-    }
-#endif
-    // Block-cyclic weighted intervals trade task length for expert locality.
-    // Adjacent intervals use identical cuts, so ownership stays disjoint even
-    // when a short interval rounds to zero tiles or spans empty experts.
-    const auto partitions = clusters * backward_tuning::kDwPartitionRounds;
-    for (; weight_partition < partitions;
-         weight_partition += clusters, weights_initialized = false) {
-      if (!weights_initialized) {
-        std::uint64_t work = 0U;
-        for (unsigned expert = 0; expert < experts; ++expert)
-          work += rows[expert] * (kDw2Pairs + kDw1Pairs);
-        weight =
-            weight_cut(rows, experts, work * weight_partition / partitions);
-        weight_end = weight_cut(rows, experts,
-                                work * (weight_partition + 1U) / partitions);
-        weights_initialized = true;
-      }
-      if (weight_task(a, task))
+    while (weight_partition < experts * (chunks2 + chunks1)) {
+      const auto index = weight_partition;
+      weight_partition += clusters;
+      const bool first = index < experts * chunks2;
+      const auto claim = first ? claim2 : claim1;
+      const auto chunks = first ? chunks2 : chunks1;
+      const auto relative = first ? index : index - experts * chunks2;
+      const auto expert = relative / chunks;
+      const auto tile = relative % chunks * claim;
+      if (a.dispatch.expert_row_count[expert]) {
+        task = {expert, tile, first ? TaskKind::Dw2 : TaskKind::Dw1,
+                min(claim, (first ? kDw2Pairs : kDw1Pairs) - tile)};
         return true;
+      }
     }
     terminal = true;
     return false;
@@ -198,47 +135,6 @@ private:
       (backward_pipeline_detail::kDw2TilesPerExpert + 1U) / 2U;
   static constexpr unsigned kDw1Pairs =
       (backward_pipeline_detail::kDw1TilesPerExpert + 1U) / 2U;
-
-  // A pair costs one expert's padded K extent. Partition the combined dW2/dW1
-  // stream by that work, rounding both adjacent cuts to the same tile boundary.
-  // Empty experts cost nothing; skewed experts still spread across clusters.
-  __device__ __forceinline__ static unsigned
-  weight_cut(const unsigned long long *rows, unsigned experts,
-             std::uint64_t work) {
-    unsigned base = 0U;
-    for (unsigned domain = 0; domain < 2U; ++domain) {
-      const auto pairs = domain ? kDw1Pairs : kDw2Pairs;
-      for (unsigned expert = 0; expert < experts; ++expert) {
-        const auto extent = rows[expert] * pairs;
-        if (work <= extent && rows[expert])
-          return base + unsigned((work + rows[expert] - 1U) / rows[expert]);
-        work -= extent;
-        base += pairs;
-      }
-    }
-    return base;
-  }
-
-  __device__ __forceinline__ bool
-  weight_task(const BackwardKernelArgs &a, pipeline::backward::TileTask &task) {
-    using namespace backward_pipeline_detail;
-    const auto split = a.dispatch.sizes.owned_expert_count * kDw2Pairs;
-    while (weight < weight_end) {
-      const bool first = weight < split;
-      const auto pairs = first ? kDw2Pairs : kDw1Pairs;
-      const auto index = first ? weight : weight - split;
-      const auto owner = index / pairs, tile = index % pairs;
-      const auto batch = first ? backward_tuning::kDw2ClaimTiles
-                               : backward_tuning::kDw1ClaimTiles;
-      const auto count = min(batch, min(pairs - tile, weight_end - weight));
-      weight += count;
-      if (a.dispatch.expert_row_count[owner]) {
-        task = {owner, tile, first ? TaskKind::Dw2 : TaskKind::Dw1, count};
-        return true;
-      }
-    }
-    return false;
-  }
 };
 
 } // namespace weftmoe_pf::backward

@@ -155,7 +155,8 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         const auto output_index = padded_row * a.intermediate + column;
         const auto input_index = compact_row * a.intermediate + column;
         const auto av = *reinterpret_cast<const uint4 *>(ab + input_index);
-        const auto bv = *reinterpret_cast<const uint4 *>(ab + b_base + input_index);
+        const auto bv =
+            *reinterpret_cast<const uint4 *>(ab + b_base + input_index);
         const auto du = *reinterpret_cast<const uint4 *>(u + output_index);
         const unsigned as[4] = {av.x, av.y, av.z, av.w};
         const unsigned bs[4] = {bv.x, bv.y, bv.z, bv.w};
@@ -163,8 +164,8 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         unsigned das[4], dbs[4], us[4];
 #pragma unroll
         for (unsigned word = 0U; word < 4U; ++word) {
-          const auto result = backward_swiglu_pair(as[word], bs[word], ds[word],
-                                                    gate, partial);
+          const auto result =
+              backward_swiglu_pair(as[word], bs[word], ds[word], gate, partial);
           das[word] = result.da;
           dbs[word] = result.db;
           us[word] = result.u;
@@ -174,8 +175,10 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         activation = make_uint4(us[0], us[1], us[2], us[3]);
       }
       *reinterpret_cast<uint4 *>(dab + output_base + column) = da;
-      *reinterpret_cast<uint4 *>(dab + output_base + a.intermediate + column) = db;
-      *reinterpret_cast<uint4 *>(u + padded_row * a.intermediate + column) = activation;
+      *reinterpret_cast<uint4 *>(dab + output_base + a.intermediate + column) =
+          db;
+      *reinterpret_cast<uint4 *>(u + padded_row * a.intermediate + column) =
+          activation;
       if constexpr (Stage) {
         *reinterpret_cast<uint4 *>(staging + column) = da;
         *reinterpret_cast<uint4 *>(staging + a.intermediate + column) = db;
@@ -218,14 +221,16 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         *reinterpret_cast<const std::uint32_t *>(ab + b_base + input_index);
     const auto du_pair =
         *reinterpret_cast<const std::uint32_t *>(u + output_index);
-    const auto result = backward_swiglu_pair(a_pair, b_pair, du_pair, gate, partial);
+    const auto result =
+        backward_swiglu_pair(a_pair, b_pair, du_pair, gate, partial);
     *reinterpret_cast<std::uint32_t *>(dab + output_base + column) = result.da;
     *reinterpret_cast<std::uint32_t *>(dab + output_base + a.intermediate +
                                        column) = result.db;
     *reinterpret_cast<std::uint32_t *>(u + output_index) = result.u;
     if constexpr (Stage) {
       *reinterpret_cast<unsigned *>(staging + column) = result.da;
-      *reinterpret_cast<unsigned *>(staging + a.intermediate + column) = result.db;
+      *reinterpret_cast<unsigned *>(staging + a.intermediate + column) =
+          result.db;
     }
   }
 #pragma unroll

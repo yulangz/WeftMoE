@@ -11,12 +11,6 @@ constexpr std::uint32_t kActivationMathThreads =
 constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 constexpr std::uint32_t kStoreReadyBarrier = 0U;
 constexpr std::uint32_t kStoreDoneBarrier = 1U;
-#ifndef WEFTMOE_PF_BWD_DW_WAIT_GROUP
-#define WEFTMOE_PF_BWD_DW_WAIT_GROUP 0
-#endif
-#ifndef WEFTMOE_PF_BWD_DW_VECTOR_EPILOGUE
-#define WEFTMOE_PF_BWD_DW_VECTOR_EPILOGUE 0
-#endif
 
 // The standalone baseline still uses every thread in its compute CTA. The
 // unified kernel supplies a narrower synchronization domain, keeping its
@@ -54,8 +48,7 @@ template <std::uint32_t TileN> constexpr std::uint32_t shared_arena_elements() {
       kActivationStages * activation_stage_elements<TileN>();
   constexpr auto dw_elements =
       kDwStages * kDwStageElements +
-      (WEFTMOE_PF_BWD_DW_VECTOR_EPILOGUE ? 0U :
-       backward_tuning::kDwTileM * backward_tuning::kDwTileN);
+      backward_tuning::kDwTileM * backward_tuning::kDwTileN;
   return activation_elements > dw_elements ? activation_elements : dw_elements;
 }
 
@@ -354,51 +347,9 @@ __device__ __forceinline__ void run_k_mn_tile_tma_store(
 // one producer/consumer pipeline: the TMA warp may start the next tile while
 // the math warps STSM/TMA-store the previous result.  This mirrors
 // DeepGEMM's persistent block loop without weakening Q_DX > Q_DAB priority.
-template <unsigned TileM, unsigned TileN>
-__device__ __forceinline__ void store_dw_vector(
-    const float *accum, transport::BFloat16 *output, unsigned width,
-    unsigned output_row, unsigned output_column) {
-  const auto lane = threadIdx.x % 32U;
-  const auto group = lane % 4U;
-  const auto mask = 0xfU << (lane / 4U * 4U);
-#pragma unroll
-  for (unsigned wave = 0U; wave < TileM / 128U; ++wave) {
-#pragma unroll
-    for (unsigned item = 0U; item < 2U; ++item) {
-      const auto row = output_row + wave * 128U + threadIdx.x / 32U * 16U +
-                       lane / 4U + item * 8U;
-#pragma unroll
-      for (unsigned index = 0U; index < TileN / 8U; index += 4U) {
-        unsigned bits[4];
-#pragma unroll
-        for (unsigned j = 0U; j < 4U; ++j) {
-          const auto *v = accum + wave * TileN / 2U + (index + j) * 4U + item * 2U;
-          asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(bits[j]) : "f"(v[1]), "f"(v[0]));
-        }
-        auto v = make_uint4(bits[0], bits[1], bits[2], bits[3]);
-        auto t = __shfl_xor_sync(mask, (group & 1U) ? v.x : v.y, 1, 4);
-        v.x = (group & 1U) ? t : v.x;
-        v.y = (group & 1U) ? v.y : t;
-        t = __shfl_xor_sync(mask, (group & 1U) ? v.z : v.w, 1, 4);
-        v.z = (group & 1U) ? t : v.z;
-        v.w = (group & 1U) ? v.w : t;
-        t = __shfl_xor_sync(mask, (group & 2U) ? v.x : v.z, 2, 4);
-        v.x = (group & 2U) ? t : v.x;
-        v.z = (group & 2U) ? v.z : t;
-        t = __shfl_xor_sync(mask, (group & 2U) ? v.y : v.w, 2, 4);
-        v.y = (group & 2U) ? t : v.y;
-        v.w = (group & 2U) ? v.w : t;
-        *reinterpret_cast<uint4 *>(output + std::uint64_t(row) * width +
-                                     output_column + index * 8U + group * 8U) = v;
-      }
-    }
-  }
-}
-
 template <std::uint32_t TileM, std::uint32_t TileN,
           std::uint32_t StorageTileN = TileN,
-          class Synchronization = FullCtaComputeSynchronization,
-          bool Continuous = false>
+          class Synchronization = FullCtaComputeSynchronization>
 __device__ __forceinline__ void
 run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
                 const CUtensorMap &output_store_map, std::uint32_t first_tile,
@@ -406,8 +357,7 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
                 std::uint32_t n_tiles, std::uint32_t left_reduction_start,
                 std::uint32_t right_reduction_start, std::uint32_t reduction,
                 std::uint32_t output_width, std::uint32_t output_owner_row,
-                unsigned char *storage, std::uint32_t &pipeline,
-                transport::BFloat16 *output = nullptr) {
+                unsigned char *storage, std::uint32_t &pipeline) {
   constexpr auto kStageK = backward_tuning::kTileK;
   using TileMma =
       typename hopper::BF16MMASelector<TileN, cute::SM90::GMMA::Major::MN,
@@ -510,48 +460,30 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
 #pragma unroll
           for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
             cute::warpgroup_fence_operand(accum[index]);
-          if constexpr (WEFTMOE_PF_BWD_DW_WAIT_GROUP == 0) {
-            cute::warpgroup_wait<0>();
-            release_stage(empty[stage]);
-          } else if (iteration) {
-            static_assert(kDwStages >= 2U);
-            cute::warpgroup_wait<1>();
-            release_stage(empty[(current - 1U) % kDwStages]);
-          }
-        }
-        if constexpr (WEFTMOE_PF_BWD_DW_WAIT_GROUP != 0) {
-          if (iterations) {
-            cute::warpgroup_wait<0>();
-            release_stage(empty[(pipeline + (offset + 1U) * iterations - 1U) % kDwStages]);
-          }
+          // Release promptly to keep all TMA stages available to the multicast
+          // producer. Holding a completed stage reduces memory prefetch depth.
+          cute::warpgroup_wait<0>();
+          release_stage(empty[stage]);
         }
 
         const auto tile = cluster_tile(first_tile + offset, rank, m_tiles,
                                        n_tiles, TileM > TileN);
         const auto m_tile = tile.m;
         const auto n_tile = tile.n;
-        if (tile.valid) {
-          if constexpr (WEFTMOE_PF_BWD_DW_VECTOR_EPILOGUE)
-            store_dw_vector<TileM, TileN>(accum, output, output_width,
-                output_owner_row + m_tile * TileM, n_tile * TileN);
-          else
-            store_tma_accumulator<TileM, TileN, kDwStages * kDwStageElements,
+        if (tile.valid)
+          store_tma_accumulator<TileM, TileN, kDwStages * kDwStageElements,
                                 Synchronization>(
               accum, output_store_map, output_owner_row + m_tile * TileM,
               n_tile * TileN, storage, true, false);
-        }
       }
     }
   }
-  if constexpr (!Continuous) {
-    Synchronization::cta_sync();
-    // An activation task may reuse this arena. A weights-only stream instead
-    // retains the arena and drains its last store when the stream terminates.
-    if (!WEFTMOE_PF_BWD_DW_VECTOR_EPILOGUE &&
-        threadIdx.x < (TileM / 128U) * (TileN / 64U))
-      asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
-    Synchronization::cta_sync();
-  }
+  Synchronization::cta_sync();
+  // A following activation task may reuse the dW output staging area. Keep
+  // stores pipelined within this range, then drain before the cluster rejoins.
+  if (threadIdx.x < (TileM / 128U) * (TileN / 64U))
+    asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");
+  Synchronization::cta_sync();
   pipeline += tile_count * iterations;
 }
 #endif

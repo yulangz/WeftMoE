@@ -297,14 +297,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
                            "Backward gathered dAB"),
                4U, "Backward dX input staging");
   state->dgate_rows_offset =
-      append(cursor, state->padded_rows *
-#if defined(WEFTMOE_PF_BWD_FUSED_SWIGLU)
-                         (pf_depth ? backward_tuning::kMainIntermediate /
-                                         backward_tuning::kDabTileN : 1U),
-#else
-                         1U,
-#endif
-             sizeof(float), "Backward dGate rows");
+      append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
   if (pf_depth && 2U * state->intermediate > state->hidden)
     state->pf_dab_offset = append(
         cursor, std::uint64_t(pf_depth) * backward_tuning::kTileM *

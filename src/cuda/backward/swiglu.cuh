@@ -4,11 +4,10 @@ struct BackwardSwigluPair {
   unsigned da, db, u;
 };
 
-// Keep the BF16 dU boundary and the per-element FP32 arithmetic shared by the
-// standalone activation pass and the fused GEMM epilogue.
-__device__ __forceinline__ BackwardSwigluPair
-backward_swiglu_pair(unsigned a, unsigned b, unsigned du, float gate,
-                     float &partial) {
+// Keep the BF16 dU boundary and the per-element FP32 arithmetic identical for
+// scalar-pair and vectorized activation passes.
+__device__ __forceinline__ BackwardSwigluPair backward_swiglu_pair(
+    unsigned a, unsigned b, unsigned du, float gate, float &partial) {
   BackwardSwigluPair result{};
 #pragma unroll
   for (unsigned element = 0U; element < 2U; ++element) {
@@ -22,7 +21,8 @@ backward_swiglu_pair(unsigned a, unsigned b, unsigned du, float gate,
       sigmoid = 1.0F / denominator;
     } else {
       asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(sigmoid) : "f"(denominator));
-      sigmoid = __fmaf_rn(sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
+      sigmoid =
+          __fmaf_rn(sigmoid, __fmaf_rn(-denominator, sigmoid, 1.0F), sigmoid);
     }
     const auto silu = av * sigmoid;
     const auto s = silu * bv;

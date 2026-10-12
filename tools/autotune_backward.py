@@ -86,7 +86,6 @@ PARAMETER_MACROS = {
     "epilogue_rows_per_task": "WEFTMOE_BWD_EPILOGUE_ROWS_PER_TASK",
     "dw2_claim_tiles": "WEFTMOE_BWD_DW2_CLAIM_TILES",
     "dw1_claim_tiles": "WEFTMOE_BWD_DW1_CLAIM_TILES",
-    "dw_partition_rounds": "WEFTMOE_BWD_DW_PARTITION_ROUNDS",
     "reduce_threads": "WEFTMOE_BWD_REDUCE_THREADS",
     "reduce_idle_nanosleep": "WEFTMOE_BWD_REDUCE_IDLE_NANOSLEEP",
     "unified_workers": "WEFTMOE_BWD_UNIFIED_WORKERS",
@@ -154,7 +153,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require_choice(config, "dx_tile_n", (128, 256))
     require_choice(config, "dx_claim_tiles", (1, 2, 4, 8, 16))
     require_choice(config, "return_window_scale", (1, 2))
-    require_choice(config, "dw_partition_rounds", (1, 2, 4, 8, 16, 32, 64, 128))
     require_choice(config, "dw_tile_m", (128, 256))
     require_choice(config, "dw_tile_n", (128, 256))
     require(config["main_hidden"] % config["dw_tile_m"] == 0,
@@ -207,8 +205,8 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     require_choice(config, "activation_owner_group", (1, 2, 4, 8, 16, 32))
     require_choice(config, "epilogue_rows_per_task",
                    (12, 16, 24, 32, 48, 64, 96, 128))
-    require_choice(config, "dw2_claim_tiles", (1, 4, 8, 16))
-    require_choice(config, "dw1_claim_tiles", (1, 4, 8, 16))
+    require_choice(config, "dw2_claim_tiles", (1, 2, 4, 8, 16))
+    require_choice(config, "dw1_claim_tiles", (1, 2, 4, 8, 16))
     for key in (
         "setup_idle_nanosleep",
         "queue_idle_nanosleep",
@@ -226,7 +224,7 @@ def make_runtime_plan(space: Mapping[str, Any], *, model: Mapping[str, Any] | No
     unified_tuning.upgrade_legacy_groups(
         space, search=True,
         extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1,
-                        "activation_tile_k": 64, "dw_partition_rounds": 1})
+                        "activation_tile_k": 64})
     flat = flatten_groups(space, require_all=False)
     require(set(flat) == set(PARAMETER_MACROS) - {"main_hidden", "main_intermediate"},
             "hyperparameters must cover every tuning parameter and exclude model dimensions")
@@ -291,7 +289,7 @@ def load_plan(path: Path, *, model: Mapping[str, Any] | None = None,
     unified_tuning.upgrade_legacy_groups(
         document.setdefault("fixed", {}),
         extra_defaults={"dx_claim_tiles": 2, "return_window_scale": 1,
-                        "activation_tile_k": 64, "dw_partition_rounds": 1})
+                        "activation_tile_k": 64})
     required_sections = {
         "jit", "benchmark", "selection", "invariants", "fixed", "candidates"
     }

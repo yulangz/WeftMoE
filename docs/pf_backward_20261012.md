@@ -3,8 +3,21 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
-本轮保留：多机 main spill **20/44 B → 0/0 B**，完整周期差异约 ±0.3%，
-性能基本持平；L2 分组消融没有确认收益，不改变生产路径的 tile 顺序。
+最新进展见 [M9：通信/GEMM 拆解与数据流优化](pf_backward_bottleneck_20261012.md)。
+M7 的主 kernel 零 spill 保持；M9 改善的是热点专家任务排布和中间数据流，
+不是把 M8 的无收益 L2 swizzle 重新启用。
+
+## M9：静态任务轮转与 activation 数据流
+
+- dW 从 FLOPs 加权连续区间改为静态 chunk 轮转，dW1/dW2 分别调参。
+- 单机 activation wave128、多机 wave64，缩短中间数据存活范围。
+- SwiGLU 使用 128-bit 读写，并从寄存器同时写 dW1 缓存和本地 dAB ring。
+- 本地 contribution 的 system fence 合并到 activation 阶段边界；网络
+  仍逐 tile 发布，不削弱有界 TX 的 NIC-read credit。
+
+不改变先完成全部本地 dX、再执行 dW 的优先级；不新增持久显存。
+FWD/DT 的算法与参数保持不变。各步收益、纯通信/真实热点 GEMM、最终
+PF/Megatron 正反序对照，以及未达到目标的部分均记录在上述 M9 文档。
 
 ## M8：L2 tile-order swizzle 消融（不启用）
 
