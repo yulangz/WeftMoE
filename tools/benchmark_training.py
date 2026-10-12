@@ -92,6 +92,8 @@ def main():
                         help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
     parser.add_argument("--report-window-padding", action="store_true",
                         help="Estimate PF M128 padding for the default node-group windows, outside timing")
+    parser.add_argument("--timeline-dir", type=Path,
+                        help="Download the final FWD timeline, outside timing; requires a timeline build")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -110,6 +112,8 @@ def main():
         parser.error("--profile-stages requires --backend pf --forward-only")
     if args.trace_stage_kernels and (args.backend != "pf" or not args.forward_only):
         parser.error("--trace-stage-kernels requires --backend pf --forward-only")
+    if args.timeline_dir and (args.backend != "pf" or not args.forward_only or args.verify):
+        parser.error("--timeline-dir requires PF forward-only diagnostics without --verify")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
     if not 1 <= args.top_k <= args.experts:
@@ -256,7 +260,8 @@ def main():
                 gradients = runtime.backward(tape, dy)
                 del gradients
             profile = tape.profile if args.profile_stages else None
-            del tape
+            if not args.timeline_dir:
+                del tape
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - start) / 1000
             if iteration >= priming_steps + args.warmups:
@@ -267,6 +272,12 @@ def main():
                 if args.profile_stages:
                     stage_profiles.append(profile)
                 measurement_intervals_ns.append((interval_start, time.time_ns()))
+            if args.timeline_dir:
+                if iteration == len(batches) * (2 if args.prime_trace else 1) - 1:
+                    args.timeline_dir.mkdir(parents=True, exist_ok=True)
+                    snapshot = tape.timeline
+                    (args.timeline_dir / f"t{tokens}.rank{rank}.json").write_text(json.dumps(snapshot))
+                del tape
             del x, dy, routes, gates
         allocator_delta = None
         stage_kernels = None

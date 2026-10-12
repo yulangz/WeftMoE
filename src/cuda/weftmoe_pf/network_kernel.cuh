@@ -91,6 +91,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   auto &s = *reinterpret_cast<local::Shared *>(storage);
   auto *extra = reinterpret_cast<ExtraShared *>(storage + sizeof(local::Shared));
   programmatic_launch::wait();
+  WEFTMOE_TIMELINE_RECORD(a.timeline, MainEnter, Kernel, 0U, 0U, 0U);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   // The standalone planner owns route publication, ring setup and status.
   if (threadIdx.x == 256U) {
@@ -128,13 +129,18 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   }
   // Return RX is source-local, but local experts can still be writing this
   // source's contribution from another GPU. Join every local writer as well.
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, threadIdx.x % 32U == 0U,
+      MainDataDone, Kernel, threadIdx.x / 32U, 0U, 0U);
   rank_barrier<0U, kThreads, true, true, true>(a);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, MainJoinDone, Kernel, 0U, 0U, 0U);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     status->relay_blocks_done = status->route_exchange_complete_clock;
     status->return_complete_clock = device_globaltimer_ns();
   }
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U, 0U, 0U);
   if (threadIdx.x < 256U && !a.dispatch.runtime->error)
     local::combine<true>(a);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U, 0U, 0U);
   grid_sync<0U, kThreads>(a);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     for (unsigned slot = 0U; slot < a.ring.contribution_depth; ++slot)
@@ -153,6 +159,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   // All Gets, local RX readers, Return requests and Reduce readers drained.
   // Only invocation metadata/input reuse needs a global rendezvous here.
   network_barrier<0U, kThreads>(a, 1U);
+  WEFTMOE_TIMELINE_RECORD(a.timeline, Terminal, Kernel, 0U, 0U, 0U);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     status->fc1_tasks_done = a.ring.state->blocks * local::kFc1Tiles;
     status->fc2_tasks_done = a.ring.state->blocks * local::kFc2Tiles;

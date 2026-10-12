@@ -71,6 +71,8 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
         __syncwarp();
         if (lane == 0U)
           publish(r.state->admitted_windows, window + 1U);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, lane == 0U, WindowAdmitted,
+            Kernel, 0U, window, 0U);
         ++window;
       }
     }

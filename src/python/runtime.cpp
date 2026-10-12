@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <map>
 #include <optional>
+#if WEFTMOE_DEVICE_TIMELINE
+#include "cuda/profiling/device_timeline_host.hpp"
+#endif
 
 namespace py = pybind11;
 using namespace weftmoe;
@@ -601,7 +604,23 @@ PYBIND11_MODULE(_runtime, m) {
     auto id = make_nccl_bootstrap_id();
     return py::bytes(reinterpret_cast<const char *>(id.bytes().data()), id.bytes().size());
   });
-  py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape").def_readonly("output", &Tape::output);
+  auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape")
+      .def_readonly("output", &Tape::output);
+#if WEFTMOE_DEVICE_TIMELINE
+  using namespace pybind11::literals;
+  tape.def_property_readonly("timeline", [](const Tape &tape) {
+    const auto snapshot = testing::download_forward_device_timeline(tape.forward);
+    py::list events;
+    for (const auto &e : snapshot.records)
+      events.append(py::dict("timestamp_ns"_a=e.timestamp_ns, "generation"_a=e.generation,
+          "rank"_a=e.rank, "cta"_a=e.cta, "channel"_a=e.channel,
+          "phase"_a=(e.metadata >> 24U), "role"_a=((e.metadata >> 16U) & 0xffU),
+          "event"_a=(e.metadata & 0xffffU), "arg0"_a=e.arg0, "arg1"_a=e.arg1));
+    return py::dict("schema"_a=snapshot.schema_version, "rank"_a=snapshot.rank,
+        "generation"_a=snapshot.generation, "phase"_a="forward",
+        "overflow_events"_a=snapshot.overflow_events, "events"_a=events);
+  });
+#endif
   py::class_<Runtime, std::shared_ptr<Runtime>>(m, "Runtime")
       .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned, std::uintptr_t, py::object,
                     unsigned, unsigned, unsigned, unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())

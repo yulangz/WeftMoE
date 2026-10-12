@@ -27,6 +27,8 @@ def main():
             "-fPIC",
             "-DWEFTMOE_ENABLE_GIN_RDMA="
             + os.environ.get("WEFTMOE_ENABLE_GIN_RDMA", "1"),
+            "-DWEFTMOE_DEVICE_TIMELINE=" + os.environ.get("WEFTMOE_DEVICE_TIMELINE", "0"),
+            "-I" + str(root / "src"),
             "-I" + str(root / "include"),
             "-I" + str(Path(torch.__file__).parent / "include"),
             "-I" + sysconfig.get_paths()["include"],

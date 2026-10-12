@@ -131,10 +131,14 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
           const auto destination = a.static_network.ring_region +
               endpoint.layout().dispatch_payload(true, channel, sequence);
           slot.retire_target += desc.fanouts;
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetStart,
+              GinDispatch, channel, sequence, rows);
           for (unsigned row = 0U; row < rows; ++row)
             endpoint.gin.get(ncclTeamWorld(endpoint.gin.comm), endpoint.peer(channel),
                 a.gin_window, a.static_network.input + tokens[row].token * row_bytes,
                 a.gin_window, destination + row * row_bytes, row_bytes);
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetIssued,
+              GinDispatch, channel, sequence, rows);
         }
       } else {
         if (sequence >= state.tx_reserve_cursor)
@@ -173,7 +177,11 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
         }
         if (!ready)
           continue;
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
+            GinReturn, channel, sequence, rows);
         endpoint.send(true, channel, sequence, rows * row_bytes);
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnGinPutIssue,
+            GinReturn, channel, sequence, rows);
         // FC2 no longer owns these rows. TX storage remains protected by the
         // independent NIC completion and remote notification-slot credit.
         static_forward::ComputeSlot *previous = nullptr;
@@ -209,6 +217,13 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
       auto &request = pending[completed % kNetworkPending];
       endpoint.gin.wait(request.request);
       if constexpr (Get) {
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchLocalCompletion,
+            GinDispatch, request.channel, request.sequence, 0U);
+      } else {
+        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnLocalCompletion,
+            GinReturn, request.channel, request.sequence, 0U);
+      }
+      if constexpr (Get) {
         if (pushing)
           endpoint.state(false, request.channel).tx_completed_head =
               request.sequence + 1U;
@@ -240,6 +255,8 @@ __device__ __forceinline__ bool publish_block(const ForwardKernelArgs &a,
       ring::acquire(slot.fc2_published) < slot.fc2_target)
     return false;
   const auto &desc = a.ring.blocks[block];
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady,
+      GinReturn, 0U, block, 0U);
   unsigned rails = 0U, local_rows = 0U;
   if (a.static_network.publication_plan) {
     local_rows = desc.local_rows;
@@ -307,6 +324,8 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
         const auto &desc = a.ring.returning.packets[
             plan.begin + sequence - state.rx_base];
         if (endpoint.import_ready(true, channel, sequence, desc.rows)) {
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, SourceSignalObserved,
+              SourceRelay, channel, sequence, desc.rows);
           // Payload goes directly to immutable invocation-sized contribution
           // storage. Only the notification slot is retired here.
           ring::arrive(endpoint.slot(true, channel, sequence).consumed_total,
@@ -399,6 +418,8 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
       while (ring::acquire<::cuda::thread_scope_system>(
                  *packet.visible_generation) != packet.generation) {
       }
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayStart,
+          ProxyRelay, worker, window * stride + task, packet.rows);
       if constexpr (Cooperative) {
         // Route/metadata loads are warp-wide; only matching routes reach the
         // lane-0 bulk copier. Packet ownership and exact RX credit stay static.
@@ -445,6 +466,8 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, local::Shared &s,
       }
       if (!lane)
         ring::arrive<::cuda::thread_scope_system>(*packet.consumed_total, packet.rows);
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, ProxyRelayEnd,
+          ProxyRelay, worker, window * stride + task, packet.rows);
     }
   }
 }

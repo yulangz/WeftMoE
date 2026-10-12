@@ -15,6 +15,7 @@
 #include "weftmoe/cuda/activation_transport.hpp"
 #undef private
 #include "weftmoe/cuda/backward.hpp"
+#include "cuda/profiling/device_timeline_host.hpp"
 
 namespace weftmoe::cuda {
 
@@ -245,10 +246,6 @@ download_activation_output_for_validation(
     const DeviceActivationTransportHandle &, const CudaExecution &);
 
 namespace testing {
-#if WEFTMOE_DEVICE_TIMELINE
-profiling::DeviceTimelineSnapshot
-download_forward_device_timeline(const DeviceForwardHandle &);
-#endif
 struct GinPutSignalProbeResult {
   std::uint64_t payload_bytes = 0;
   std::uint32_t rail_rank = 0;

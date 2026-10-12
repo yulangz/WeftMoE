@@ -17,6 +17,8 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
   while (schedule.next(t)) {
     auto &slot = a.ring.slots[t.row / kM];
     if (cute::elect_one_sync()) {
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, InputWaitBegin, Compute,
+          unsigned(t.fc2), t.block, t.column);
       if constexpr (Network)
         while (!ring::admitted(a, t.block)) {
         }
@@ -25,6 +27,8 @@ __device__ __forceinline__ void produce(const ForwardKernelArgs &a, Shared &s,
           std::uint64_t(t.generation) * (t.fc2 ? kFc1Tiles : kM);
       while (ring::acquire(ready) < target) {
       }
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, InputWaitEnd, Compute,
+          unsigned(t.fc2), t.block, t.column);
       asm volatile("fence.proxy.async.global;" ::: "memory");
     }
     __syncwarp();
@@ -69,6 +73,11 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
   const auto bbase = __shfl_sync(0xffffffffU, db.reg32_[0], 0);
   bool previous_fc2 = false;
   while (schedule.next(t)) {
+    if (t.fc2) {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileStart, Compute, t.column, t.block, 0U);
+    } else {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileStart, Compute, t.column, t.block, 0U);
+    }
     auto &slot = a.ring.slots[t.row / kM];
     const bool started = t.fc2 ? started_fc2 : started_fc1;
     if (!started && threadIdx.x == 0U)
@@ -93,8 +102,25 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
     const bool checkpoint_owner =
         a.saved_x && !t.fc2 && t.column / 2U == t.block % (kFc1Tiles / 2U);
     StaticV4XCheckpoint<kK, false, kCheckpointRows> checkpoint;
+#if WEFTMOE_DEVICE_TIMELINE
+    std::uint64_t tma_wait_ns = 0U;
+#endif
     for (unsigned k = 0; k < reduction; k += kK) {
+#if WEFTMOE_DEVICE_TIMELINE
+      const auto wait_begin = threadIdx.x == 0U ? profiling::read_globaltimer_ns() : 0U;
+#endif
       s.full[stage].wait(phase);
+#if WEFTMOE_DEVICE_TIMELINE
+      if (threadIdx.x == 0U)
+        tma_wait_ns += profiling::read_globaltimer_ns() - wait_begin;
+#endif
+      if (k == 0U) {
+        if (t.fc2) {
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MmaBegin, Compute, t.column, t.block, 0U);
+        } else {
+          WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MmaBegin, Compute, t.column, t.block, 0U);
+        }
+      }
       const auto astart = abase + stage * (kM * kK / 8U);
       const auto bstart = bbase + stage * (kN * kK / 8U);
 #pragma unroll
@@ -156,6 +182,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         s.empty[retirement].arrive(lane);
     }
     if (t.fc2) {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MathEnd, Compute, t.column, t.block, 0U);
       static_v4_push_fc2_tile<Mma, false, kN, true, kM, kMathThreads, true>(
           a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
       // This is an S read-retirement credit, not contribution publication.
@@ -173,6 +200,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         collective_scope_sync<kMathThreads, 7U>();
       }
     } else {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1MathEnd, Compute, t.column, t.block, 0U);
       // X and S have independent lifetimes. Pull can recycle X as soon as
       // all FC1 tiles retire, but the new S must wait for the previous FC2.
       while (ring::acquire(slot.fc2_done) <
@@ -191,6 +219,13 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         arrive(slot.fc1_done, 1U);
       collective_scope_sync<kMathThreads, 7U>();
     }
+    if (t.fc2) {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2TileEnd, Compute, t.column, t.block, 0U);
+    } else {
+      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1TileEnd, Compute, t.column, t.block, 0U);
+    }
+    WEFTMOE_TIMELINE_RECORD(a.timeline, TmaWaitNs, Compute,
+        unsigned(t.fc2), tma_wait_ns, t.block);
   }
   if (threadIdx.x == 0U) {
     const auto now = device_globaltimer_ns();
