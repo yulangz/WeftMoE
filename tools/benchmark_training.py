@@ -106,8 +106,8 @@ def main():
         parser.error("--trace-kernels requires --verify")
     if args.profile_stages and (args.backend != "pf" or not args.forward_only):
         parser.error("--profile-stages requires --backend pf --forward-only")
-    if args.trace_stage_kernels and not args.profile_stages:
-        parser.error("--trace-stage-kernels requires --profile-stages")
+    if args.trace_stage_kernels and (args.backend != "pf" or not args.forward_only):
+        parser.error("--trace-stage-kernels requires --backend pf --forward-only")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
     if not 1 <= args.top_k <= args.experts:
@@ -207,7 +207,7 @@ def main():
                 generator.set_state(input_rng_state)
             if args.backend == "megatron" and iteration == priming_steps + args.warmups:
                 compile_graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-            if args.profile_stages and iteration == priming_steps + args.warmups:
+            if (args.profile_stages or args.trace_stage_kernels) and iteration == priming_steps + args.warmups:
                 allocator_before = torch.cuda.memory_stats()
                 if args.trace_stage_kernels:
                     kernel_probe = torch.profiler.profile(
@@ -250,13 +250,20 @@ def main():
         if kernel_probe is not None:
             kernel_probe.stop()
             stage_kernels = {}
+            local = world == int(os.environ.get("LOCAL_WORLD_SIZE", world))
+            split_notify = bool(os.environ.get("WEFTMOE_PF_SPLIT_NOTIFY"))
             for label, name in (("mini_notify", "training_count_notify_kernel"),
+                                ("standalone_notify", "weftmoe_pf::notify_kernel"),
                                 ("weight_repack", "interleave_forward_w1_kernel"),
-                                ("main", "weftmoe_pf::network::kernel")):
+                                ("main", "weftmoe_pf::local::kernel" if local
+                                 else "weftmoe_pf::network::kernel")):
                 events = sorted((event for event in kernel_probe.events()
                                  if event.device_type == torch.autograd.DeviceType.CUDA
                                  and name in event.name), key=lambda event: event.time_range.start)
                 expected = 0 if label == "weight_repack" and args.prepared_weights else args.samples
+                if ((label == "mini_notify" and split_notify) or
+                        (label == "standalone_notify" and not split_notify)):
+                    expected = 0
                 assert len(events) == expected, (label, len(events), expected)
                 stage_kernels[label] = [event.time_range.elapsed_us() for event in events]
         if args.profile_stages:
