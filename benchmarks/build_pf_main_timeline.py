@@ -10,13 +10,16 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("label")
 parser.add_argument("--timeline", action="store_true")
 parser.add_argument("--local", action="store_true")
+parser.add_argument("--profile", type=Path,
+                    help="Directory containing the combined tuning header")
 parser.add_argument("--define", action="append", default=[])
 args = parser.parse_args()
 output = ROOT / "build/pf_main_timeline" / args.label
 output.mkdir(parents=True, exist_ok=True)
 flags = ["-lineinfo", "-Xptxas=-v,--warn-on-spills",
          "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1",
-         "-I" + str(ROOT / ("configs/pf_inference_flash_20261008" if args.local else
+         "-I" + str(args.profile.resolve() if args.profile else
+                    ROOT / ("configs/pf_inference_flash_20261008" if args.local else
                             "configs/pf_network_l132_20261009")),
          *("-D" + d for d in args.define)]
 env = dict(os.environ, NVCCFLAGS=" ".join(flags),

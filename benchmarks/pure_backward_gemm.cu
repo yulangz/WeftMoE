@@ -28,19 +28,25 @@ using ForwardBarrier = cutlass::arch::ClusterTransactionBarrier;
 #include "cuda/backward/cluster_task.cuh"
 #include "cuda/backward/compute_kernels.cuh"
 
-template <int Op>
-__global__ __launch_bounds__(384, 1) void backward_gemm(
-    const __grid_constant__ CUtensorMap am,
-    const __grid_constant__ CUtensorMap bm,
-    const __grid_constant__ CUtensorMap om, transport::BFloat16 *output, int M,
-    int N, int K, int groups) {
+#ifndef WEFTMOE_GEMM_MATH_REGISTERS
+#define WEFTMOE_GEMM_MATH_REGISTERS 208
+#endif
+template <bool Math>
+struct DiagnosticSynchronization : backward_compute_detail::FullCtaComputeSynchronization {
+  static constexpr bool kMathEnabled = Math;
+  static constexpr bool kProducerEnabled = !Math;
+  static constexpr unsigned kActivationWaitGroup = 0;
+};
+
+template <int Op, bool Math>
+__device__ __forceinline__ void gemm_tasks(
+    const CUtensorMap &am, const CUtensorMap &bm, const CUtensorMap &om,
+    int M, int N, int K, int groups, unsigned char *storage) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
   using namespace backward_compute_detail;
   constexpr bool Dw = Op >= 2;
   constexpr auto storage_n =
       std::max(backward_tuning::kDabTileN, backward_tuning::kDxTileN);
-  extern __shared__ __align__(1024) unsigned char storage[];
-  initialize_k_mn_pipeline<storage_n>(storage);
   unsigned pipeline = 0;
   constexpr auto tile_m =
       Dw ? backward_tuning::kDwTileM : backward_tuning::kActivationTileM;
@@ -58,7 +64,7 @@ __global__ __launch_bounds__(384, 1) void backward_gemm(
       const int expert = task / chunks;
       const int first = task % chunks * claim;
       const int count = std::min(pairs - first, claim);
-      run_mn_mn_chunk<tile_m, tile_n, storage_n>(
+      run_mn_mn_chunk<tile_m, tile_n, storage_n, DiagnosticSynchronization<Math>>(
           am, bm, om, first, count, mt, nt, expert * K, expert * K, K, N,
           expert * M, storage, pipeline);
       cute::cluster_sync();
@@ -71,13 +77,35 @@ __global__ __launch_bounds__(384, 1) void backward_gemm(
       const int expert = task / (mp * np);
       const int row = task / np % mp * 128;
       const int col = task % np * pair_n * tile_n;
-      run_k_mn_tile_tma_store<tile_n, storage_n>(
+      run_k_mn_tile_tma_store<tile_n, storage_n, DiagnosticSynchronization<Math>>(
           am, bm, om, expert * M + row, expert * K, K, expert * M + row, col,
           storage, pipeline);
       cute::cluster_sync();
     }
   }
   cute::cluster_sync();
+#endif
+}
+
+template <int Op>
+__global__ __launch_bounds__(384, 1) void backward_gemm(
+    const __grid_constant__ CUtensorMap am,
+    const __grid_constant__ CUtensorMap bm,
+    const __grid_constant__ CUtensorMap om, transport::BFloat16 *output, int M,
+    int N, int K, int groups) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+  constexpr auto storage_n = std::max(backward_tuning::kDabTileN,
+                                      backward_tuning::kDxTileN);
+  extern __shared__ __align__(1024) unsigned char storage[];
+  backward_compute_detail::initialize_k_mn_barriers<storage_n>(storage);
+  cute::cluster_sync();
+  if (threadIdx.x < 256) {
+    cutlass::arch::warpgroup_reg_alloc<WEFTMOE_GEMM_MATH_REGISTERS>();
+    gemm_tasks<Op, true>(am, bm, om, M, N, K, groups, storage);
+  } else {
+    cutlass::arch::warpgroup_reg_dealloc<504 - 2 * WEFTMOE_GEMM_MATH_REGISTERS>();
+    gemm_tasks<Op, false>(am, bm, om, M, N, K, groups, storage);
+  }
 #endif
 }
 #include "gemm_benchmark.cuh"

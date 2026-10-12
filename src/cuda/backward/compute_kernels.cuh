@@ -11,6 +11,9 @@ constexpr std::uint32_t kActivationMathThreads =
 constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 constexpr std::uint32_t kStoreReadyBarrier = 0U;
 constexpr std::uint32_t kStoreDoneBarrier = 1U;
+#ifndef WEFTMOE_PF_BWD_DW_WAIT_GROUP
+#define WEFTMOE_PF_BWD_DW_WAIT_GROUP 0
+#endif
 
 // The standalone baseline still uses every thread in its compute CTA. The
 // unified kernel supplies a narrower synchronization domain, keeping its
@@ -460,10 +463,20 @@ run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
 #pragma unroll
           for (int index = 0; index < TileMma::kNumAccum * kMWaves; ++index)
             cute::warpgroup_fence_operand(accum[index]);
-          // Release promptly to keep all TMA stages available to the multicast
-          // producer. Holding a completed stage reduces memory prefetch depth.
-          cute::warpgroup_wait<0>();
-          release_stage(empty[stage]);
+          if constexpr (WEFTMOE_PF_BWD_DW_WAIT_GROUP == 0) {
+            cute::warpgroup_wait<0>();
+            release_stage(empty[stage]);
+          } else if (iteration) {
+            static_assert(kDwStages >= 2U);
+            cute::warpgroup_wait<1>();
+            release_stage(empty[(current - 1U) % kDwStages]);
+          }
+        }
+        if constexpr (WEFTMOE_PF_BWD_DW_WAIT_GROUP != 0) {
+          if (iterations) {
+            cute::warpgroup_wait<0>();
+            release_stage(empty[(pipeline + (offset + 1U) * iterations - 1U) % kDwStages]);
+          }
         }
 
         const auto tile = cluster_tile(first_tile + offset, rank, m_tiles,

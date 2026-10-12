@@ -2,7 +2,8 @@
 
 namespace weftmoe_pf::backward_stream {
 
-constexpr unsigned kM = 128U, kK = 64U;
+constexpr unsigned kM = 128U, kK = backward_tuning::kActivationTileK;
+static_assert(kK == 64U || kK == 128U);
 constexpr unsigned kStages = backward_tuning::kDabStages;
 constexpr unsigned kDuN = backward_tuning::kDabTileN;
 constexpr unsigned kDxN = backward_tuning::kDxTileN;
@@ -15,6 +16,12 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #endif
 #ifndef WEFTMOE_PF_BWD_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_WAVE_BLOCKS 128
+#endif
+#ifndef WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES
+#define WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES 0
+#endif
+#ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
+#define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 0
 #endif
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
@@ -53,6 +60,7 @@ struct Task {
 struct Schedule {
   const ForwardKernelArgs &a;
   unsigned expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
+  unsigned wave_expert = 0U;
 
   __device__ Schedule(const ForwardKernelArgs &args, const BackwardKernelArgs &)
       : a(args) {}
@@ -60,8 +68,16 @@ struct Schedule {
   __device__ __forceinline__ bool next(Task &t) {
     const auto all_blocks = unsigned(a.ring.state->blocks);
     while (begin < all_blocks) {
-      if (end == begin)
+      if (end == begin) {
         end = min(all_blocks, begin + a.ring.depth);
+        if constexpr (WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS > 0)
+          end = min(end, begin + WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS);
+        if constexpr (WEFTMOE_PF_BWD_LOCAL_EXPERT_WAVES) {
+          while (begin >= a.ring.expert_blocks[wave_expert + 1U])
+            ++wave_expert;
+          end = min(end, unsigned(a.ring.expert_blocks[wave_expert + 1U]));
+        }
+      }
       const auto blocks = end - begin;
       const auto du = blocks * kDuTiles;
       const auto epilogue = blocks * 2U;
@@ -179,6 +195,9 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 } // namespace weftmoe_pf::backward_stream
 
 #include "cuda/weftmoe_pf/backward_network.cuh"
+#if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
+#include "../../../benchmarks/pf_backward_identity.cuh"
+#endif
 
 namespace weftmoe_pf::backward_stream {
 
@@ -267,7 +286,7 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       !Dx && !Network && t.column / 2U == t.block % (kDuTiles / 2U);
   const auto half = (t.column % 2U) * 64U;
   const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
-  forward_compute_detail::StaticV4XCheckpoint<kK, 64U> checkpoint;
+  forward_compute_detail::StaticV4XCheckpoint<64U, 64U> checkpoint;
   for (unsigned k = 0U; k < reduction; k += kK) {
     s.full[stage].wait(phase);
     if (k == 0U && checkpoint_owner)
@@ -297,8 +316,11 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     for (auto &value : accum)
       cute::warpgroup_fence_operand(value);
     if (checkpoint_owner)
-      checkpoint.save(s.a[stage] + half * kK, checkpoint_rows, k, f.hidden,
-                      f.saved_x_map);
+#pragma unroll
+      for (unsigned atom = 0U; atom < kK / 64U; ++atom)
+        checkpoint.save(s.a[stage] + atom * kM * 64U + half * 64U,
+                        checkpoint_rows, k + atom * 64U, f.hidden,
+                        f.saved_x_map);
     cute::warpgroup_wait<0>();
     backward_compute_detail::release_stage(s.empty[stage]);
     stage = (stage + 1U) % kStages;
@@ -513,6 +535,10 @@ __global__ __launch_bounds__(384U, 1) void kernel(
     cutlass::arch::warpgroup_reg_alloc<
         Network ? kNetworkMathRegisters
                 : backward_tuning::kUnifiedMathRegisters>();
+#if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
+    identity<Network>(f, a);
+    begin_weights<Network>(f, a, storage, state);
+#else
     compute<Network>(f, a, s);
     begin_weights<Network>(f, a, storage, state);
     backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
@@ -522,12 +548,16 @@ __global__ __launch_bounds__(384U, 1) void kernel(
         a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
         x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
         geometry, storage, state, sync);
+#endif
     finish();
   } else {
     cutlass::arch::warpgroup_reg_dealloc<
         Network ? kNetworkControlRegisters
                 : backward_tuning::kUnifiedControlRegisters>();
     if (threadIdx.x < 288U) {
+#if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
+      begin_weights<Network>(f, a, storage, state);
+#else
       produce<Network>(f, a, s, dy_map, dab_map, w2_map, w1_map);
       begin_weights<Network>(f, a, storage, state);
       backward_unified_compute_detail::UnifiedComputeSynchronization<false>
@@ -537,6 +567,7 @@ __global__ __launch_bounds__(384U, 1) void kernel(
           a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
           x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
           geometry, storage, state, sync);
+#endif
       finish();
     } else {
       if constexpr (Network) {

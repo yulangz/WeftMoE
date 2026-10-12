@@ -1,6 +1,9 @@
 #pragma once
 
 namespace weftmoe_pf::backward {
+#ifndef WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM
+#define WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM 0
+#endif
 
 // Canonical dU/SwiGLU/dX stays on one cluster when the source range fits.
 // Bounded source windows use a separate, window-major dX N-pair domain.
@@ -108,6 +111,29 @@ struct Schedule {
     }
     const auto *rows = words + layout.dw_reduction_rows;
     const auto experts = a.dispatch.sizes.owned_expert_count;
+#if WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM > 0
+    {
+      constexpr unsigned claim = WEFTMOE_PF_BWD_DW_CYCLIC_CLAIM;
+      constexpr auto chunks2 = (kDw2Pairs + claim - 1U) / claim;
+      constexpr auto chunks1 = (kDw1Pairs + claim - 1U) / claim;
+      while (weight_partition < experts * (chunks2 + chunks1)) {
+        const auto index = weight_partition;
+        weight_partition += clusters;
+        const bool first = index < experts * chunks2;
+        const auto chunks = first ? chunks2 : chunks1;
+        const auto relative = first ? index : index - experts * chunks2;
+        const auto expert = relative / chunks;
+        const auto tile = relative % chunks * claim;
+        if (a.dispatch.expert_row_count[expert]) {
+          task = {expert, tile, first ? TaskKind::Dw2 : TaskKind::Dw1,
+                  min(claim, (first ? kDw2Pairs : kDw1Pairs) - tile)};
+          return true;
+        }
+      }
+      terminal = true;
+      return false;
+    }
+#endif
     // Block-cyclic weighted intervals trade task length for expert locality.
     // Adjacent intervals use identical cuts, so ownership stays disjoint even
     // when a short interval rounds to zero tiles or spans empty experts.

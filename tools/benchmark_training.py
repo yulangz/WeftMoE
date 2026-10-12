@@ -80,6 +80,8 @@ def main():
                         help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
     parser.add_argument("--verify", action="store_true",
                         help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
+    parser.add_argument("--backward-identity", action="store_true",
+                        help="Verify the communication-only diagnostic, not a training kernel")
     parser.add_argument("--forward-only", action="store_true",
                         help="Time training forward with saved X/GU, tape release and synchronize, without backward")
     parser.add_argument("--prepared-weights", action="store_true",
@@ -92,6 +94,8 @@ def main():
                         help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
     parser.add_argument("--report-window-padding", action="store_true",
                         help="Estimate PF M128 padding for the default node-group windows, outside timing")
+    parser.add_argument("--report-communication", action="store_true",
+                        help="Count route-derived dispatch/return payloads outside timing")
     parser.add_argument("--timeline-dir", type=Path,
                         help="Download the final FWD timeline, outside timing; requires a timeline build")
     parser.add_argument("--ring-tokens", type=int, default=512)
@@ -104,6 +108,8 @@ def main():
     parser.add_argument("--route-distribution", choices=("random", "balanced"), default="random",
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
     args = parser.parse_args()
+    if args.backward_identity and (args.backend != "pf" or not args.verify):
+        parser.error("--backward-identity requires PF --verify and an identity diagnostic build")
     if args.prepared_weights and (args.backend != "pf" or not args.forward_only):
         parser.error("--prepared-weights requires --backend pf --forward-only")
     if args.trace_kernels and not args.verify:
@@ -149,6 +155,28 @@ def main():
                         sha256=digest.hexdigest())
         workloads = [None] * world
         dist.all_gather_object(workloads, workload)
+        communication = None
+        if args.report_communication:
+            local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+            # [trace step, sending rail/expert rank, dispatch rows/return rows/peer rows].
+            traffic = torch.zeros((len(batches), world, 3), dtype=torch.int64)
+            for step, (routes, _) in enumerate(batches):
+                destination = routes.long() // owned
+                nodes = destination // local_world
+                for node in range(world // local_world):
+                    if node != rank // local_world:
+                        traffic[step, rank, 0] += (nodes == node).any(dim=1).sum()
+                remote = destination[nodes != rank // local_world]
+                traffic[step, :, 1] = torch.bincount(remote, minlength=world)
+                peers = destination[destination != rank]
+                traffic[step, :, 2] = torch.bincount(peers, minlength=world)
+            traffic = traffic.cuda()
+            dist.all_reduce(traffic)
+            communication = dict(
+                rows_per_step_rank=traffic[args.warmups:].cpu().tolist(),
+                columns=["dispatch_rdma_rows", "return_rdma_rows", "off_rank_expert_rows"],
+                dispatch_bytes_per_row=2 * args.hidden,
+                backward_return_bytes_per_row=2 * args.hidden + 4)
         # Size both backends for the exact same trace, including skewed routes.
         # Do not assume received rows <= 2 * nominal tokens * top-k.
         incoming = torch.stack([
@@ -202,7 +230,16 @@ def main():
                     probe = torch.profiler.profile(activities=[
                         torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
                     probe.start()
-                errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy)
+                if args.backward_identity:
+                    tape = runtime.forward(x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2)
+                    dx, dg, dw1, dw2 = runtime.backward(tape, dy)
+                    expected = (dy.float() * args.top_k).bfloat16()
+                    torch.testing.assert_close(dx, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(dg, torch.zeros_like(dg), rtol=0, atol=0)
+                    errors = {"identity_dx_exact": True, "identity_dgate_zero": True}
+                    del tape, dx, dg, dw1, dw2
+                else:
+                    errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy)
                 if probe is not None:
                     probe.stop()
                     kernels = sorted({event.name for event in probe.events()
@@ -361,6 +398,7 @@ def main():
                 per_rank_forward_ready_us=ready_per_rank,
                 per_rank_stage_profiles=profiles_per_rank,
                 window_padding=window_padding,
+                communication=communication,
                 per_rank_allocator_delta=allocator_per_rank,
                 per_rank_stage_kernel_us=kernels_per_rank,
                 forward_ready_timing_scope=("eager training forward + device synchronize; checkpoint still live"

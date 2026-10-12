@@ -19,6 +19,8 @@ def main():
                         default="backward")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--define", action="append", default=[],
+                        help="Compile-time ablation, recorded in provenance")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
@@ -31,6 +33,8 @@ def main():
     benchmark = root / f"benchmarks/pure_{args.phase.replace('-', '_')}_gemm.cu"
     command = [os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc"), "-O2",
                "-std=c++17", "--expt-relaxed-constexpr", "-arch=sm_90a",
+               "-lineinfo", "-Xptxas=-v,--warn-on-spills",
+               *("-D" + value for value in args.define),
                "--threads", str(args.jobs), "-I" + str(root / "src"),
                "-include", str(directory / "tuning.hpp"),
                "-I" + os.environ.get("CUTLASS_INCLUDE_DIR", "/opt/cutlass/include"),
