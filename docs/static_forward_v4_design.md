@@ -1,5 +1,27 @@
 # WeftMoE Static Forward V4：静态任务与有界流水设计
 
+## 2026-10-12：正式 notify 拆分与多机 main 衔接优化
+
+当前训练/推理均为完整 notify → 可选训练 tape 申请 → 共用 main；inference
+传空缓存指针，不再由 main 重复执行 planner。双机训练已接入借用 warp 数据面，
+不能再用下方10月9日的“训练保留原入口”描述当前版本。配置为每 CTA 两个
+机内 pull warp，132 个借用 warp 分成64 Get、48 Put、19 progress、1 admission。
+
+- 目的端 compute windows 在每个 token window 内按本节点 source group 优先
+  循环枚举，先算本地已就绪 X，覆盖远端 Get/转发的启动等待。source token
+  window、packet sequence、slot generation 及 canonical saved-row 编号不变。
+  目的端局部 window ordinal 不再是所有节点共享的顺序，见2.2节。
+- network FC2 使用 accumulator → BF16转换/四lane transpose → `uint4` 直接写
+  contribution 或 rail Return TX，去掉 shared epilogue 中转。保留独立的 S
+  读退休与 system-fence 后的 contribution 发布；单机 FC2 epilogue 不改。
+- 提前 reduce 的独立 RX-completion 计数方案通过了数值/跨调用验证，但没有
+  证明稳定的整体收益，已撤出正式代码。继续在完整节点内 join 后 reduce，
+  kernel 终止前排空全部通信；不提前复用仍在途的数据。
+
+控制面与权重重排记录见 [notify 正式接入](pf_notify_production_20261012.md)，
+main timeline、分步收益及未保留的同步消融见
+[main 衔接优化](pf_main_timeline_20261012.md)。以下各日期节为历史阶段记录。
+
 ## 2026-10-09：PF 跨机 Get / direct Return 重构
 
 目标为 Flash H4096/I2048/E256/top-k6、双机 EP16、变长随机路由的 8K/20K，
@@ -527,7 +549,12 @@ group 跨实际节点边界，原 Pull 的逐行 local/remote 过滤仍然适用
 收益，已撤回。完整 global completion 后发布 X credit 的合同不变。
 B512/B1024 等参数继续按拓扑和规模实测选择，不改变有界最坏容量公式。
 
-所有 rank 使用同一窗口编号与顺序；不等长/空 rank 由实际 token counts 决定空区间。
+2026-10-12 起，网络目的端的 compute window 使用本节点优先的循环顺序：
+`first_group = node * local_world_size / G`，
+`w = (token / B) * groups + (source / G + groups - first_group) % groups`。
+各节点共享 source-token window 的 `token / B`、packet sequence 和 generation，
+不要求 destination-local 的 `w` 相同；反向映射统一使用 `WindowShape`。
+本地单机仍为 `first_group=0`。不等长/空 rank 由实际 token counts 决定空区间。
 窗口里的 route 按 expert 形成逻辑 Mblocks，不能把一个 Mblock 的未到齐行留给
 未准入的后续窗口。一个 packet 也不跨窗口。
 

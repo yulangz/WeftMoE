@@ -69,7 +69,8 @@ def analyze(path):
                 main_to_first_mma_us=extents[113]["first_us"],
                 last_fc2_to_reduce_us=extents[20]["first_us"] - extents[87]["last_us"],
                 last_rx_to_reduce_us=extents[20]["first_us"] - extents[16]["last_us"],
-                join_us=extents[20]["first_us"] - extents[109]["last_us"],
+                # Negative after early Reduce means useful control/Reduce overlap.
+                reduce_minus_all_workers_done_us=extents[20]["first_us"] - extents[109]["last_us"],
                 reduce_span_us=extents[21]["last_us"] - extents[20]["first_us"],
                 terminal_span_us=main_us - extents[21]["last_us"])
 
@@ -83,7 +84,7 @@ for path in sorted(args.directory.glob("t*.rank*.json")):
 result = {}
 for size, ranks in groups.items():
     keys = ("main_us", "main_to_first_mma_us", "last_fc2_to_reduce_us", "last_rx_to_reduce_us",
-            "join_us", "reduce_span_us", "terminal_span_us")
+            "reduce_minus_all_workers_done_us", "reduce_span_us", "terminal_span_us")
     totals = {k: stats([r[k] for r in ranks]) for k in keys}
     result[size] = dict(ranks=ranks, summary=totals)
     print(size, json.dumps(totals))
