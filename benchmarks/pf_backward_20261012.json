@@ -19,7 +19,8 @@
     "m1_windows_perf": [25.1156685, 60.8837835],
     "m1_prepared_perf": [24.9560515, 64.0169485],
     "m1_final_perf": [25.2091185, 62.164202],
-    "m1_final_repeat": [25.192544, 62.1781735]
+    "m1_final_repeat": [25.192544, 62.1781735],
+    "m3_local_regression": [25.164714, 62.174251]
   },
   "two_node_ep16_old_backward_only": {
     "baseline_network": [32.6678875, 78.5314285],
@@ -40,9 +41,25 @@
   "two_node_ep16_new_backward": {
     "m2_perf_window2048": [33.7120965, 85.981711],
     "m2_window4096": [32.271035, 80.7416315],
+    "m2_window8192": [31.3962025, 77.1580065],
     "m2_window4096_padding_fraction": [0.1420296819805955, 0.10672923060040773],
     "generation_verification": {"tokens": [129, 8192, 20480], "steps_each": 3, "ring_tokens": 512},
     "hot_route_verification": {"tokens": [8192, 20480], "steps_each": 2, "ring_tokens": 512, "route_bias_std": 8, "max_relative_l2": 0.0002749997074715793}
   },
-  "status": "M1 and M2 correctness complete; multi-node performance tuning in progress"
+  "rejected_ablation_window2048": {
+    "skip_empty_math_warpgroup": [34.8149955, 87.7202355],
+    "short_tail_split_n_between_math_warpgroups": [34.0336995, 86.2871765],
+    "reason": "No measured speedup; first option serialized WGMMA, second increased static spills"
+  },
+  "compute_and_gin_pool_mib": {
+    "window2048": [5650.1153, 8516.5828],
+    "window4096": [8057.6991, 10923.5970],
+    "window8192": [13269.4627, 16135.0831]
+  },
+  "forward_only_regression_ep16": {
+    "baseline": [12.179694, 29.734521],
+    "new": [12.3283535, 29.6796055]
+  },
+  "lifetime_caveat": "Initial M1/M2 measurements use immediate FWD+BWD. Multi-tape regression revealed shared physical plan reuse; final results must rebuild from each tape's immutable counts/routes.",
+  "status": "M1/M2 implemented; validating multi-tape lifetime fix and final performance"
 }

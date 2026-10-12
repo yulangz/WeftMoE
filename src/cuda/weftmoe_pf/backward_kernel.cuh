@@ -376,8 +376,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
   }
 }
 
-// Keep the register domains disjoint across the phase transition. A common
-// outer join can make ptxas discard setmaxnreg for the N256 accumulators.
+// Phase helpers keep math/producer scopes separate from the return roles.
 template <bool Network>
 __device__ __noinline__ void
 begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
@@ -515,9 +514,14 @@ __global__ __launch_bounds__(384U, 1) void kernel(
         if (threadIdx.x == 288U)
           atomicMax(&status->backward_reduce_complete_clock,
                     device_globaltimer_ns());
-        rank_barrier<288U, 96U>(f);
       }
       finish();
+      // Return/reduce overlaps dW, but a peer must not reuse invocation
+      // metadata until every rank has also finished its weight gradients.
+      if constexpr (Network)
+        network_barrier<288U, 96U>(f, 1U);
+      else
+        rank_barrier<288U, 96U>(f);
     }
   }
 #endif

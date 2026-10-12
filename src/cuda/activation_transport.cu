@@ -6192,6 +6192,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     pf_args.timeline = {};
 #endif
     pf_args.source_input_offset = layout.input;
+    pf_args.input = gradient.pointer;
+    pf_args.training_counts_ready = true;
     pf_args.saved_x = args.dr;
     pf_args.output = static_cast<transport::BFloat16 *>(data.dx->data);
     args.activation_stride = std::max<std::uint64_t>(
@@ -6365,7 +6367,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                     "cluster launch support and at least two compute SMs",
                     std::to_string(compute_ctas));
   saved.completion.wait_on(exec->stream);
-  if (data.tokens) {
+  if (data.tokens && !pf_stream) {
     internal::throw_cuda(
         "backward-stage-dy",
         internal::wait_input_ready(exec->stream, gradient.allocation->ready,
@@ -6375,9 +6377,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     internal::throw_cuda(
         "backward-stage-dy",
         cudaMemcpyAsync(
-            pf_stream && use_gin
-                ? at<void>(slot.gin_window, pf_args.static_network.input)
-                : at<void>(slot.device, layout.input),
+            at<void>(slot.device, layout.input),
             gradient.pointer,
             data.tokens * config.hidden_size * sizeof(transport::BFloat16),
             cudaMemcpyDeviceToDevice, exec->stream),
@@ -6432,6 +6432,37 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "wait dY producer");
   if (pf_stream) {
+    // Only count/route metadata belongs to the tape. The physical PF plan
+    // belongs to the shared execution workspace and may contain a later layer.
+    // Rebuild it from retained counts (no count notify), staging dY in the same
+    // planner just as Forward stages X.
+    const auto planner = use_gin ? weftmoe_pf::notify_kernel<true>
+                                : weftmoe_pf::notify_kernel<false>;
+    constexpr std::size_t planner_smem = 64U * 1024U;
+    int planner_clusters = 0;
+    auto planner_error = retained.backend->prepare_unified_launch<>(
+        reinterpret_cast<const void *>(planner), planner_smem, compute_ctas,
+        384U, 2U, false, false, &planner_clusters);
+    if (planner_error == cudaSuccess &&
+        unsigned(planner_clusters) * 2U < compute_ctas)
+      planner_error = cudaErrorLaunchOutOfResources;
+    internal::throw_cuda("backward-plan", planner_error, identity.rank,
+                         identity.world, "backward", identity.generation,
+                         ExchangeKind::ExpertCounts, "prepare PF planner");
+    cudaLaunchAttribute planner_cluster{};
+    planner_cluster.id = cudaLaunchAttributeClusterDimension;
+    planner_cluster.val.clusterDim = {2U, 1U, 1U};
+    cudaLaunchConfig_t planner_launch{};
+    planner_launch.gridDim = dim3(compute_ctas);
+    planner_launch.blockDim = dim3(384U);
+    planner_launch.dynamicSmemBytes = planner_smem;
+    planner_launch.stream = transport_stream;
+    planner_launch.attrs = &planner_cluster;
+    planner_launch.numAttrs = 1U;
+    internal::throw_cuda(
+        "backward-plan", cudaLaunchKernelEx(&planner_launch, planner, pf_args),
+        identity.rank, identity.world, "backward", identity.generation,
+        ExchangeKind::ExpertCounts, "restore current tape PF plan and stage dY");
     if (use_gin) {
       backward_build_row_directory_kernel<<<1, 256, 0, transport_stream>>>(
           args);
@@ -6650,7 +6681,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
         std::getenv("WEFTMOE_BACKWARD_PROGRESS") != nullptr;
     const auto diagnostic_status = [&](const TransportDeviceStatus &s,
                                        bool pending) {
-      std::cerr << "BACKWARD_STATUS rank=" << identity.rank
+      std::ostringstream record;
+      record << "BACKWARD_STATUS rank=" << identity.rank
                 << " epoch=" << backward_epoch << " pending=" << pending
                 << " return_puts=" << s.gin_return_put_count
                 << " return_bytes=" << s.gin_return_payload_bytes
@@ -6678,6 +6710,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                 << (use_gin ? args.gin_dev_comm.ginContextCount : 0)
 #endif
                 << " gin_workers=" << args.gin_total_ctas << std::endl;
+      std::cerr << record.str();
     };
     if (diagnostic_progress) {
       const auto started = std::chrono::steady_clock::now();

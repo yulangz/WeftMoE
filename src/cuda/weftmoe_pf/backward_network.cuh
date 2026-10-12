@@ -74,35 +74,14 @@ gradient_output(const ForwardKernelArgs &f,
 }
 #endif
 
-// Rebind only mutable transport addresses. Source routes, packet membership,
-// fanout counts and saved-row mappings come directly from the Forward tape.
+// Notify rebuilds the current tape's physical plan in shared execution storage.
+// Its slot generations are in Forward tile units; convert only the slots used
+// by this Backward before any producer or communication worker runs.
 __global__ void prepare_network(ForwardKernelArgs f) {
-#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
-  constexpr unsigned Threads = 256U;
-  const auto tid = std::uint64_t(blockIdx.x) * Threads + threadIdx.x;
-  const auto stride = std::uint64_t(gridDim.x) * Threads;
   const auto &r = f.ring;
-  const auto &n = f.static_network;
-  if (!tid) {
-    r.state->admitted_windows = 0U;
-  }
-  // Advance payload generations without re-exchanging immutable routing.
-  // Every destination already knows every source's exact window count.
-  for (auto source = tid; source < f.world; source += stride)
-    r.source_epochs[source].base += static_forward::ceil_div(
-        r.source_epochs[source].tokens, r.source.shape.tokens);
-  for (auto block = tid; block < r.state->blocks; block += stride) {
-    auto &desc = r.blocks[block];
-    const auto sequence = r.state->block_base + block;
-    desc.slot = unsigned(sequence % r.depth);
-    desc.generation = sequence / r.depth + 1U;
-  }
-  grid_sync<0U, Threads>(f);
-  if (!tid)
-    r.state->source_base = r.source_epochs[f.rank].base;
-  for (auto i = tid; i < r.depth; i += stride) {
-    if (!r.state->blocks)
-      break;
+  const auto tid = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto stride = std::uint64_t(gridDim.x) * blockDim.x;
+  for (auto i = tid; i < r.depth && r.state->blocks; i += stride) {
     const auto first = (i + r.depth - r.blocks[0].slot) % r.depth;
     if (first >= r.state->blocks)
       continue;
@@ -114,98 +93,6 @@ __global__ void prepare_network(ForwardKernelArgs f) {
     s.fc2_done = s.fc2_target = s.fc2_published = prior * kDxTiles;
     s.activation_ready = prior * 2U;
   }
-  for (auto i = tid; i < std::uint64_t(f.local_world_size) * r.depth;
-       i += stride)
-    r.return_ready[i] = 0U;
-  for (auto i = tid; i < 2U * n.rings.channels(); i += stride) {
-    auto &s = *peer_at<static_forward::NetworkChannel>(
-        f.gin_window_base,
-        n.ring_region + i * sizeof(static_forward::NetworkChannel));
-    s.tx_cursor = s.tx_reserve_cursor = s.tx_reserved_head =
-        s.tx_completed_head = s.tx_base;
-    s.rx_cursor = s.consume_cursor = s.acknowledged_head = s.rx_base;
-  }
-  // Publish dY staging and initialization before any peer probes RX/TX state.
-  network_barrier<0U, Threads>(f, 1U);
-  for (auto task = tid; task < r.state->windows * r.source.shape.sources;
-       task += stride) {
-    const auto window = task / r.source.shape.sources;
-    const auto source =
-        r.source.shape.source_begin(window) + task % r.source.shape.sources;
-    if (source >= r.source.shape.source_end(window))
-      continue;
-    const auto sequence =
-        r.source_epochs[source].base + window / r.source.shape.groups();
-    r.window_sources[task] = {sequence, sequence / r.contribution_depth + 1U,
-                              sequence % r.contribution_depth *
-                                  r.contribution_stride,
-                              unsigned(sequence % r.contribution_depth)};
-  }
-  for (auto logical = tid; logical < r.state->blocks * kM; logical += stride) {
-    const auto &desc = r.blocks[logical / kM];
-    if (logical % kM >= desc.tile.rows)
-      continue;
-    auto &row = r.rows[logical];
-    ring::source_metadata(f, row.source, r.locations)[row.route] = {
-        desc.generation, logical / kM, desc.slot * kM + unsigned(logical % kM)};
-    if (row.source / f.local_world_size == f.node) {
-      auto *base = static_cast<char *>(ncclGetLsaPointer(
-          f.gin_window, n.contribution, row.source % f.local_world_size));
-      const auto ordinal = (static_cast<char *>(row.output) - base) /
-                           (f.hidden * 2U) % r.contribution_stride;
-      const auto sequence = r.source_epochs[row.source].base +
-                            desc.window / r.source.shape.groups();
-      row.output =
-          base +
-          (sequence % r.contribution_depth * r.contribution_stride + ordinal) *
-              f.hidden * 2U;
-    }
-  }
-  // Locations are rail-shared: all destinations finish their disjoint writes
-  // before another rail decodes a Return packet containing those locations.
-  rank_barrier<0U, Threads, true, true, true>(f);
-  const auto packets =
-      r.source.shape.sources * r.source.packets.packets(r.source.shape.tokens);
-  for (auto i = tid; i < r.state->windows * packets; i += stride)
-    ring::build_pull_packet(f, i / packets, i % packets);
-
-  // Every source rail owns its own TX channels. Decode those immutable packet
-  // rows once, rather than searching expert/source ordinals inside GEMM.
-  const auto owned = f.dispatch.sizes.owned_expert_count;
-  for (unsigned task = blockIdx.x; task < f.world * n.rings.lanes;
-       task += gridDim.x) {
-    const auto source = task / n.rings.lanes;
-    if (source / f.local_world_size == f.node)
-      continue;
-    const auto lane = task % n.rings.lanes;
-    const auto directory = f.node * n.rings.lanes + lane;
-    const auto *offsets =
-        ring::source_metadata(f, source, r.returning.channel_offsets);
-    const auto *plans = ring::source_metadata(f, source, r.returning.packets);
-    const auto *order = ring::source_metadata(f, source, r.source.route_order);
-    const auto *experts =
-        ring::source_metadata(f, source, r.source.selected_experts);
-    const auto *locations = ring::source_metadata(f, source, r.locations);
-    const auto base = return_tx::state(f, source, lane).tx_base;
-    const auto channel = return_tx::channel(f, source, lane);
-    for (auto p = offsets[directory]; p < offsets[directory + 1U]; ++p) {
-      const auto &packet = plans[p];
-      auto *output = static_cast<char *>(ncclGetLsaPointer(
-          f.gin_window,
-          n.ring_region +
-              n.rings.return_payload(channel, base + p - offsets[directory]),
-          source % f.local_world_size));
-      for (unsigned row = threadIdx.x; row < packet.rows; row += Threads) {
-        const auto route = order[packet.route_begin + row];
-        if (unsigned(experts[route]) / owned != f.rank)
-          continue;
-        const auto location = locations[route];
-        r.rows[location.block * kM + location.row % kM].output =
-            output + row * f.hidden * 2U;
-      }
-    }
-  }
-#endif
 }
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
@@ -265,7 +152,6 @@ __device__ __forceinline__ void finish_network(const ForwardKernelArgs &f,
         s.rx_base = s.rx_cursor;
       }
   }
-  network_barrier<Base, Threads>(f, 1U);
 }
 #endif
 

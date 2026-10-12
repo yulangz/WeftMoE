@@ -11,16 +11,19 @@ from weftmoe.runtime import TensorRuntime, moe
 
 
 def reference_moe(x, route, gate, w1, w2):
-    output = torch.zeros_like(x)
+    # PF sums BF16 expert contributions in FP32, then casts once at combine.
+    output = torch.zeros_like(x, dtype=torch.float32)
+    # Accumulate expert dX contributions in FP32 too; GEMM inputs remain BF16.
+    gathered_x = x.float()
     for expert in range(w1.shape[0]):
         rows, slots = torch.where(route == expert)
-        ab = x[rows] @ w1[expert].T
+        ab = gathered_x[rows].to(x.dtype) @ w1[expert].T
         a, b = ab.chunk(2, dim=-1)
         u = (
             torch.nn.functional.silu(a.float()) * b.float() * gate[rows, slots, None]
         ).to(torch.bfloat16)
-        output.index_add_(0, rows, u @ w2[expert].T)
-    return output
+        output.index_add_(0, rows, (u @ w2[expert].T).float())
+    return output.to(x.dtype)
 
 
 def main():

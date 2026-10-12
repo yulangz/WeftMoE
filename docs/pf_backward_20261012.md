@@ -9,8 +9,8 @@
   contribution；producer/math 独立重放静态 dQ/SwiGLU/dX 任务流。
   dX epilogue 从 accumulator 直接 128-bit 写回。所有本地 dX 完成后
   math 开始静态 dW，通信 warp 进行 source reduce。
-- [x] M2 多机协议/正确性：复用当前借用 warp 的按节点去重、逐 token Get、机内 pull、
-  直接 TX contribution/Put return。路由计划来自 FWD tape，不再重新
+- [x] M2 多机协议：复用当前借用 warp 的按节点去重、逐 token Get、机内 pull、
+  直接 TX contribution/Put return。路由和计数来自 FWD tape，不再重新
   counts notify。RX fanout、TX NIC completion 和远端 credit 分开退休。
 - [ ] M3 优化与回归：分别测 dQ/dX/dW 参数、缓存写出和激活融合；覆盖随机
   tokens/routes、热点/空专家、多轮 slot 回绕。FWD 和 DT 不改变数学流程。
@@ -40,7 +40,7 @@ FC1-done credit。`2I > H` 才申请独立 dAB ring。已有 Forward contributio
 直接用于 dX；不在 BWD peer workspace 再申请一份无用 contribution。
 
 持久 peer workspace 目前仍保存 dY cache 和 IPC 可见 dr 标量；容量增长
-与地址交换沿用现有策略。单机初始化直接复用 FWD 的专家目录，只生成
+与地址交换沿用现有策略。单机初始化使用 FWD tape 的专家目录，只生成
 dW 所需 padded-row 映射、清空本调用计数器和空专家梯度，不再初始化
 旧 activation scheduler 或重新拷贝 route headers。
 
@@ -101,15 +101,16 @@ Python 回归为 117 tests / 470 subtests。没有新增碎片化单元测试。
 
 ## 多机实施约束
 
-FWD 的 immutable route/packet plan 可复用，但物理 RX/TX 地址必须按
-当前 channel base 重新绑定，不能复用 FWD 已退休的 packet generation。
+FWD tape 的 immutable routes/counts 可复用，但物理计划属于共享工作区，
+可能已被后续层覆盖。必须重新规划并按当前 channel base 绑定 RX/TX，
+不能复用 FWD 已退休的 packet generation。
 dr 使用独立小型 FP32 TX/contribution 平面与 GIN 完成信号；dX 和 dr
 分别 acquire 成功后才返还 packet credit，TX 仍保留本地 NIC completion。
 通信共享内存必须与 dW arena 分离，否则为了复用 arena 而等待所有
 Return 结束，会让 dW 与 Return 串行。
 
 M2 已实现。`backward_kernel.cuh` 共享单机/多机 dQ/SwiGLU/dX/dW 数学流程；
-`backward_network.cuh` 只负责窗口任务流、地址重绑定、dr 地址和终止协议。
+`backward_network.cuh` 只负责窗口任务流、slot 计数单位、dr 地址和终止协议。
 源 contribution、compute block 与 NIC packet generation 均单调前进。
 每次 BWD 重新绑定 RX/TX/本地 contribution 地址，但不重新交换路由计数、
 不重新分配通信池。结束时将共享 compute counters 归一到 FWD 的 N-tile
@@ -133,5 +134,74 @@ producer、96 communication。保留 64 Get / 48 Put / 19 progress / 1 admit
 33.712/85.982 ms，慢于旧 PF。仅将 window 放大到 4096，得到
 32.271/80.742 ms；此时实际路由的 M128 padding 仍为约 14.2%/10.7%。
 放大窗口同时增大持久 ring 容量，因此不将它悄悄改为默认配置。
-下一步先尝试跳过没有有效行的 WGMMA warpgroup，保持相同 2048 window
-和同步计数，检查能否减少 padding 的计算代价。
+
+## 后续消融与诊断
+
+同一组随机 workload、相同 2048-token window：
+
+| 实验 | 8K (ms) | 20K (ms) | 决策 |
+|---|---:|---:|---|
+| M2 单调 generation 原版 | 33.712 | 85.982 | 保留 |
+| 尾块跳过空的第二个 math WG | 34.815 | 87.720 | 撤回 |
+| 尾块两个 WG 各算一半 N，均计算有效的前 64 行 | 34.034 | 86.287 | 撤回 |
+
+第一个尾块方案出现 ptxas C7518（WGMMA 序列化）。第二个通过数值验证，
+也没有 C7518，但网络 kernel 的静态 spill store/load 从 76/132 B
+增至 124/216 B，没有测到速度收益。不能将降低 padding FLOPs 等同于
+降低耗时。尝试提前执行 control reg-dealloc 也没有消除 C7507
+（setmaxnreg 被忽略），同样撤回，不留运行时开关或死分支。
+
+8192-token window 测得 31.396/77.158 ms；M128 padding 从 2048 window
+的 23.19%/22.17% 降至 9.99%/5.43%。但 compute+GIN 池从
+5650/8517 MiB 增至 13269/16135 MiB，约增加 **7.4 GiB/卡**。
+4096 window 也增加约 2.35 GiB/卡。这些是容量/性能消融，不更改默认值；
+窗口同时影响 FWD，不能把完整周期收益全部归给 BWD。
+
+`m3_phase_profile` 使用 GPU 时间戳：各规模三次调用、16 ranks 中，
+main 入口到首次 dQ 的最大观测约 46/47 us，dQ 开始到该 rank 全部
+dX 完成最长约 15.84/34.80 ms，dW 阶段最长约 10.90/20.72 ms，
+reduce 最长约 1.13/2.94 ms。不同 GPU 时钟不互相相减，阶段最大值
+也不能相加当作总耗时（可能来自不同 rank/step，且阶段存在重叠）。
+该组带诊断、包含初次分配，不能替代上面的无插桩性能结果。
+目前瓶颈不是 main 到首次 GEMM 的启动空隙，优先看窗口内激活计算、
+padding 与 dW。快 rank 的 dX 到 reduce 间隔还包括等待其它 rank，
+不能解释成纯 RDMA 耗时。
+
+同口径 cached FWD 单独回归：旧版 12.180/29.735 ms，新版
+12.328/29.680 ms，没有发现明显退化；单机完整周期回归
+25.165/62.174 ms。DT EP2/4/8、E256、1/64 tokens 的数值与 graph replay
+检查通过；没有修改 DT 数学流程。
+
+### 多 tape 生命周期修正
+
+上述初始性能数据来自 FWD 紧接 BWD 的单 tape 周期，不能视为完整训练
+生命周期验收。`m3_lifetime_network` 在三份不同热点、不同长度的 FWD
+tape 同时存活时发现错误：Notify handle 保留了路由、计数和检查点，
+但物理 ring plan 是共享执行工作区，不会随每份 tape 保存。
+新 BWD 直接使用最后一次 FWD 的物理计划，因此早期 tape 的反向错误。
+
+修正为每次 BWD 复用现有 PF planner，从该 tape 的 routes/counts 重建
+物理计划；`training_counts_ready=true` 跳过 counts notify，不申请另一份
+通信池或逐层保存大计划。dY staging 合入 planner，移除原来的独立
+D2D 拷贝；网络 BWD 不再自己重复实现 RX/TX 地址重绑定。准备工作只
+留下 canonical dW 行目录、padding 清零与 BWD slot 计数单位转换。
+**修正后的性能须重新测量，不能沿用上表当最终结果。**
+
+`m3_tape_network` / `m3_tape_local_accum` 已通过 EP16/EP8 的三份同时
+存活 tape、热点迁移、短批次、权重原地更新、通信池释放和两层推理 graph
+切换检查（H4096/I2048/E32/top-6，129 tokens）。沿用现有集成测试。
+单机权重更新测试还暴露参考实现的累加口径差异：一项接近零的 dX
+误差为 2.098e-5，略超 2e-5 绝对阈值。参考原先在 BF16 内累加 output
+及不同 expert 的 dX，现改为 FP32 累加后转回 BF16；各 GEMM 输入、
+中间结果仍为 BF16，**没有放宽容差**。与性能测试已有 FP32 combine
+参考的口径一致。只改 output 的中间候选不足以修复 dX 的累加差异，
+也保留了该失败日志。
+
+修复版 `bwd_tape_plan` 通过 EP16、129/8K/20K、每规模两次变化路由，
+512-token window 的完整数值检查，全部输出/梯度相对 L2 最大约
+0.000734；8K/20K 最大约 0.000111/0.000105。Python 回归仍为
+117 tests / 470 subtests。
+
+收尾同步：return/reduce 可以在 dW 期间执行，但保护下一次调用复用
+metadata 的最后一道 rank/network barrier 移到完整 CTA/cluster 的 dW
+结束之后。不增加 barrier 数量，也不把 return/reduce 与 dW 串行化。

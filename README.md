@@ -11,8 +11,11 @@ inspection.
 The retained implementations are `weftmoe_pf` (single-/multi-node prefill,
 inference and training) and `weftmoe_dt` (single-node decode). PF inference and
 training share the same main kernel after standalone notify; training additionally
-allocates and writes the activation tape. Current PF backward lives in
-`src/cuda/backward/`; reusable communication lives in `src/cuda/communication/`.
+allocates and writes the activation tape. PF's streaming backward lives in
+`src/cuda/weftmoe_pf/backward_kernel.cuh`: it reuses the PF planner and transport,
+then runs static dQ/SwiGLU/dX work before dW. Shared backward math and the
+compatibility schedule for other tile configurations live in `src/cuda/backward/`.
+See [backward implementation and measurements](docs/pf_backward_20261012.md).
 
 V3, earlier PF kernels, WG3 experiments and their frozen build profiles have
 been removed from `main`. The complete pre-cleanup tree is preserved by tag
