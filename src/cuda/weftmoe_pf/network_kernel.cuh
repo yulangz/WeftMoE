@@ -127,20 +127,36 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
       workers(a, s, extra);
     }
   }
-  // Return RX is source-local, but local experts can still be writing this
-  // source's contribution from another GPU. Join every local writer as well.
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, threadIdx.x % 32U == 0U,
       MainDataDone, Kernel, threadIdx.x / 32U, 0U, 0U);
-  rank_barrier<0U, kThreads, true, true, true>(a);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, MainJoinDone, Kernel, 0U, 0U, 0U);
-  if (blockIdx.x == 0U && threadIdx.x == 0U) {
-    status->relay_blocks_done = status->route_exchange_complete_clock;
-    status->return_complete_clock = device_globaltimer_ns();
+  if constexpr (WEFTMOE_PF_EARLY_REDUCE) {
+    if (threadIdx.x < 256U) {
+      // Local experts write this source directly. Join their math writers,
+      // independently of Get/Put retirement and the return-credit traffic.
+      rank_barrier<0U, 256U, true, true, true>(a);
+      if (threadIdx.x == 0U && !a.dispatch.runtime->error)
+        while (ring::acquire(a.ring.state->return_rx_done) != kProgressWorkers) {
+        }
+      collective_scope_sync<256U, 7U>();
+    }
+  } else {
+    rank_barrier<0U, kThreads, true, true, true>(a);
   }
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U, 0U, 0U);
-  if (threadIdx.x < 256U && !a.dispatch.runtime->error)
-    local::combine<true>(a);
-  WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U, 0U, 0U);
+  if (threadIdx.x < 256U) {
+    WEFTMOE_TIMELINE_RECORD(a.timeline, MainJoinDone, Kernel, 0U, 0U, 0U);
+    if (blockIdx.x == 0U && threadIdx.x == 0U) {
+      status->relay_blocks_done = status->route_exchange_complete_clock;
+      status->return_complete_clock = device_globaltimer_ns();
+    }
+    WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceStart, Reduce, 0U, 0U, 0U);
+    if (!a.dispatch.runtime->error)
+      local::combine<true>(a);
+    WEFTMOE_TIMELINE_RECORD(a.timeline, ReduceEnd, Reduce, 0U, 0U, 0U);
+  }
+  // Do not let control warps enter the reusable grid barrier while math is
+  // still using it above. All TX/RX/input readers must drain before reuse.
+  if constexpr (WEFTMOE_PF_EARLY_REDUCE)
+    collective_scope_sync<kThreads, kCollectiveJoinBarrier>();
   grid_sync<0U, kThreads>(a);
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
     for (unsigned slot = 0U; slot < a.ring.contribution_depth; ++slot)

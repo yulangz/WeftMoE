@@ -4954,6 +4954,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     p.shape.world = id.world_size;
     p.shape.sources = std::min(id.world_size, l.shape.sources);
     p.shape.top_k = id.top_k;
+    if (network_prefill && WEFTMOE_PF_LOCAL_FIRST)
+      p.shape.first_group = args.node * args.local_world_size / p.shape.sources;
     p.packets = l.packets;
     p.source_rank = id.calling_rank;
     p.experts = id.num_experts;

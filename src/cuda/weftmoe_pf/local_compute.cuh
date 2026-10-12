@@ -183,8 +183,11 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
     }
     if (t.fc2) {
       WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MathEnd, Compute, t.column, t.block, 0U);
-      static_v4_push_fc2_tile<Mma, false, kN, true, kM, kMathThreads, true>(
-          a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
+      if constexpr (Network && WEFTMOE_PF_FC2_REGISTER_STORE)
+        static_v4_store_fc2_register_tile<kN>(a, accum, t.rows, t.column * kN, t.block);
+      else
+        static_v4_push_fc2_tile<Mma, false, kN, true, kM, kMathThreads, true>(
+            a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
       // This is an S read-retirement credit, not contribution publication.
       // All TMA/WGMMA reads and the math join have finished. The terminal
       // rank barrier publishes remote stores once, without draining them at

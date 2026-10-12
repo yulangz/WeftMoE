@@ -33,6 +33,9 @@ struct WindowShape {
   std::uint32_t tokens;
   std::uint32_t top_k;
   std::uint32_t tile_m = 128U;
+  // Destination-local cyclic order. Source packet sequence numbers still
+  // use token windows; only the order of source groups within them changes.
+  std::uint32_t first_group = 0U;
 
   WEFTMOE_STATIC_PLAN_HD constexpr std::uint32_t groups() const {
     return static_cast<std::uint32_t>(ceil_div(world, sources));
@@ -40,12 +43,13 @@ struct WindowShape {
 
   WEFTMOE_STATIC_PLAN_HD constexpr std::uint64_t
   window(std::uint32_t source, std::uint64_t token) const {
-    return (token / tokens) * groups() + source / sources;
+    return (token / tokens) * groups() +
+           (source / sources + groups() - first_group) % groups();
   }
 
   WEFTMOE_STATIC_PLAN_HD constexpr std::uint32_t
   source_begin(std::uint64_t window_id) const {
-    return static_cast<std::uint32_t>(window_id % groups()) * sources;
+    return static_cast<std::uint32_t>((window_id + first_group) % groups()) * sources;
   }
 
   WEFTMOE_STATIC_PLAN_HD constexpr std::uint32_t

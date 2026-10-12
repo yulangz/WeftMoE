@@ -1,5 +1,42 @@
 #pragma once
 
+#ifndef WEFTMOE_PF_FC2_REGISTER_STORE
+#define WEFTMOE_PF_FC2_REGISTER_STORE 0
+#endif
+
+// Same BF16 rounding and route destinations as the shared-memory epilogue.
+// A four-lane transpose produces aligned 128-bit stores directly from GMMA.
+template <unsigned TileN>
+__device__ __forceinline__ void static_v4_store_fc2_register_tile(
+    const ForwardKernelArgs &a, const float *accum, unsigned valid_rows,
+    unsigned column_base, std::uint64_t mblock) {
+  static_assert(TileN % 32U == 0U);
+  const auto lane = threadIdx.x % 32U;
+  const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
+#pragma unroll
+  for (unsigned item = 0U; item < 2U; ++item) {
+    const auto m = row0 + item * 8U;
+    if (m >= valid_rows)
+      continue;
+    auto *output = static_cast<transport::BFloat16 *>(
+        a.ring.rows[mblock * forward_tuning::kTileM + m].output) + column_base;
+#pragma unroll
+    for (unsigned index = 0U; index < TileN / 8U; index += 4U) {
+      std::uint32_t words[4];
+#pragma unroll
+      for (unsigned j = 0U; j < 4U; ++j) {
+        const auto *value = accum + (index + j) * 4U + item * 2U;
+        words[j] = float2_to_bf16x2_bits(value[0], value[1]);
+      }
+      *reinterpret_cast<uint4 *>(output + index * 8U + (lane % 4U) * 8U) =
+          static_v4_transpose_vector(make_uint4(words[0], words[1], words[2], words[3]));
+    }
+  }
+  // Retire both math warpgroups' S reads before the caller recycles the slot.
+  cutlass::arch::NamedBarrier::sync(kMathThreads,
+                                    physical_barrier<true>(kMathDoneBarrier));
+}
+
 // Included inside forward_compute_detail after the fragment-layout and named
 // barrier helpers.  Keeping this specialization out of the generic epilogue
 // avoids carrying static peer addressing through the dynamic V3 epilogue.

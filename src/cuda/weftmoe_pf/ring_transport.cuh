@@ -230,7 +230,7 @@ __device__ __noinline__ void ring_reduce(const ForwardKernelArgs &a,
   const auto &shape = r.source.shape;
   for (std::uint64_t window = 0; window < r.source.local_windows(); ++window) {
     const auto &address = ring::window_source(
-        a, window * shape.groups() + a.rank / shape.sources, a.rank);
+        a, shape.window(a.rank, window * shape.tokens), a.rank);
     const auto begin = window * shape.tokens;
     const auto end = begin + static_forward::block_rows(r.source.tokens, window,
                                                         shape.tokens);

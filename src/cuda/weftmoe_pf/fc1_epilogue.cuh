@@ -44,7 +44,7 @@ __device__ __forceinline__ void static_v4_save_fc1_tile(
 
 // Transpose four BF16x2 words across four lanes. Each lane then owns eight
 // consecutive columns, without staging the WGMMA fragment through shared.
-__device__ __forceinline__ uint4 static_v4_transpose_fc1_vector(uint4 v) {
+__device__ __forceinline__ uint4 static_v4_transpose_vector(uint4 v) {
   const auto lane = threadIdx.x % 4U;
   const auto mask = 0xfU << (threadIdx.x % 32U / 4U * 4U);
   auto t = __shfl_xor_sync(mask, (lane & 1U) ? v.x : v.y, 1, 4);
@@ -85,7 +85,7 @@ __device__ __forceinline__ void static_v4_store_fc1_register_vector_tile(
         const auto value = static_v4_swiglu_pair<FastMath>(g, g + 4U, gate);
         words[j] = float2_to_bf16x2_bits(value.x, value.y);
       }
-      const auto vector = static_v4_transpose_fc1_vector(
+      const auto vector = static_v4_transpose_vector(
           make_uint4(words[0], words[1], words[2], words[3]));
       const auto column = column_base + index * 8U + (lane % 4U) * 8U;
       *reinterpret_cast<uint4 *>(output + (row + m) * a.intermediate + column) =
