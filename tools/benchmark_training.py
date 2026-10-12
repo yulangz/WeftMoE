@@ -86,6 +86,10 @@ def main():
                         help="Reuse immutable PF weights; default includes per-call packing as in training")
     parser.add_argument("--trace-kernels", action="store_true",
                         help="Record CUDA entries during the first numerical check, outside performance runs")
+    parser.add_argument("--profile-stages", action="store_true",
+                        help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
+    parser.add_argument("--trace-stage-kernels", action="store_true",
+                        help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
     parser.add_argument("--ring-tokens", type=int, default=512)
     parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
@@ -100,6 +104,10 @@ def main():
         parser.error("--prepared-weights requires --backend pf --forward-only")
     if args.trace_kernels and not args.verify:
         parser.error("--trace-kernels requires --verify")
+    if args.profile_stages and (args.backend != "pf" or not args.forward_only):
+        parser.error("--profile-stages requires --backend pf --forward-only")
+    if args.trace_stage_kernels and not args.profile_stages:
+        parser.error("--trace-stage-kernels requires --profile-stages")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
     if not 1 <= args.top_k <= args.experts:
@@ -187,15 +195,24 @@ def main():
         samples = []
         forward_samples = []
         forward_ready_samples = []
+        stage_profiles = []
         measurement_intervals_ns = []
         priming_steps = len(batches) if args.prime_trace else 0
         input_rng_state = generator.get_state()
         compile_graphs_before = 0
+        allocator_before = None
+        kernel_probe = None
         for iteration, (cpu_routes, cpu_gates) in enumerate(batches * (2 if args.prime_trace else 1)):
             if args.prime_trace and iteration == priming_steps:
                 generator.set_state(input_rng_state)
             if args.backend == "megatron" and iteration == priming_steps + args.warmups:
                 compile_graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+            if args.profile_stages and iteration == priming_steps + args.warmups:
+                allocator_before = torch.cuda.memory_stats()
+                if args.trace_stage_kernels:
+                    kernel_probe = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CUDA])
+                    kernel_probe.start()
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
             dist.barrier()
@@ -215,6 +232,7 @@ def main():
             else:
                 gradients = runtime.backward(tape, dy)
                 del gradients
+            profile = tape.profile if args.profile_stages else None
             del tape
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - start) / 1000
@@ -223,14 +241,44 @@ def main():
                 forward_samples.append((forward_end - start) / 1000)
                 if args.forward_only:
                     forward_ready_samples.append(forward_ready_us)
+                if args.profile_stages:
+                    stage_profiles.append(profile)
                 measurement_intervals_ns.append((interval_start, time.time_ns()))
             del x, dy, routes, gates
+        allocator_delta = None
+        stage_kernels = None
+        if kernel_probe is not None:
+            kernel_probe.stop()
+            stage_kernels = {}
+            for label, name in (("mini_notify", "training_count_notify_kernel"),
+                                ("weight_repack", "interleave_forward_w1_kernel"),
+                                ("main", "weftmoe_pf::network::kernel")):
+                events = sorted((event for event in kernel_probe.events()
+                                 if event.device_type == torch.autograd.DeviceType.CUDA
+                                 and name in event.name), key=lambda event: event.time_range.start)
+                expected = 0 if label == "weight_repack" and args.prepared_weights else args.samples
+                assert len(events) == expected, (label, len(events), expected)
+                stage_kernels[label] = [event.time_range.elapsed_us() for event in events]
+        if args.profile_stages:
+            allocator_after = torch.cuda.memory_stats()
+            allocator_delta = {key: allocator_after[key] - allocator_before[key]
+                               for key in ("num_device_alloc", "num_device_free",
+                                           "num_alloc_retries", "num_ooms")}
         per_rank = [None] * world
         dist.all_gather_object(per_rank, samples)
         forward_per_rank = [None] * world
         dist.all_gather_object(forward_per_rank, forward_samples)
         ready_per_rank = [None] * world
         dist.all_gather_object(ready_per_rank, forward_ready_samples)
+        profiles_per_rank = [None] * world if args.profile_stages else None
+        if args.profile_stages:
+            dist.all_gather_object(profiles_per_rank, stage_profiles)
+        allocator_per_rank = [None] * world if args.profile_stages else None
+        if args.profile_stages:
+            dist.all_gather_object(allocator_per_rank, allocator_delta)
+        kernels_per_rank = [None] * world if args.trace_stage_kernels else None
+        if args.trace_stage_kernels:
+            dist.all_gather_object(kernels_per_rank, stage_kernels)
         intervals_per_rank = [None] * world
         dist.all_gather_object(intervals_per_rank, measurement_intervals_ns)
         compile_graphs = None
@@ -271,6 +319,9 @@ def main():
                 forward_ready_slowest_rank_p50_us=(statistics.median(
                     map(max, zip(*ready_per_rank))) if args.forward_only else None),
                 per_rank_forward_ready_us=ready_per_rank,
+                per_rank_stage_profiles=profiles_per_rank,
+                per_rank_allocator_delta=allocator_per_rank,
+                per_rank_stage_kernel_us=kernels_per_rank,
                 forward_ready_timing_scope=("eager training forward + device synchronize; checkpoint still live"
                                             if args.forward_only else None),
                 forward_slowest_rank_p50_us=statistics.median(
