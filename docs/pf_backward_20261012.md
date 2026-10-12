@@ -3,6 +3,53 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M6：原生库仅保留 GDAKI 后端
+
+按部署硬件约束，在项目统一的 `communication/nccl_device.cuh` 入口关闭
+device 编译中的 Proxy/GPI/EFA GDA，覆盖 FWD、BWD、notify 和 NCCL 内部
+barrier 调用；所有 GIN device communicator 的初始化显式请求
+`NCCL_GIN_TYPE_GDAKI`，不再自动回退到 Proxy。单机 notify 仍不申请 GIN。
+不修改系统 NCCL；独立通信参考 benchmark 不属于原生库的裁剪范围。
+
+宏只作用于 NVCC device pass。host pass 保留 SDK 默认定义，因为该阶段
+NCCL 默认关闭 GDAKI，若再关闭其余后端，非模板接口的 `auto` 返回类型
+无法推导。host 头文件解析不等于生成或使用 GPU Proxy 分支。
+保留原有 assertion 策略、GEMM 参数、缓冲容量、静态任务和同步协议。
+
+`bwd_gdaki_only_final` 中 return helper 从 8/8 B spill 降为 0/0 B；
+静态 SASS 指令数从 4243 降至 2383。裁剪也改变编译器寄存器分配：
+多机 BWD 主 kernel 从 0/0 B 变为 20/44 B spill store/load，位置是
+调度索引及阶段收尾的标量状态，不是 GEMM accumulator。单机主 kernel
+仍为 0/0 B；没有 C7507/C7512/C7518。不能将这次修改称为整个算子零 spill，
+也不能从删掉未执行分支直接推断性能收益。
+
+双机 EP16 Flash、B2048/D2，沿用 M5 的变化长度/热点路由和
+4 warmups / 16 samples、完整 prime trace。旧/新/新/旧各跑两轮，
+逐 rank workload hash 一致；两轮 p50 均值如下（ms）：
+
+| 口径 / 版本 | 8K | 20K |
+|---|---:|---:|
+| 完整 FWD+BWD，旧版 | 33.082 | 77.605 |
+| 完整 FWD+BWD，GDAKI-only | 33.170 | 77.811 |
+| BWD host API 边界，旧版 | 20.576 | 49.097 |
+| BWD host API 边界，GDAKI-only | 20.585 | 49.123 |
+
+完整周期差异约 +0.27%，BWD 约 +0.04%/+0.05%；视为基本持平，不宣称
+加速，也没有由这些数据确认明显性能回退。BWD host 边界仍不是独立 GPU
+kernel event 时间。两机均设置 SM 1620 MHz，计时内旧/新各观测到 3 个
+低于目标的 GPU 频率点（合计范围 1545–1590 MHz），保留所有样本。
+计时内采到的 HBM 均为 3201 MHz；部分短区间没有采样点。
+一次新版本启动因端口占用失败，未进入 GPU 计时，保留日志并换端口重跑。
+
+单机 EP8 / 双机 EP16 均通过 129/8K/20K 各两轮变化路由的完整数值验证，
+最大 relative L2 分别为 0.000838 / 0.000734；双机还通过 8K/20K
+无缓存推理、kernel-entry 检查及两次调用的 CUDA Graph 回放验证。
+前后 native 工作区容量一致；现有 Python 回归 117 tests / 470 subtests
+通过，没有增加单元测试。
+
+编译、SASS 归因及回归原始结果位于 `build/pf_backward_gdaki_20261012/`
+和 `build/pf_main_timeline/bwd_gdaki_only_final/`。
+
 ## M5：当前 GEMM 参数的 autotune
 
 原生源码保持 `e4db718`，固定当前 FWD、通信协议、M128 canonical 行、

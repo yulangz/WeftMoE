@@ -277,5 +277,63 @@
       "exported_capacity_entries": 2
     }
   },
-  "status": "M3 removes communication-window GEMM padding and fixes role register allocation. M4 reduces first-GEMM blocking with static readiness ordering. Final EP16 cycle improves 4.9%/6.6% over b151d93, but is only 1.9%/0.1% faster than old PF: no claimed substantial 20K lead. M5 bounded GEMM autotune finds no confirmed gain and retains native parameters; remaining 8/8 B return spill is in the unused proxy backend."
+  "gdaki_only_m6": {
+    "parent_commit": "8f8ba43",
+    "before_artifact": "build/pf_main_timeline/bwd_ready_final",
+    "after_artifact": "build/pf_main_timeline/bwd_gdaki_only_final",
+    "raw_directory": "build/pf_backward_gdaki_20261012",
+    "change": "Compile only GDAKI in native device code; explicitly request GDAKI for GIN device communicators. Preserve host-pass header parsing defaults, assertions, GEMM parameters, synchronization and pool geometry. System NCCL and standalone communication reference benchmark are unchanged.",
+    "topology": "two-node EP16 performance, EP8/EP16 correctness",
+    "tokens_per_rank": [8192, 20480],
+    "window_tokens": 2048,
+    "contribution_windows": 2,
+    "warmups": 4,
+    "samples": 16,
+    "prime_trace": true,
+    "requested_sm_clock_mhz": 1620,
+    "workload": "Gaussian token std fraction 0.1, route bias std 0.5, seed123",
+    "workload_hash_match": true,
+    "workspace_capacity_match": true,
+    "full_ms": {
+      "before0": [33.0302365, 77.382961],
+      "after0_retry": [33.2196365, 77.585914],
+      "after1": [33.12097, 78.037005],
+      "before1": [33.133854, 77.827915]
+    },
+    "backward_host_boundary_ms": {
+      "before0": [20.548652, 48.900664],
+      "after0_retry": [20.6048685, 48.895277],
+      "after1": [20.5642315, 49.3504815],
+      "before1": [20.6042135, 49.2939635]
+    },
+    "mean_full_ms": {
+      "before": [33.08204525, 77.605438],
+      "after": [33.17030325, 77.8114595]
+    },
+    "mean_backward_host_boundary_ms": {
+      "before": [20.57643275, 49.09731375],
+      "after": [20.58455, 49.12287925]
+    },
+    "conclusion": "Approximately +0.27% full-cycle latency and +0.04%/+0.05% BWD host-boundary latency: broadly unchanged, no demonstrated speedup or material regression. Not standalone GPU event timing.",
+    "clock_caveats": "Three sub-1620 MHz timed GPU observations in before0 and three across both after runs (1545-1590 MHz combined). All samples retained; all timed HBM observations 3201 MHz. Some short intervals have no clock sample.",
+    "setup_failure": "after0 rendezvous port32202 was occupied, no GPU timing occurred. Terminated only this run's waiting remote launcher and retained failure logs; retried on a free port as after0_retry.",
+    "compiler_spill_store_load_bytes": {
+      "before_network_main": [0, 0],
+      "after_network_main": [20, 44],
+      "before_return_helper": [8, 8],
+      "after_return_helper": [0, 0],
+      "after_local_main": [0, 0]
+    },
+    "static_return_helper_instructions": {"before": 4243, "after": 2383},
+    "spill_caveat": "Backend pruning changes register allocation. New main spills are scalar scheduling/phase-finish state, not GEMM accumulators; not a whole-program zero-local-memory claim. No C7507/C7512/C7518.",
+    "verification": {
+      "training": "EP8 and EP16: 129/8192/20480 tokens, two changing-route calls per size, window512, output/dX/dr/dW1/dW2",
+      "ep8_max_relative_l2": 0.0008383619715459645,
+      "ep16_max_relative_l2": 0.0007335633272305131,
+      "inference": "EP16 8192/20480, checkpoint off, numerical/kernel-entry checks, two-call CUDA Graph replay with changing routes",
+      "python_tests": 117,
+      "python_subtests": 470
+    }
+  },
+  "status": "M3 removes communication-window GEMM padding and fixes role register allocation. M4 reduces first-GEMM blocking with static readiness ordering. Final EP16 cycle improves 4.9%/6.6% over b151d93, but is only 1.9%/0.1% faster than old PF: no claimed substantial 20K lead. M5 bounded GEMM autotune retains native parameters. M6 restricts native device GIN to GDAKI; paired performance is broadly unchanged, return helper spill is removed but main retains scalar spills."
 }

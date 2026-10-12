@@ -27,7 +27,7 @@ __device__ __forceinline__ void fail(const char *, const char *, unsigned,
   ::weftmoe::cuda::nccl_assert_detail::fail(message, file, line, function)
 #endif
 
-#include <nccl_device.h>
+#include "cuda/communication/nccl_device.cuh"
 
 #if defined(__CUDA_ARCH__) && !WEFTMOE_DEBUG_VALIDATE
 #pragma pop_macro("__assert_fail")

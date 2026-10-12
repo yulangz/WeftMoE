@@ -1,4 +1,5 @@
 #include "cuda/activation_transport_internal.hpp"
+#include "cuda/communication/nccl_device.cuh"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/pipeline/contracts.hpp"
 #include "cuda/primitives/programmatic_launch.cuh"
@@ -8,7 +9,6 @@
 #include <cuda.h>
 #include <cuda/atomic>
 #include <cuda_runtime.h>
-#include <nccl_device.h>
 
 #include <algorithm>
 #include <atomic>
@@ -2709,6 +2709,7 @@ void DeviceNotifyPoolBridge::configure_communication(
   req.ginQueueDepth = 1024;
   req.ginConnectionType = resource->view.remote ? NCCL_GIN_CONNECTION_FULL
                                                 : NCCL_GIN_CONNECTION_NONE;
+  req.ginType = resource->view.remote ? NCCL_GIN_TYPE_GDAKI : NCCL_GIN_TYPE_NONE;
 #else
   // Single-node build: only the LSA (intra-node) exchange is compiled in, so
   // no GIN context, queue, or connection is requested from the device

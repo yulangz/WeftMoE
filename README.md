@@ -39,7 +39,9 @@ native code. Environments managed by uv can use `uv pip install .` or
 Python `build` package and run `python3 -m build`.
 
 Source builds require a C++17 compiler, CUDA with SM90a support, CUTLASS headers,
-and NCCL 2.31.2 or newer headers and libraries with GIN support. Configure toolchain discovery
+and NCCL 2.31.2 or newer headers and libraries with GIN support. Multi-node
+execution requires the GDAKI backend; CPU Proxy, GPI, and EFA GDA device paths
+are not compiled into the native library. Configure toolchain discovery
 with `CUDA_HOME`, `NVCC`, `CXX`, `CUTLASS_INCLUDE_DIR`, `NCCL_INCLUDE_DIR`, and
 `NCCL_LIB_DIR`. CUDA and NCCL are external runtime dependencies; the package does
 not bundle them. `MAX_JOBS` controls package-build parallelism.

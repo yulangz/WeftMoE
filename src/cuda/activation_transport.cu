@@ -1,6 +1,7 @@
 #include "cuda/activation_transport_internal.hpp"
 #include "cuda/communication/chunk_ring.cuh"
 #include "cuda/communication/local_notification.cuh"
+#include "cuda/communication/nccl_device.cuh"
 #include "cuda/communication/return_layout.hpp"
 #include "cuda/primitives/hopper.cuh"
 #include "cuda/primitives/programmatic_launch.cuh"
@@ -17,14 +18,6 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
-#include <nccl.h>
-#if __has_include(<nccl_device/core.h>)
-#include <nccl_device/core.h>
-#include <nccl_device/impl/comm__types.h>
-#endif
-#if __has_include(<nccl_device.h>)
-#include <nccl_device.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -1818,6 +1811,7 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
         pool->gin_layout.rings.channels() * communication::kRingDepth;
     requirements.ginCounterCount = 2U + wire_counters * pool->slots.size();
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+    requirements.ginType = NCCL_GIN_TYPE_GDAKI;
     internal::throw_nccl(
         "gin-create",
         dev_comm_create(nccl->comm, &requirements, &resources.dev_comm),
@@ -7081,6 +7075,7 @@ testing::run_distributed_gin_put_signal_probe(const NcclSession &session,
   requirements.ginSignalCount = 1;
   requirements.ginCounterCount = 1;
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
+  requirements.ginType = NCCL_GIN_TYPE_GDAKI;
   ncclDevComm_t dev_comm{};
   ncclWindow_t window = nullptr;
   void *allocation = nullptr;
@@ -7367,6 +7362,7 @@ testing::GinLinkBenchmarkResult testing::run_distributed_gin_link_benchmark(
   requirements.ginConnectionType = mode == GinConnectionMode::Rail
                                        ? NCCL_GIN_CONNECTION_RAIL
                                        : NCCL_GIN_CONNECTION_FULL;
+  requirements.ginType = NCCL_GIN_TYPE_GDAKI;
   ncclDevComm_t dev_comm{};
   ncclWindow_t window = nullptr;
   void *allocation = nullptr;
@@ -7676,6 +7672,7 @@ probe_activation_transport_capability(std::uint32_t world_size) {
         requirements.magic = NCCL_API_MAGIC;
         requirements.version = NCCL_VERSION_CODE;
         requirements.ginContextCount = 1;
+        requirements.ginType = NCCL_GIN_TYPE_GDAKI;
         requirements.ginExclusiveContexts = true;
         requirements.ginQueueDepth = 32;
         requirements.ginSignalCount = 4;
@@ -7832,6 +7829,7 @@ probe_activation_transport_capability(const NcclSession &session,
       error = "ncclCommQueryProperties: no GIN context type";
     } else {
       requirements.ginContextCount = 1;
+      requirements.ginType = NCCL_GIN_TYPE_GDAKI;
       requirements.ginExclusiveContexts = true;
       requirements.ginQueueDepth = 32;
       requirements.ginSignalCount = 4;
