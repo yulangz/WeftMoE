@@ -68,5 +68,6 @@ for i, variant in enumerate(variants):
         if line.startswith(("TRAINING_CYCLE_JSON ", "MEGAMOE_PREFILL_JSON ")):
             row = json.loads(line.partition(" ")[2])
             print("RESULT", label, row["nominal_tokens_per_rank"],
-                  row.get("forward_ready_slowest_rank_p50_us", row.get("device_slowest_rank_p50_us")),
+                  row.get("forward_ready_slowest_rank_p50_us") or
+                  row.get("device_slowest_rank_p50_us") or row["wall_slowest_rank_p50_us"],
                   flush=True)

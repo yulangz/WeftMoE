@@ -2,7 +2,7 @@
 
 namespace weftmoe_pf::ring {
 
-// The count-only Notify leaves route-sized tables untouched. Recover stable
+// The count phase leaves route-sized tables untouched. Recover stable
 // expert/source/route order here using its immutable chunk-count prefixes.
 __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
                                                  unsigned char *scratch) {

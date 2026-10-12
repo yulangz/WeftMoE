@@ -1,5 +1,7 @@
 # PF：将 main 的 notify/planner 拆成独立 kernel
 
+后续已在 `19ab646` 正式接入，见[正式实现与复测](pf_notify_production_20261012.md)；下文保留此前实验口径。
+
 本文测试的是训练缓存 FWD；不带缓存的单机 inference 拆分另见[专门消融](pf_inference_split_notify_20261012.md)。
 
 结论：可以替代 mini-notify，并保持训练缓存及 BWD 正确。完整 FWD 的收益不大：单机基本持平，双机 8K / 20K 耗时分别下降约 1.5% / 0.6%。本次保留为实验，不切换默认实现。

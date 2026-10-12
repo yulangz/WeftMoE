@@ -1,5 +1,7 @@
 # 单机 PF inference：独立 notify 的性能消融
 
+后续已在 `19ab646` 正式接入，见[正式实现与复测](pf_notify_production_20261012.md)；下文保留此前实验口径。
+
 结论：Flash 规模、EP8、8K/20K 下，拆出 notify 后完整推理性能基本持平，没有测到明显回退。这里是 **inference，不保存训练中间结果、不执行 mini-notify、不申请训练缓存**；与此前的[训练缓存实验](pf_split_notify_20261012.md)分开看。
 
 ## 完整推理结果

@@ -261,8 +261,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             planner, w, counts, a.dispatch.route_dst_row);
     }
   }
-  // Input staging overlaps source planning in both modes. The host has
-  // already allocated the training tape; math has no live GEMM state yet.
+  // Input staging overlaps source planning in both modes. This phase only
+  // uses persistent metadata; the training tape may be allocated after Notify.
   collective_scope_sync<Threads, kCollectiveJoinBarrier>();
   if constexpr (Network) {
     const auto &network = a.static_network;
