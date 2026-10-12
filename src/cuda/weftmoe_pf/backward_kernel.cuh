@@ -20,6 +20,12 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 128
 #endif
+#ifndef WEFTMOE_PF_BWD_WEIGHT_CACHE
+#define WEFTMOE_PF_BWD_WEIGHT_CACHE cute::TMA::CacheHintSm90::EVICT_NORMAL
+#endif
+#ifndef WEFTMOE_PF_BWD_INPUT_CACHE
+#define WEFTMOE_PF_BWD_INPUT_CACHE cute::TMA::CacheHintSm90::EVICT_NORMAL
+#endif
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -260,15 +266,18 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
         hopper::tma_load<kK, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
-                                       s.a[stage], k, input_row, 2U);
+                                       s.a[stage], k, input_row, 2U,
+                                       static_cast<uint64_t>(WEFTMOE_PF_BWD_INPUT_CACHE));
         if (dx)
           hopper::tma_load<kDxN, kK, 128U>(
               &w1, &s.full[stage], s.b[stage], t.column * kDxN,
-              t.expert * unsigned(2U * f.intermediate) + k);
+              t.expert * unsigned(2U * f.intermediate) + k, 1U,
+              static_cast<uint64_t>(WEFTMOE_PF_BWD_WEIGHT_CACHE));
         else
           hopper::tma_load<kDuN, kK, 128U>(&w2, &s.full[stage], s.b[stage],
                                            t.column * kDuN,
-                                           t.expert * unsigned(f.hidden) + k);
+                                           t.expert * unsigned(f.hidden) + k, 1U,
+                                           static_cast<uint64_t>(WEFTMOE_PF_BWD_WEIGHT_CACHE));
         s.full[stage].arrive_and_expect_tx((kM + (dx ? kDxN : kDuN)) * kK * 2U);
       }
       stage = (stage + 1U) % kStages;
