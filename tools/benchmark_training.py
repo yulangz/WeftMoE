@@ -179,7 +179,11 @@ def main():
                     len(batches), nodes, windows, world, owned).sum((1, 2, 4))
                 assert torch.equal(counts.sum((1, 2)).cpu(), expert_rows)
             window_padding = dict(actual_rows=incoming[args.warmups:].tolist(),
-                                  m128_rows=padded[args.warmups:].tolist())
+                                  m128_rows=padded[args.warmups:].tolist(),
+                                  canonical_m128_rows=(
+                                      ((expert_rows + 127) // 128 * 128)
+                                      .reshape(len(batches), world, owned)
+                                      .sum(-1)[args.warmups:].tolist()))
         max_rows = int(incoming.max()) + owned * 128
         if args.backend == "megatron":
             from benchmarks.megatron_training_backend import MegatronTrainingBackend

@@ -301,33 +301,18 @@ struct Copy {
   }
 };
 
-template <class Storage>
-__device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
-                                  unsigned warp, unsigned worker,
-                                  unsigned workers) {
+template <bool WindowAdmission, class Publish>
+__device__ __forceinline__ void pull_rows(const ForwardKernelArgs &a,
+                                          unsigned worker, unsigned workers,
+                                          Publish publish_row) {
   const auto lane = threadIdx.x % 32U;
-  Copy copy{s.pull[warp], s.pull_full[warp]};
   const auto &r = a.ring;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto bytes = unsigned(a.hidden * 2U);
-  auto *output = peer_at<char>(a.local_base, a.canonical_rows_offset);
-  auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
-  const auto publish_row = [&](std::uint64_t block, unsigned m, float gate,
-                               const char *input) {
-    const auto row = ring::row(a, block) + m;
-    if (!lane)
-      copy(input, output + row * bytes, bytes);
-    __syncwarp();
-    if (!lane) {
-      gates[row] = gate;
-      const auto valid = r.blocks[block].tile.rows;
-      local::arrive(ring::slot(a, block).x_full,
-                    m + 1U == valid ? local::kM - valid + 1U : 1U);
-    }
-  };
   for (std::uint64_t window = 0; window < r.state->windows; ++window) {
-    while (ring::acquire(r.state->admitted_windows) < window + 1U) {
-    }
+    if constexpr (WindowAdmission)
+      while (ring::acquire(r.state->admitted_windows) < window + 1U) {
+      }
     const auto begin = r.window_prefix[window] * local::kM;
     const auto end = r.window_prefix[window + 1U] * local::kM;
     for (auto row = begin + worker; row < end; row += workers) {
@@ -395,6 +380,31 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
                                  worker, window * stride + task, packet.rows);
     }
   }
+}
+
+template <class Storage>
+__device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
+                                  unsigned warp, unsigned worker,
+                                  unsigned workers) {
+  const auto lane = threadIdx.x % 32U;
+  Copy copy{s.pull[warp], s.pull_full[warp]};
+  const auto bytes = unsigned(a.hidden * 2U);
+  auto *output = peer_at<char>(a.local_base, a.canonical_rows_offset);
+  auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
+  pull_rows<true>(
+      a, worker, workers,
+      [&](std::uint64_t block, unsigned m, float gate, const char *input) {
+        const auto row = ring::row(a, block) + m;
+        if (!lane)
+          copy(input, output + row * bytes, bytes);
+        __syncwarp();
+        if (!lane) {
+          gates[row] = gate;
+          const auto valid = a.ring.blocks[block].tile.rows;
+          local::arrive(ring::slot(a, block).x_full,
+                        m + 1U == valid ? local::kM - valid + 1U : 1U);
+        }
+      });
 }
 
 } // namespace weftmoe_pf::network

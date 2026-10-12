@@ -130,7 +130,7 @@ __device__ __noinline__ void count_training_routes(const ForwardKernelArgs &a) {
     rank_barrier<0U, Threads>(a);
 }
 
-template <bool Network>
+template <bool Network, bool Backward = false>
 __global__ __launch_bounds__(384U, 1) void notify_kernel(
     const __grid_constant__ ForwardKernelArgs a) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
@@ -153,7 +153,7 @@ __global__ __launch_bounds__(384U, 1) void notify_kernel(
   if constexpr (Network) {
 
     if (a.retain_backward_state)
-      ring::prepare<true, true, Threads>(a, scratch);
+      ring::prepare<true, true, Threads, Backward>(a, scratch);
     else
       ring::prepare<true, false, Threads>(a, scratch);
 

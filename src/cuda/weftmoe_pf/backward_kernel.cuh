@@ -9,6 +9,18 @@ constexpr unsigned kDxN = backward_tuning::kDxTileN;
 constexpr unsigned kN = kDuN > kDxN ? kDuN : kDxN;
 constexpr unsigned kDuTiles = backward_tuning::kMainIntermediate / kDuN;
 constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
+#ifndef WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS
+#define WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS 184
+#endif
+#ifndef WEFTMOE_PF_BWD_WAVE_BLOCKS
+#define WEFTMOE_PF_BWD_WAVE_BLOCKS 128
+#endif
+constexpr unsigned kNetworkMathRegisters =
+    WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
+// The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
+constexpr unsigned kNetworkControlRegisters = 504U - 2U * kNetworkMathRegisters;
+static_assert(kNetworkMathRegisters >= 168U && kNetworkMathRegisters <= 240U &&
+              kNetworkMathRegisters % 8U == 0U);
 constexpr bool kEnabled = backward_tuning::kActivationClusterN == 2U &&
                           backward_tuning::kActivationTileK == kK &&
                           backward_tuning::kUnifiedWorkers &&
@@ -41,7 +53,8 @@ struct Schedule {
   const ForwardKernelArgs &a;
   unsigned expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
 
-  __device__ explicit Schedule(const ForwardKernelArgs &args) : a(args) {}
+  __device__ Schedule(const ForwardKernelArgs &args, const BackwardKernelArgs &)
+      : a(args) {}
 
   __device__ __forceinline__ bool next(Task &t) {
     const auto all_blocks = unsigned(a.ring.state->blocks);
@@ -169,10 +182,11 @@ namespace weftmoe_pf::backward_stream {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
 template <bool Network>
 __device__ __forceinline__ void
-produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
-        const CUtensorMap &dab, const CUtensorMap &w2, const CUtensorMap &w1) {
+produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
+        const CUtensorMap &dy, const CUtensorMap &dab, const CUtensorMap &w2,
+        const CUtensorMap &w1) {
   using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
-  Scheduler schedule(f);
+  Scheduler schedule(f, a);
   Task t;
   unsigned stage = 0U, phase = 0U;
   while (schedule.next(t)) {
@@ -181,12 +195,24 @@ produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
     const bool dx = t.phase == Phase::Dx;
     auto &slot = f.ring.slots[t.row / kM];
     if (cute::elect_one_sync()) {
-      if constexpr (Network)
-        while (!ring::admitted(f, t.block)) {
+      if constexpr (Network) {
+        if (!dx) {
+          const auto *ready = backward_pipeline_detail::scheduler_words(a) +
+                              directory_layout(a).dispatch_arrived;
+          while (ring::acquire(*reinterpret_cast<const std::uint64_t *>(
+                     ready + t.block)) < t.rows) {
+          }
+        } else {
+          while (ring::acquire(slot.activation_ready) <
+                     std::uint64_t(t.generation) * 2U ||
+                 ring::acquire(slot.returned) < t.generation - 1U) {
+          }
         }
-      const auto &ready = dx ? slot.activation_ready : slot.x_full;
-      while (ring::acquire(ready) <
-             std::uint64_t(t.generation) * (dx ? 2U : kM)) {
+      } else {
+        const auto &ready = dx ? slot.activation_ready : slot.x_full;
+        while (ring::acquire(ready) <
+               std::uint64_t(t.generation) * (dx ? 2U : kM)) {
+        }
       }
       if (!dx)
         while (ring::acquire(slot.fc2_done) <
@@ -196,11 +222,14 @@ produce(const ForwardKernelArgs &f, Shared &s, const CUtensorMap &dy,
     }
     __syncwarp();
     const auto reduction = dx ? 2U * f.intermediate : f.hidden;
+    const auto input_row =
+        Network ? (dx ? t.block * kM : directory(a)[t.block].compact_row)
+                : t.row;
     for (unsigned k = 0U; k < reduction; k += kK) {
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
         hopper::tma_load<kK, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
-                                       s.a[stage], k, t.row, 2U);
+                                       s.a[stage], k, input_row, 2U);
         if (dx)
           hopper::tma_load<kDxN, kK, 128U>(
               &w1, &s.full[stage], s.b[stage], t.column * kDxN,
@@ -232,7 +261,7 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   float accum[Mma::kNumAccum] = {};
   const auto reduction = Dx ? 2U * f.intermediate : f.hidden;
   const bool checkpoint_owner =
-      !Dx && t.column / 2U == t.block % (kDuTiles / 2U);
+      !Dx && !Network && t.column / 2U == t.block % (kDuTiles / 2U);
   const auto half = (t.column % 2U) * 64U;
   const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
   forward_compute_detail::StaticV4XCheckpoint<kK, 64U> checkpoint;
@@ -281,12 +310,17 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     const auto row = row0 + item * 8U;
     if (row >= t.rows)
       continue;
-    auto *output =
-        Dx ? static_cast<transport::BFloat16 *>(
-                 f.ring.rows[t.block * kM + row].output)
-           : a.recomputed_u +
-                 std::uint64_t(mapping[f.checkpoint.rows[t.block * kM + row]]) *
-                     a.intermediate;
+    transport::BFloat16 *output;
+    if constexpr (Dx)
+      output = Network ? dx_output(f, a, t, row)
+                       : static_cast<transport::BFloat16 *>(
+                             f.ring.rows[t.block * kM + row].output);
+    else
+      output = a.recomputed_u +
+               std::uint64_t(
+                   Network ? t.block * kM + row
+                           : mapping[f.checkpoint.rows[t.block * kM + row]]) *
+                   a.intermediate;
     output += t.column * N;
 #pragma unroll
     for (unsigned index = 0U; index < N / 8U; index += 4U) {
@@ -319,7 +353,7 @@ template <bool Network>
 __device__ __forceinline__ void
 compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
   using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
-  Scheduler schedule(f);
+  Scheduler schedule(f, a);
   Task t;
   unsigned stage = 0U, phase = 0U;
   const auto *mapping =
@@ -333,7 +367,8 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
       auto &slot = f.ring.slots[t.row / kM];
       if (!threadIdx.x)
         while (ring::acquire(slot.fc1_done) <
-               std::uint64_t(t.generation) * kDuTiles) {
+                   std::uint64_t(t.generation) * kDuTiles ||
+               (Network && ring::acquire(slot.returned) < t.generation - 1U)) {
         }
       using Sync =
           backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
@@ -341,27 +376,33 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
       for (unsigned row = t.column * 64U + threadIdx.x / 32U;
            row < (t.column + 1U) * 64U; row += 8U) {
         const bool valid = row < t.rows;
-        const auto saved = valid ? f.checkpoint.rows[t.block * kM + row] : 0U;
-        const auto padded = valid ? mapping[saved] : t.block * kM + row;
-        if (!Network || valid)
-          backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
-                                            threadIdx.x % 32U);
+        const auto saved =
+            valid ? (Network ? directory(a)[t.block].compact_row + row
+                             : f.checkpoint.rows[t.block * kM + row])
+                  : 0U;
+        const auto padded =
+            Network || !valid ? t.block * kM + row : mapping[saved];
+        backward_swiglu_epilogue_warp_row(a, padded, saved, valid,
+                                          threadIdx.x % 32U);
         __syncwarp();
         const auto lane = threadIdx.x % 32U;
-        auto *out = reinterpret_cast<uint4 *>(
-            a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
-        const auto *in = reinterpret_cast<const uint4 *>(
-            a.dab + std::uint64_t(padded) * 2U * a.intermediate);
-        for (unsigned column = lane; column < 2U * a.intermediate / 8U;
-             column += 32U)
-          out[column] = valid ? in[column] : make_uint4(0U, 0U, 0U, 0U);
+        if constexpr (!Network) {
+          auto *out = reinterpret_cast<uint4 *>(
+              a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
+          const auto *in = reinterpret_cast<const uint4 *>(
+              a.dab + std::uint64_t(padded) * 2U * a.intermediate);
+          for (unsigned column = lane; column < 2U * a.intermediate / 8U;
+               column += 32U)
+            out[column] = valid ? in[column] : make_uint4(0U, 0U, 0U, 0U);
+        }
         if (valid && !lane) {
-          const auto identity = f.ring.rows[t.block * kM + row];
           if constexpr (Network)
-            *gradient_output(f, identity) = a.dgate_rows[padded];
-          else
+            *gradient_output(f, a, t, row) = a.dgate_rows[padded];
+          else {
+            const auto identity = f.ring.rows[t.block * kM + row];
             a.peer_payloads[identity.source].dgate[identity.route] =
                 a.dgate_rows[padded];
+          }
         }
       }
       __threadfence_system();
@@ -378,7 +419,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
 
 // Phase helpers keep math/producer scopes separate from the return roles.
 template <bool Network>
-__device__ __noinline__ void
+__device__ __forceinline__ void
 begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
               unsigned char *storage,
               backward_unified_compute_detail::SharedState &state) {
@@ -417,7 +458,7 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
               device_globaltimer_ns());
 }
 
-__device__ __noinline__ void finish() {
+__device__ __forceinline__ void finish() {
   __syncthreads();
   cute::cluster_sync();
 }
@@ -467,7 +508,8 @@ __global__ __launch_bounds__(384U, 1) void kernel(
   cute::cluster_sync();
   if (threadIdx.x < 256U) {
     cutlass::arch::warpgroup_reg_alloc<
-        backward_tuning::kUnifiedMathRegisters>();
+        Network ? kNetworkMathRegisters
+                : backward_tuning::kUnifiedMathRegisters>();
     compute<Network>(f, a, s);
     begin_weights<Network>(f, a, storage, state);
     backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
@@ -480,9 +522,10 @@ __global__ __launch_bounds__(384U, 1) void kernel(
     finish();
   } else {
     cutlass::arch::warpgroup_reg_dealloc<
-        backward_tuning::kUnifiedControlRegisters>();
+        Network ? kNetworkControlRegisters
+                : backward_tuning::kUnifiedControlRegisters>();
     if (threadIdx.x < 288U) {
-      produce<Network>(f, s, dy_map, dab_map, w2_map, w1_map);
+      produce<Network>(f, a, s, dy_map, dab_map, w2_map, w1_map);
       begin_weights<Network>(f, a, storage, state);
       backward_unified_compute_detail::UnifiedComputeSynchronization<false>
           sync{state};
@@ -496,7 +539,7 @@ __global__ __launch_bounds__(384U, 1) void kernel(
       if constexpr (Network) {
         auto &comm =
             *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
-        network::workers<true, kDuTiles, kDxTiles>(f, comm);
+        network_workers(f, a, comm);
         finish_network(f, a);
       } else {
         if ((threadIdx.x - 288U) / 32U < local::kPullWarps)

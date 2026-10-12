@@ -6198,7 +6198,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     pf_args.output = static_cast<transport::BFloat16 *>(data.dx->data);
     args.activation_stride = std::max<std::uint64_t>(
         config.hidden_size, 2ULL * config.intermediate_size);
-    if (2U * config.intermediate_size <= config.hidden_size) {
+    if (use_gin) {
+      dab_map = make_bf16_tma_map(
+          args.dab, 2ULL * config.intermediate_size, data.padded_rows, 128U,
+          "PF Backward canonical dAB", 64U);
+    } else if (2U * config.intermediate_size <= config.hidden_size) {
       args.dx_rows =
           at<transport::BFloat16>(slot.device, layout.canonical_rows);
       dab_map = make_bf16_tma_map(args.dx_rows, config.hidden_size,
@@ -6436,7 +6440,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     // belongs to the shared execution workspace and may contain a later layer.
     // Rebuild it from retained counts (no count notify), staging dY in the same
     // planner just as Forward stages X.
-    const auto planner = use_gin ? weftmoe_pf::notify_kernel<true>
+    const auto planner = use_gin ? weftmoe_pf::notify_kernel<true, true>
                                 : weftmoe_pf::notify_kernel<false>;
     constexpr std::size_t planner_smem = 64U * 1024U;
     int planner_clusters = 0;
@@ -6470,7 +6474,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
           <<<dim3(128U, view.sizes.owned_expert_count), 256, 0,
              transport_stream>>>(pf_args, args);
       weftmoe_pf::backward_stream::
-          prepare_network<<<compute_ctas, 256, 0, transport_stream>>>(pf_args);
+          prepare_network<<<compute_ctas, 256, 0, transport_stream>>>(pf_args,
+                                                                      args);
     } else {
       weftmoe_pf::backward_stream::prepare<false>
           <<<dim3(128U, view.sizes.owned_expert_count), 256, 0,
@@ -6579,7 +6584,9 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto launch_result =
       pf_stream
           ? cudaLaunchKernelEx(&launch, stream_kernel, pf_args, args,
-                               slot.forward_x_map, dab_map,
+                               use_gin ? peer_workspace.buffer->dr_map
+                                       : slot.forward_x_map,
+                               dab_map,
                                retained.weights.impl_->backward_w2_map,
                                retained.weights.impl_->backward_w1_map,
                                peer_workspace.buffer->dr_mn_map, data.u_mn_map,

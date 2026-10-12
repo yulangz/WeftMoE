@@ -36,6 +36,8 @@ struct alignas(64) NetworkSlot {
   // Backward-only scalar payload. Forward does not advance this sequence.
   std::uint64_t gradient_signal = 0;
   std::uint64_t gradient_target = 0;
+  std::uint64_t backward_dx_signal = 0;
+  std::uint64_t backward_gate_signal = 0;
 };
 static_assert(sizeof(NetworkSlot) == 64U);
 
@@ -53,6 +55,7 @@ struct alignas(64) NetworkChannel {
   std::uint64_t acknowledged_head;
   std::uint64_t credit_signal;
   std::uint64_t tx_packed_head;
+  std::uint64_t backward_rows;
 };
 static_assert(sizeof(NetworkChannel) == 128U);
 

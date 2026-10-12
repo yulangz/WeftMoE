@@ -88,5 +88,65 @@
     "python_tests": 117,
     "python_subtests": 470
   },
-  "status": "M1/M2 and multi-tape lifetime correctness complete; same-window2048 multi-node performance remains below old PF"
+  "canonical_backward_m3": {
+    "before_commit": "b151d93",
+    "artifact": "build/pf_main_timeline/bwd_canonical_final",
+    "retained": {
+      "network_math_registers": 184,
+      "network_control_registers": 136,
+      "network_compute_wave_mblocks": 128,
+      "activation_wgmma_wait_group": 0,
+      "return_pending_fragments_per_owner": 1,
+      "additional_persistent_payload_bytes": 0
+    },
+    "single_node_ep8_full_ms": {
+      "before": [25.236215, 64.4898965],
+      "after": [25.2127835, 62.568548],
+      "inline_only_earlier_measurement": [25.071469, 61.1551005]
+    },
+    "two_node_ep16_full_ms": {
+      "old_pf_repeated": [33.5024805, 80.921348],
+      "before": [34.5632975, 86.5512],
+      "after": [33.237604, 81.5221745]
+    },
+    "after_backward_host_boundary_ms": {
+      "ep8": [17.102615, 42.9709505],
+      "ep16": [21.113178, 51.8413775]
+    },
+    "ep16_extra_m128_rows_over_real_rows": {
+      "before": [0.23189818090281689, 0.2216873271455868],
+      "after": [0.020937066751083755, 0.008102094558926964]
+    },
+    "ablation_ep16_full_ms": {
+      "inline_only": [35.659299, 86.7988825],
+      "canonical_r192": [33.575473, 83.7415775],
+      "canonical_r184": [35.6405315, 82.932665],
+      "wave128": [33.385175, 81.892678],
+      "retained_tape_tables": [33.015994, 81.374635],
+      "rejected_async_return": [33.9727045, 81.7820025],
+      "rejected_wgmma_wait1": [33.5398745, 81.856258]
+    },
+    "compiler_spill_store_load_bytes": {
+      "single_node_kernel": [0, 0],
+      "two_node_kernel": [12, 224],
+      "network_pull_get_return_receive": [0, 0],
+      "caveat": "Static compiler totals, not dynamic traffic. Main retains scalar reloads; no accumulator local stores found in math branch. No C7507/C7512/C7518 in retained build."
+    },
+    "clock_caveats": {
+      "canonical_local_perf": "All observed clocks 1620 MHz",
+      "canonical_final_perf": "One 1590 MHz observation outside timed intervals",
+      "m3_old_repeat": "One 1500 MHz observation during 20K sample 6; all samples retained"
+    },
+    "verification": {
+      "single_node": "tape_local_verify: tokens 1/129/8192/20480, two changing-route calls each, window512",
+      "two_node": "canonical_final_verify: tokens129/8192/20480, two changing-route calls each, window512",
+      "hot_routes": "canonical_hot_verify: tokens8192/20480, two changing-route calls each, bias8, window512",
+      "hot_routes_max_relative_l2": 0.0002749997074715793,
+      "lifetime": "tape_lifetime and canonical_lifetime: three live tapes, moving hotspots/lengths, weight update, workspace release/recreate, two-layer inference graph/offload",
+      "inference": "tape_inference_network: EP16 8192/20480, checkpoint off, numerical and kernel-entry checks",
+      "python_tests": 117,
+      "python_subtests": 470
+    }
+  },
+  "status": "M3 removes repeated communication-window GEMM padding and fixes role register allocation. Single node improves over old PF; two-node complete-cycle performance is approximately tied with old PF, not a claimed universal speedup."
 }

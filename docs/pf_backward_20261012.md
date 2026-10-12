@@ -3,6 +3,137 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M3：消除窗口 padding 和修复寄存器分工
+
+本轮改动的简要说明（详细消融和最终测量见本节末尾）：
+
+- 多机 dQ/dX 按完整专家行切 M128，不再按每个通信窗口分别补齐。
+  同一随机 trace 的额外计算行数 / 有效行数，8K 从 23.19% 降到 2.09%，
+  20K 从 22.17% 降到 0.81%。剩余仅为各专家最后一个 M tile 的对齐。
+- Dispatch 直接填充 dW2 本来就需要的 compact dY cache；dX 直接读完整
+  dAB cache。RX 的 fanout credit 与 GEMM 解耦，不增加一份完整激活缓冲。
+- dX 按 canonical M-block 写已有注册 TX，目的为源 rank 的完整 contribution。
+  不再绕到同 rail GPU 的旧物理窗口 TX；连续 source/contribution 行合并 Put。
+  本地 NIC completion 保护 TX 复用，源 contribution 在调用结束前不复用。
+- 内联跨 math/producer/comm 的阶段收尾 helper，让 `setmaxnreg` 真正生效。
+  单机静态 spill store/load 从 72/92 B 降至 0/0 B；完整周期
+  25.236/64.490 ms → 25.071/61.155 ms（8K/20K）。
+- 多机重新分配 math/control 寄存器，并将 compute wave 从整个 ring
+  缩小到 128 个 M-block；提前开始 dX/return，不改变 RX/TX 容量。
+- BWD 直接使用当前 tape 保存的 route ordinals 和 packet/fanout 表，省去
+  重复生成；仍重建共享工作区的物理计划和当前通信 epoch。
+
+### 布局与同步
+
+FWD 的行缓存仍为 expert/source/route 顺序。BWD 的物理 RX 目录也改用
+稳定 source 顺序，但只用于读取/退休通信 packet，不再决定 GEMM M-padding。
+每次 BWD 从当前 tape 重建 canonical M-block 目录和 source/contribution
+反向映射，分别复用旧 scheduler descriptor 和闲置 route-header 区域。
+不能复用前次 FWD 的物理目录；后续层可能已覆盖它。
+
+本地 pull 把 dY 写入 compact cache，release 增加对应 canonical M-block
+的 arrived rows；producer acquire 达到 valid_rows 才发出该块 TMA。
+dQ 的 N tiles 完成后，两份 SwiGLU 任务生成 Q、dAB、dr，再发布 dX ready。
+return owner 等所有 dX N tiles 完成后发送；对本块全部 fragment 完成
+本地 NIC flush/wait 才发布 TX returned generation。下代 SwiGLU/dr 和
+dX 都等待这一 credit，因此不会在 NIC 仍读取时覆盖 TX。
+
+return 不需要远端 RX-slot credit：它写的是源 rank 已有的整调用 contribution，
+不是短 RX ring。每个源 rank 按远端节点累计期望 route 行数；各 expert rank
+用两个独立 GIN weak signal 累加 dX/dr 完成行数，源端 acquire 两个计数后
+才能 reduce。最终仍有全 rank 终止 barrier，防止下一次调用覆盖 contribution。
+RX Get/fanout ring、TX ring、compute slot 仍是有界容量；没有 full dX 缓冲。
+两个 signal 和一个累计行数字段填入原结构的 padding，结构大小不变。
+
+### spill 的原因与不能混淆的指标
+
+原来的跨角色 `__noinline__` 阶段 helper 令 ptxas 报 C7507：
+`setmaxnreg` 被忽略，math 和 control 实际都受初始 168 registers 限制。
+仅修复内联又会暴露另一个问题：单机合适的 208/88 配额不够多机 GIN
+控制流使用，控制路径出现大量 spill。因此不能直接沿用单机配额。
+
+384-thread CTA 初始池是 `384 * 168 = 64512`，不是 65536。
+192/128 超过实际池，试验中在 setmaxnreg 等待而无法前进，已撤回；
+192/120 和 184/136 才满足池约束。184/136 下同步 return 版本的
+pull/Get/return/receive 编译器 spill 均为零，主 kernel 仍有少量 spill。
+SASS 中大量 LDL/STL 来自 GIN/SDK 的调用栈和 local-address atomic 分支，
+不能把它们全部算作 WGMMA accumulator spill；主 kernel 残留项包含线程编号
+和控制状态的 reload，仍要检查是否落在 K-loop，并以实际耗时决定取舍。
+
+### 逐步消融
+
+以下均为 EP16、Flash H4096/I2048/E256/top6、2048-token window、相同
+变化长度/变化路由 trace，4 warmups / 8 samples；单位 ms，完整 FWD+BWD。
+
+| 候选 | 8K | 20K | 说明 |
+|---|---:|---:|---|
+| 本轮修改前 `b151d93` | 34.563 | 86.551 | 旧物理窗口切 GEMM |
+| 只修复内联 | 35.659 | 86.799 | 208/88 引入 GIN spill，不单独保留 |
+| canonical M-block + 192/120 | 33.575 | 83.742 | 消除重复 padding |
+| 184/136，整 ring compute wave | 35.641 | 82.933 | spill 更少不等于更快 |
+| 184/136，wave=128 | 33.385 | 81.893 | 提前启动 dX/return |
+| 再去掉重复 tape 表生成 | 33.016 | 81.375 | 多份 live tape 回归通过 |
+| return 每 owner 4 个在途 fragment | 33.973 | 81.782 | 无收益，撤回；增加了 spill |
+| dQ/dX 保留一个在途 WGMMA group | 33.540 | 81.856 | 数值通过，无收益，撤回 |
+
+没有筛除慢样本。前三个 canonical 候选和 tape 候选各存在少量低于请求
+1620 MHz 的观测，其中部分落在 20K 计时区间，不能解读百分之一的差异。
+return 流水候选频率采样全部 1620 MHz；其结果仍不支持保留此改动。
+将整个通信收尾拆成 noinline 函数还触发 ptxas C7512/C7600
+（184 寄存器下 WGMMA 分配失败），也未保留。
+在途 WGMMA group 方案将 empty-stage release 延后一轮，最终 drain
+剩下的一组；没有 C7512/C7518，EP16 的 129/8K/20K 数值检查通过，
+但单机也测得 25.651/63.857 ms，不优于原 K-loop。因此保留逐轮 wait<0>。
+
+构建日志、SASS 和逐 rank 原始测量分别在
+`build/pf_main_timeline/bwd_canonical_*`、
+`build/pf_backward_20261012/*_spills/` 和
+`build/pf_backward_20261012/results/`。
+
+### 保留版复测
+
+最终 artifact 为 `bwd_canonical_final`：184/136、wave=128、同步 fragment
+return、原 wait<0> K-loop。相同 trace 的完整 FWD+BWD wall p50：
+
+| 拓扑 / tokens | 旧 PF `main@1cfb423` | 本轮前 `b151d93` | 本轮后 | 对本轮前延迟下降 |
+|---|---:|---:|---:|---:|
+| 单机 EP8 / 8K | 26.483 | 25.236 | 25.213 | 0.1% |
+| 单机 EP8 / 20K | 68.624 | 64.490 | 62.569 | 3.0% |
+| 双机 EP16 / 8K | 33.502 | 34.563 | 33.238 | 3.8% |
+| 双机 EP16 / 20K | 80.921 | 86.551 | 81.522 | 5.8% |
+
+旧 PF 单机行沿用本轮任务早期基线；双机旧 PF 为此次重新运行的
+`m3_old_repeat`。旧 PF 不是 V3。所有 workload hash 与对应旧 trace 一致。
+最终单机频率观测全为 1620 MHz；最终双机仅在计时外观测到一次 1590 MHz。
+旧 PF 双机复测有一次 1500 MHz 落在 20K sample 6，所有样本原样保留。
+双机相较旧 PF 8K 快 0.8%、20K 慢 0.7%，只称基本持平，不宣称全面领先。
+
+按 host API 边界拆分的 BWD p50（不是纯 kernel 时间）：
+
+| 拓扑 | 本轮前 8K / 20K | 本轮后 8K / 20K |
+|---|---:|---:|
+| EP8 | 17.261 / 44.717 | 17.103 / 42.971 |
+| EP16 | 22.429 / 56.678 | 21.113 / 51.841 |
+
+padding 降幅不能直接当成完整周期收益：此次改变的是 dQ/dX 的 M 行数，
+dW1/dW2 原本已经按完整专家行计算，且 FWD 未变。以有效 GEMM FLOPs 计，
+dQ/dX 只占 BWD 的一半、FWD+BWD 的三分之一，此外还有通信和准备开销。
+
+保留版编译：单机 BWD 0/0 B spill；多机主 kernel 12/224 B spill
+store/load，pull/Get/return/receive 均为 0/0 B。没有 C7507、C7512、C7518。
+这些字节是编译器静态统计，不是每调用或每 M-tile 的实际流量。
+反汇编 math 分支无 accumulator store-to-local；少量标量 reload 尚未消除。
+
+验证覆盖：EP8 的 1/129/8K/20K、EP16 的 129/8K/20K，每规模两轮变化
+路由；EP16 8K/20K 额外 bias=8、512-token 窗口回绕，包含空专家。
+output/dX/dr/dW1/dW2 全部通过原容差；热点最大 relative L2 为 0.000275。
+保留 tape 优化通过三份同时存活 tape、权重更新、workspace 释放重建、
+两层 inference graph/offload 检查。PF 无缓存推理的 EP16 8K/20K 数值和
+kernel-entry 回归通过。现有 Python 回归 117 tests / 470 subtests 通过，
+没有新增单元测试或更改误差阈值。DT 代码未改，此轮未重跑其性能。
+
+后面的 M1/M2 章节保留当时的实现和测量过程；当前多机协议以本节为准。
+
 ## 设计与里程碑
 
 - [x] M1 单机：复用 PF destination-pull、输入 ring 和完整 source
@@ -12,8 +143,9 @@
 - [x] M2 多机协议：复用当前借用 warp 的按节点去重、逐 token Get、机内 pull、
   直接 TX contribution/Put return。路由和计数来自 FWD tape，不再重新
   counts notify。RX fanout、TX NIC completion 和远端 credit 分开退休。
-- [ ] M3 优化与回归：分别测 dQ/dX/dW 参数、缓存写出和激活融合；覆盖随机
-  tokens/routes、热点/空专家、多轮 slot 回绕。FWD 和 DT 不改变数学流程。
+- [x] M3 消除通信窗口引入的 dQ/dX padding，修复寄存器分工，缩小 compute
+  wave，消除重复 tape 表生成；覆盖随机 tokens/routes、热点/空专家和
+  slot 回绕。FWD 和 DT 不改变数学流程。dW 参数的进一步搜索不在本次结论内。
 
 数学记号：A/B 为 FC1 gate/up，r 为 router 权重，Q=r*SiLU(A)*B。
 dQ=dY*W2^T；SwiGLU backward 同时生成 dAB、dr 和供 dW2 使用的 Q。

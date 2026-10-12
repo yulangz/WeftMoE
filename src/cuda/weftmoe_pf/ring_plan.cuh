@@ -191,11 +191,12 @@ build_small_window_rows(const ForwardKernelArgs &a, const unsigned *counts,
   }
 }
 
-template <bool Network, bool Training = false, unsigned Threads = 384U>
+template <bool Network, bool Training = false, unsigned Threads = 384U,
+          bool Backward = false>
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
   constexpr unsigned Math = 256U, SourceThreads = Threads - Math;
-  constexpr bool Canonical = Training && !Network;
+  constexpr bool Canonical = Training && (!Network || Backward);
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -218,7 +219,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   } else {
     grid_sync<0U, Threads>(a);
   }
-  if constexpr (Training)
+  // Route ordinals and fanout belong to the retained tape. Backward only
+  // rebuilds the execution workspace's physical window/packet directory.
+  if constexpr (Training && !Backward)
     if (a.checkpoint.counts.runtime) {
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline,
                                  blockIdx.x == 0U && threadIdx.x == 0U,
@@ -318,7 +321,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     }
     // Backward's immutable packet/fanout tape is not part of the published
     // Forward directory. Build it while those independent puts are in flight.
-    if constexpr (Training)
+    if constexpr (Training && !Backward)
       if (a.checkpoint.counts.runtime) {
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U,
                                    TrainingPacketsBegin, Kernel, 0U, 0U, 0U);
