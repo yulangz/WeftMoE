@@ -3,6 +3,32 @@
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
 旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
 
+## M10：autotune 修补与 FWD 训练缓存向量化（2026-10-13）
+
+- 修复 dW chunk 的 Python/C++ 约束不一致：1/2/4/8/16 都是合法值，
+  dW1/dW2 仍独立配置，生产默认保持 4/1。没有重新引入旧调度分支。
+- FWD 的 saved gate/up 从 BF16×2 store 改为 128-bit store，复用已有
+  四 lane 寄存器转置。直接保存 WGMMA 的 BF16 舍入结果，不新增 shared
+  staging、GM 重读、持久缓冲，也不改变 saved-row 映射。
+- FC1→FC2、saved-X 已有向量化/复用 GEMM 加载，单机 FC2 已有延后发布，
+  不重复修改。多机逐 tile 的 NIC 可见性 fence 保留。
+- benchmark 新增 `--backward-only`，先在计时外完成新 FWD 和跨 rank
+  同步，再测 BWD 到梯度就绪；与 `--forward-only` 分开运行。
+
+相同热点 trace 的带缓存 FWD 初筛（ms，4 warmups / 16 samples）：
+
+| 拓扑 / tokens | 改动前 | saved gate/up 向量化 | 延迟下降 |
+|---|---:|---:|---:|
+| EP8 / 8K | 8.221 | 7.895 | 4.0% |
+| EP8 / 20K | 18.655 | 18.211 | 2.4% |
+| EP16 / 8K | 12.415 | 12.165 | 2.0% |
+| EP16 / 20K | 28.552 | 27.801 | 2.6% |
+
+这是单轮消融，不代替最终正反序 PF/Megatron 对照。单/双机、均衡/热点
+路由的 129/8K/20K 两轮完整梯度检查均通过；默认 FWD main 未新增 spill。
+原始日志位于 `build/pf_fwd_bwd_20261013/`，初筛标签 `screen_fwd_*`，
+正确性标签 `vector_verify_*`。
+
 最新进展见 [M9：通信/GEMM 拆解与数据流优化](pf_backward_bottleneck_20261012.md)。
 M7 的主 kernel 零 spill 保持；M9 改善的是热点专家任务排布和中间数据流，
 不是把 M8 的无收益 L2 swizzle 重新启用。

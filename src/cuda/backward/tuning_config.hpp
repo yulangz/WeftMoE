@@ -268,10 +268,12 @@ static_assert(kDispatchBatchRows >= kComputeThreads / 32U &&
               kDispatchBatchRows <= 128U);
 static_assert(kEpilogueRowsPerTask >= kComputeThreads / 32U &&
               kEpilogueRowsPerTask <= kTileM);
-static_assert(kDw2ClaimTiles == 1U || kDw2ClaimTiles == 2U || kDw2ClaimTiles == 4U ||
-              kDw2ClaimTiles == 8U || kDw2ClaimTiles == 16U);
-static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 2U || kDw1ClaimTiles == 4U ||
-              kDw1ClaimTiles == 8U || kDw1ClaimTiles == 16U);
+static_assert(kDw2ClaimTiles == 1U || kDw2ClaimTiles == 2U ||
+              kDw2ClaimTiles == 4U || kDw2ClaimTiles == 8U ||
+              kDw2ClaimTiles == 16U);
+static_assert(kDw1ClaimTiles == 1U || kDw1ClaimTiles == 2U ||
+              kDw1ClaimTiles == 4U || kDw1ClaimTiles == 8U ||
+              kDw1ClaimTiles == 16U);
 static_assert(kSetupThreads >= 32U && kSetupThreads <= 1024U &&
               kSetupThreads % 32U == 0U);
 static_assert(kReduceThreads >= 32U && kReduceThreads <= 1024U &&

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Eager training FWD(+BWD) with varying tokens and synthetic routes (torchrun).
+"""Eager training cycle or isolated FWD/BWD with varying tokens/routes (torchrun).
 
 Input preparation is untimed. This exercises changing communication sizes, not
 a full training step: expert weights are fixed and there is no optimizer.

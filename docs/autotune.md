@@ -8,12 +8,19 @@
 
 - dU/dX 的 N tile 可分别取 128/256；二者共用 operand ring，stage 数
   联合比较 2/3/4。本轮 Flash 的 M128、K64 和 cluster N2 保持不变；
-  改 K128 会退出当前 stream kernel，不能混进这次纯调参比较。
+  stream 已支持 K128，但当前搜索配置未加入这项；此前 K128/两级流水
+  没有确认跨规模收益，因此仍以 K64 为默认。
   更换 H/I 时还需确认 `I % (2*DuN) == 0`、`H % (2*DxN) == 0`，
   否则会退出当前 cluster-N2 stream 路径，不能沿用本轮结论。
 - dW1/dW2 共用 M/N 几何和 stage 数，比较 M128/N256、M256/N128、
   M128/N128，以及两级/三级流水。四级流水也提出候选，但 M128/N256
   的 shared memory 超限会被资源检查过滤。
+- 静态轮转的 chunk 粒度分别由 `backward.dw1_claim_tiles` 和
+  `backward.dw2_claim_tiles` 控制，单位是 cluster tile-pair，默认 4/1。
+  两者均支持 1/2/4/8/16。2026-10-13 修复了 C++ 仍拒绝 2、而 Python
+  已允许 2 的不一致；搜索配置中的 2/2、4/2 现在可以正常编译。
+  本配置比较有限的组合，若需要笛卡尔搜索，可使用已有 `axes` 字段；
+  并非将 4/1 视为所有模型的最优解。
 - 不搜索旧 `dx_claim_tiles` / `return_window_scale`，它们不控制当前
   canonical stream 的 dX/return；下面旧记录不能当作新实现的调参结论。
 - `environment` 显式固定工作区环境参数，逐节点传入，避免改变 buffer
@@ -24,6 +31,18 @@
 不能只按静态 spill 字节数排序，需检查执行分支和完整周期性能。
 该配置是有限预算的单参数/耦合组合筛选，不是全部超参的笛卡尔穷举，
 也尚未把 dW1/dW2 的 tile/stages 拆成四套完全独立的 GEMM 配置。
+
+### 独立 FWD / 缓存就绪后的 BWD 测量
+
+`tools/benchmark_training.py --forward-only` 的
+`forward_ready_slowest_rank_p50_us` 包含带 X/GU 缓存的 FWD 及完成同步，
+计时结束时 tape 仍存活；默认包括每调用权重重排。
+
+`--backward-only` 每次在计时外执行一次新 FWD、同步所有 rank，再执行
+BWD。`backward_ready_slowest_rank_p50_us` 包含 BWD 前置、临时分配、计算、
+通信与完成同步，计时结束时输出梯度仍存活。不是复用旧路由/tape，也不是
+用完整周期减去 FWD host API 时间。两模式互斥，均另报包含外部释放的
+`wall_slowest_rank_p50_us`。分开运行的两项 p50 不能直接拼成历史完整周期。
 
 ## PF 动态训练 FWD+BWD 搜索（2026-10-04）
 

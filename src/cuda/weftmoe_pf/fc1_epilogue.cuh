@@ -15,35 +15,6 @@ __device__ __forceinline__ float2 static_v4_swiglu_pair(const float *gate,
                      gated_swiglu_fc2_input<FastMath>(g.y, u.y, route_weight));
 }
 
-// Save directly from WGMMA registers when the shared epilogue arena cannot
-// hold three planes. In particular, local PF keeps its S-only TMA fast path.
-template <unsigned Fc1TileN, class Args>
-__device__ __forceinline__ void
-static_v4_save_fc1_tile(const Args &a, const float *accum,
-                        std::uint32_t valid_rows, std::uint32_t column_base,
-                        std::uint64_t mblock) {
-  const auto lane = threadIdx.x % 32U;
-  const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
-  for (unsigned item = 0U; item < 2U; ++item) {
-    const auto m = row0 + item * 8U;
-    if (m >= valid_rows)
-      continue;
-    const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
-#pragma unroll
-    for (unsigned index = 0U; index < Fc1TileN / 16U; ++index) {
-      const auto *g = accum + index * 8U + item * 2U;
-      const auto *u = g + 4U;
-      const auto column = column_base + index * 8U + (lane % 4U) * 2U;
-      auto *gate = a.saved_ab + saved * a.intermediate + column;
-      auto *up = gate + a.saved_rows * a.intermediate;
-      *reinterpret_cast<__nv_bfloat162 *>(gate) =
-          __float22bfloat162_rn(make_float2(g[0], g[1]));
-      *reinterpret_cast<__nv_bfloat162 *>(up) =
-          __float22bfloat162_rn(make_float2(u[0], u[1]));
-    }
-  }
-}
-
 // Transpose four BF16x2 words across four lanes. Each lane then owns eight
 // consecutive columns, without staging the WGMMA fragment through shared.
 __device__ __forceinline__ uint4 static_v4_transpose_vector(uint4 v) {
@@ -62,6 +33,41 @@ __device__ __forceinline__ uint4 static_v4_transpose_vector(uint4 v) {
   v.y = (lane & 2U) ? t : v.y;
   v.w = (lane & 2U) ? v.w : t;
   return v;
+}
+
+// Checkpoint gate/up directly from the same WGMMA accumulators used by
+// SwiGLU. Each four-lane group owns one row, including a partial M tail.
+template <unsigned Fc1TileN, class Args>
+__device__ __forceinline__ void
+static_v4_save_fc1_tile(const Args &a, const float *accum,
+                        std::uint32_t valid_rows, std::uint32_t column_base,
+                        std::uint64_t mblock) {
+  const auto lane = threadIdx.x % 32U;
+  const auto row0 = (threadIdx.x / 32U) * 16U + lane / 4U;
+  for (unsigned item = 0U; item < 2U; ++item) {
+    const auto m = row0 + item * 8U;
+    if (m >= valid_rows)
+      continue;
+    const auto saved = a.checkpoint.rows[mblock * forward_tuning::kTileM + m];
+#pragma unroll
+    for (unsigned index = 0U; index < Fc1TileN / 16U; index += 4U) {
+      unsigned gate_words[4], up_words[4];
+#pragma unroll
+      for (unsigned j = 0U; j < 4U; ++j) {
+        const auto *g = accum + (index + j) * 8U + item * 2U;
+        const auto *u = g + 4U;
+        gate_words[j] = float2_to_bf16x2_bits(g[0], g[1]);
+        up_words[j] = float2_to_bf16x2_bits(u[0], u[1]);
+      }
+      const auto column = column_base + index * 8U + (lane % 4U) * 8U;
+      auto *gate = a.saved_ab + saved * a.intermediate + column;
+      auto *up = gate + a.saved_rows * a.intermediate;
+      *reinterpret_cast<uint4 *>(gate) = static_v4_transpose_vector(
+          make_uint4(gate_words[0], gate_words[1], gate_words[2], gate_words[3]));
+      *reinterpret_cast<uint4 *>(up) = static_v4_transpose_vector(
+          make_uint4(up_words[0], up_words[1], up_words[2], up_words[3]));
+    }
+  }
 }
 
 template <unsigned Fc1TileN, bool FastMath = false, class Args>
