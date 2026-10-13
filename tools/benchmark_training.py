@@ -5,6 +5,8 @@ Input preparation is untimed. This exercises changing communication sizes, not
 a full training step: expert weights are fixed and there is no optimizer.
 Forward-only retains X/GU until device completion and reports both cache-ready
 and release-inclusive wall time. Default PF timing includes weight packing.
+Backward-only prepares and synchronizes a fresh Forward tape outside timing;
+its cache-ready measurement ends with gradients live, before external release.
 """
 
 import argparse
@@ -82,8 +84,11 @@ def main():
                         help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
     parser.add_argument("--backward-identity", action="store_true",
                         help="Verify the communication-only diagnostic, not a training kernel")
-    parser.add_argument("--forward-only", action="store_true",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--forward-only", action="store_true",
                         help="Time training forward with saved X/GU, tape release and synchronize, without backward")
+    mode.add_argument("--backward-only", action="store_true",
+                      help="Time backward on a fresh, synchronized Forward tape; Forward is untimed")
     parser.add_argument("--prepared-weights", action="store_true",
                         help="Reuse immutable PF weights; default includes per-call packing as in training")
     parser.add_argument("--trace-kernels", action="store_true",
@@ -259,6 +264,7 @@ def main():
         samples = []
         forward_samples = []
         forward_ready_samples = []
+        backward_ready_samples = []
         stage_profiles = []
         measurement_intervals_ns = []
         priming_steps = len(batches) if args.prime_trace else 0
@@ -281,20 +287,30 @@ def main():
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
             dist.barrier()
             torch.cuda.synchronize()
+            if args.backward_only:
+                tape = runtime.forward(x, routes, gates, w1, w2)
+                torch.cuda.synchronize()
+                # Every rank has a complete, current tape before BWD starts.
+                dist.barrier()
+                torch.cuda.synchronize()
             interval_start = time.time_ns()
             start = time.perf_counter_ns()
-            if args.prepared_weights:
-                runtime._check(x, routes, gates, w1, w2)
-                tape = runtime.native.forward(x, routes, gates, w1, w2, layer=0)
-            else:
-                tape = runtime.forward(x, routes, gates, w1, w2)
-            forward_end = time.perf_counter_ns()
+            if not args.backward_only:
+                if args.prepared_weights:
+                    runtime._check(x, routes, gates, w1, w2)
+                    tape = runtime.native.forward(x, routes, gates, w1, w2, layer=0)
+                else:
+                    tape = runtime.forward(x, routes, gates, w1, w2)
+                forward_end = time.perf_counter_ns()
             if args.forward_only:
                 # Keep the checkpoint alive until it is usable by Backward.
                 torch.cuda.synchronize()
                 forward_ready_us = (time.perf_counter_ns() - start) / 1000
             else:
                 gradients = runtime.backward(tape, dy)
+                if args.backward_only:
+                    torch.cuda.synchronize()
+                    backward_ready_us = (time.perf_counter_ns() - start) / 1000
                 del gradients
             profile = tape.profile if args.profile_stages else None
             if not args.timeline_dir:
@@ -303,9 +319,12 @@ def main():
             elapsed = (time.perf_counter_ns() - start) / 1000
             if iteration >= priming_steps + args.warmups:
                 samples.append(elapsed)
-                forward_samples.append((forward_end - start) / 1000)
+                if not args.backward_only:
+                    forward_samples.append((forward_end - start) / 1000)
                 if args.forward_only:
                     forward_ready_samples.append(forward_ready_us)
+                if args.backward_only:
+                    backward_ready_samples.append(backward_ready_us)
                 if args.profile_stages:
                     stage_profiles.append(profile)
                 measurement_intervals_ns.append((interval_start, time.time_ns()))
@@ -349,6 +368,8 @@ def main():
         dist.all_gather_object(forward_per_rank, forward_samples)
         ready_per_rank = [None] * world
         dist.all_gather_object(ready_per_rank, forward_ready_samples)
+        backward_ready_per_rank = [None] * world
+        dist.all_gather_object(backward_ready_per_rank, backward_ready_samples)
         profiles_per_rank = [None] * world if args.profile_stages else None
         if args.profile_stages:
             dist.all_gather_object(profiles_per_rank, stage_profiles)
@@ -373,7 +394,7 @@ def main():
             measured_tokens = [workload["tokens"][args.warmups:] for workload in workloads]
             flat_tokens = [count for counts in measured_tokens for count in counts]
             print("TRAINING_CYCLE_JSON " + json.dumps(dict(
-                schema_version=2, workload=f"variable_tokens_{args.route_distribution}_routes",
+                schema_version=3, workload=f"variable_tokens_{args.route_distribution}_routes",
                 backend=args.backend, world=world, nominal_tokens_per_rank=tokens,
                 seed=args.seed, token_std_fraction=args.token_std_fraction,
                 token_truncation_std=3, route_bias_std=args.route_bias_std,
@@ -393,11 +414,15 @@ def main():
                 experts=args.experts, top_k=args.top_k, hidden=args.hidden,
                 intermediate=args.intermediate, warmups=args.warmups,
                 priming_steps=priming_steps, compiled_graphs_during_measurement=compile_graphs,
-                forward_only=args.forward_only, weights_prepared_once=args.prepared_weights,
+                forward_only=args.forward_only, backward_only=args.backward_only,
+                weights_prepared_once=args.prepared_weights,
                 samples=args.samples, wall_slowest_rank_p50_us=statistics.median(slowest),
                 forward_ready_slowest_rank_p50_us=(statistics.median(
                     map(max, zip(*ready_per_rank))) if args.forward_only else None),
                 per_rank_forward_ready_us=ready_per_rank,
+                backward_ready_slowest_rank_p50_us=(statistics.median(
+                    map(max, zip(*backward_ready_per_rank))) if args.backward_only else None),
+                per_rank_backward_ready_us=backward_ready_per_rank,
                 per_rank_stage_profiles=profiles_per_rank,
                 window_padding=window_padding,
                 communication=communication,
@@ -405,14 +430,20 @@ def main():
                 per_rank_stage_kernel_us=kernels_per_rank,
                 forward_ready_timing_scope=("eager training forward + device synchronize; checkpoint still live"
                                             if args.forward_only else None),
-                forward_slowest_rank_p50_us=statistics.median(
-                    max(row[i] for row in forward_per_rank) for i in range(args.samples)),
-                backward_slowest_rank_p50_us=None if args.forward_only else statistics.median(
+                backward_ready_timing_scope=(
+                    "eager backward + device synchronize; fresh Forward tape prepared untimed; gradients still live"
+                    if args.backward_only else None),
+                forward_slowest_rank_p50_us=(None if args.backward_only else statistics.median(
+                    max(row[i] for row in forward_per_rank) for i in range(args.samples))),
+                backward_slowest_rank_p50_us=(statistics.median(slowest) if args.backward_only
+                    else None if args.forward_only else statistics.median(
                     max(per_rank[r][i] - forward_per_rank[r][i] for r in range(world))
-                    for i in range(args.samples)),
+                    for i in range(args.samples))),
                 wall_slowest_rank_samples_us=slowest, per_rank_wall_us=per_rank,
                 measurement_intervals_ns_per_rank=intervals_per_rank,
-                measurement_scope=("eager training forward+release+device synchronize; input preparation excluded"
+                measurement_scope=("eager backward+release+device synchronize; fresh Forward and input preparation excluded"
+                                   if args.backward_only else
+                                   "eager training forward+release+device synchronize; input preparation excluded"
                                    if args.forward_only else
                                    "eager forward+backward+release+device synchronize; input preparation excluded"),
                 forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
