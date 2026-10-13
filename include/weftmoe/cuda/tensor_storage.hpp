@@ -117,11 +117,6 @@ public:
 private:
   struct Impl;
   std::shared_ptr<Impl> impl_;
-  friend BackwardTensorStorage
-  prepare_backward_tensors(const DeviceDispatchHandle &, const CudaExecution &,
-                           const BackwardMegaKernelConfig &,
-                           const BackwardTensorBuffers &,
-                           const CudaTensorAllocator &);
   friend class BackwardMegaKernel;
   friend class BackwardValidationBridge;
   friend class DeviceBackwardHandle;
@@ -132,11 +127,6 @@ ForwardTensorStorage prepare_forward_tensors(const DeviceDispatchHandle &,
                                              const ForwardMegaKernelConfig &,
                                              const ForwardTensorBuffers & = {},
                                              const CudaTensorAllocator & = {});
-BackwardTensorStorage
-prepare_backward_tensors(const DeviceDispatchHandle &, const CudaExecution &,
-                         const BackwardMegaKernelConfig &,
-                         const BackwardTensorBuffers & = {},
-                         const CudaTensorAllocator & = {});
 
 } // namespace weftmoe::cuda
 WEFTMOE_PUBLIC_API_END

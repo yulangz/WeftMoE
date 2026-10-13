@@ -122,8 +122,7 @@
       16
     ],
     "dispatch_batch_rows": [
-      64,
-      32
+      64
     ],
     "setup_threads": [
       256

@@ -11,7 +11,8 @@
   stream 已支持 K128，但当前搜索配置未加入这项；此前 K128/两级流水
   没有确认跨规模收益，因此仍以 K64 为默认。
   更换 H/I 时还需确认 `I % (2*DuN) == 0`、`H % (2*DxN) == 0`，
-  否则会退出当前 cluster-N2 stream 路径，不能沿用本轮结论。
+  不满足的候选在资源检查时过滤；N256 尾部不足一个 cluster 时选择
+  N128。当前只保留 cluster-N2 stream，不再回退到旧 BWD 实现。
 - dW1/dW2 共用 M/N 几何和 stage 数，比较 M128/N256、M256/N128、
   M128/N128，以及两级/三级流水。四级流水也提出候选，但 M128/N256
   的 shared memory 超限会被资源检查过滤。
@@ -25,6 +26,11 @@
   canonical stream 的 dX/return；下面旧记录不能当作新实现的调参结论。
 - `environment` 显式固定工作区环境参数，逐节点传入，避免改变 buffer
   容量后把通信收益误认为 GEMM 收益。配置仍不修改时钟。
+
+2026-10-13 清理后，编译资源检查直接识别当前 PF stream 的单/双机入口，
+不再检查已删除的 unified/split kernel。旧格式 BWD grid 保留生成头文件的
+兼容字段，但不再搜索已失效的 `dispatch_batch_rows`；新实验优先使用
+上面的 `pf_backward_stream_autotune.json`。
 
 保留基线，与候选使用相同变化长度/热点路由 trace，初筛后正反顺序确认，
 数值通过才导出训练表。候选编译日志包含 ptxas 寄存器/spill 报告；
@@ -46,6 +52,10 @@ BWD。`backward_ready_slowest_rank_p50_us` 包含 BWD 前置、临时分配、�
 `wall_slowest_rank_p50_us`。分开运行的两项 p50 不能直接拼成历史完整周期。
 
 ## PF 动态训练 FWD+BWD 搜索（2026-10-04）
+
+本节保留当时的流程与消融记录。CLI 的完整周期计时口径仍适用；旧
+bounded-return 实现及其 `dx_claim_tiles` / `return_window_scale` 优化已于
+2026-10-13 删除，不是当前 PF stream 的有效搜索轴。
 
 `tools/autotune_training.py` 使用 `configs/pf_training_autotune.json`，按传入
 H/I/E/top-k、EP 拓扑和 token 规模自动生成组合头文件、编译、计时、校验、选优。

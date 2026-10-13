@@ -37,6 +37,8 @@ class AutotuneTopologyTest(unittest.TestCase):
                     group[key] = values[:1]
             source['2_transport']['relay_ctas'] = [16]
             source['2_transport']['rdma_ctas'] = [8, 0, 12]
+            if phase == 'backward':
+                source['1_gemm']['dab_tile_n'] = [128]
             original = copy.deepcopy(source)
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / 'misleading_multi_node_name.json'

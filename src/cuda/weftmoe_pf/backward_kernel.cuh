@@ -44,7 +44,7 @@ struct Shared {
   local::Barrier pull_full[local::kPullWarps];
 };
 constexpr auto kDwBytes = backward_compute_detail::dynamic_shared_bytes<
-    backward_unified_detail::kStorageTileN>();
+    backward_weights::kStorageTileN>();
 constexpr auto kSharedBytes = sizeof(Shared) > kDwBytes ? sizeof(Shared)
                                                         : kDwBytes;
 
@@ -378,7 +378,7 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   } else {
     __threadfence();
   }
-  backward_unified_compute_detail::UnifiedComputeSynchronization<
+  backward_weights::UnifiedComputeSynchronization<
       true>::math_sync(256U, 0U);
   if (!threadIdx.x) {
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
@@ -419,7 +419,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
                (Network && ring::acquire(slot.returned) < t.generation - 1U)) {
         }
       using Sync =
-          backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
+          backward_weights::UnifiedComputeSynchronization<true>;
       Sync::math_sync(256U, 0U);
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
       const auto task_begin = device_globaltimer_ns();
@@ -435,7 +435,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
             Network || !valid ? t.block * kM + row : mapping[saved];
         // All dU N tiles have retired above. The local dY ring can now
         // receive dAB directly from registers, alongside the dW1 cache.
-        backward_swiglu_epilogue_warp_row<!Network, 4U>(
+        backward_swiglu_epilogue_warp_row<!Network>(
             a, padded, saved, valid, threadIdx.x % 32U,
             Network
                 ? nullptr
@@ -477,15 +477,15 @@ template <bool Network>
 __device__ __forceinline__ void
 begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
               unsigned char *storage,
-              backward_unified_compute_detail::SharedState &state) {
+              backward_weights::SharedState &state) {
   if constexpr (Network) {
     // Only compute joins here. Return owners keep their disjoint communication
     // arena alive and can drain dX/dr while the static dW stream executes.
     using Sync =
-        backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
+        backward_weights::UnifiedComputeSynchronization<true>;
     Sync::cta_sync();
-    backward_unified_compute_detail::initialize_compute<
-        backward_unified_detail::kStorageTileN>(storage, state);
+    backward_weights::initialize_compute<
+        backward_weights::kStorageTileN>(storage, state);
     Sync::cta_sync();
     if (!threadIdx.x) {
       const auto layout = pipeline::backward::make_backward_scheduler_layout(
@@ -505,8 +505,8 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     // Every writer drains once before the grid/rank handoff to Reduce.
     __threadfence_system();
     grid_sync<0U, 384U>(f);
-    backward_unified_compute_detail::initialize_compute<
-        backward_unified_detail::kStorageTileN>(storage, state);
+    backward_weights::initialize_compute<
+        backward_weights::kStorageTileN>(storage, state);
     __syncthreads();
     cute::cluster_sync();
   }
@@ -534,15 +534,13 @@ __global__ __launch_bounds__(384U, 1) void kernel(
     const __grid_constant__ CUtensorMap u_mn_map,
     const __grid_constant__ CUtensorMap dab_mn_map,
     const __grid_constant__ CUtensorMap x_mn_map,
-    const __grid_constant__ CUtensorMap u_store_map,
-    const __grid_constant__ CUtensorMap dx_store_map,
     const __grid_constant__ CUtensorMap dw2_store_map,
     const __grid_constant__ CUtensorMap dw1_store_map) {
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
   extern __shared__ __align__(1024) unsigned char storage[];
   auto &s = *reinterpret_cast<Shared *>(storage);
-  __shared__ backward_unified_compute_detail::SharedState state;
-  const auto geometry = backward_unified_compute_detail::load_row_geometry(a);
+  __shared__ backward_weights::SharedState state;
+  const auto geometry = backward_weights::load_row_geometry(a);
   if (!blockIdx.x && !threadIdx.x)
     peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)->start_clock =
         device_globaltimer_ns();
@@ -574,12 +572,10 @@ __global__ __launch_bounds__(384U, 1) void kernel(
 #else
     compute<Network>(f, a, s);
     begin_weights<Network>(f, a, storage, state);
-    backward_unified_compute_detail::UnifiedComputeSynchronization<true> sync{
+    backward_weights::UnifiedComputeSynchronization<true> sync{
         state};
-    backward_unified_compute_detail::run_compute<
-        kDuN, kDxN, backward_tuning::kDwTileN, true>(
-        a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
-        x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
+    backward_weights::run_compute<backward_tuning::kDwTileN>(
+        a, dr_mn_map, u_mn_map, dab_mn_map, x_mn_map, dw2_store_map, dw1_store_map,
         geometry, storage, state, sync);
 #endif
     finish();
@@ -593,12 +589,10 @@ __global__ __launch_bounds__(384U, 1) void kernel(
 #else
       produce<Network>(f, a, s, dy_map, dab_map, w2_map, w1_map);
       begin_weights<Network>(f, a, storage, state);
-      backward_unified_compute_detail::UnifiedComputeSynchronization<false>
+      backward_weights::UnifiedComputeSynchronization<false>
           sync{state};
-      backward_unified_compute_detail::run_compute<
-          kDuN, kDxN, backward_tuning::kDwTileN, true>(
-          a, dy_map, dab_map, w2_map, w1_map, dr_mn_map, u_mn_map, dab_mn_map,
-          x_mn_map, u_store_map, dx_store_map, dw2_store_map, dw1_store_map,
+      backward_weights::run_compute<backward_tuning::kDwTileN>(
+        a, dr_mn_map, u_mn_map, dab_mn_map, x_mn_map, dw2_store_map, dw1_store_map,
           geometry, storage, state, sync);
 #endif
       finish();

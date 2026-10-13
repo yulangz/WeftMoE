@@ -13,8 +13,12 @@ inference and training) and `weftmoe_dt` (single-node decode). PF inference and
 training share the same main kernel after standalone notify; training additionally
 allocates and writes the activation tape. PF's streaming backward lives in
 `src/cuda/weftmoe_pf/backward_kernel.cuh`: it reuses the PF planner and transport,
-then runs static dQ/SwiGLU/dX work before dW. Shared backward math and the
-compatibility schedule for other tile configurations live in `src/cuda/backward/`.
+then runs static dU/SwiGLU/dX work before dW. The dW schedule and cluster
+synchronization live in `src/cuda/weftmoe_pf/backward_weights.cuh`; shared
+GEMM math and payload ownership live in `src/cuda/backward/`. There is no older
+Backward fallback: activation tiles must satisfy cluster-N2 geometry (use N128
+when a dimension has an odd number of N256 tiles). Prepare Backward buffers
+through `BackwardMegaKernel::prepare_tensors` using the retained Forward tape.
 See [backward implementation and measurements](docs/pf_backward_20261012.md).
 
 V3, earlier PF kernels, WG3 experiments and their frozen build profiles have
@@ -24,7 +28,6 @@ measurement files remain available; their old source paths refer to that tag.
 There is no V3 fallback. Use a PF or DT specialization matching the model shape;
 see [current profiles](configs/README.md).
 
-## Installation
 ## Installation
 
 Build and install from the repository:

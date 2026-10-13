@@ -2,45 +2,16 @@
 // implementation. This header is included only by the CUDA aggregation TU.
 struct BackwardKernelArgs {
   DeviceDispatchKernelView dispatch;
-  DispatchWaveKernelView dispatch_waves;
-  const transport::BFloat16 *dy = nullptr;
   std::uint64_t hidden = 0;
   std::uint64_t intermediate = 0;
-  std::uint64_t max_destination_rows = 0;
-  std::uint64_t padded_capacity_rows = 0;
-  std::uint64_t padded_rows = 0;
-  std::uint64_t scheduler_words = 0;
   std::uint64_t epoch = 0;
   unsigned long long *runtime_epoch = nullptr;
   std::uint32_t scheduler_mblock_capacity = 0;
   std::uint32_t scheduler_expert_capacity = 0;
-  std::uint32_t mblocks = 0;
-  std::uint32_t active_experts = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
-  std::uint32_t node = 0;
-  std::uint32_t local_world_size = 0;
-  std::uint32_t gin_context_count = 0;
-  std::uint64_t max_tokens_per_rank = 0;
-  std::uint64_t backward_return_chunk_rows = 0;
-  bool use_gin = false;
   void *local_base = nullptr;
   void **peer_bases = nullptr;
-#if __has_include(<nccl_device.h>)
-  ncclDevComm_t gin_dev_comm{};
-  ncclWindow_t gin_window = nullptr;
-#endif
-  void *gin_window_base = nullptr;
-  communication::ChunkRingLayout gin_rings;
-  std::size_t local_notification_offset = 0;
-  unsigned local_notification_ctas = 0;
-  void *gin_sender_done = nullptr;
-  unsigned gin_sender_count = 0;
-  unsigned gin_receiver_base = 0;
-  unsigned gin_receiver_count = 0;
-  unsigned gin_total_ctas = 0;
-  std::size_t forward_return_queues_offset = 0;
-  std::size_t forward_return_rows_offset = 0;
 
   const float *saved_gates = nullptr;
   const transport::BFloat16 *saved_ab = nullptr;
@@ -49,24 +20,19 @@ struct BackwardKernelArgs {
   // Stable, IPC-visible dR owned by the execution slot. Logical TMA bounds
   // follow the actual route count independently of its cached capacity.
   transport::BFloat16 *dr = nullptr;
-  std::size_t input_offset = 0;
   transport::BFloat16 *recomputed_u = nullptr;
   transport::BFloat16 *dab = nullptr;
   transport::BFloat16 *dx_rows = nullptr;
   std::uint64_t activation_stride = 0;
   float *dgate_rows = nullptr;
   float *dgate = nullptr;
-  backward_detail::ReturnRingView return_ring;
   transport::BFloat16 *dw1 = nullptr;
   transport::BFloat16 *dw2 = nullptr;
-  transport::BFloat16 *dx = nullptr;
   std::size_t direct_headers_offset = 0;
   std::size_t compact_to_padded_offset = 0;
   std::size_t padded_expert_rows_offset = 0;
   std::size_t padded_expert_offsets_offset = 0;
   std::size_t setup_epoch_offset = 0;
-  std::size_t dispatch_ready_offset = 0;
-  std::size_t return_ready_offset = 0;
   std::size_t scheduler_offset = 0;
   std::size_t status_offset = 0;
 };

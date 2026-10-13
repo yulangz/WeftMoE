@@ -1,7 +1,70 @@
 # PF Backward 对齐现版 Forward（2026-10-12）
 
 基线是 `main@1cfb423`；实现分支 `feature/pf-backward-20261012`。
-旧静态 BWD 保留为迁移期间的正确性/性能对照，不将新 FWD 的收益外推到 BWD。
+旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
+PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
+
+## M11：仅保留当前 PF/DT（2026-10-13）
+
+本轮只整理代码，不改变已接受的计算、通信协议、调度参数或 buffer
+容量，不引入新的优化方案。
+
+- 删除旧 unified/split BWD、旧 GIN transport、旧 bounded-return helper
+  和不可达的 fallback；当前 BWD 统一走 PF stream。
+- 将仍在使用的 dW 调度、cluster 同步放入
+  `src/cuda/weftmoe_pf/backward_weights.cuh`，保留当前 dW chunk 与累加顺序。
+- 去除旧 dense dX/return-gather 分配、peer payload 字段和未使用的
+  compute stream；当前 dR/dGate IPC 复用、容量增长和释放协议不变。
+- 删除基于旧 GEMM 实现的 standalone diagnostics；保留当前 kernel 的
+  identity/task timing 工具。旧测量报告保留，不重写历史性能记录。
+- 删除 Python 模拟旧协议、固定默认值、源码文本和旧 kernel 分支的
+  细碎测试；保留实际资源约束、编译、runtime、梯度与释放检查。
+- autotune 的资源检查改为当前 PF stream 入口，过滤不满足 cluster-N2
+  的候选；兼容 grid 不再变化已失效的 dispatch batch 参数。
+
+C++ 不再提供脱离 retained FWD tape 的 `prepare_backward_tensors` 自由
+函数。使用 `BackwardMegaKernel::prepare_tensors(retained_forward, ...)`；
+Python TensorRuntime/Megatron 原本就走这条路径，无需修改调用方式。
+
+验证：单/双机、均衡/非均衡、129/8K/20K 各两组新路由，完整
+output/dX/dGate/dW1/dW2 数值检查通过，最大 relative L2 与清理前一致。
+EP8/EP16 的 IPC 复用、权重刷新、工作区释放、多层图和 offload 检查通过。
+Python 测试从 117/470 tests/subtests 精简为 101/170，全部通过；未增加
+测试函数。host 17/17、16 个 public header 独立编译、34 个旧 API 编译拒绝
+检查通过。
+PF/DT 的 8 个非 BWD 设备函数，清理前后 SASS 指令序列完全相同；当前
+BWD 单/双机主 kernel 均无 stack/local spill。既有 mini-notify spill 未改变。
+
+### 清理前后回归
+
+沿用 M10 的 Flash shape、B2048/D2、随机长度/非均衡路由和独立 ready
+计时口径，FWD 带训练缓存。每轮 prime 20 步、4 warmups、16 samples。
+FWD 旧→新一轮；BWD 旧→新、新→旧两轮，取两轮 p50 均值。下表单位
+ms，变化为延迟变化，正值表示略慢，不是吞吐收益。
+
+| 阶段 | 拓扑 / tokens | 清理前 | 清理后 | 变化 |
+|---|---|---:|---:|---:|
+| FWD | EP8 / 8K | 7.915 | 7.956 | +0.52% |
+| FWD | EP8 / 20K | 18.215 | 18.188 | -0.15% |
+| FWD | EP16 / 8K | 12.044 | 11.984 | -0.49% |
+| FWD | EP16 / 20K | 27.816 | 27.870 | +0.19% |
+| BWD | EP8 / 8K | 13.022 | 13.122 | +0.77% |
+| BWD | EP8 / 20K | 32.047 | 32.032 | -0.05% |
+| BWD | EP16 / 8K | 15.933 | 15.872 | -0.38% |
+| BWD | EP16 / 20K | 38.964 | 38.690 | -0.70% |
+
+12 次启动、24 条规模记录的逐 rank token/route hash、收到行数、expert
+行数统计一致。平均变化均在 ±0.8% 内，未观察到明显性能回退；不把清理
+宣称为性能优化。GIN/notify 容量相同，compute bytes 因删掉旧 peer 描述
+字段，每 rank 减少 256–1024 B，而非增大数据缓冲换性能。
+
+两机沿用 SM 1620 MHz 设置。粗粒度时钟采样覆盖 10/24 个计时区间，
+88 个 GPU 采样点中 10 个低于 1620，最低 1365；HBM 均为 3201 MHz。
+未过滤性能样本，也不声称整段严格恒频。
+
+原始回归日志：`build/pf_cleanup_20261013/results/`；清理前 artifact 为
+`build/pf_main_timeline/fwd_cache_vector`，清理后为
+`build/pf_main_timeline/cleanup_release_20261013`。
 
 ## M10：autotune 修补与 FWD 训练缓存向量化（2026-10-13）
 

@@ -9,7 +9,7 @@ template <bool Network>
 __device__ __forceinline__ void identity(const ForwardKernelArgs &f,
                                         const BackwardKernelArgs &a) {
   using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
-  using Sync = backward_unified_compute_detail::UnifiedComputeSynchronization<true>;
+  using Sync = backward_weights::UnifiedComputeSynchronization<true>;
   Scheduler schedule(f, a);
   Task t;
   while (schedule.next(t)) {

@@ -41,10 +41,16 @@ inference benchmark with `--backend dt` and its own compiled profile.
 
 `pf_training_autotune.json` searches current PF ring/FWD/BWD settings through
 `tools/autotune_training.py`, with caller-supplied model dimensions and topology.
+For current stream BWD GEMM tuning, prefer `pf_backward_stream_autotune.json`:
+it holds FWD/communication fixed and varies the active activation/dW tiles,
+stages and dW chunks. BWD now has no legacy kernel fallback; cluster-N2 shapes
+must fit the selected N tile (use N128 for odd N256 extents).
 `forward_v4_ring_autotune.json` and `forward_v4_decode_autotune.json` select PF
 and DT respectively in the independent Forward tuner. Compatibility parameter
 spellings remain in the generated-header format; obsolete scheduler axes are
-no longer varied by the shipped Forward grids. Candidates and configuration
+no longer varied by the shipped Forward grids. The compatibility BWD grids also
+keep the retired `dispatch_batch_rows` field fixed, avoiding duplicate builds.
+Candidates and configuration
 files are search definitions, not claims of measured optimality.
 
 The optional single-node `table.json` performs exact-capacity profile lookup,

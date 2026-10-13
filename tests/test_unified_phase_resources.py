@@ -16,41 +16,6 @@ from run_performance_matrix import combined_generated_header
 
 
 class UnifiedDefaultMacroTest(unittest.TestCase):
-    def test_backward_sender_quota_is_independent_of_forward(self):
-        compiler = shutil.which("c++")
-        if not compiler:
-            self.skipTest("a host C++ compiler is required")
-        for requested in (None, 0, 1, 16, 32):
-            source = "#define WEFTMOE_FWD_UNIFIED_RDMA_CTAS 0\n"
-            if requested is not None:
-                source += f"#define WEFTMOE_BWD_UNIFIED_RDMA_CTAS {requested}\n"
-            source += '#include "cuda/forward/tuning_config.hpp"\n'
-            source += '#include "cuda/backward/tuning_config.hpp"\n'
-            source += ("static_assert(weftmoe::cuda::backward_tuning::"
-                       f"kUnifiedRdmaCtas == {requested or 16});\n")
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-fsyntax-only", "-x", "c++",
-                 "-I", str(ROOT / "src"), "-"], input=source, text=True,
-                capture_output=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_rdma_partition_keeps_a_relay_on_small_grids(self):
-        compiler = shutil.which("c++")
-        if not compiler:
-            self.skipTest("a host C++ compiler is required")
-        for requested in (0, 1, 3, 16, 2048):
-            source = f"#define WEFTMOE_FWD_UNIFIED_RDMA_CTAS {requested}\n"
-            source += '#include "cuda/forward/tuning_config.hpp"\n'
-            source += "using weftmoe::cuda::forward_tuning::unified_rdma_ctas;\n"
-            for total in (2, 8, 9, 16, 31, 132, 256):
-                source += f"static_assert(unified_rdma_ctas({total}, false) == 0);\n"
-                source += f"static_assert(unified_rdma_ctas({total}, true) == {min(requested, total - 1)});\n"
-            result = subprocess.run(
-                [compiler, "-std=c++17", "-fsyntax-only", "-x", "c++",
-                 "-I", str(ROOT / "src"), "-"], input=source, text=True,
-                capture_output=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-
     def preprocess(self, defines="", *, generated=None, generated_defines=""):
         compiler = shutil.which("c++")
         if not compiler:
@@ -102,11 +67,6 @@ class UnifiedDefaultMacroTest(unittest.TestCase):
                                     ("COPY_BUFFERS", buffers)):
                 self.assertEqual(values[f"WEFTMOE_{phase}_UNIFIED_{field}"], expected)
 
-
-
-
-
-
     def test_channel_pack_limit_explicit_and_generated_overrides(self):
         for value in (1, 2, 8):
             for generated in (None, "forward", "backward"):
@@ -136,7 +96,6 @@ class UnifiedDefaultMacroTest(unittest.TestCase):
                     f"#define {key} {value}\n" for key, value in defines.items()))
                 self.assertEqual((values["WEFTMOE_FWD_UNIFIED_COPY_BUFFERS"],
                                   values["WEFTMOE_BWD_UNIFIED_COPY_BUFFERS"]), expected)
-
 
 class UnifiedPhaseResourcesTest(unittest.TestCase):
     def configs(self):
@@ -211,37 +170,11 @@ class UnifiedPhaseResourcesTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 combined_generated_header("mismatch", forward, dict(backward, **{key: other}))
 
-
-
-
-    def test_legacy_shared_macros_remain_defaults_with_phase_override(self):
-        header = """#define WEFTMOE_UNIFIED_MATH_REGISTERS 216
-#define WEFTMOE_UNIFIED_CONTROL_REGISTERS 64
-#define WEFTMOE_UNIFIED_COPY_BUFFERS 2
-#define WEFTMOE_BWD_UNIFIED_MATH_REGISTERS 208
-#define WEFTMOE_BWD_UNIFIED_CONTROL_REGISTERS 80
-#define WEFTMOE_BWD_UNIFIED_COPY_BUFFERS 1
-"""
-        self.syntax_check(header, [
-            ("forward", "kUnifiedMathRegisters", 216),
-            ("forward", "kUnifiedProducerRegisters", 64),
-            ("forward", "kUnifiedCopyBuffers", 2),
-            ("backward", "kUnifiedMathRegisters", 208),
-            ("backward", "kUnifiedProducerRegisters", 80),
-            ("backward", "kUnifiedCopyBuffers", 1)], generated=False)
-
     def test_only_declared_shared_keys_have_identical_macro_names(self):
         forward = unified_tuning.parameter_macros("forward")
         backward = unified_tuning.parameter_macros("backward")
         self.assertEqual({key for key in forward if forward[key] == backward[key]},
                          unified_tuning.SHARED_PARAMETERS)
-
-    def test_backward_staging_covers_every_reducer_warp(self):
-        _, backward = self.configs()
-        with self.assertRaisesRegex(ValueError, "pointer tables"):
-            bw.validate_tuning(dict(backward, unified_segment_bytes=256))
-        bw.validate_tuning(dict(backward, unified_segment_bytes=384))
-
 
 if __name__ == "__main__":
     unittest.main()

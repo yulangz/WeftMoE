@@ -139,10 +139,6 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
         require(config["unified_producer_registers"] in
                 (0, config["unified_control_registers"]),
                 "Backward currently shares the producer and communication register quota")
-        warps = config["unified_comm_threads"] // 32
-        unified_tuning.require_resources(warps * 32 * 8 <= (warps - 1) * config["unified_segment_bytes"] *
-                config["unified_copy_buffers"],
-                "Backward retired communication staging must hold reduce pointer tables")
     require(config["main_hidden"] > 0 and config["main_hidden"] % 256 == 0,
              "main_hidden must be a positive multiple of 256")
     require(config["main_intermediate"] > 0 and config["main_intermediate"] % 256 == 0,
@@ -151,6 +147,15 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
             "the activation dependency block is fixed at M128")
     require_choice(config, "dab_tile_n", (128, 256))
     require_choice(config, "dx_tile_n", (128, 256))
+    unified_tuning.require_resources(
+        config["main_intermediate"] % (2 * config["dab_tile_n"]) == 0 and
+        config["main_hidden"] % (2 * config["dx_tile_n"]) == 0,
+        "PF stream requires cluster-N2 tiles; select N128 for odd N256 extents")
+    require(config["unified_workers"] == 1 and
+            config["unified_threads"] == 384 and
+            config["unified_comm_base"] == 288 and
+            config["unified_comm_threads"] == 96,
+            "PF stream uses 384 threads with a 288/96 compute/communication split")
     require_choice(config, "dx_claim_tiles", (1, 2, 4, 8, 16))
     require_choice(config, "return_window_scale", (1, 2))
     require_choice(config, "dw_tile_m", (128, 256))
@@ -446,11 +451,7 @@ def inspect_backward_kernels(binary: Path, log_path: Path,
     log_path.write_text(completed.stdout, encoding="utf-8")
     resource_pattern = re.compile(
         r"REG:(\d+) STACK:(\d+) SHARED:(\d+) LOCAL:(\d+)")
-    unified = bool(config["unified_workers"])
-    kernel_names = ({"unified": "unified_backward_kernel"} if unified else {
-        "compute": "backward_local_compute_kernel",
-        "transport": "backward_local_transport_kernel",
-    })
+    kernel_names = {"pf_stream": "backward_stream6kernel"}
     kernels: dict[str, list[dict[str, Any]]] = {name: [] for name in kernel_names}
     lines = completed.stdout.splitlines()
     for index, line in enumerate(lines[:-1]):
@@ -472,19 +473,11 @@ def inspect_backward_kernels(binary: Path, log_path: Path,
     return {
         "available": completed.returncode == 0,
         "returncode": completed.returncode,
-        "layout": "unified" if unified else "split",
-        "valid_compiled_kernel_set": (
-            bool(kernels["unified"]) if unified else
-            len(kernels["compute"]) == 1 and len(kernels["transport"]) == 1),
-        "single_compute_kernel": len(kernels.get("compute", [])) == 1,
-        "single_transport_kernel": len(kernels.get("transport", [])) == 1,
-        "compiled_unified_kernel_count": len(kernels.get("unified", [])),
+        "layout": "pf_stream",
+        "valid_compiled_kernel_set": bool(kernels["pf_stream"]),
+        "compiled_kernel_count": len(kernels["pf_stream"]),
         "kernels": kernels,
         "dynamic_shared_memory_bytes": dynamic_shared_memory(config),
-        "unified_total_shared_memory_upper_bound": (
-            unified_tuning.shared_memory_upper_bound(
-                config, dynamic_shared_memory(config), phase="backward")
-            if unified else None),
         "log": str(log_path),
     }
 
@@ -525,8 +518,7 @@ def compile_candidate(candidate: Mapping[str, Any],
                 not resources.get("valid_compiled_kernel_set")):
             result["returncode"] = 125
             result["resource_validation_error"] = (
-                "expected unified Backward entries" if candidate["config"]["unified_workers"]
-                else "expected one Backward compute and one transport kernel"
+                "expected current PF stream Backward entries"
             )
     return result
 
@@ -792,6 +784,8 @@ def main(argv: list[str] | None = None) -> int:
     requested = set(args.candidate)
     if requested:
         known = {candidate["name"] for candidate in candidates}
+        if "incumbent" in requested and "incumbent" not in known:
+            requested = (requested - {"incumbent"}) | {candidates[0]["name"]}
         require(not requested - known,
                 f"unknown requested candidates: {sorted(requested - known)}")
         candidates = [candidate for candidate in candidates

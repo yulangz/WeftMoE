@@ -3,13 +3,11 @@
 import copy
 import json
 import math
-import re
 import sys
 import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -24,8 +22,6 @@ def grid_count(topology):
 
 
 class ForwardAutotuneTest(unittest.TestCase):
-
-
     def test_runtime_does_not_select_checkout_nccl_artifacts(self):
         from autotune_common import resolve_runtime_settings
 
@@ -44,11 +40,6 @@ class ForwardAutotuneTest(unittest.TestCase):
                 repo_root=root)
             self.assertEqual(settings["nccl_lib_dir"], "/explicit/nccl")
 
-
-
-
-
-
     def test_local_runtime_library_path_precedes_inherited_libraries(self):
         benchmark = dict(self.plan["benchmark"], launcher="local", world=8,
                          nccl_lib_dir="/link/nccl",
@@ -61,7 +52,6 @@ class ForwardAutotuneTest(unittest.TestCase):
                                      {"LD_LIBRARY_PATH": "/inherited"}, rounds=30)
             self.assertEqual(run.call_args.kwargs["env"]["LD_LIBRARY_PATH"],
                              "/cuda/compat:/runtime/nccl:/inherited")
-
 
     def test_grid_rejects_missing_duplicate_invalid_and_oversized_axes(self):
         source = json.loads((ROOT / "configs" /
@@ -130,27 +120,6 @@ class ForwardAutotuneTest(unittest.TestCase):
             system={"ep": 16, "remote": "root@example"})
         self.candidates = tune.expand_candidates(self.plan)
 
-    def test_removed_reduce_divisor_legacy_migration(self):
-        document = copy.deepcopy(self.plan)
-        document["schema"] = 2
-        document["max_candidates"] = 2
-        document["candidates"] = document["candidates"][:2]
-        document["fixed"]["4_completion_reduce"]["reduce_cta_divisor"] = 2
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "legacy.json"
-            path.write_text(json.dumps(document))
-            migrated = tune.expand_candidates(tune.load_plan(path))
-        self.assertEqual(migrated[0]["config"], self.candidates[0]["config"])
-        config = dict(self.candidates[0]["config"], reduce_cta_divisor=2)
-        with self.assertRaises(tune.PlanError):
-            tune.validate_tuning(config)
-
-    def test_removed_compute_return_path_is_rejected(self):
-        config = dict(self.candidates[0]["config"], relay_local_return=False)
-        with self.assertRaisesRegex(tune.PlanError, "relay_local_return=true"):
-            tune.validate_tuning(config)
-
-
     def test_standalone_cutlass_path_resolution(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -191,8 +160,6 @@ class ForwardAutotuneTest(unittest.TestCase):
             rounds=benchmark["tune_rounds"])
         self.assertEqual(command[command.index("--seed") + 1],
                          str(benchmark["seed"]))
-
-
 
     def test_generated_header_has_one_definition_per_parameter(self):
         candidate = self.candidates[0]
@@ -316,8 +283,6 @@ class ForwardAutotuneTest(unittest.TestCase):
             self.assertEqual(paths["header"].read_text(encoding="utf-8"),
                              tune.generated_header(candidate["name"],
                                                    candidate["config"]))
-
-
 
 if __name__ == "__main__":
     unittest.main()

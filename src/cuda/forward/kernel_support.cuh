@@ -1444,7 +1444,6 @@ struct PoolSlot {
   // PF backward uses a communication stream and a completion join stream.
   // These streams belong to the reusable workspace, not individual calls.
   cudaStream_t backward_transport_stream = nullptr;
-  cudaStream_t backward_compute_stream = nullptr;
   cudaEvent_t backward_roles_ready = nullptr;
   cudaEvent_t backward_join_transport = nullptr;
   cudaEvent_t backward_join_compute = nullptr;
@@ -1657,8 +1656,6 @@ struct ActivationPoolState {
       }
       if (slot.backward_transport_stream)
         (void)cudaStreamDestroy(slot.backward_transport_stream);
-      if (slot.backward_compute_stream)
-        (void)cudaStreamDestroy(slot.backward_compute_stream);
       if (slot.dispatch_complete)
         internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       if (slot.dispatch_complete)

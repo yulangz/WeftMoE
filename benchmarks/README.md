@@ -141,15 +141,9 @@ are measured independently of that archive.
   supplies routing gates for reference checks.
 - `notify_dispatch_bench.cpp` is built with
   `python3 build_native.py metadata-bench`.
-- `run_gemm_diagnostics.py` builds `pure_forward_gemm.cu` or
-  `pure_backward_gemm.cu` with an explicit tuning header. The forward benchmark
-  extracts production WGMMA math and the FC2 epilogue; the backward benchmark
-  calls the production GEMM routines. `gemm_benchmark.cuh` provides the shared
-  cuBLAS comparison, full-output checks, CUDA Graph timing, and NVML sampling.
-- `run_gemm_matrix.py` runs prebuilt diagnostics for the EP8/EP16 shapes. This
-  measures isolated GEMMs with preallocated tensors; it observes GPU clocks
-  and never changes them. `run_forward_gemm_diagnostics.py` retains the older
-  forward build entry point.
+- Historical standalone GEMM diagnostics used the old activation kernel.
+  Their source is available at `7b558e8`; the current tree keeps the PF
+  identity and task-timing diagnostics that exercise the retained pipeline.
 - `forward_diagnostics.py` is enabled through the Flex baseline's
   `--forward-diagnostics-dir` option. It records communication-only and isolated
   expert measurements, stage events, HCA counters, and a Chrome trace after

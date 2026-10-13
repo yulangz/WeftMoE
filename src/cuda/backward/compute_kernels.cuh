@@ -12,26 +12,6 @@ constexpr std::uint32_t kStageM = backward_tuning::kTileM;
 constexpr std::uint32_t kStoreReadyBarrier = 0U;
 constexpr std::uint32_t kStoreDoneBarrier = 1U;
 
-// The standalone baseline still uses every thread in its compute CTA. The
-// unified kernel supplies a narrower synchronization domain, keeping its
-// communication warps independent while sharing the exact GEMM implementation.
-struct FullCtaComputeSynchronization {
-  static constexpr std::uint32_t kThreads = backward_tuning::kComputeThreads;
-  static constexpr std::uint32_t kWorkWarps = kThreads / 32U;
-  static constexpr bool kMathEnabled = true;
-  static constexpr bool kProducerEnabled = true;
-  static constexpr bool kUnifiedReturnQueue = false;
-  static constexpr std::uint32_t kActivationWaitGroup = 1U;
-
-  __device__ __forceinline__ static void cta_sync() { __syncthreads(); }
-  __device__ __forceinline__ static void math_sync(std::uint32_t threads,
-                                                   std::uint32_t barrier) {
-    cutlass::arch::NamedBarrier::sync(threads, barrier);
-  }
-  __device__ __forceinline__ void cluster_sync() { cute::cluster_sync(); }
-  __device__ __forceinline__ void mailbox_read_done() { cta_sync(); }
-};
-
 template <std::uint32_t TileN>
 constexpr std::uint32_t activation_stage_elements() {
   return (backward_tuning::kActivationTileM + TileN) *
@@ -100,18 +80,6 @@ initialize_k_mn_barriers(unsigned char *storage) {
   }
 }
 
-template <std::uint32_t TileN>
-__device__ __forceinline__ void
-initialize_k_mn_pipeline(unsigned char *storage) {
-  initialize_k_mn_barriers<TileN>(storage);
-  cute::cluster_sync();
-  const auto warpgroup = threadIdx.x / 128U;
-  if (warpgroup < kMathWarpGroups)
-    cutlass::arch::warpgroup_reg_alloc<backward_tuning::kMathRegisters>();
-  else
-    cutlass::arch::warpgroup_reg_dealloc<backward_tuning::kProducerRegisters>();
-}
-
 struct TmaOutput {
   template <unsigned TileM, unsigned TileN>
   __device__ __forceinline__ bool store(transport::BFloat16 *, unsigned,
@@ -122,7 +90,7 @@ struct TmaOutput {
 
 template <std::uint32_t TileM, std::uint32_t TileN,
           std::uint32_t OutputOffsetElements,
-          class Synchronization = FullCtaComputeSynchronization,
+          class Synchronization,
           class Output = TmaOutput>
 __device__ __forceinline__ void
 store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
@@ -197,159 +165,14 @@ store_tma_accumulator(float *accum, const CUtensorMap &output_store_map,
   __syncwarp();
 }
 
-template <std::uint32_t TileN, std::uint32_t StorageTileN = TileN,
-          class Synchronization = FullCtaComputeSynchronization,
-          class Output = TmaOutput>
-__device__ __forceinline__ void run_k_mn_tile_tma_store(
-    const CUtensorMap &activation_map, const CUtensorMap &weight_mn_map,
-    const CUtensorMap &output_store_map, std::uint32_t activation_row,
-    std::uint32_t weight_reduction_start, std::uint32_t reduction,
-    std::uint32_t output_row, std::uint32_t output_column,
-    unsigned char *storage, std::uint32_t &pipeline,
-    const Output &output = {}) {
-  constexpr auto TileM = backward_tuning::kActivationTileM;
-  constexpr bool kPairN = backward_tuning::kActivationClusterN == 2U;
-  constexpr auto MajorA = cute::SM90::GMMA::Major::K;
-  constexpr auto MajorB = cute::SM90::GMMA::Major::MN;
-  constexpr auto StageCount = kActivationStages;
-  constexpr auto kStageK = backward_tuning::kActivationTileK;
-  static_assert(Synchronization::kActivationWaitGroup <= 1U,
-                "Activation WGMMA supports zero or one outstanding group");
-  static_assert(TileM == 64U || TileM == 128U);
-  const auto cluster_rank = cute::block_rank_in_cluster();
-  const auto row_half = kPairN ? 0U : cluster_rank * TileM;
-  const auto a_m = activation_row + row_half;
-  output_row += row_half;
-  if constexpr (kPairN)
-    output_column += cluster_rank * TileN;
-  static_assert(TileN == 128U || TileN == 256U);
-  using TileMma = typename hopper::BF16MMASelector<TileN, MajorA, MajorB,
-                                                   kStageK, 128U>::type;
-  constexpr std::uint32_t kAStageElements = TileM * kStageK;
-  constexpr std::uint32_t kBStageElements = TileN * kStageK;
-  constexpr auto kStageStorageElements =
-      activation_stage_elements<StorageTileN>();
-  static_assert(kAStageElements + kBStageElements <= kStageStorageElements);
-  auto *smem = reinterpret_cast<transport::BFloat16 *>(storage);
-  auto *barriers = reinterpret_cast<ForwardBarrier *>(
-      smem + shared_arena_elements<StorageTileN>());
-  auto *full = barriers;
-  auto *empty = full + StageCount;
-
-  // The scheduler/dispatch acquire is in the generic proxy. Make its dR/dAB
-  // payload writes visible before the producer issues the first TMA load.
-  if (Synchronization::kProducerEnabled && threadIdx.x == kMathThreads)
-    asm volatile("fence.proxy.async.global;" : : : "memory");
-
-  const auto iterations = reduction / kStageK;
-  if (Synchronization::kProducerEnabled && threadIdx.x == kMathThreads) {
-    for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
-      const auto current = pipeline + iteration;
-      const auto stage = current % StageCount;
-      const auto phase = (current / StageCount) & 1U;
-      empty[stage].wait(phase ^ 1U);
-      auto *stage_a = reinterpret_cast<cutlass::bfloat16_t *>(
-          smem + stage * kStageStorageElements);
-      auto *stage_b = stage_a + kAStageElements;
-      const auto k = iteration * kStageK;
-      hopper::tma_load<kStageK, TileM, 128, cutlass::bfloat16_t>(
-          &activation_map, &full[stage], stage_a, k, a_m, kPairN ? 2U : 1U);
-      hopper::tma_load<TileN, kStageK, 128, cutlass::bfloat16_t>(
-          &weight_mn_map, &full[stage], stage_b, output_column,
-          weight_reduction_start + k, kPairN ? 1U : 2U);
-      full[stage].arrive_and_expect_tx((kAStageElements + kBStageElements) *
-                                       sizeof(transport::BFloat16));
-    }
-  }
-  if constexpr (Synchronization::kMathEnabled) {
-    if (threadIdx.x < kActivationMathThreads) {
-      // Keep accumulators entirely in the math role. Conditional initialization
-      // outside this branch lets ptxas carry unused producer-side values across
-      // task kinds, spilling N128 accumulators when dW uses N256.
-      float accum[TileMma::kNumAccum];
-#pragma unroll
-      for (int index = 0; index < TileMma::kNumAccum; ++index)
-        accum[index] = 0.0F;
-      auto a_desc = hopper::make_gmma_desc<MajorA, TileM, kStageK, 128,
-                                           cutlass::bfloat16_t>(
-          reinterpret_cast<cutlass::bfloat16_t *>(smem),
-          (threadIdx.x / 128U) * TileMma::M, 0U);
-      auto b_desc = hopper::make_gmma_desc<MajorB, TileN, kStageK, 128,
-                                           cutlass::bfloat16_t>(
-          reinterpret_cast<cutlass::bfloat16_t *>(smem) + kAStageElements, 0U,
-          0U);
-      const auto a_desc_lo = __shfl_sync(0xffffffffU, a_desc.reg32_[0], 0);
-      const auto b_desc_lo = __shfl_sync(0xffffffffU, b_desc.reg32_[0], 0);
-
-      for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
-        const auto current = pipeline + iteration;
-        const auto stage = current % StageCount;
-        const auto phase = (current / StageCount) & 1U;
-        full[stage].wait(phase);
-#pragma unroll
-        for (int index = 0; index < TileMma::kNumAccum; ++index)
-          cute::warpgroup_fence_operand(accum[index]);
-        cute::warpgroup_arrive();
-        const auto stage_desc_offset =
-            stage * kStageStorageElements * sizeof(transport::BFloat16) / 16U;
-#pragma unroll
-        for (std::uint32_t k = 0U; k < kStageK / TileMma::K; ++k) {
-          a_desc.reg32_[0] =
-              hopper::advance_gmma_desc_lo<MajorA, TileM, kStageK, 128,
-                                           cutlass::bfloat16_t>(
-                  a_desc_lo + stage_desc_offset, 0U, k * TileMma::K);
-          b_desc.reg32_[0] =
-              hopper::advance_gmma_desc_lo<MajorB, TileN, kStageK, 128,
-                                           cutlass::bfloat16_t>(
-                  b_desc_lo + stage_desc_offset, 0U, k * TileMma::K);
-          TileMma::wgmma(a_desc, b_desc, accum, 1);
-        }
-        cute::warpgroup_commit_batch();
-#pragma unroll
-        for (int index = 0; index < TileMma::kNumAccum; ++index)
-          cute::warpgroup_fence_operand(accum[index]);
-        if constexpr (Synchronization::kActivationWaitGroup == 0U) {
-          // Complete this K group before releasing its operand stage. This
-          // avoids conservative WGMMA serialization in the unified entry.
-          cute::warpgroup_wait<0>();
-          release_stage(empty[stage]);
-        } else if (iteration != 0U) {
-          cute::warpgroup_wait<1>();
-          const auto completed = pipeline + iteration - 1U;
-          release_stage(empty[completed % StageCount]);
-        }
-      }
-      if constexpr (Synchronization::kActivationWaitGroup == 1U) {
-        if (iterations != 0U) {
-          cute::warpgroup_wait<0>();
-          const auto completed = pipeline + iterations - 1U;
-          release_stage(empty[completed % StageCount]);
-        }
-      }
-      // The final WGMMA wait has consumed the last TMA stage. The TMA store
-      // helper synchronizes the math warpgroup before reusing the arena;
-      // producer threads must not carry accumulators across a CTA-wide join.
-      static_assert(TileM * TileN <= shared_arena_elements<StorageTileN>());
-      store_tma_accumulator<TileM, TileN, 0U, Synchronization>(
-          accum, output_store_map, output_row, output_column, storage, false,
-          true, output);
-    }
-  }
-  // The compute roles rejoin before the next task reuses the pipeline. In a
-  // unified CTA this excludes the independently progressing communication
-  // warps.
-  Synchronization::cta_sync();
-  pipeline += iterations;
-}
-
 // Once all activation work has completed, a claimed dW range cannot be
-// preempted by a higher-priority queue.  Run that short contiguous range as
+// preempted by activation work.  Run that short contiguous range as
 // one producer/consumer pipeline: the TMA warp may start the next tile while
 // the math warps STSM/TMA-store the previous result.  This mirrors
-// DeepGEMM's persistent block loop without weakening Q_DX > Q_DAB priority.
+// DeepGEMM's persistent block loop; dX still completes before dW starts.
 template <std::uint32_t TileM, std::uint32_t TileN,
-          std::uint32_t StorageTileN = TileN,
-          class Synchronization = FullCtaComputeSynchronization>
+          std::uint32_t StorageTileN,
+          class Synchronization>
 __device__ __forceinline__ void
 run_mn_mn_chunk(const CUtensorMap &left_map, const CUtensorMap &right_map,
                 const CUtensorMap &output_store_map, std::uint32_t first_tile,
