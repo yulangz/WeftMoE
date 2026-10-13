@@ -29,11 +29,13 @@ DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
                 ordered_dispatch=0, coalesce_get=0, window_ordered_tape=0,
                 backward_return_pending=1, backward_wave_blocks=64,
                 backward_full_reduce=0, network_credit_windows=1, network_get_workers=64,
-                backward_return_spans=0, network_private_dr=0, network_vector_pull=0)
+                backward_return_spans=0, backward_striped_signals=0,
+                network_private_dr=0, network_vector_pull=0)
 MACROS = {
     "network_private_dr": "WEFTMOE_PF_NETWORK_PRIVATE_DR",
     "network_vector_pull": "WEFTMOE_PF_NETWORK_VECTOR_PULL",
     "backward_return_spans": "WEFTMOE_PF_BWD_RETURN_SPANS",
+    "backward_striped_signals": "WEFTMOE_PF_BWD_STRIPED_SIGNALS",
     "network_get_workers": "WEFTMOE_PF_NETWORK_GET_WORKERS",
     "backward_full_reduce": "WEFTMOE_PF_BWD_FULL_REDUCE",
     "network_credit_windows": "WEFTMOE_PF_CREDIT_WINDOWS",
@@ -81,7 +83,7 @@ def validate(config):
                    backward_wave_blocks=(0, 16, 32, 64, 66, 128, 132, 256),
                    backward_full_reduce=(0, 1), network_credit_windows=(1, 2, 3, 4, 8),
                    network_get_workers=(16, 32, 48, 64, 80, 96),
-                   backward_return_spans=(0, 1),
+                   backward_return_spans=(0, 1), backward_striped_signals=(0, 1),
                    network_private_dr=(0, 1), network_vector_pull=(0, 1),
                    decode_math_m=(0, 16, 64), decode_stages=(2, 3),
                    decode_cta_multiplier=(0, 1, 2, 3),
@@ -94,6 +96,9 @@ def validate(config):
         require(v[key] in allowed, f"V4 {key} must be one of {allowed}")
     require(not v["backward_return_spans"] or v["window_ordered_tape"],
             "precomputed Return spans require a window-ordered tape")
+    require(not v["backward_striped_signals"] or
+            v["network_lanes"] >= 112 - v["network_get_workers"],
+            "striped Return signals require one channel lane per Put worker")
     require(v["cta_count"] % 2 == 0, "V4 cta_count must be even")
     require(v["window_tokens"] > 0 and v["contribution_windows"] > 0,
             "V4 window and contribution capacity must be positive")

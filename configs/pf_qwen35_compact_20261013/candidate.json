@@ -160,10 +160,11 @@
       "network_credit_windows": 4,
       "network_get_workers": 64,
       "backward_return_spans": 1,
+      "backward_striped_signals": 1,
       "network_private_dr": 1,
       "network_vector_pull": 0
     }
   },
-  "compiled_digest": "0b87af4c8ddf",
-  "config_digest": "329e89f2c110"
+  "compiled_digest": "23023d511ccf",
+  "config_digest": "f16f5dc2e13f"
 }

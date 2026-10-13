@@ -39,9 +39,15 @@ class StaticForwardAutotuneTest(unittest.TestCase):
             else:
                 self.assertEqual({c["config"]["v4"]["decode_math_m"] for c in candidates}, {0})
 
-    def test_network_cannot_silently_ignore_decode_m(self):
+    def test_unsafe_network_layouts_are_rejected(self):
         with self.assertRaisesRegex(tune.PlanError, "network ring implements M128"):
             tune.expand_candidates(self.plan(nodes=2))
+        config = tune.expand_candidates(self.plan(kind="ring", nodes=2))[0]["config"]
+        config["v4"].update(backward_striped_signals=1, network_lanes=32)
+        with self.assertRaisesRegex(tune.PlanError, "one channel lane per Put worker"):
+            v4.validate(config)
+        config["v4"]["network_lanes"] = 64
+        v4.validate(config)
 
     def test_route_suite_rejects_memory_and_batch_dependence(self):
         spec = dict(memory_limit_bytes=1024, cases=[dict(route="balanced", seed=0),

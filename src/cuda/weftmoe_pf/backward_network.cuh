@@ -5,6 +5,12 @@ namespace weftmoe_pf::backward_stream {
 #ifndef WEFTMOE_PF_BWD_RETURN_SPANS
 #define WEFTMOE_PF_BWD_RETURN_SPANS 0
 #endif
+#ifndef WEFTMOE_PF_BWD_STRIPED_SIGNALS
+#define WEFTMOE_PF_BWD_STRIPED_SIGNALS 0
+#endif
+static_assert(!WEFTMOE_PF_BWD_STRIPED_SIGNALS ||
+                  kPutWorkers <= static_forward::kNetworkPackets.lanes,
+              "Striped Return signals require one channel lane per Put worker");
 #if WEFTMOE_PF_BWD_RETURN_SPANS
 static_assert(WEFTMOE_PF_WINDOW_ORDERED_TAPE,
               "Return spans require a window-ordered tape");
@@ -175,8 +181,17 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
         ring::window_source(f, desc.window, identity.source).row_base +
             prefix[f.rank * owned + desc.tile.expert] + ordinal};
     const auto block = padded / kM;
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+    // Tape rows are monotonic in window within each expert. Only the last
+    // valid row of an M block publishes its last-required-window key.
+    if ((padded + 1U) % kM == 0U ||
+        saved + 1U == a.dispatch.expert_row_prefix[desc.tile.expert + 1U])
+      words[layout.phase + block] =
+          (static_cast<unsigned long long>(desc.window) << 32U) | block;
+#else
     atomicMax(words + layout.phase + block,
               (static_cast<unsigned long long>(desc.window) << 32U) | block);
+#endif
   }
   for (auto peer = tid; peer < f.static_network.rings.nodes; peer += stride) {
     if (peer == f.node)
@@ -391,7 +406,8 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
         if (issued - completed == Pending)
           retire();
 #endif
-        const auto channel = endpoint.layout().channel(node, f.node, 0U);
+        const auto channel = endpoint.layout().channel(
+            node, f.node, WEFTMOE_PF_BWD_STRIPED_SIGNALS ? worker : 0U);
         const auto control = endpoint.control(true, channel, 0U);
         const auto source_row = std::uint64_t(position % depth) * kM + row;
         endpoint.gin.put(
@@ -450,8 +466,10 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
 
 __device__ __noinline__ void receive_canonical(const ForwardKernelArgs &f,
                                                unsigned worker) {
+#if !WEFTMOE_PF_BWD_STRIPED_SIGNALS
   if (threadIdx.x % 32U)
     return;
+#endif
   netring::Endpoint endpoint(f, kGetWorkers + kPutWorkers + worker);
   for (auto peer = worker; peer < endpoint.layout().nodes;
        peer += kProgressWorkers) {
@@ -459,6 +477,31 @@ __device__ __noinline__ void receive_canonical(const ForwardKernelArgs &f,
       continue;
     const auto channel = endpoint.layout().channel(f.node, peer, 0U);
     const auto target = endpoint.state(true, channel).backward_rows;
+#if WEFTMOE_PF_BWD_STRIPED_SIGNALS
+    // Sender-owned counters avoid a shared remote atomic hotspot. Their sum
+    // uses the existing exact cumulative node target: no new expected-count
+    // directory, reset protocol, or payload capacity is needed.
+    const auto lane = threadIdx.x % 32U;
+    while (true) {
+      unsigned long long dx = 0U, gate = 0U;
+      for (unsigned sender = lane; sender < kPutWorkers; sender += 32U) {
+        const auto control = endpoint.control(
+            true, endpoint.layout().channel(f.node, peer, sender), 0U);
+        dx += endpoint.gin.readSignal(
+            f.gin_window, control + offsetof(static_forward::NetworkSlot,
+                                             backward_dx_signal));
+        gate += endpoint.gin.readSignal(
+            f.gin_window, control + offsetof(static_forward::NetworkSlot,
+                                             backward_gate_signal));
+      }
+      for (unsigned offset = 16U; offset; offset /= 2U) {
+        dx += __shfl_down_sync(0xffffffffU, dx, offset);
+        gate += __shfl_down_sync(0xffffffffU, gate, offset);
+      }
+      if (__shfl_sync(0xffffffffU, dx >= target && gate >= target, 0U))
+        break;
+    }
+#else
     const auto control = endpoint.control(true, channel, 0U);
     while (endpoint.gin.readSignal(
                f.gin_window, control + offsetof(static_forward::NetworkSlot,
@@ -469,6 +512,7 @@ __device__ __noinline__ void receive_canonical(const ForwardKernelArgs &f,
                                                 backward_gate_signal)) <
            target) {
     }
+#endif
   }
 }
 
