@@ -6,9 +6,27 @@ namespace weftmoe_pf::local {
 #ifndef WEFTMOE_PF_LOCAL_PULL_WARPS
 #define WEFTMOE_PF_LOCAL_PULL_WARPS 2
 #endif
+#ifndef WEFTMOE_PF_LOCAL_PULL_MODE
+#define WEFTMOE_PF_LOCAL_PULL_MODE 0
+#endif
 constexpr unsigned kPullWarps = WEFTMOE_PF_LOCAL_PULL_WARPS;
 static_assert(kPullWarps > 0U && kPullWarps <= 3U);
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+
+__device__ __forceinline__ transport::BFloat16 *
+contribution_output(const ForwardKernelArgs &a, unsigned source,
+                    unsigned route) {
+  const auto top_k = a.dispatch.identity.top_k;
+  auto row =
+      std::uint64_t(route % top_k) * a.max_tokens_per_rank + route / top_k;
+#if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
+  if (a.retain_backward_state)
+    row = ring::peer(a, source, a.ring.contribution_rows)[route];
+#endif
+  return peer_at<transport::BFloat16>(a.peer_bases[source],
+                                      a.contribution_offset) +
+         row * a.hidden;
+}
 
 __device__ __forceinline__ void geometry(const ForwardKernelArgs &a) {
   if (blockIdx.x == 0U && threadIdx.x == 0U) {
@@ -49,8 +67,170 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a) {
   grid_sync(a);
 }
 
+// Scalar inverse of the interleaved source order. Each lane can decode an
+// independent row; the small count table is destination-local and immutable.
+__device__ __forceinline__ void decode_row(const ForwardKernelArgs &a,
+                                           unsigned expert, unsigned row,
+                                           unsigned &source,
+                                           unsigned &ordinal) {
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  unsigned peeled = 0U;
+  for (;;) {
+    unsigned active = 0U, layer = ~0U;
+    for (unsigned rank = 0U; rank < a.world; ++rank) {
+      const auto count =
+          unsigned(a.fused_local_expert_count[rank * owned + expert]);
+      if (count > peeled) {
+        ++active;
+        layer = min(layer, count - peeled);
+      }
+    }
+    if (row < std::uint64_t(active) * layer) {
+      ordinal = peeled + row / active;
+      auto index = row % active;
+      for (source = 0U; source < a.world; ++source)
+        if (a.fused_local_expert_count[source * owned + expert] > peeled) {
+          if (!index)
+            return;
+          --index;
+        }
+    }
+    row -= active * layer;
+    peeled += layer;
+  }
+}
+
+template <unsigned ReadTiles, bool WaitFc2, class Storage>
+__device__ __forceinline__ void pull_blocks(const ForwardKernelArgs &a,
+                                            Storage &s) {
+  const auto warp = (threadIdx.x - kMathThreads - 32U) / 32U;
+  const auto lane = threadIdx.x & 31U;
+  auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
+  unsigned expert = 0U, peer_rows = 0U;
+#if WEFTMOE_PF_LOCAL_PULL_MODE != 2
+  unsigned phase = 0U;
+#endif
+  for (unsigned block = blockIdx.x * kPullWarps + warp;
+       block < a.ring.state->blocks; block += gridDim.x * kPullWarps) {
+    while (block >= a.ring.expert_blocks[expert + 1U])
+      ++expert;
+    const auto begin = (block - unsigned(a.ring.expert_blocks[expert])) * kM;
+    const auto rows = min(kM, unsigned(a.ring.expert_rows[expert]) - begin);
+    const auto generation = block / a.ring.depth + 1U;
+    const auto ring_row = block % a.ring.depth * kM;
+    auto &slot = a.ring.slots[block % a.ring.depth];
+    if (!lane)
+      while (ring::acquire(WaitFc2 ? slot.fc2_done : slot.fc1_done) <
+             std::uint64_t(generation - 1U) * ReadTiles) {
+      }
+    __syncwarp();
+    for (unsigned batch = 0U; batch < rows; batch += 32U) {
+      const auto count = min(32U, rows - batch);
+      unsigned long long address = 0ULL;
+      if (lane < count) {
+        const auto logical = block * kM + batch + lane;
+        unsigned source, ordinal;
+        decode_row(a, expert, begin + batch + lane, source, ordinal);
+        const auto route = source_routes(a, a.rank, source, expert)[ordinal];
+        const auto token = route / a.dispatch.identity.top_k;
+        const auto gate = peer_at<float>(a.peer_bases[source],
+                                         a.fused_source_gates_offset)[route];
+        if (a.saved_x) {
+          const auto saved =
+              ring::source_metadata(a, source, a.checkpoint.source_rows)[route];
+          a.checkpoint.rows[logical] = saved;
+          a.checkpoint.gates[saved] = gate;
+          a.checkpoint.headers[saved] = {
+              transport::kActivationTransportSchemaVersion,
+              source,
+              a.rank,
+              0U,
+              a.dispatch.identity.generation,
+              execution_epoch(a),
+              route,
+              route,
+              token,
+              saved,
+              a.rank * a.dispatch.sizes.owned_expert_count + expert,
+              unsigned(route % a.dispatch.identity.top_k)};
+        }
+        a.ring.rows[logical] = {route, source, gate, token,
+                                contribution_output(a, source, route)};
+        gates[ring_row + batch + lane] = gate;
+        address = reinterpret_cast<unsigned long long>(peer_at<const char>(
+                      a.peer_bases[source], a.source_input_offset)) +
+                  std::uint64_t(token) * a.hidden * 2U;
+        peer_rows += source != a.rank;
+      }
+      __threadfence();
+      __syncwarp();
+      for (unsigned row = 0U; row < count; ++row) {
+        const auto *input = reinterpret_cast<const char *>(
+            __shfl_sync(0xffffffffU, address, row));
+#if WEFTMOE_PF_LOCAL_PULL_MODE == 2
+        auto *output = peer_at<uint4>(a.local_base, a.canonical_rows_offset) +
+                       std::uint64_t(ring_row + batch + row) * a.hidden / 8U;
+        constexpr unsigned batch_vectors = 4U;
+        for (unsigned column = lane; column < a.hidden / 8U;
+             column += 32U * batch_vectors) {
+          uint4 values[batch_vectors];
+#pragma unroll
+          for (unsigned i = 0U; i < batch_vectors; ++i)
+            if (column + i * 32U < a.hidden / 8U)
+              values[i] =
+                  reinterpret_cast<const uint4 *>(input)[column + i * 32U];
+#pragma unroll
+          for (unsigned i = 0U; i < batch_vectors; ++i)
+            if (column + i * 32U < a.hidden / 8U)
+              output[column + i * 32U] = values[i];
+        }
+#else
+        if (!lane) {
+          auto *output = peer_at<char>(a.local_base, a.canonical_rows_offset) +
+                         std::uint64_t(ring_row + batch + row) * a.hidden * 2U;
+          for (unsigned offset = 0U; offset < a.hidden * 2U; offset += 4096U) {
+            const auto bytes = min(4096U, unsigned(a.hidden * 2U) - offset);
+            cute::SM90_BULK_COPY_G2S::copy(
+                input + offset,
+                reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]),
+                s.pull[warp], bytes);
+            s.pull_full[warp].arrive_and_expect_tx(bytes);
+            s.pull_full[warp].wait(phase);
+            phase ^= 1U;
+            cute::SM90_BULK_COPY_S2G::copy(s.pull[warp], output + offset,
+                                           bytes);
+            cute::tma_store_arrive();
+            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+          }
+        }
+#endif
+        __syncwarp();
+      }
+#if WEFTMOE_PF_LOCAL_PULL_MODE == 2
+      __threadfence();
+      __syncwarp();
+#endif
+      if (!lane)
+        arrive(slot.x_full, count + (batch + count == rows ? kM - rows : 0U));
+    }
+  }
+  peer_rows = __reduce_add_sync(0xffffffffU, peer_rows);
+  if (!lane) {
+    auto *status =
+        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    if (peer_rows)
+      atomicAdd(&status->actual_dispatch_peer_bytes,
+                std::uint64_t(peer_rows) * a.hidden * 2ULL);
+    atomicMax(&status->dispatch_complete_clock, device_globaltimer_ns());
+  }
+}
+
 template <unsigned ReadTiles = kFc1Tiles, bool WaitFc2 = false, class Storage>
 __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
+#if WEFTMOE_PF_LOCAL_PULL_MODE != 0
+  pull_blocks<ReadTiles, WaitFc2>(a, s);
+  return;
+#endif
   const auto warp = (threadIdx.x - kMathThreads - 32U) / 32U;
   const auto lane = threadIdx.x & 31U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -88,14 +268,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
             token, saved, a.rank * owned + expert,
             unsigned(route % a.dispatch.identity.top_k)};
       }
-      a.ring.rows[logical] = {
-          route, source, gate, token,
-          peer_at<transport::BFloat16>(a.peer_bases[source],
-                                       a.contribution_offset) +
-              (std::uint64_t(route % a.dispatch.identity.top_k) *
-                   a.max_tokens_per_rank +
-               token) *
-                  a.hidden};
+      a.ring.rows[logical] = {route, source, gate, token,
+                              contribution_output(a, source, route)};
       gates[row] = gate;
       const auto *input =
           peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
@@ -160,6 +334,11 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
             position < 32U ? __shfl_sync(0xffffffffU, order, position)
                            : a.dispatch.combine_order[token * top_k + position];
         auto row = slot * a.max_tokens_per_rank + token;
+#if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
+        if constexpr (!Network)
+          if (a.retain_backward_state)
+            row = a.ring.contribution_rows[token * top_k + slot];
+#endif
         if constexpr (Network) {
           const auto sequence = a.ring.state->source_base +
                                 token / a.ring.source.shape.tokens;

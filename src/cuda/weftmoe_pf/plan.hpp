@@ -162,7 +162,7 @@ struct PacketPartition {
 #define WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS 32
 #endif
 static_assert(WEFTMOE_FWD_STATIC_V4_SOURCE_GROUP <= 16);
-static_assert(WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH >= 8);
+static_assert(WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH >= 1);
 static_assert(WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS > 0 &&
               WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS <= 32);
 #ifndef WEFTMOE_FWD_STATIC_V4_PACKET_ROWS
@@ -251,7 +251,10 @@ struct SourcePlanView {
     return std::uint64_t(shape.tokens) * shape.top_k;
   }
   WEFTMOE_STATIC_PLAN_HD unsigned scratch_words(bool canonical = false) const {
-    const auto counts = experts + nodes;
+    auto counts = experts + nodes;
+#if defined(WEFTMOE_PF_ORDERED_DISPATCH) && WEFTMOE_PF_ORDERED_DISPATCH
+    counts = counts < 32U ? 32U : counts;
+#endif
     return canonical ? ((counts + 1U) & ~1U) + 2U * experts : counts;
   }
 };

@@ -3,13 +3,27 @@
 #ifndef WEFTMOE_PF_NETWORK_PENDING
 #define WEFTMOE_PF_NETWORK_PENDING 4
 #endif
+#ifndef WEFTMOE_PF_NETWORK_GET_WORKERS
+#define WEFTMOE_PF_NETWORK_GET_WORKERS 64
+#endif
+#ifndef WEFTMOE_PF_NETWORK_PRIVATE_DR
+#define WEFTMOE_PF_NETWORK_PRIVATE_DR 0
+#endif
+#ifndef WEFTMOE_PF_CREDIT_WINDOWS
+#define WEFTMOE_PF_CREDIT_WINDOWS 1
+#endif
 
 namespace weftmoe_pf {
 
+inline constexpr bool kNetworkPrivateDr = WEFTMOE_PF_NETWORK_PRIVATE_DR;
+inline constexpr unsigned kNetworkCreditWindows = WEFTMOE_PF_CREDIT_WINDOWS;
+static_assert(kNetworkCreditWindows >= 1U && kNetworkCreditWindows <= 8U);
+
 // Borrow one control warp per CTA: dispatch, return, progress, admission.
 inline constexpr unsigned kNetworkPending = WEFTMOE_PF_NETWORK_PENDING;
-inline constexpr unsigned kGetWorkers = 64U;
-inline constexpr unsigned kPutWorkers = 48U;
+inline constexpr unsigned kGetWorkers = WEFTMOE_PF_NETWORK_GET_WORKERS;
+inline constexpr unsigned kPutWorkers = 112U - kGetWorkers;
+static_assert(kGetWorkers > 0U && kGetWorkers < 112U);
 inline constexpr unsigned kProgressWorkers = 19U;
 inline constexpr unsigned kNetworkOwners =
     kGetWorkers + kPutWorkers + kProgressWorkers + 1U;
@@ -28,6 +42,8 @@ struct NetworkLayout {
   std::size_t ring_region = 0;
   std::size_t source_bytes =
       0; // Immutable sender metadata, excluding RX geometry.
+  std::size_t dispatch_bytes =
+      0; // Backward does not consume Forward Return plans.
   unsigned ring_workers = 0;
 };
 

@@ -1,5 +1,22 @@
 # Forward / Backward autotune
 
+Qwen3.5-35B-A3B（H2048/I512/E256/top8）的 EP8/EP16 实测专属 profile、
+查表文件和复现命令见
+[`configs/pf_qwen35_20261013`](../configs/pf_qwen35_20261013/README.md)。
+搜索配置为 `configs/pf_qwen35_training_autotune.json`，不是把 Flash 的
+实测参数直接标成 Qwen 最优值。
+
+M14 的数据流候选见 `configs/pf_qwen35_compact_20261013`，消融与最终
+验证状态以 `docs/pf_backward_20261012.md` 为准。新增 V4 搜索轴包括
+local pull warp 数/分块方式、紧凑 contribution、有序 dispatch/连续 Get、
+window-ordered tape、BWD return pending/span 和 full-CTA reduce。
+默认关闭新策略，不改 Flash profile。`network_credit_windows` 控制真正的
+RDMA ring 深度倍率，进入编译 ID；`network_min_depth` 允许 1/2/4 等 floor，
+但仍满足最坏窗口的容量下界。环境变量 `WEFTMOE_PF_CREDIT_WINDOWS` /
+`WEFTMOE_PF_MIN_RING_DEPTH` 是显式覆盖；搜索这些轴时须从 `environment`
+移除固定覆盖。`window_tokens` / `contribution_windows` 仍是运行时容量项；
+network PF 使用全调用 contribution，不能把 D-only 候选当成有效 wire tune。
+
 ## 当前 PF stream BWD 的 GEMM 搜索（2026-10-12）
 
 `configs/pf_backward_stream_autotune.json` 用于新 BWD：固定 FWD 和通信协议，

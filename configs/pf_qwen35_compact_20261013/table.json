@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "key": {
+        "gpu": "NVIDIA L20X",
+        "dtype": "bfloat16",
+        "input_layout": "dp",
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "nodes": 1,
+        "gpus_per_node": 8,
+        "training": true,
+        "max_tokens": 10055,
+        "interconnect": "nvlink"
+      },
+      "compiled_digest": "0b87af4c8ddf",
+      "config_digest": "48d53d4cffb6",
+      "window_tokens": 2048,
+      "contribution_windows": 2,
+      "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
+    },
+    {
+      "key": {
+        "gpu": "NVIDIA L20X",
+        "dtype": "bfloat16",
+        "input_layout": "dp",
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "nodes": 1,
+        "gpus_per_node": 8,
+        "training": true,
+        "max_tokens": 25820,
+        "interconnect": "nvlink"
+      },
+      "compiled_digest": "0b87af4c8ddf",
+      "config_digest": "48d53d4cffb6",
+      "window_tokens": 2048,
+      "contribution_windows": 2,
+      "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
+    },
+    {
+      "key": {
+        "gpu": "NVIDIA L20X",
+        "dtype": "bfloat16",
+        "input_layout": "dp",
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "nodes": 2,
+        "gpus_per_node": 8,
+        "training": true,
+        "max_tokens": 10277,
+        "interconnect": "nvlink+gin"
+      },
+      "compiled_digest": "0b87af4c8ddf",
+      "config_digest": "329e89f2c110",
+      "window_tokens": 1024,
+      "contribution_windows": 2,
+      "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
+    },
+    {
+      "key": {
+        "gpu": "NVIDIA L20X",
+        "dtype": "bfloat16",
+        "input_layout": "dp",
+        "experts": 256,
+        "hidden": 2048,
+        "intermediate": 512,
+        "top_k": 8,
+        "nodes": 2,
+        "gpus_per_node": 8,
+        "training": true,
+        "max_tokens": 25820,
+        "interconnect": "nvlink+gin"
+      },
+      "compiled_digest": "0b87af4c8ddf",
+      "config_digest": "329e89f2c110",
+      "window_tokens": 1024,
+      "contribution_windows": 2,
+      "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
+    }
+  ]
+}

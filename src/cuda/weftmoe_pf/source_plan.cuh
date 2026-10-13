@@ -155,6 +155,43 @@ __device__ void build_source_window(const SourcePlanView &a,
         route_order[position] = route;
       });
   if constexpr (NodeDirectory) {
+#if defined(WEFTMOE_PF_ORDERED_DISPATCH) && WEFTMOE_PF_ORDERED_DISPATCH
+    // The expert cursors are dead after route_order publication. Reuse their
+    // storage for a CTA prefix scan, keeping node tokens in source order.
+    source_plan_sync<Threads, Barrier>();
+    for (unsigned node = 0U; node < a.nodes; ++node) {
+      auto cursor = node_prefix[node];
+      for (unsigned chunk = 0U; chunk < tokens; chunk += Threads) {
+        const auto token = chunk + tid;
+        unsigned fanouts = 0U;
+        if (token < tokens)
+          for (unsigned slot = 0U; slot < a.shape.top_k; ++slot) {
+            const auto route =
+                route_begin + std::uint64_t(token) * a.shape.top_k + slot;
+            const auto expert = a.selected_experts[route];
+            fanouts += (!a.valid || a.valid[route]) && expert >= 0 &&
+                       unsigned(expert) < a.experts &&
+                       unsigned(expert) / experts_per_node == node;
+          }
+        const auto scan = unsigned(warp_inclusive_sum(fanouts != 0U));
+        if (tid % 32U == 31U)
+          scratch[tid / 32U] = scan;
+        source_plan_sync<Threads, Barrier>();
+        unsigned prior = 0U, total = 0U;
+#pragma unroll
+        for (unsigned warp = 0U; warp < Threads / 32U; ++warp) {
+          const auto count = scratch[warp];
+          if (warp < tid / 32U)
+            prior += count;
+          total += count;
+        }
+        if (fanouts)
+          node_tokens[cursor + prior + scan - 1U] = {begin + token, fanouts};
+        cursor += total;
+        source_plan_sync<Threads, Barrier>();
+      }
+    }
+#else
     for (auto token = tid; token < tokens; token += Threads) {
       const auto first_route = route_begin + std::uint64_t(token) * a.shape.top_k;
       for (unsigned k = 0; k < a.shape.top_k; ++k) {
@@ -181,6 +218,7 @@ __device__ void build_source_window(const SourcePlanView &a,
         }
       }
     }
+#endif
   }
   source_plan_sync<Threads, Barrier>();
 }

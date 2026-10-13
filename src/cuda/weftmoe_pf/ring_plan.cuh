@@ -196,7 +196,13 @@ template <bool Network, bool Training = false, unsigned Threads = 384U,
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
   constexpr unsigned Math = 256U, SourceThreads = Threads - Math;
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+  // Forward and Backward must use the same source order within a window;
+  // otherwise identical physical row numbers describe different routes.
+  constexpr bool Canonical = Training;
+#else
   constexpr bool Canonical = Training && (!Network || Backward);
+#endif
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -297,42 +303,40 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             static_cast<unsigned>(ordinal);
     }
     static_forward::build_source_packet_prefix(p, worker, workers);
-    static_forward::build_return_packet_prefix(p, r.returning, worker, workers);
+    if constexpr (!Backward)
+      static_forward::build_return_packet_prefix(p, r.returning, worker,
+                                                 workers);
     grid_sync<0U, Threads>(a);
     if (worker == 0U) {
       static_forward::build_channel_offsets(
           p.packet_prefix, p.nodes * p.packets.lanes, p.local_windows(),
           r.dispatch.channel_offsets);
-      static_forward::build_channel_offsets(
-          r.returning.packet_prefix, p.nodes * p.packets.lanes,
-          p.local_windows(), r.returning.channel_offsets);
+      if constexpr (!Backward)
+        static_forward::build_channel_offsets(
+            r.returning.packet_prefix, p.nodes * p.packets.lanes,
+            p.local_windows(), r.returning.channel_offsets);
     }
     grid_sync<0U, Threads>(a);
     static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
-    static_forward::build_return_packets(p, r.returning, worker, workers);
+    if constexpr (!Backward)
+      static_forward::build_return_packets(p, r.returning, worker, workers);
     grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanPacketsReady,
                                Kernel, 0U, 0U, 0U);
+    const auto metadata_bytes = Backward ? a.static_network.dispatch_bytes
+                                         : a.static_network.source_bytes;
     if (blockIdx.x < a.static_network.contexts && tid == 0U) {
       const auto base = source_offset(a, a.rank);
       for (unsigned node = 0U; node < p.nodes; ++node)
         if (node != a.node)
-          network_put(a, node, base, base, a.static_network.source_bytes);
+          network_put(a, node, base, base, metadata_bytes);
     }
-    // Backward's immutable packet/fanout tape is not part of the published
-    // Forward directory. Build it while those independent puts are in flight.
-    if constexpr (Training && !Backward)
-      if (a.checkpoint.counts.runtime) {
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U,
-                                   TrainingPacketsBegin, Kernel, 0U, 0U, 0U);
-        build_training_packets(a, scratch);
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, TrainingPacketsEnd,
-                                   Kernel, 0U, 0U, 0U);
-      }
+    // Backward rebuilds this same ring directory from its retained routes;
+    // it does not consume a second packet/fanout tape.
     // network_put assigns contiguous chunks to contexts from zero. Fence
     // every owner with a Put, but do not signal on the unused contexts.
-    const auto chunks = static_forward::ceil_div(a.static_network.source_bytes,
-                                                 kNetworkChunkBytes);
+    const auto chunks =
+        static_forward::ceil_div(metadata_bytes, kNetworkChunkBytes);
     network_barrier<0U, Threads>(
         a, static_cast<unsigned>(
                min(chunks, std::uint64_t(a.static_network.contexts))));
@@ -490,6 +494,14 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     build_blocks(a, w, expert, tid, Threads);
     if constexpr (Network)
       collective_scope_sync<Threads, kCollectiveScopeBarrier>();
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+    std::uint64_t tape_begin = 0U;
+    if constexpr (Network && Training) {
+      tape_begin = a.dispatch.expert_row_prefix[expert];
+      for (std::uint64_t previous = 0U; previous < w; ++previous)
+        tape_begin += r.expert_rows[previous * owned + expert];
+    }
+#endif
     // Freeze reverse identity and gate before payload starts. Each warp reads
     // a contiguous source-expert route list; pull does no peer count/ordinal
     // search, and Return never depends on the lifetime of an X slot.
@@ -515,39 +527,47 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           route = order[source_prefix[a.rank * owned + expert] + ordinal];
           gate = gates[route];
         }
-        void *output;
-        if (!Network || source / a.local_world_size == a.node) {
-          const auto &address = window_source(a, w, source);
-          if constexpr (Network) {
-            const auto output_row = address.row_base +
-                                    source_prefix[a.rank * owned + expert] +
-                                    ordinal;
-            output = ncclGetLsaPointer(a.gin_window,
-                                       a.static_network.contribution +
-                                           output_row * a.hidden *
-                                               sizeof(transport::BFloat16),
-                                       source % a.local_world_size);
+        void *output = nullptr;
+        // Canonical dX resolves its own output; no Forward TX plan is needed.
+        if constexpr (!Network || !Backward) {
+          if (!Network || source / a.local_world_size == a.node) {
+            const auto &address = window_source(a, w, source);
+            if constexpr (Network) {
+              const auto output_row = address.row_base +
+                                      source_prefix[a.rank * owned + expert] +
+                                      ordinal;
+              output = ncclGetLsaPointer(a.gin_window,
+                                         a.static_network.contribution +
+                                             output_row * a.hidden *
+                                                 sizeof(transport::BFloat16),
+                                         source % a.local_world_size);
+            } else {
+              output = local_row_output(a, w, source, route);
+            }
           } else {
-            output = local_row_output(a, w, source, route);
+            const auto node_expert = a.node * a.local_world_size * owned;
+            const auto node_row = source_prefix[a.rank * owned + expert] +
+                                  ordinal - source_prefix[node_expert];
+            output = return_tx::row_output(a, source, local_window, node_row);
           }
-        } else {
-          const auto node_expert = a.node * a.local_world_size * owned;
-          const auto node_row = source_prefix[a.rank * owned + expert] +
-                                ordinal - source_prefix[node_expert];
-          output = return_tx::row_output(a, source, local_window, node_row);
         }
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
             static_cast<unsigned>(route), source, gate,
             static_cast<unsigned>(route / p.shape.top_k), output};
         if constexpr (Training) {
           const auto tape_row =
-              source_metadata(a, source, a.checkpoint.source_rows)[route];
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+              Network
+                  ? tape_begin + row
+                  :
+#endif
+                  source_metadata(a, source, a.checkpoint.source_rows)[route];
           a.checkpoint
               .rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m +
                     row] = tape_row;
           // These are immutable route metadata, independent of X arrival.
           // Publish them with the plan, leaving payload issuers only the copy.
-          if (a.checkpoint.gates) {
+          if (!Backward && a.checkpoint.gates) {
             a.checkpoint.gates[tape_row] = gate;
             a.checkpoint.headers[tape_row] = {
                 transport::kActivationTransportSchemaVersion,
@@ -576,7 +596,7 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       }
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
-    if constexpr (Network) {
+    if constexpr (Network && !Backward) {
       // The source identity is immutable. Compress publication destinations
       // while this CTA still owns the complete row table, instead of making
       // a single progress lane rescan M128 rows on the Return critical path.

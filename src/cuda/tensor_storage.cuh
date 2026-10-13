@@ -154,7 +154,8 @@ struct BackwardTensorStorage::Impl {
       workspace;
   tensor_storage_detail::Completion completion;
   std::uint64_t tokens, hidden, intermediate, rows, padded_rows;
-  std::size_t u_offset, dab_offset, dgate_rows_offset;
+  std::size_t u_offset, dab_offset, dgate_rows_offset, dr_offset = 0;
+  bool private_dr = false;
   unsigned pf_depth = 0;
   std::size_t pf_dab_offset = 0;
   CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{};
@@ -163,7 +164,7 @@ struct BackwardTensorStorage::Impl {
   static std::shared_ptr<Impl>
   make(const DeviceDispatchHandle &, const CudaExecution &,
        const BackwardMegaKernelConfig &, const BackwardTensorBuffers &,
-       const CudaTensorAllocator &, unsigned pf_depth);
+       const CudaTensorAllocator &, unsigned pf_depth, bool private_dr);
 };
 
 ForwardTensorStorage prepare_forward_tensors(
@@ -223,7 +224,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
     const DeviceDispatchHandle &dispatch, const CudaExecution &execution,
     const BackwardMegaKernelConfig &config,
     const BackwardTensorBuffers &bindings, const CudaTensorAllocator &allocator,
-    unsigned pf_depth) {
+    unsigned pf_depth, bool private_dr) {
   using namespace tensor_storage_detail;
   if (!dispatch || !execution || !config.hidden_size ||
       !config.intermediate_size)
@@ -231,6 +232,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
         "prepare Backward tensors requires Notify and a model shape");
   auto state = std::make_shared<BackwardTensorStorage::Impl>(execution);
   state->pf_depth = pf_depth;
+  state->private_dr = private_dr;
   state->tokens = dispatch.identity().num_tokens;
   state->top_k = dispatch.identity().top_k;
   state->experts = dispatch.sizes().owned_expert_count;
@@ -266,8 +268,8 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
       bindings.dgate);
   state->dw1 = make(checked_mul(weight, 4ULL, "dW1 bytes"), bindings.dw1);
   state->dw2 = make(checked_mul(weight, 2ULL, "dW2 bytes"), bindings.dw2);
-  // Notify already carries exact R/P. U/dAB remain private; communication dR
-  // belongs to the execution slot and is shared by its successive calls.
+  // Notify already carries exact R/P. Local IPC dR belongs to the execution
+  // slot. Network PF can keep dR private: only this GPU forwards into it.
   std::size_t cursor = 0;
   const auto intermediate_elements = checked_mul(
       state->padded_rows, state->intermediate, "Backward workspace elements");
@@ -275,6 +277,12 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   state->dab_offset = append(cursor, intermediate_elements, 4U, "Backward dAB");
   state->dgate_rows_offset =
       append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
+  if (private_dr)
+    state->dr_offset =
+        append(cursor,
+               checked_mul(std::max(state->rows, std::uint64_t{1}),
+                           state->hidden, "private Backward dR elements"),
+               2U, "private Backward dR");
   if (pf_depth && 2U * state->intermediate > state->hidden)
     state->pf_dab_offset = append(
         cursor, std::uint64_t(pf_depth) * backward_tuning::kTileM *

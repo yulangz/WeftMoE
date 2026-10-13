@@ -83,12 +83,20 @@ __device__ __noinline__ void transfer(const ForwardKernelArgs &a,
         slot.retire_target += desc.fanouts;
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetStart,
                                    GinDispatch, channel, sequence, rows);
-        for (unsigned row = 0U; row < rows; ++row)
+        for (unsigned row = 0U; row < rows;) {
+          unsigned count = 1U;
+#if defined(WEFTMOE_PF_COALESCE_GET) && WEFTMOE_PF_COALESCE_GET
+          while (row + count < rows &&
+                 tokens[row + count].token == tokens[row].token + count)
+            ++count;
+#endif
           endpoint.gin.get(
               ncclTeamWorld(endpoint.gin.comm), endpoint.peer(channel),
               a.gin_window,
               a.static_network.input + tokens[row].token * row_bytes,
-              a.gin_window, destination + row * row_bytes, row_bytes);
+              a.gin_window, destination + row * row_bytes, count * row_bytes);
+          row += count;
+        }
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, DispatchGetIssued,
                                    GinDispatch, channel, sequence, rows);
 
@@ -277,6 +285,10 @@ __device__ __noinline__ void progress(const ForwardKernelArgs &a,
   } while (!done);
 }
 
+#ifndef WEFTMOE_PF_NETWORK_VECTOR_PULL
+#define WEFTMOE_PF_NETWORK_VECTOR_PULL 0
+#endif
+
 // The same 4 KiB bulk-copy staging used by local PF. Each warp owns its slot;
 // every copy finishes before X-ready or RX-reader retirement is published.
 struct Copy {
@@ -298,6 +310,32 @@ struct Copy {
       cute::tma_store_arrive();
       asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
     }
+  }
+
+  __device__ void warp_copy(const char *input, char *output, unsigned bytes) {
+    const auto lane = threadIdx.x % 32U;
+#if WEFTMOE_PF_NETWORK_VECTOR_PULL
+    constexpr unsigned Batch = 4U;
+    const auto *source = reinterpret_cast<const uint4 *>(input);
+    auto *destination = reinterpret_cast<uint4 *>(output);
+    for (unsigned column = lane; column < bytes / sizeof(uint4);
+         column += 32U * Batch) {
+      uint4 values[Batch];
+#pragma unroll
+      for (unsigned i = 0U; i < Batch; ++i)
+        if (column + i * 32U < bytes / sizeof(uint4))
+          values[i] = source[column + i * 32U];
+#pragma unroll
+      for (unsigned i = 0U; i < Batch; ++i)
+        if (column + i * 32U < bytes / sizeof(uint4))
+          destination[column + i * 32U] = values[i];
+    }
+    __threadfence();
+#else
+    if (!lane)
+      (*this)(input, output, bytes);
+#endif
+    __syncwarp();
   }
 };
 
@@ -395,9 +433,7 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
       a, worker, workers,
       [&](std::uint64_t block, unsigned m, float gate, const char *input) {
         const auto row = ring::row(a, block) + m;
-        if (!lane)
-          copy(input, output + row * bytes, bytes);
-        __syncwarp();
+        copy.warp_copy(input, output + row * bytes, bytes);
         if (!lane) {
           gates[row] = gate;
           const auto valid = a.ring.blocks[block].tile.rows;

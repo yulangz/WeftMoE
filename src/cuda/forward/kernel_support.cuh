@@ -764,6 +764,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     const auto metadata = make_source_metadata_layout(config, shape, packets);
     network.source_stride = metadata.bytes;
     network.source_bytes = metadata.published_bytes;
+    network.dispatch_bytes = metadata.return_prefix;
     network.source = append(cursor, config.max_nodes, metadata.bytes,
                             "ring source replicas");
     const auto packet =
@@ -793,12 +794,13 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
     if (network_prefill_streaming(config)) {
+      unsigned long windows = weftmoe_pf::kNetworkCreditWindows;
       if (const auto *value = std::getenv("WEFTMOE_PF_CREDIT_WINDOWS")) {
-        const auto windows = std::stoul(value);
+        windows = std::stoul(value);
         if (!windows || windows > 8U)
           throw std::invalid_argument("PF credit windows must be in [1, 8]");
-        network.rings.depth *= static_cast<unsigned>(windows);
       }
+      network.rings.depth *= static_cast<unsigned>(windows);
       network.contexts = weftmoe_pf::kNetworkOwners - 1U;
       network.input =
           append(cursor,
@@ -1047,7 +1049,11 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                std::uint64_t(ring.contribution_depth) * ring.shape.tokens *
                    config.max_top_k,
                sizeof(std::uint64_t), "contribution route generations");
-    if (config.max_nodes > 1U)
+    if (config.max_nodes > 1U
+#if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
+        || config.enable_backward_state
+#endif
+    )
       ring.contribution_rows =
           append(cursor,
                  checked_mul(config.max_tokens_per_rank, config.max_top_k,

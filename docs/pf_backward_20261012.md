@@ -4,6 +4,567 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M14：Qwen 数据流优化（进行中，2026-10-13）
+
+目标：保持 Flash H4096/I2048/E256/top6 不回退，使 Qwen
+H2048/I512/E256/top8 的 EP8/EP16、8K/20K、均衡/非均衡路由，
+带缓存 FWD 和独立 BWD 全部达到 `Megatron / PF - 1 >= 15%`。
+不将吞吐提升和延迟下降混用。整理后的 Qwen 配置在本轮 16 项复测中
+全部超过目标，单机最小领先 40.2%、双机最小领先 15.9%。新的 Megatron
+复测和最终 Flash 配对回归尚在进行，未将首轮达标当作最终回归完成。
+Flash 默认路径较早的 16 项配对检查未发现系统性回退。
+
+口径沿用 M13：1620 MHz、token 数正态随机 ±3σ（σ=10%）、seed 123；
+4 warmups、16 samples，先完整回放 trace 预热。每步取最慢 rank，再取 p50。
+FWD 包含当次权重重排、notify、缓存申请、main；BWD 使用当次新 FWD
+tape，FWD 本身不计时。这里只是算子测试，非完整模型训练 step。
+编译、数值检查和正式计时串行。
+
+两个 shape 不能只按 TFLOPS 直接外推：每 token 的 FWD 专家 GEMM
+为 `6 * H * I * topk`，Flash 是 Qwen 的 6 倍；contribution 字节数
+为 `2 * H * topk`，Flash 只有 Qwen 的 1.5 倍。因此 Qwen 每字节
+return 所对应的计算量仅为 Flash 的 1/4，而 top8 又比 top6 多 1/3
+专家输入行及相关同步工作。较小 I 下，写回地址局部性、每 tile fence、
+host 协商等开销更容易暴露，不能仅靠调 GEMM N/K/stages 假设解决。
+
+### 单机：主要瓶颈是 contribution 地址布局，不是 GEMM tile
+
+原布局 `C[topk_slot][max_tokens][H]` 让专家 GEMM 的相邻行写入离散
+source-token 地址。训练 notify 已有每 source/expert 的稳定 ordinal；
+将 C 地址改为 source 上的 expert-prefix + ordinal，reduce 再通过
+route→C-row 表读回。只改变地址布局，不改变 GEMM 的行、BF16 舍入、
+expert-sorted FP32 combine 顺序，不复用上一调用的路由计划。
+Qwen 20K 测量容量下映射表约 0.79 MiB/卡，不增加 contribution payload。
+
+| 单机随机路由候选 | FWD 8K / 20K (ms) | BWD 8K / 20K (ms) |
+|---|---:|---:|
+| M13（历史，本轮未改动二进制） | 4.598 / 14.398 | 5.918 / 16.212 |
+| 2→3 pull warps | 4.197 / 12.774 | 5.507 / 15.204 |
+| warp 领取 M-block，批量解码行，vector pull | 4.266 / 11.342 | 5.370 / 14.660 |
+| 再加紧凑 contribution | **3.372 / 7.031** | **4.272 / 9.399** |
+
+最后一项均衡路由为 FWD 3.248/5.916、BWD 3.431/7.468 ms。
+同环境 Megatron 复测后，单机 8 个 case 首轮全部超过目标，最小吞吐
+领先约 36.9%；最终生成配置仍须极端路由/多 tape 检查和确认轮。
+artifact `build/pf_main_timeline/qwen_blocks_compact`；日志在
+`build/qwen35_opt_20261013/results/compact_*`。
+129/8K/20K 各两次变化路由，output/dX/dGate/dW1/dW2 校验已通过。
+
+同环境 Megatron 复测和紧凑地址单独消融：
+
+| 单机 | Megatron FWD / BWD (ms) | 紧凑 C + 原逐行 bulk pull，3 warps | 紧凑 C + M-block vector pull，3 warps |
+|---|---:|---:|---:|
+| 均衡 8K | 5.662 / 5.899 | 2.784 / 3.562 | 3.248 / 3.431 |
+| 均衡 20K | 10.010 / 10.833 | 6.143 / 7.736 | 5.916 / 7.468 |
+| 随机 8K | 6.225 / 6.093 | 3.258 / 4.406 | 3.372 / 4.272 |
+| 随机 20K | 11.646 / 12.867 | 7.767 / 9.954 | 7.031 / 9.399 |
+
+两种方案单机 8 项均达到吞吐领先 15% 的目标；大部分收益来自紧凑 C，
+不能全部归功于 vector pull。原逐行 pull 在 8K FWD 更快，M-block
+pull 在 20K 更快；尚未宣称任何一项在所有规模占优。
+本次将 `local_pull_warps`、`local_pull_mode`（逐行 bulk / M-block bulk /
+M-block vector）和 `local_compact_return` 纳入 autotune 参数及 compiled ID，
+不修改 Flash 默认值。历史额外 `--define` 候选仅用于消融，其 artifact
+SHA 和定义记录在 manifest 中，不冒充最终生成配置。
+
+没有保留的消融：pull 4-buffer 异步流水、提前释放 shared epilogue、
+单独 return warp、math warp bulk return、额外 source route+gate 打包。
+它们没有稳定收益，部分反而变慢；没有据此断言某种拷贝指令普遍更快。
+单机旧布局的插桩 timeline 显示 20K FC2 epilogue 明显拖长，纯 GEMM
+诊断相对 cuBLAS 约差 12%–13%，不足以解释完整路径的大幅差距。
+未成功取得可靠 TLB/warp-stall 计数器，不能将地址布局收益归因为已证实的 TLB miss。
+
+### 双机：已测试的消融与下一步
+
+在不提前释放 TX 的前提下，将 BWD return 的逐 fragment flush/wait
+改为最多 4 个请求的 FIFO。仅最后一个 fragment 退役后释放 M-block
+的 TX credit，跨 peer 的前序请求同样必须退役。均衡路由有小幅收益；
+将完成信号分散到 channel 的消融没有进一步收益，已从源码撤销。
+
+再把 BWD contribution 从 window-major 改为跨 window 的 source/expert
+连续布局，可减少 return fragment，但收益远小于单机：
+
+| 双机 BWD | 均衡 8K / 20K (ms) | 随机 8K / 20K (ms) |
+|---|---:|---:|
+| M13（历史） | 8.519 / 15.791 | 8.441 / 18.012 |
+| 有界 pending=4 | 7.983 / 14.931 | 8.185 / 18.251 |
+| 再加跨 window 紧凑 return | 7.830 / 14.692 | 8.073 / 18.189 |
+
+以上双机候选均通过完整梯度检查，仍未达到目标。随后分别验证了：
+直接利用 FWD canonical 行 tape 省去 BWD 的 FWD-window 目录重建、
+机内转发 vector copy、按真实消费者缩小 system-fence 范围。
+NIC 使用的 TX 数据仍保留发布与完成 credit，不用数值偶然通过代替同步证明。
+
+canonical planner 第一版同样通过全部梯度，但未保留其“先转发完整本地 dY，
+再消费远端 RX”的顺序：均衡 BWD 7.549/15.192、随机 8.310/19.705 ms。
+这种顺序延后 RX credit，20K 回退；修订版恢复 window 内的本地/远端
+交错，只从 source route-order 直接取 canonical saved-row，不重建 FWD
+物理目录。第一版再叠加 vector forwarding 更慢：
+均衡 BWD 7.613/15.541、随机 8.493/20.194 ms；FWD 6.320/12.893、
+6.718/13.423 ms，与历史基线相近，不据此替换原 bulk copy。
+
+canonical planner 恢复 window 内交错后的 BWD 为均衡 7.988/14.564、
+随机 8.038/18.255 ms；再加 deferred local fence 和容量 fast path 为
+7.905/14.534、7.920/18.435 ms，没有足够收益支持保留全部复杂度。
+该组合 FWD 为均衡 6.325/12.911、随机 6.652/13.350 ms。
+同环境 Megatron 双机 FWD 为均衡 7.475/14.288、随机 8.351/17.474；
+BWD 为均衡 6.764/15.184、随机 7.936/18.932 ms。
+
+通信隔离：用现有 identity diagnostic 替换专家 Jacobian，保留实际
+dispatch、GM 读写、TX credit、return、reduce。随机 8K/20K 的设备
+main envelope 仍为 6.055/15.166 ms，dispatch envelope 为 2.930/6.832，
+return tail 为 3.828/8.193，reduce 为 0.305/0.760 ms。各项为独立
+rank-max p50、可重叠，不可相加；identity 有额外 GM 读，且启用了
+progress 输出，不能当作纯 RDMA 峰值或正式完整 BWD 性能。
+日志 `identity_net_current_comm*`，129 token identity 数值检查通过。
+这支持继续优先改变 return 数据组织，而非只调 GEMM。
+
+节点内 FP32 partial combine 消融（未保留）：复用 dispatch 按节点去重的
+token 目录和包顺序；中转仍采用 source/window/expert 紧凑 BF16 地址，
+避免重新引入随机 token 写回。节点 partial 用 FP32 发送，最后转 BF16，
+不额外引入 BF16 舍入；节点归约改变 FP32 加法结合顺序，必须重新做
+原容差数值检查。先测整段 join 后发送，再测 source-window 完成后流水
+发送。后者用每 GPU/window 的精确完成行计数，M-slot credit 不等待 NIC
+读取全调用中转区，packet scratch 仍等待本地 NIC completion 后复用。
+这些实验均已撤回，不是生产路径。
+
+负结果：整段 join 后仅用一个 warp/CTA 合并发送，均衡 FWD
+14.560/31.210、BWD 15.915/34.070 ms；窗口流水原型分别为
+20.681/46.333、22.782/52.760 ms。减少 wire bytes 并没有补偿额外
+合并/打包开销，不能保留为默认。该原型新增的 GEMM/通信 helper
+没有寄存器 spill，不能将此次回退简单归咎于 spill。
+
+将每条 token 的 contribution 地址解析和排序从 H 列循环中提到外面后，
+8K 单次插桩 main 约 10.73 ms；各 rank 最后 FC2 完成于 main 后
+1.93–3.53 ms，最后 pack 为 6.96–9.68 ms。单 CTA 累计 pack
+5.22–7.92 ms，而累计 NIC wait 0.35–0.55 ms；不同 CTA 的区间
+重叠，不能相加。此证据指向少量打包 warp 上的串行访存，而非 GEMM
+或 NIC wait。再增加四组独立向量累加，随机 8K FWD/BWD 为
+9.408/12.324 ms，仍不达标；这版 FWD helper 还出现少量 spill，未保留。
+随后隔离消融直接批量发送 GEMM 已写好的连续节点区间，不做 FP32
+partial combine：随机 8K FWD/BWD 为 6.925/9.950 ms；再加本地
+ready 推送为 6.906/9.710 ms。逐包 ready 则为 9.356/12.023 ms。
+均未保留。负结果原型保存在 ignored build 目录的补丁归档中。
+
+后续有效改动是**先消除窗口之间的错误依赖，再改通信发射节奏**：
+
+1. dispatch 节点去重目录按 token 递增生成；连续 token 合并为一个 Get。
+   不增加 pack buffer，不多发送未命中节点的 token，不改变 RX credit。
+2. 训练 tape 从 `[expert][source][source 的所有窗口]` 改为
+   `[expert][window/group][source][ordinal]`，FWD/BWD 使用同一稳定行序。
+   cache 仍按 expert 紧凑、不恢复窗口 M-padding、不增加激活容量。
+   原来的 M-block 可能跨越一个 source 的末窗口和下一个 source 的首窗口，
+   从而使首窗口部分行一直等到最后才完成。新顺序解除这类跨窗口依赖。
+   dW 的 K 行遍历顺序改变，不能仅验证 dX；129/8K/20K、两次新 tape 的
+   output/dX/dGate/dW1/dW2 均通过原容差，最大 dW relative-L2 约 4.72e-4。
+3. 配合有界 pending=4 的 return FIFO，不在每个 fragment 后立即等 NIC。
+   TX 仍必须等所有 fragment 本地完成才回收；B128、8K 的强制环复用验证通过。
+
+| 双机候选 | 均衡 FWD 8K / 20K | 随机 FWD 8K / 20K | 均衡 BWD 8K / 20K | 随机 BWD 8K / 20K |
+|---|---:|---:|---:|---:|
+| 有序 dispatch + 连续 Get | 5.965 / 12.469 | 6.192 / 12.928 | 8.040 / 15.063 | 8.040 / 17.975 |
+| 再加 window-ordered tape | 5.853 / 12.506 | 6.032 / 12.984 | 6.856 / 14.349 | 7.603 / 17.565 |
+| 再加 pending=4（仅 BWD） | — | — | 6.503 / 13.663 | 7.395 / 17.463 |
+
+单位 ms，仍是候选首轮、尚未全部达标。`window_tape_progress` 的均衡
+8K 插桩中，main envelope 5.190 ms，activation envelope 2.384 ms，
+dW 0.698 ms、return tail 2.564 ms、reduce 0.400 ms；这些区间可重叠，
+不能相加或当作未插桩正式计时。
+
+`dGate` 随 `dX` 合包的消融未保留：每行尾部多留 16B 保持向量对齐，
+两条 Put/完成信号合为一条，129/8K/20K 完整梯度检查通过，但均衡
+BWD 6.488/13.738、随机 7.521/17.522 ms，没有稳定收益；新增 padding
+及专用分支已撤销。不能把当前尾部开销简单归因于 dGate 小消息。
+
+window-ordered tape 每 expert 的 last-window key 单调，可用各 sorted
+run 的二分 rank 在一个 kernel 内合并静态任务顺序，替代多轮 merge
+和最后的复制。复用原 dU 计数 scratch 保存排列，不新增显存；所有
+空 expert/rank 必须合法。129/8K 梯度检查通过；均衡 BWD 首轮为
+6.449/13.711 ms，减少 kernel 数量，但不宣称这几十微秒差异是稳定收益。
+
+继续消融（尚未选作默认）：静态 return 归属逐轮旋转 5 个 worker，
+均衡 BWD 6.349/13.607 ms、随机 7.592/17.449 ms，随机 8K 回退，
+不能仅据均衡 case 选型。把相同的 112 个数据通信 owner 从 Get64/Put48
+改为 Get48/Put64，总 CTA/warp/context 数不变，结果如下；增加 return
+worker 没有普遍收益，20K FWD 反而变慢。
+
+| Get48/Put64 | 均衡 8K / 20K (ms) | 随机 8K / 20K (ms) |
+|---|---:|---:|
+| 缓存 FWD | 5.920 / 12.546 | 6.126 / 13.699 |
+| BWD | 6.438 / 14.260 | 7.353 / 17.350 |
+
+两者均通过 129/8K 两个新 tape 的梯度检查。基准包含随机 token 打乱，
+实际 task key 还按 source group/window 排序，因此不能用理想均衡的
+整除关系直接断言固定比例 worker 空闲。
+
+预计算 BWD return span：利用 `CanonicalRow` 的 4B 对齐空隙记录
+`min(当前 source/expert/window 剩余行数, 当前 canonical M-block 剩余行数)`。
+只对 window-ordered tape 启用，连续区间在 planner 中已知，不增加容量，
+Return 不再逐行扫描确认 source/address。129/8K/20K 两次新 tape 梯度通过；
+均衡 BWD 6.352/13.606 ms、随机 7.431/17.306 ms，小幅改善，仍未达标。
+
+当前 dU 每 M-block 两个 N-tile，设备 132 CTA，所以补测 66/132 块的
+发射批次，检查整轮 CTA 对齐是否有帮助。两者 B128、129/8K 强制环复用
+梯度均通过。66 块：均衡 BWD 6.389/13.638、随机 7.339/17.556 ms；
+132 块：6.332/13.639、7.338/17.255 ms。差别很小，不能把 132 块认定
+为稳定胜出，更不能用它宣称已解决主瓶颈。
+
+增大 window 到 B4096（其余保持 span/64-wave 候选）也没有帮助：
+均衡缓存 FWD 6.567/12.852 ms、随机 6.889/13.310 ms。减少 window 数量
+或 M-padding 不自动等于提升完整路径，通信/计算衔接同样受影响。
+
+将 network dR 改为当前 BWD workspace 内的私有精确尺寸缓冲，跳过
+原 peer workspace 每调用的容量协商（network dR 不供 peer 直接写）。
+复用现有 tensor allocation agreement，不取消分配失败的全 rank 一致处理。
+129/8K/20K 两次新 tape 的完整梯度通过；均衡 BWD 6.408/13.551 ms、
+随机 7.339/17.371 ms。相对 span 候选基本是波动，不能记为明确收益。
+
+生命周期检查还复现了独立于该改动的旧问题：standalone notify 已完成后，
+若缓存申请失败，异常分支会永久隔离 activation slot，导致重试失败。
+前一版 `qwen_window_spans` 同样失败。Notify 只更新 rendezvous epoch、
+规划元数据，尚未推进数据面的 ring generation；集体分配失败协议已经
+同步完所有 rank 的 Notify，因此该分支可以释放槽位、重新规划。
+`lean_vector_lifecycle` 已通过：EP16/B128，集中到一个 rank 的路由、空
+rank、真实 CUDA OOM 重试、三份移动热点 tape、原地更新权重、关闭释放，
+以及 EP16 训练→EP4 推理/graph/offload。保留原有集成测试，没有添加
+函数名或编译符号匹配测试。
+
+删除当前数据流不再读取的旧规划：32-row striped dY 顺序，以及额外的
+training packet/fanout tape。当前 BWD 根据 retained route/counts 重建
+PF ring 目录；不依赖这两张旧表。再独立消融 network warp-vector pull：
+每 warp 按 uint4 协作拷贝，替代逐行 shared bulk-copy/wait。无新增 spill。
+
+| B2048/D2 | 均衡 FWD 8K / 20K | 随机 FWD 8K / 20K | 均衡 BWD 8K / 20K | 随机 BWD 8K / 20K |
+|---|---:|---:|---:|---:|
+| 精简旧规划，bulk | 5.725 / 12.339 | 5.881 / 12.690 | 6.210 / 13.636 | 7.393 / 17.477 |
+| 同上，warp vector | 5.760 / 12.218 | 5.883 / 12.678 | 6.279 / 13.520 | 7.393 / 17.114 |
+
+单位 ms。FWD 首轮四项超过 15%；vector 没有普遍改善 BWD，不能据此
+宣称 bulk copy 是剩余瓶颈。最终配置及 Flash 默认路径仍需确认轮。
+前一版本 private-dR 的 B1024/D2 结果：均衡 FWD 5.712/12.426、BWD
+6.142/13.296，随机 FWD 5.924/12.922、BWD 7.125/17.439 ms；不能用
+较小窗口在一个 case 的收益外推到全部 case。
+
+后续两项未保留（源码快照 `build/qwen35_opt_20261013/prototypes_08.patch`）：
+
+- dX Put 暂缓 doorbell，由同 peer/context 紧接的 dGate Put 一并提交；
+  使用生产者已有的 system release，省去重复 fence。仍保留完成信号、
+  flush 和本地 TX credit。B128、129/8K 梯度通过；均衡 BWD
+  6.322/13.571、随机 7.305/17.292 ms，没有明确收益。
+- 在此基础上，BWD 每 token window 内先处理远端 source groups，期望
+  更早启动 return。只旋转静态任务及 dY 转发顺序，不改变 tape/GEMM
+  行内容。B128、129/8K/20K 梯度通过；均衡 BWD 6.513/13.729、随机
+  7.208/17.301 ms。均衡 8K 回退，不能保留为统一默认；更早等待远端
+  数据可能损失本地计算对 dispatch 的遮盖，尚不能把这个解释当作计数器证据。
+
+进一步独立消融（基于精简规划的 bulk 候选，其余不变）：
+
+| 双机 BWD 候选 | 均衡 8K / 20K (ms) | 随机 8K / 20K (ms) |
+|---|---:|---:|
+| activation K128、2 stages | 6.303 / 13.560 | 7.453 / 17.492 |
+| dispatch packet 32→64 rows | 6.327 / 13.579 | 7.292 / 17.340 |
+| wire credit windows 2→3 | 6.308 / 13.581 | 7.276 / 16.959 |
+| wire credit windows 2→4 | 6.243 / 13.552 | 7.261 / 16.453 |
+
+前两项通过 129/8K 的完整梯度检查、无新增 spill，但没有稳定全面收益。
+credit 增大对随机 20K 有帮助，仍未达标。这里改变的是
+`WEFTMOE_PF_CREDIT_WINDOWS`，不是 benchmark 的 contribution `--ring-depth`；
+两者不能混称 D。双机 132 channels、最小 channel depth=2 时，credit=2
+有 528 个 TX M-slot，credit=3 有 792 个；Qwen 每增加一个 credit window
+约增加 198 MiB/卡 registered ring 容量。credit=4 随机 20K 首轮刚好
+超过 15%（Megatron 18.932 ms），其它三项仍未达标，须保留确认裕量。
+
+全 CTA Reduce 消融：原来每 CTA 96 个通信线程在 return 后 reduce，
+与 288 个计算线程的 dW 重叠；新候选先 join dW/return，再用 384 个
+线程 reduce。减少尾部访存等待，但失去原有重叠，不能假定总是更快。
+单机与默认 Flash 路径不启用这一开关。
+
+| 双机 BWD | 均衡 8K / 20K (ms) | 随机 8K / 20K (ms) |
+|---|---:|---:|
+| full-CTA reduce，B2048/credit2 | 6.009 / 12.952 | 7.065 / 17.856 |
+| full-CTA reduce，B1024/credit4 | 5.888 / 12.664 | 6.717 / 16.008 |
+
+B128、129/8K/20K 两次新 tape 的完整梯度检查通过，最大 relative-L2：
+output 1.40e-4、dX 1.27e-4、dGate 1.46e-7、dW1 4.24e-4、dW2 4.71e-4。
+第一行随机 20K 反而回退，因此不将 balanced 的收益外推。第二行首轮
+三项超过 15%，均衡 8K 仅 14.9%，还不能宣布全部完成。
+`backward_full_reduce` 和真正控制 wire 容量的 `network_credit_windows`
+均加入生成配置；默认分别为 0、1，保留原环境变量显式覆盖。
+允许 `network_min_depth` 搜索 1/2/4；总深度仍不低于完整最坏窗口所需容量。
+无稳定收益的 return worker rotation 分支已撤销。
+
+最后精简 BWD planner：canonical return 不使用 FWD 的 Return packet
+prefix/directory、row-output 指针和 publication mask，跳过其构建；跨机
+只发布 dispatch 所需的 metadata 前缀。保留 dispatch packet、route location、
+checkpoint row 映射、credit 初始化及所有必要的 barrier。FWD 的 gates/headers
+已经属于 tape，BWD 不再重复写入。不是复用前一次调用的路由计划。
+
+生成候选 `0b87af4c8ddf`，B1024/credit4、full-CTA Reduce，直接使用 header
+中的 ring 配置、不加环境覆盖：BWD 均衡 8K/20K 为 **5.795/12.505 ms**，
+随机为 **6.732/15.984 ms**；对本轮 Megatron 分别领先 **16.7%/21.4%、
+17.9%/18.4%**。首轮四项全部超过目标，仍须最终复测、FWD 与 Flash 回归。
+129/8K/20K、B128 强制环复用、两次新 tape 的完整梯度检查通过。
+日志 `lean_bwd_plan_screen_*`、`lean_bwd_plan_verify_*`；本次没有添加碎片单测。
+
+容量组合并非单纯增大显存：B2048/credit2→B1024/credit4 后，8K 的
+compute pool 从 1807.83 降到 1163.64 MiB，GIN 从 1169.14 增到 1533.14 MiB；
+20K 分别从 2549.09/1693.20 变为 1910.05/2089.75 MiB。固定 pool 总量
+反而减少约 280/242 MiB。这里不包含每 tape 的 X/GU、输出/梯度及 BWD
+workspace，不把固定 pool 统计冒充完整训练峰值显存。
+
+### 整理后 Qwen 配置的首轮正式复测
+
+`qwen_release_candidate`，compiled ID `0b87af4c8ddf`；EP8 B2048/D2，
+EP16 B1024、channel floor=2、credit4，使用生成配置，没有 ring 环境覆盖。
+下表比较同一 workload SHA 的 `mt_refresh_*`；单位 ms，括号为吞吐提升。
+不是将完整 FWD+BWD p50 拆成两个时间，也没有排除每调用的前置与缓存申请。
+
+| 拓扑 / 路由 / tokens | PF 缓存 FWD | Megatron FWD | PF BWD | Megatron BWD |
+|---|---:|---:|---:|---:|
+| EP8 均衡 8K | 3.036 (+86.5%) | 5.662 | 3.299 (+78.8%) | 5.899 |
+| EP8 均衡 20K | 5.759 (+73.8%) | 10.010 | 7.098 (+52.6%) | 10.833 |
+| EP8 随机 8K | 3.121 (+99.5%) | 6.225 | 4.105 (+48.4%) | 6.093 |
+| EP8 随机 20K | 6.754 (+72.4%) | 11.646 | 9.180 (+40.2%) | 12.867 |
+| EP16 均衡 8K | 5.656 (+32.2%) | 7.475 | 5.781 (+17.0%) | 6.764 |
+| EP16 均衡 20K | 12.331 (+15.9%) | 14.288 | 12.559 (+20.9%) | 15.184 |
+| EP16 随机 8K | 5.742 (+45.4%) | 8.351 | 6.709 (+18.3%) | 7.936 |
+| EP16 随机 20K | 12.629 (+38.4%) | 17.474 | 15.797 (+19.8%) | 18.932 |
+
+日志 `release_local_*` / `release_network_*`。整理后的单机 129/8K/20K
+完整梯度通过；双机的 B128 小环验证同样通过。`release_lifecycle` 覆盖
+集中热点、空 incoming rank、真实 CUDA OOM 重试、三份独立 tape、原地
+更新权重、工作区关闭释放，以及 EP16 训练→EP4 推理 graph/offload。
+没有新增细粒度单测；现有四个 autotune 测试文件为 46 passed、15 subtests。
+后续新的基线与 Flash 配对确认另列，不覆盖此前消融记录。
+
+### Flash 默认路径首轮配对回归
+
+所有 Qwen 专用新开关关闭。下表为当前/旧版 ms，旧版 artifact 为
+`cleanup_release_20261013`，当前为 `flash_regression_default`；16 项中
+最大慢约 0.73%，其余差异也很小，没有发现系统性退化。仅一轮，不能
+将小幅波动认定为优化收益。最终清理后的二进制需再次复测。
+
+| Flash case | 带缓存 FWD 当前 / 旧版 | BWD 当前 / 旧版 |
+|---|---:|---:|
+| EP8 均衡 8K | 6.744 / 6.706 | 10.693 / 10.636 |
+| EP8 均衡 20K | 14.865 / 14.912 | 25.287 / 25.788 |
+| EP8 随机 8K | 7.875 / 8.006 | 12.967 / 13.048 |
+| EP8 随机 20K | 18.067 / 18.064 | 31.563 / 31.708 |
+| EP16 均衡 8K | 9.975 / 10.047 | 13.269 / 13.359 |
+| EP16 均衡 20K | 21.173 / 21.177 | 27.052 / 26.857 |
+| EP16 随机 8K | 12.058 / 12.155 | 16.033 / 16.281 |
+| EP16 随机 20K | 27.842 / 27.859 | 38.864 / 38.838 |
+
+另一个同步消融用两类消费者区分可见性：NIC TX 仍逐 tile system fence；
+仅在整次调用结束时消费的本节点 contribution 延迟到计算结束统一 drain。
+BWD reduce 额外等待计算完成计数，防止通信线程先进入 reduce；FWD
+已有全 CTA 的末尾 rank barrier。暖态容量优化则复用 FWD 计数得到的
+全局最大 rows，以及上次 IPC 交换得到的所有 rank 最小容量，只有二者
+证明全体都无需扩容才跳过协商；极端热点仍走原先的集体扩容/错误路径。
+这些同步/容量改动没有足够收益，已撤回；保留实验记录，不保留生产代码。
+
+后续交付待办：选出最小有效改动；将保留的参数纳入 autotune/compiled ID；
+复测 Megatron 与 Flash；更新正式表格与冻结 profile；整理源码并提交 milestone。
+
+## M13：Qwen shape 专属 autotune（2026-10-13）
+
+在 M12 的同一份 `main@bb444c2` CUDA 代码上离线搜索，没有修改生产 kernel、
+Flash/DT 默认配置。交付文件：
+
+- [搜索配置](../configs/pf_qwen35_training_autotune.json)。
+- [冻结 profile、编译/加载/复现说明](../configs/pf_qwen35_20261013/README.md)。
+- [EP8/EP16 tune table](../configs/pf_qwen35_20261013/table.json)。
+- [候选、确认轮和独立阶段结果 JSON](../benchmarks/results/qwen35_pf_autotune_20261013.json)。
+
+### 搜索与选型
+
+固定 H2048/I512/E256/top8、BF16、1620 MHz，沿用 M12 的随机 token 数和
+合成非均衡路由。优化目标是 8K/20K **完整 FWD+BWD 周期**的 rank-max p50
+几何平均；不是独立 BWD 时间，也不是全部路由分布的统一最优。
+
+分 FWD、activation、dW、ring 四轮，分别比较：
+FWD N128/256 与 2–5 stages；dU/dX 独立 N128/256、2/3/4 stages、
+K128/两级流水；dW M128/N256、M256/N128、M128/N128、两级流水、
+chunk 1/1、2/2、4/2；最后比较 ring 容量。
+每轮保留 incumbent，前两名正反顺序确认两次，提升不足 1% 不切换。
+实际各拓扑 25 次初筛（包含重复 incumbent），共复用 18 种编译配置，
+编译与 GPU 计时串行，不在计时过程中编译。
+
+初始网络 ring 网格还包含 B2048/D4 重复对照；网络 contribution 容量
+由整次调用推导，单改 D 不改变实际数据路径。该项未被选中，交付配置已
+去掉；原始成绩仍保留。真正入围确认的是 B1024 与 B2048。
+B512 双机完整周期约 54.9/122.0 ms，明显回退，不能将缩窗口当作纯省显存。
+
+**单/双机最终都只改变 `backward.dw1_claim_tiles: 4 → 1`**：
+dW1/dW2 chunk=1/1，FWD/dU/dX/dW 继续使用原 M128/N256/K64、三级流水，
+ring 保持 B2048/D2，network lanes132、D32/R128，min depth/credit windows=2/2。
+compiled ID=`eab65a9995ff`，config ID=`481cffe7fbc7`。
+
+dW 确认轮的完整周期：EP8 8K/20K 为 10.958→10.639 / 32.123→30.609 ms；
+EP16 为 15.007→14.881 / 33.317→31.539 ms。综合延迟降低 **3.81% / 3.12%**。
+最后一次完整周期复测分别为 EP8 10.728/30.720、EP16 14.879/31.521 ms，
+不可将它们与独立阶段 p50 相加/相减混用。
+
+此 shape 每专家 dW1 有 `(1024/128)*(2048/256)/2=32` 个 cluster tile-pair。
+chunk4 将其合为 8 个静态任务，chunk1 则保留 32 个，能将热点专家分给
+更多 cluster，而不改变 GEMM 的 M/N/K 或 reduction 顺序。更细任务有利于
+减轻非均衡尾部，但也增加任务切换；以下均衡结果说明收益有 workload 依赖，
+不能据此把 1/1 推广为所有模型的全局默认。本轮未额外做 timeline 归因。
+
+### 独立 FWD/BWD 验收
+
+同 M12 的计时边界：FWD 带 X/GU 缓存，BWD 每步在计时外生成新 FWD tape；
+包含每调用权重准备/缓存与临时分配，排除首次固定池/IPC 初始化。
+原配置和 tuned 各跑一轮相同 trace，20 prime、4 warmups、16 samples；
+单机均衡 BWD 发现小幅回退后，额外做反序一轮，该两行取两轮 p50 均值。
+本轮原配置也重新实测，不用历史 PF 数字代替对照。每项保存原始 p50。
+
+Megatron 列引用 **M12 已测的两轮均值，本轮没有重测 Megatron**，
+仍为 Flex/DeepEP20SM + TE grouped GEMM、`moe_act` 缓存口径。
+表中单位 ms；末列为 `Megatron / tuned PF - 1` 的吞吐变化，不是延迟降幅。
+所有原/tuned/FWD/BWD 与 M12 的逐 rank trace hash、token 数和专家行数一致。
+
+FWD：
+
+| 拓扑 | 路由 | tokens/rank | 原 PF | Tuned PF | Megatron（M12） | Tuned 吞吐相对 MT |
+|---|---|---:|---:|---:|---:|---:|
+| EP8 | 均衡 | 8K | 3.621 | 3.673 | 5.949 | +61.9% |
+| EP8 | 均衡 | 20K | 10.845 | 10.904 | 9.845 | -9.7% |
+| EP8 | 非均衡 | 8K | 4.631 | 4.598 | 6.244 | +35.8% |
+| EP8 | 非均衡 | 20K | 14.397 | 14.398 | 11.428 | -20.6% |
+| EP16 | 均衡 | 8K | 6.313 | 6.331 | 7.205 | +13.8% |
+| EP16 | 均衡 | 20K | 12.913 | 12.955 | 14.288 | +10.3% |
+| EP16 | 非均衡 | 8K | 6.537 | 6.567 | 8.038 | +22.4% |
+| EP16 | 非均衡 | 20K | 13.289 | 13.366 | 17.176 | +28.5% |
+
+BWD：
+
+| 拓扑 | 路由 | tokens/rank | 原 PF | Tuned PF | Megatron（M12） | Tuned 吞吐相对 MT |
+|---|---|---:|---:|---:|---:|---:|
+| EP8 | 均衡 | 8K | 4.621 | 4.747 | 5.663 | +19.3% |
+| EP8 | 均衡 | 20K | 13.266 | 13.118 | 10.773 | -17.9% |
+| EP8 | 非均衡 | 8K | 6.228 | 5.918 | 5.821 | -1.6% |
+| EP8 | 非均衡 | 20K | 17.522 | 16.212 | 12.767 | -21.2% |
+| EP16 | 均衡 | 8K | 8.575 | 8.519 | 6.677 | -21.6% |
+| EP16 | 均衡 | 20K | 15.553 | 15.791 | 15.175 | -3.9% |
+| EP16 | 非均衡 | 8K | 8.394 | 8.441 | 7.889 | -6.5% |
+| EP16 | 非均衡 | 20K | 19.507 | 18.012 | 19.022 | +5.6% |
+
+结论：**FWD 没有确认收益**。非均衡 BWD 的 EP8 8K/20K 延迟降低
+5.0%/7.5%，EP16 8K 持平、20K 降低 7.7%。
+均衡不是普遍受益：EP8 均衡 8K 两轮均确认约 **2.7% 回退**，
+20K 约改善 1.1%；EP16 均衡 20K 单轮约慢 1.5%。
+该 profile 按非均衡联合目标选出，保留这些取舍，不宣称全面无回退。
+单机 20K 仍落后 M12 Megatron；双机非均衡 20K BWD 从接近/略落后变为
+领先约 5.6%。这些超参搜索只追回部分差距，没有消除所有剩余瓶颈。
+
+### 验证与产物
+
+单/双机随机 129-token 入围检查与最终 8K/20K 检查通过；
+另补均衡 129/8K/20K 各两组 output/dX/dGate/dW1/dW2 检查，全通过。
+最终随机/均衡大规模检查最大 relative L2 为 **0.000464 以下**。
+选中配置单/双机 BWD main 均为 168 个初始寄存器、零 stack/spill；
+未改变既有 mini-notify 的 spill。
+
+全部 9 次 tuned 独立阶段启动实际使用交付的 `table.json` 加载，通过 EP8/EP16
+和实际 prepared capacity 校验。同一头文件可用于两种拓扑；table 的
+`max_tokens` 是 EP8 10055/25820、EP16 10277/25820，不是名义 8192/20480。
+这是精确容量离线查表，不会自动在首调用重新搜索，也不代表任意容量已验证。
+
+两机事先锁定 SM 1620 MHz；独立测量的粗粒度时钟采样覆盖 5/36 个计时
+记录，共 40 个 GPU 点，均为 SM1620/HBM3201；没有筛除性能样本，
+不将未采样区间声称为严格恒频。完整搜索和验收日志在
+`build/qwen35_tune_20261013/`，原始配置/候选保留在各 `ep*/result.json`。
+选中 native artifact 在 `build/qwen35_perf_20261013/artifacts/eab65a9995ff/`。
+
+## M12：Qwen3.5-35B-A3B shape 对比 Megatron（2026-10-13）
+
+测试代码为已合入 main 的 `bb444c2`，没有改生产代码或做新的 autotune。
+使用现有 combined profile，只将 FWD/BWD 的 H/I 改为 2048/512 重新编译；
+E256/top8、BF16，参数来自
+[官方模型配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)。
+这是合成权重/激活和路由的单层 routed MoE benchmark，不是整模型端到端，
+不含 attention、shared expert、router projection/top-k。
+
+### 口径
+
+- EP8 为单机八卡，EP16 为两机各八卡；GPU 报告 NVIDIA L20X。
+  8K/20K 指每 rank 的名义 8192/20480 tokens，每步长度为 10% 标准差的
+  截断正态变化（±3σ），seed=123。
+- 均衡路由保留随机完整均衡周期；非均衡为每步共享 expert 偏置 std=0.5
+  的合成热点路由，不是模型采集的 route trace。最大 expert 行数/平均值
+  的中位数，均衡约 1.0004–1.0015，非均衡 8K/20K 约 7.1/8.6。
+- Megatron Core 0.17.0、TE 2.14.1+27de67e1、DeepEP 1.2.1+567632d；
+  Flex/DeepEP 20 SM + grouped GEMM，`recompute_modules=["moe_act"]`。
+  两者均缓存 X、gate/up，BWD 重算 SwiGLU。
+- PF 固定 B2048/D2、min ring depth=2、credit windows=2；
+  GEMM 参数沿用当前 profile，dW1/dW2 chunk=4/1，不按 case 换参数。
+- 每轮 prime 全部 20 步，再 4 warmups、16 timed samples；第一轮
+  Megatron→PF，第二轮 PF→Megatron。每轮取逐步最慢 rank 时间的 p50，
+  表中取两轮 p50 的算术均值。32 次正式启动、64 条规模记录均成功。
+- FWD 测到 output 和 X/GU 缓存就绪，包含每调用 notify、权重重排、
+  缓存分配及完成同步；排除初次固定池/IPC 初始化。
+  BWD 每步在计时外完成一次新 FWD 并同步，再独立测到梯度就绪，
+  包含 BWD 临时分配、前置流程、通信/计算、native handle 释放及完成同步。
+  两项独立 p50 不可相加当成完整周期。
+
+表中单位 ms；吞吐相对变化为 `Megatron_ms / PF_ms - 1`，正值表示 PF
+领先，负值表示 PF 落后，不是延迟变化。
+
+### FWD：带训练缓存
+
+| 拓扑 | 路由 | 每 rank tokens | PF（ms） | Megatron（ms） | PF 吞吐相对变化 |
+|---|---|---:|---:|---:|---:|
+| 单机 EP8 | 均衡 | 8K | 3.582 | 5.949 | +66.1% |
+| 单机 EP8 | 均衡 | 20K | 10.813 | 9.845 | -9.0% |
+| 单机 EP8 | 非均衡 | 8K | 4.739 | 6.244 | +31.8% |
+| 单机 EP8 | 非均衡 | 20K | 14.420 | 11.428 | -20.7% |
+| 双机 EP16 | 均衡 | 8K | 6.355 | 7.205 | +13.4% |
+| 双机 EP16 | 均衡 | 20K | 12.979 | 14.288 | +10.1% |
+| 双机 EP16 | 非均衡 | 8K | 6.536 | 8.038 | +23.0% |
+| 双机 EP16 | 非均衡 | 20K | 13.379 | 17.176 | +28.4% |
+
+### BWD：新 FWD 缓存就绪后独立测量
+
+| 拓扑 | 路由 | 每 rank tokens | PF（ms） | Megatron（ms） | PF 吞吐相对变化 |
+|---|---|---:|---:|---:|---:|
+| 单机 EP8 | 均衡 | 8K | 4.632 | 5.663 | +22.3% |
+| 单机 EP8 | 均衡 | 20K | 13.240 | 10.773 | -18.6% |
+| 单机 EP8 | 非均衡 | 8K | 6.273 | 5.821 | -7.2% |
+| 单机 EP8 | 非均衡 | 20K | 17.614 | 12.767 | -27.5% |
+| 双机 EP16 | 均衡 | 8K | 8.588 | 6.677 | -22.2% |
+| 双机 EP16 | 均衡 | 20K | 15.551 | 15.175 | -2.4% |
+| 双机 EP16 | 非均衡 | 8K | 8.484 | 7.889 | -7.0% |
+| 双机 EP16 | 非均衡 | 20K | 19.331 | 19.022 | -1.6% |
+
+当前配置下，FWD 在单机 8K 和双机均领先，但单机 20K 落后；
+BWD 只有单机均衡 8K 明显领先，双机 20K 接近，其余落后。
+Flash 的性能收益不能直接外推到 Qwen shape。本轮没有做性能归因或调参，
+不能据此断言是哪一项优化、或静态分配本身导致差距，也不把这组结果称为
+Qwen shape 的最优性能。
+
+### 验证与记录
+
+PF 在 EP8/EP16、均衡/非均衡、129/8K/20K 各两组新路由下，全部通过
+output/dX/dGate/dW1/dW2 数值检查；最大 relative L2 为 0.000465。
+Megatron 在两种拓扑的 129-token 随机路由各两组检查通过，最大 relative
+L2 为 0.003109。64 条正式记录的逐 rank workload hash、token 数、
+收到行数、expert 行数统计在后端/轮次/FWD/BWD 间完全一致。
+Megatron 所有 rank 的计时阶段新增编译图数量均为 0。
+
+两机显式设置 SM 1620 MHz。粗粒度时钟采样覆盖 7/64 个计时区间，共
+56 个 GPU 采样点，均为 SM 1620 / HBM 3201 MHz；不能据此宣称所有
+未采样区间严格恒频。没有筛除性能样本。Qwen 单/双机 BWD 主 kernel
+均无 stack/local spill；既有 mini-notify 的 28/28 B spill 仍存在。
+
+[汇总 JSON](../benchmarks/results/qwen35_pf_fwd_bwd_20261013.json) 保存双轮
+原始 p50、逐 rank workload hash、版本、时钟摘要与数值检查结果。
+原始日志、manifest、时钟：`build/qwen35_perf_20261013/results/`；
+构建 artifact：`build/qwen35_perf_20261013/artifacts/da93ec093a09/`。
+批量复现脚本为 `build/qwen35_perf_20261013/run_matrix.py`，调用现有
+`benchmarks/run_pf_network.py` 和 `tools/benchmark_training.py`，
+未改变 benchmark 的生成/计时流程。
+
 ## M11：仅保留当前 PF/DT（2026-10-13）
 
 本轮只整理代码，不改变已接受的计算、通信协议、调度参数或 buffer

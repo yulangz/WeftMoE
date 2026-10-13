@@ -2,10 +2,19 @@
 
 namespace weftmoe_pf::backward_stream {
 
+#ifndef WEFTMOE_PF_BWD_RETURN_SPANS
+#define WEFTMOE_PF_BWD_RETURN_SPANS 0
+#endif
+#if WEFTMOE_PF_BWD_RETURN_SPANS
+static_assert(WEFTMOE_PF_WINDOW_ORDERED_TAPE,
+              "Return spans require a window-ordered tape");
+#endif
+
 // Dispatch fills the compact dY cache already needed by dW2. Communication
 // windows do not pad GEMM; Return reuses Forward's registered TX as an M ring.
 struct CanonicalRow {
   unsigned source;
+  unsigned span;
   std::uint64_t contribution;
 };
 
@@ -32,8 +41,14 @@ __device__ __forceinline__ auto *canonical_rows(const BackwardKernelArgs &a) {
 
 __device__ __forceinline__ unsigned ordered_block(const BackwardKernelArgs &a,
                                                   unsigned position) {
-  return unsigned(backward_pipeline_detail::scheduler_words(
-      a)[directory_layout(a).phase + position]);
+  const auto layout = directory_layout(a);
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+  const auto offset = layout.du_completed;
+#else
+  const auto offset = layout.phase;
+#endif
+  return unsigned(
+      backward_pipeline_detail::scheduler_words(a)[offset + position]);
 }
 
 __device__ __forceinline__ unsigned
@@ -102,9 +117,9 @@ __device__ __forceinline__ std::size_t tx_base(const ForwardKernelArgs &f) {
          f.static_network.rings.return_payload(0U, 0U);
 }
 
-// The BWD planner uses stable expert/source ordinals within each window (the
-// FWD planner interleaves sources). Keep its physical directory for RX fanout.
-// Canonical reverse rows reuse the idle route-header arena, never a second
+// Keep the BWD planner's physical directory for RX fanout. A window-ordered
+// tape shares this stable expert/source order with FWD; the legacy tape does
+// not. Canonical reverse rows reuse the idle route-header arena, never a second
 // activation payload.
 __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
   const auto tid = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -144,13 +159,22 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
       ordinal -= unsigned(
           ring::source_count(f, source, window, desc.tile.expert, false));
     const auto saved = f.checkpoint.rows[row];
+    const auto padded = peer_at<const unsigned>(
+        a.local_base, a.compact_to_padded_offset)[saved];
+    unsigned span = 0U;
+#if WEFTMOE_PF_BWD_RETURN_SPANS
+    // This source/expert interval is contiguous in the window-ordered tape.
+    // Clip at the canonical M boundary, with no runtime row-by-row scan.
+    span = min(kM - padded % kM,
+               unsigned(ring::source_count(f, identity.source, window,
+                                           desc.tile.expert, false)) -
+                   ordinal);
+#endif
     canonical_rows(a)[saved] = {
-        identity.source,
+        identity.source, span,
         ring::window_source(f, desc.window, identity.source).row_base +
             prefix[f.rank * owned + desc.tile.expert] + ordinal};
-    const auto block = peer_at<const unsigned>(
-                           a.local_base, a.compact_to_padded_offset)[saved] /
-                       kM;
+    const auto block = padded / kM;
     atomicMax(words + layout.phase + block,
               (static_cast<unsigned long long>(desc.window) << 32U) | block);
   }
@@ -172,6 +196,39 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
     state.backward_rows += rows;
   }
 }
+
+// Each expert's window-ordered tape already has monotonically increasing
+// last-window keys. Merge those sorted runs in one launch by finding each
+// block's rank. The old dU counter arena holds the immutable task permutation;
+// stream BWD uses ring slots for dU completion instead.
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+__global__ void order_windows(BackwardKernelArgs a) {
+  const auto block = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= network_blocks(a))
+    return;
+  const auto layout = directory_layout(a);
+  auto *words = backward_pipeline_detail::scheduler_words(a);
+  const auto *keys = words + layout.phase;
+  const auto key = keys[block];
+  const auto *padded = peer_at<const unsigned long long>(
+      a.local_base, a.padded_expert_offsets_offset);
+  unsigned position = 0U;
+  for (unsigned expert = 0U; expert < a.dispatch.sizes.owned_expert_count;
+       ++expert) {
+    const auto begin = padded[expert] / kM;
+    auto lo = begin, hi = padded[expert + 1U] / kM;
+    while (lo < hi) {
+      const auto mid = (lo + hi) / 2U;
+      if (keys[mid] < key)
+        lo = mid + 1U;
+      else
+        hi = mid;
+    }
+    position += unsigned(lo - begin);
+  }
+  words[layout.du_completed + position] = key;
+}
+#endif
 
 // The key is (last required source window, canonical block). Sort only this
 // static task permutation; saved rows and GEMM reduction order stay unchanged.
@@ -242,10 +299,10 @@ __device__ __noinline__ void pull_canonical(const ForwardKernelArgs &f,
   network::pull_rows<false>(
       f, worker, workers,
       [&](std::uint64_t block, unsigned row, float, const char *input) {
+        const auto saved = f.checkpoint.rows[block * kM + row];
+        copy.warp_copy(input, reinterpret_cast<char *>(a.dr + saved * a.hidden),
+                       unsigned(a.hidden * 2U));
         if (!lane) {
-          const auto saved = f.checkpoint.rows[block * kM + row];
-          copy(input, reinterpret_cast<char *>(a.dr + saved * a.hidden),
-               unsigned(a.hidden * 2U));
           ring::arrive(
               *reinterpret_cast<std::uint64_t *>(ready + mapping[saved] / kM),
               1U);
@@ -260,16 +317,54 @@ __device__ __noinline__ void pull_canonical(const ForwardKernelArgs &f,
 #endif
 }
 
+#ifndef WEFTMOE_PF_BWD_RETURN_PENDING
+#define WEFTMOE_PF_BWD_RETURN_PENDING 1
+#endif
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+struct ReturnPending {
+  ncclGinRequest_t request;
+  std::uint64_t position;
+};
+static_assert(WEFTMOE_PF_BWD_RETURN_PENDING * sizeof(ReturnPending) <= 4096U);
+#endif
+
+__device__ __forceinline__ unsigned fragment_rows(const CanonicalRow *rows,
+                                                  unsigned row, unsigned end,
+                                                  CanonicalRow identity) {
+#if WEFTMOE_PF_BWD_RETURN_SPANS
+  return identity.span;
+#else
+  unsigned count = 1U;
+  while (row + count < end && rows[row + count].source == identity.source &&
+         rows[row + count].contribution == identity.contribution + count)
+    ++count;
+  return count;
+#endif
+}
+
 // Consecutive rows to one source/contribution interval become one Put. An
 // expert/source boundary splits only communication, never a GEMM tile.
 __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
                                               const BackwardKernelArgs &a,
-                                              unsigned worker) {
+                                              unsigned worker, void *scratch) {
   if (threadIdx.x % 32U)
     return;
   netring::Endpoint endpoint(f, kGetWorkers + worker);
   const auto depth = network_depth(f);
   const auto bytes = f.hidden * 2U;
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+  constexpr unsigned Pending = WEFTMOE_PF_BWD_RETURN_PENDING;
+  auto *pending = static_cast<ReturnPending *>(scratch);
+  unsigned issued = 0U, completed = 0U;
+  const auto retire = [&]() {
+    auto &entry = pending[completed % Pending];
+    endpoint.gin.wait(entry.request);
+    if (entry.position != ~0ULL)
+      ring::publish(f.ring.slots[entry.position % depth].returned,
+                    entry.position / depth + 1U);
+    ++completed;
+  };
+#endif
   for (auto position = worker; position < network_blocks(a);
        position += kPutWorkers) {
     const auto block = ordered_block(a, position);
@@ -277,18 +372,25 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
     const auto generation = position / depth + 1U;
     while (ring::acquire(slot.fc2_done) <
            std::uint64_t(generation) * kDxTiles) {
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+      if (completed != issued)
+        retire();
+#endif
     }
     const auto desc = directory(a)[block];
     const auto *rows = canonical_rows(a) + desc.compact_row;
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+    const auto first_request = issued;
+#endif
     for (unsigned row = 0U; row < desc.valid_rows;) {
       const auto identity = rows[row];
       const auto node = identity.source / f.local_world_size;
-      unsigned count = 1U;
-      while (row + count < desc.valid_rows &&
-             rows[row + count].source == identity.source &&
-             rows[row + count].contribution == identity.contribution + count)
-        ++count;
+      const auto count = fragment_rows(rows, row, desc.valid_rows, identity);
       if (node != f.node) {
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+        if (issued - completed == Pending)
+          retire();
+#endif
         const auto channel = endpoint.layout().channel(node, f.node, 0U);
         const auto control = endpoint.control(true, channel, 0U);
         const auto source_row = std::uint64_t(position % depth) * kM + row;
@@ -317,17 +419,33 @@ __device__ __noinline__ void return_canonical(const ForwardKernelArgs &f,
                 count},
             ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
             ::cuda::thread_scope_block, ::cuda::thread_scope_system);
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+        auto &entry = pending[issued++ % Pending];
+        entry.position = ~0ULL;
+        endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm),
+                                identity.source, &entry.request);
+#else
         ncclGinRequest_t request;
         endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm),
                                 identity.source, &request);
         endpoint.gin.wait(request);
+#endif
       }
       row += count;
     }
-    // C is invocation-sized: no RX slot is reused before the terminal barrier.
-    // The flush above is the local NIC-read credit for this bounded TX slot.
-    ring::publish(slot.returned, generation);
+    // FIFO retirement includes requests to other peers. Only the last
+    // fragment releases this M-slot's local NIC-read credit.
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+    if (issued != first_request)
+      pending[(issued - 1U) % Pending].position = position;
+    else
+#endif
+      ring::publish(slot.returned, generation);
   }
+#if WEFTMOE_PF_BWD_RETURN_PENDING > 1
+  while (completed != issued)
+    retire();
+#endif
 }
 
 __device__ __noinline__ void receive_canonical(const ForwardKernelArgs &f,
@@ -364,7 +482,7 @@ __device__ __forceinline__ void network_workers(const ForwardKernelArgs &f,
     network::transfer<true>(f, reinterpret_cast<network::Pending *>(s.pull[0]),
                             role);
   else if (role < kGetWorkers + kPutWorkers)
-    return_canonical(f, a, role - kGetWorkers);
+    return_canonical(f, a, role - kGetWorkers, s.pull[0]);
   else if (role < kNetworkOwners - 1U)
     receive_canonical(f, role - kGetWorkers - kPutWorkers);
   else if (role != kNetworkOwners - 1U) {
@@ -375,9 +493,9 @@ __device__ __forceinline__ void network_workers(const ForwardKernelArgs &f,
   }
 }
 
+template <unsigned Base = 288U, unsigned Threads = 96U>
 __device__ __forceinline__ void finish_network(const ForwardKernelArgs &f,
                                                const BackwardKernelArgs &a) {
-  constexpr unsigned Base = 288U, Threads = 96U;
   rank_barrier<Base, Threads, true, true, true>(f);
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   if (threadIdx.x == Base) {

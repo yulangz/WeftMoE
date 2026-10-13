@@ -24,8 +24,27 @@ DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
                 network_max_workers=32, source_group=0,
                 network_prefill_min_tokens=0,
                 window_tokens=256, contribution_windows=2,
-                local_prefill_streaming=0, local_prefill_fast_math=0)
+                local_prefill_streaming=0, local_prefill_fast_math=0,
+                local_pull_warps=2, local_pull_mode=0, local_compact_return=0,
+                ordered_dispatch=0, coalesce_get=0, window_ordered_tape=0,
+                backward_return_pending=1, backward_wave_blocks=64,
+                backward_full_reduce=0, network_credit_windows=1, network_get_workers=64,
+                backward_return_spans=0, network_private_dr=0, network_vector_pull=0)
 MACROS = {
+    "network_private_dr": "WEFTMOE_PF_NETWORK_PRIVATE_DR",
+    "network_vector_pull": "WEFTMOE_PF_NETWORK_VECTOR_PULL",
+    "backward_return_spans": "WEFTMOE_PF_BWD_RETURN_SPANS",
+    "network_get_workers": "WEFTMOE_PF_NETWORK_GET_WORKERS",
+    "backward_full_reduce": "WEFTMOE_PF_BWD_FULL_REDUCE",
+    "network_credit_windows": "WEFTMOE_PF_CREDIT_WINDOWS",
+    "ordered_dispatch": "WEFTMOE_PF_ORDERED_DISPATCH",
+    "coalesce_get": "WEFTMOE_PF_COALESCE_GET",
+    "window_ordered_tape": "WEFTMOE_PF_WINDOW_ORDERED_TAPE",
+    "backward_return_pending": "WEFTMOE_PF_BWD_RETURN_PENDING",
+    "backward_wave_blocks": "WEFTMOE_PF_BWD_WAVE_BLOCKS",
+    "local_pull_warps": "WEFTMOE_PF_LOCAL_PULL_WARPS",
+    "local_pull_mode": "WEFTMOE_PF_LOCAL_PULL_MODE",
+    "local_compact_return": "WEFTMOE_PF_LOCAL_COMPACT_RETURN",
     "local_prefill_streaming": "WEFTMOE_FWD_LOCAL_PREFILL_STREAMING",
     "local_prefill_fast_math": "WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH",
     "decode_math_m": "WEFTMOE_FWD_LOCAL_DECODE_M",
@@ -55,15 +74,26 @@ def validate(config):
     require(all(type(x) is int and x >= 0 for x in v.values()),
             "V4 parameters must be nonnegative integers")
     choices = dict(local_prefill_streaming=(0, 1), local_prefill_fast_math=(0, 1),
+                   local_pull_warps=(1, 2, 3), local_pull_mode=(0, 1, 2),
+                   local_compact_return=(0, 1),
+                   ordered_dispatch=(0, 1), coalesce_get=(0, 1),
+                   window_ordered_tape=(0, 1), backward_return_pending=(1, 2, 4, 8),
+                   backward_wave_blocks=(0, 16, 32, 64, 66, 128, 132, 256),
+                   backward_full_reduce=(0, 1), network_credit_windows=(1, 2, 3, 4, 8),
+                   network_get_workers=(16, 32, 48, 64, 80, 96),
+                   backward_return_spans=(0, 1),
+                   network_private_dr=(0, 1), network_vector_pull=(0, 1),
                    decode_math_m=(0, 16, 64), decode_stages=(2, 3),
                    decode_cta_multiplier=(0, 1, 2, 3),
                    network_lanes=(1, 2, 4, 8, 16, 32, 64, 132), packet_rows=(8, 16, 32, 64, 128),
                    return_packet_rows=(16, 32, 64, 128),
-                   network_min_depth=(8, 16, 32),
+                   network_min_depth=(1, 2, 4, 8, 16, 32),
                    network_max_workers=(1, 2, 4, 8, 16, 32),
                    source_group=(0, 1, 2, 4, 8, 16))
     for key, allowed in choices.items():
         require(v[key] in allowed, f"V4 {key} must be one of {allowed}")
+    require(not v["backward_return_spans"] or v["window_ordered_tape"],
+            "precomputed Return spans require a window-ordered tape")
     require(v["cta_count"] % 2 == 0, "V4 cta_count must be even")
     require(v["window_tokens"] > 0 and v["contribution_windows"] > 0,
             "V4 window and contribution capacity must be positive")

@@ -4815,8 +4815,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     r.rows = at<static_forward::RingRow>(slot.device, l.rows);
     if (training_ring)
       args.checkpoint.rows = at<std::uint64_t>(slot.device, l.tape_rows);
-    if (use_gin) {
+    if (use_gin
+#if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
+        || training_ring
+#endif
+    )
       r.contribution_rows = at<std::uint32_t>(slot.device, l.contribution_rows);
+    if (use_gin) {
       r.pull_packets =
           at<static_forward::PullPacket>(slot.device, l.pull_packets);
       r.return_ready = at<std::uint64_t>(slot.device, l.return_ready);
@@ -5103,8 +5108,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         bind_storage();
       });
     } catch (const TensorPreparationFailure &) {
-      // A standalone planner has already advanced device epochs.
-      failure_guard.committed = !standalone_notify;
+      // The collective allocation agreement drained Notify on every rank.
+      // Notify advances rendezvous epochs, but no payload requests or ring
+      // generations start until main. A retry can overwrite this idle plan.
+      failure_guard.committed = true;
       throw;
     }
   }
@@ -5937,7 +5944,8 @@ BackwardTensorStorage BackwardMegaKernel::prepare_tensors(
   BackwardTensorStorage result;
   result.impl_ = BackwardTensorStorage::Impl::make(
       retained.dispatch, retained.backend->execution, config, bindings,
-      allocator, depth);
+      allocator, depth,
+      retained.pf_args.use_gin && weftmoe_pf::kNetworkPrivateDr);
   return result;
 }
 
@@ -5986,6 +5994,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto gin_backend =
       std::dynamic_pointer_cast<GinBackendState>(retained.backend);
   const bool use_gin = static_cast<bool>(gin_backend);
+  const bool private_dr = use_gin && weftmoe_pf::kNetworkPrivateDr;
   const bool valid_local =
       local_backend && identity.world == local_backend->peer_slot_bases.size();
   const bool valid_gin =
@@ -6047,7 +6056,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.padded_rows <
           ActivationTransportBridge::padded_received_rows(retained.dispatch) ||
       data.pf_depth != retained.pf_args.ring.depth ||
-      data.completion.device != pool->device)
+      data.private_dr != private_dr || data.completion.device != pool->device)
     throw std::runtime_error(
         "Backward tensor storage does not match this invocation");
   const auto writes = {data.dx, data.dgate, data.dw1, data.dw2, data.workspace};
@@ -6066,10 +6075,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   GinExecution communication(pool->gin_resources, exec->stream);
   auto flight = std::make_shared<OperatorFlight>(lease, true);
   auto &peer_workspace = *slot.backward_peer_workspace;
-  peer_workspace.prepare(
-      identity.generation, view.sizes.incoming_row_count,
-      checked_mul(identity.tokens, dispatch_id.top_k, "Backward source routes"),
-      config.hidden_size);
+  if (!private_dr)
+    peer_workspace.prepare(identity.generation, view.sizes.incoming_row_count,
+                           checked_mul(identity.tokens, dispatch_id.top_k,
+                                       "Backward source routes"),
+                           config.hidden_size);
   SlotFailureGuard failure_guard{lease, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /
@@ -6108,8 +6118,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.saved_gates = static_cast<const float *>(saved.gates->data);
   args.saved_ab = static_cast<const transport::BFloat16 *>(saved.ab->data);
   args.saved_rows = saved.rows;
-  args.peer_payloads = peer_workspace.device_payloads();
-  args.dr = peer_workspace.payloads[identity.rank].dr;
+  args.peer_payloads = private_dr ? nullptr : peer_workspace.device_payloads();
+  args.dr = private_dr
+                ? at<transport::BFloat16>(data.workspace->data, data.dr_offset)
+                : peer_workspace.payloads[identity.rank].dr;
   args.recomputed_u =
       at<transport::BFloat16>(data.workspace->data, data.u_offset);
   args.dab = at<transport::BFloat16>(data.workspace->data, data.dab_offset);
@@ -6265,6 +6277,12 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const auto blocks =
         ActivationTransportBridge::padded_received_rows(retained.dispatch) /
         backward_tuning::kTileM;
+#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
+    if (blocks)
+      weftmoe_pf::backward_stream::
+          order_windows<<<(blocks + 255U) / 256U, 256, 0, transport_stream>>>(
+              args);
+#else
     auto *words = at<unsigned long long>(slot.device, args.scheduler_offset);
     auto *order = words + scheduler_layout.phase;
     auto *scratch = words + scheduler_layout.du_completed;
@@ -6282,6 +6300,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                           cudaMemcpyDeviceToDevice, transport_stream),
           identity.rank, identity.world, "backward", identity.generation,
           ExchangeKind::ExpertCounts, "publish static PF Backward order");
+#endif
   } else {
     weftmoe_pf::backward_stream::prepare<false>
         <<<dim3(128U, view.sizes.owned_expert_count), 256, 0,
@@ -6341,13 +6360,23 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     transport_error(NotifyErrorCode::BackendUnavailable, "backward-run",
                     "unified Backward residency", identity.rank,
                     "all worker CTAs resident", std::to_string(clusters));
+  const auto dr_rows =
+      std::max(view.sizes.incoming_row_count, std::uint64_t{1});
+  const auto dr_map =
+      private_dr
+          ? make_bf16_tma_map(args.dr, config.hidden_size, dr_rows,
+                              backward_tuning::kActivationTileM,
+                              "private Backward dR", backward_tuning::kTileK)
+          : peer_workspace.buffer->dr_map;
+  const auto dr_mn_map =
+      private_dr ? make_bf16_tma_map_mn(args.dr, config.hidden_size, dr_rows,
+                                        "private Backward dR MN")
+                 : peer_workspace.buffer->dr_mn_map;
   const auto launch_result = cudaLaunchKernelEx(
-      &launch, kernel, pf_args, args,
-      use_gin ? peer_workspace.buffer->dr_map : slot.forward_x_map, dab_map,
-      retained.weights.impl_->backward_w2_map,
-      retained.weights.impl_->backward_w1_map,
-      peer_workspace.buffer->dr_mn_map, data.u_mn_map, data.dab_mn_map, x_map,
-      dw2_map, dw1_map);
+      &launch, kernel, pf_args, args, use_gin ? dr_map : slot.forward_x_map,
+      dab_map, retained.weights.impl_->backward_w2_map,
+      retained.weights.impl_->backward_w1_map, dr_mn_map, data.u_mn_map,
+      data.dab_mn_map, x_map, dw2_map, dw1_map);
   internal::throw_cuda("backward-run", launch_result, identity.rank,
                        identity.world, "backward", identity.generation,
                        ExchangeKind::ExpertCounts,
