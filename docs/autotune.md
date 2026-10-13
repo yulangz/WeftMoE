@@ -40,7 +40,8 @@
 
 `--backward-only` 每次在计时外执行一次新 FWD、同步所有 rank，再执行
 BWD。`backward_ready_slowest_rank_p50_us` 包含 BWD 前置、临时分配、计算、
-通信与完成同步，计时结束时输出梯度仍存活。不是复用旧路由/tape，也不是
+通信与完成同步，以及 native BWD 内部释放 forward/dispatch handle 的
+开销；计时结束时输出梯度仍存活。不是复用旧路由/tape，也不是
 用完整周期减去 FWD host API 时间。两模式互斥，均另报包含外部释放的
 `wall_slowest_rank_p50_us`。分开运行的两项 p50 不能直接拼成历史完整周期。
 

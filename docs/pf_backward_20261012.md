@@ -15,21 +15,132 @@
 - benchmark 新增 `--backward-only`，先在计时外完成新 FWD 和跨 rank
   同步，再测 BWD 到梯度就绪；与 `--forward-only` 分开运行。
 
-相同热点 trace 的带缓存 FWD 初筛（ms，4 warmups / 16 samples）：
+### 独立消融：FWD saved gate/up 向量化
+
+相同热点 trace，旧→新、新→旧各测一次；取两轮 p50 的算术均值。
+以下单位为 ms，下降比例是延迟下降，不是后面 PF/Megatron 的吞吐提升。
 
 | 拓扑 / tokens | 改动前 | saved gate/up 向量化 | 延迟下降 |
 |---|---:|---:|---:|
-| EP8 / 8K | 8.221 | 7.895 | 4.0% |
-| EP8 / 20K | 18.655 | 18.211 | 2.4% |
-| EP16 / 8K | 12.415 | 12.165 | 2.0% |
-| EP16 / 20K | 28.552 | 27.801 | 2.6% |
+| EP8 / 8K | 8.179 | 7.859 | 3.9% |
+| EP8 / 20K | 18.694 | 18.141 | 3.0% |
+| EP16 / 8K | 12.388 | 12.272 | 0.9% |
+| EP16 / 20K | 28.575 | 27.869 | 2.5% |
 
-这是单轮消融，不代替最终正反序 PF/Megatron 对照。单/双机、均衡/热点
-路由的 129/8K/20K 两轮完整梯度检查均通过；默认 FWD main 未新增 spill。
-原始日志位于 `build/pf_fwd_bwd_20261013/`，初筛标签 `screen_fwd_*`，
-正确性标签 `vector_verify_*`。
+双机 8K 的反序一轮略慢 0.14%，两轮平均不到 1%，视为接近测量波动，
+不宣称稳定收益。其余三项确认收益，保留向量化；新旧 native 工作区容量
+逐 rank 相同。初筛与最终矩阵使用不同的首轮测量，因此这张表的 PF 均值
+不应直接替换下面矩阵的 PF 均值。
 
-最新进展见 [M9：通信/GEMM 拆解与数据流优化](pf_backward_bottleneck_20261012.md)。
+### 独立 FWD/BWD 对比 Megatron
+
+模型为 H4096/I2048/E256/top6、BF16。EP8 是单机八卡，EP16 是两机各
+八卡，GPU 报告 NVIDIA L20X。8K/20K 指每 rank 的名义 8192/20480 tokens，
+每步、每 rank 的长度按 10% 标准差正态变化，截断在 ±3σ；seed=123。
+
+- 均衡路由使用随机化的完整均衡周期，尾部允许不完整。计时步骤中
+  最大 expert 行数/平均值的中位数约 1.001–1.002。
+- 非均衡路由每步重新生成，共享 expert 偏置 std=0.5；8K/20K 的上述
+  比值约 7.8/9.6，不是只加入少量 token 抖动的近似均衡路由。
+- PF 与 Megatron、FWD 与 BWD、正反两轮的逐 rank token/route hash、
+  收到的行数与 expert 行数统计完全一致。
+- Megatron 使用 Flex/DeepEP（20 SM）+ TE grouped GEMM，
+  `recompute_modules=["moe_act"]`；与 PF 一样保留 X、gate/up，BWD 重算
+  SwiGLU。测量已选择的路由和权重对应的 MoE，不包含 router projection/top-k。
+- 固定 B2048/D2、min ring depth=2、credit windows=2；全矩阵均用
+  dW1/dW2 chunk=4/1，没有逐 case 换参数。autotune 的 2/2 是另行验证的候选，
+  本轮没有重跑全空间搜索，也不把修复编译约束说成搜索取得的性能收益。
+
+各 case 完整 prime 20 步，4 warmups、16 timed samples。第一轮
+Megatron→PF，第二轮 PF→Megatron；每轮取逐步最慢 rank 时间的 p50，
+表中再取两轮 p50 的算术均值。32 次独立启动、64 个规模测量全部成功；
+Megatron 所有 rank 的计时阶段新增编译图数量均为 0。
+
+**FWD：带训练缓存，测到 output 和 routed X/gate-up 缓存完成。** 包括
+每调用 notify、权重重排、缓存分配、main 与完成同步；计时结束 tape 存活。
+排除首次固定池/IPC 初始化、输入和路由生成，未启用一次性预打包权重。
+
+| 拓扑 | 路由 | 每 rank tokens | PF（ms） | Megatron（ms） | PF 吞吐领先 |
+|---|---|---:|---:|---:|---:|
+| 单机 EP8 | 均衡 | 8K | 6.738 | 8.670 | 28.7% |
+| 单机 EP8 | 均衡 | 20K | 14.877 | 18.752 | 26.0% |
+| 单机 EP8 | 非均衡 | 8K | 7.883 | 10.350 | 31.3% |
+| 单机 EP8 | 非均衡 | 20K | 18.096 | 22.937 | 26.7% |
+| 双机 EP16 | 均衡 | 8K | 10.112 | 11.253 | 11.3% |
+| 双机 EP16 | 均衡 | 20K | 21.431 | 25.142 | 17.3% |
+| 双机 EP16 | 非均衡 | 8K | 12.198 | 14.146 | 16.0% |
+| 双机 EP16 | 非均衡 | 20K | 27.886 | 33.397 | 19.8% |
+
+**BWD：每步先在计时外运行新 FWD，完成设备与跨 rank 同步，再独立测量。**
+包括 BWD 的临时/梯度分配、前置流程、计算、通信和完成同步。native BWD
+返回前本身会释放 forward/dispatch handle，这部分没有从计时中扣除；
+计时结束返回的梯度仍存活，外部 gradient 引用删除不计入 ready 时间。
+
+| 拓扑 | 路由 | 每 rank tokens | PF（ms） | Megatron（ms） | PF 吞吐领先 |
+|---|---|---:|---:|---:|---:|
+| 单机 EP8 | 均衡 | 8K | 10.670 | 11.976 | 12.2% |
+| 单机 EP8 | 均衡 | 20K | 25.568 | 27.627 | 8.1% |
+| 单机 EP8 | 非均衡 | 8K | 12.992 | 14.666 | 12.9% |
+| 单机 EP8 | 非均衡 | 20K | 31.753 | 34.697 | 9.3% |
+| 双机 EP16 | 均衡 | 8K | 13.262 | 14.393 | 8.5% |
+| 双机 EP16 | 均衡 | 20K | 26.998 | 34.142 | 26.5% |
+| 双机 EP16 | 非均衡 | 8K | 16.068 | 19.541 | 21.6% |
+| 双机 EP16 | 非均衡 | 20K | 39.216 | 48.538 | 23.8% |
+
+两张表的吞吐领先均按 `Megatron_ms / PF_ms - 1` 计算，不是延迟下降。
+独立两项 p50 不可相加当成历史完整周期：同步边界、缓存释放位置、每步
+最慢 rank 都可能不同。当前全部分项快于 Megatron，但单机 BWD 只有
+8%–13% 左右收益，不能据此宣称完整周期的单机 25% / 双机 20% 目标全部达到。
+
+两机均重新请求锁定 SM 1620 MHz。粗粒度时钟记录与计时区间相交的 104 个
+GPU 采样点中，4 个低于 1620：PF 双机均衡 20K BWD 有 3 个点、最低
+1515 MHz；Megatron 双机非均衡 20K BWD 有 1 个点、1455 MHz。其他采到的
+点均为 1620，HBM 均为 3201。部分短区间未采到时钟点，不能声称全程严格
+恒频；未过滤掉任何性能样本。
+
+### 验证与复现
+
+- 默认版通过 EP8/EP16、均衡/非均衡、129/8K/20K 各两次变化路由的
+  output/dX/dGate/dW1/dW2 数值检查。最大 relative L2：单机 0.001006、
+  双机 0.000928；最大值来自均衡 dX，非均衡分别为 0.000838/0.000734。
+- autotune 单/双机候选计划均正常生成；真实生成的 2/2 profile 完整编译，
+  并通过两种拓扑的 129/8K 各两次完整梯度检查。第一次通过命令行覆盖宏
+  的尝试被 frozen profile 重定义回 4/1，已排除，不能作为 2/2 验证证据。
+  有效日志使用 `claim2_generated_verify_*` 标签。
+- EP8/EP16 的 IPC payload 复用、训练权重刷新、工作区释放、多层图、
+  graph destroy/offload 均通过。已有 Python 117 tests / 470 subtests、
+  host 17/17 通过；未新增细碎测试函数。
+- FWD main 未新增 spill，未出现 C7507/C7512/C7518；不将既有 mini-notify
+  的 28/28 B spill 隐去，也不将本轮称为整库零 spill。
+
+实现提交 `dea1d57`（autotune/独立 BWD 计时）、`07d8b32`（FWD 缓存）。
+原始逐 rank 日志、时钟和 artifact manifest：
+`build/pf_fwd_bwd_20261013/results/`；最终矩阵标签为
+`matrix_{forward,backward}_{balanced,random}_ep{8,16}_{pf,megatron}_r{0,1}`。
+消融首轮标签 `screen_fwd_{old,vector}_ep*`，反序用
+`matrix_forward_random_ep*_pf_r1` 与紧随其后的 `reverse_fwd_old_ep*`。
+[汇总 JSON](../benchmarks/results/pf_fwd_bwd_20261013.json) 保存双轮原始 p50、
+逐 rank workload hash、时钟摘要和验证结果。
+
+复现一个 case：
+
+```bash
+/opt/.venv/bin/python benchmarks/run_pf_network.py \
+  --artifact build/pf_main_timeline/fwd_cache_vector \
+  --label reproduce_fwd_random_ep8_pf --nodes 1 \
+  --output build/pf_fwd_bwd_20261013/reproduce --master-port 24500 \
+  --benchmark tools/benchmark_training.py \
+  --env WEFTMOE_PF_MIN_RING_DEPTH=2 --env WEFTMOE_PF_CREDIT_WINDOWS=2 \
+  -- --backend pf --hidden 4096 --intermediate 2048 --experts 256 --top-k 6 \
+  --ring-depth 2 --ring-tokens 2048 --tokens 8192 20480 \
+  --route-distribution random --forward-only --prime-trace --warmups 4 --samples 16
+```
+
+换 `--nodes 2` 测双机；分别替换 backend、route-distribution、
+`--forward-only`/`--backward-only`，使用不同 label 和空闲端口。
+不要与编译、其他 GPU job 或 host 测试并行计时。
+
+上一轮瓶颈拆解见 [M9：通信/GEMM 拆解与数据流优化](pf_backward_bottleneck_20261012.md)。
 M7 的主 kernel 零 spill 保持；M9 改善的是热点专家任务排布和中间数据流，
 不是把 M8 的无收益 L2 swizzle 重新启用。
 
