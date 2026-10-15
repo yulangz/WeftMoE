@@ -160,9 +160,10 @@
       "backward_return_spans": 1,
       "backward_striped_signals": 1,
       "network_private_dr": 1,
-      "network_vector_pull": 0
+      "network_vector_pull": 0,
+      "return_rails": 1
     }
   },
-  "compiled_digest": "e8955a4e0df6",
-  "config_digest": "de91f52ad9e3"
+  "compiled_digest": "3172e19487b0",
+  "config_digest": "14727edb3f32"
 }

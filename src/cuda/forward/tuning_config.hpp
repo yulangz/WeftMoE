@@ -22,6 +22,10 @@
 
 #include "cuda/unified_worker_tuning.hpp"
 
+#ifndef WEFTMOE_PF_RETURN_RAILS
+#define WEFTMOE_PF_RETURN_RAILS 1
+#endif
+
 #ifndef WEFTMOE_FWD_MAIN_HIDDEN
 #define WEFTMOE_FWD_MAIN_HIDDEN 7168
 #endif

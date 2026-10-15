@@ -23,21 +23,31 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
   const auto &r = a.ring;
   const auto lane = threadIdx.x % 32U;
   const auto bytes = a.hidden * 2U;
+  constexpr unsigned task_stride =
+      WEFTMOE_PF_RETURN_RAILS == 1U ? kPutWorkers : 1U;
+  const auto first = std::uint64_t(worker) * (task_stride == 1U ? 32U : 1U);
   unsigned issued = 0U, completed = 0U;
   std::uint64_t packets = 0U, payload = 0U, remaining = 0U;
-  for (auto base = std::uint64_t(worker) * 32U; base < r.state->return_tasks;
+  for (auto base = first; base < r.state->return_tasks;
        base += kPutWorkers * 32U)
-    remaining += min(std::uint64_t(32U), r.state->return_tasks - base);
+    remaining += min(
+        std::uint64_t(32U),
+        static_forward::ceil_div(r.state->return_tasks - base, task_stride));
   auto retire = [&]() {
     auto &entry = s.pending[completed++ % kNetworkPending];
     endpoint.gin.wait(entry.request);
-    reduce_add_release_system(
-        reinterpret_cast<unsigned long long *>(entry.consumed), entry.rows);
+    if (entry.rows) {
+      if constexpr (WEFTMOE_PF_RETURN_RAILS == 1U)
+        ring::arrive(*entry.consumed, entry.rows);
+      else
+        reduce_add_release_system(
+            reinterpret_cast<unsigned long long *>(entry.consumed), entry.rows);
+    }
   };
   while (remaining) {
-    for (auto base = std::uint64_t(worker) * 32U; base < r.state->return_tasks;
+    for (auto base = first; base < r.state->return_tasks;
          base += kPutWorkers * 32U) {
-      const auto index = base + lane;
+      const auto index = base + lane * task_stride;
       bool empty = false, ready = false;
       if (index < r.state->return_tasks) {
         auto &task = r.return_tasks[index];
@@ -45,13 +55,15 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         if (empty)
           task.count = ~0U;
         else if (task.count != ~0U)
-          ready = ring::acquire<::cuda::thread_scope_system>(*task.published) >=
-                  task.target;
+          ready = ring::acquire<(WEFTMOE_PF_RETURN_RAILS == 1U
+                                     ? ::cuda::thread_scope_device
+                                     : ::cuda::thread_scope_system)>(
+                      *task.published) >= task.target;
       }
       remaining -= __popc(__ballot_sync(0xffffffffU, empty));
       auto active = __ballot_sync(0xffffffffU, ready);
       while (active) {
-        const auto task_id = base + unsigned(__ffs(active) - 1);
+        const auto task_id = base + unsigned(__ffs(active) - 1) * task_stride;
         auto &task = r.return_tasks[task_id];
         for (unsigned row = lane; row < task.count; row += 32U) {
           const auto identity = task.rows[row];
@@ -60,25 +72,17 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         }
         __syncwarp();
         if (!lane) {
-          for (unsigned row = 0U, packed = 0U; row < task.count;) {
+          for (unsigned row = 0U; row < task.count;) {
             const auto source = s.sources[row];
-            if (source / a.local_world_size == a.node ||
-                source % a.local_world_size != a.rank % a.local_world_size) {
+            if (source / a.local_world_size == a.node) {
               ++row;
               continue;
             }
-            unsigned count = 1U, end = row + 1U;
-            while (end < task.count) {
-              const auto next = s.sources[end];
-              if (next / a.local_world_size != a.node &&
-                  next % a.local_world_size == a.rank % a.local_world_size) {
-                if (next != source ||
-                    s.contributions[end] != s.contributions[row] + count)
-                  break;
-                ++count;
-              }
-              ++end;
-            }
+            unsigned count = 1U;
+            while (row + count < task.count &&
+                   s.sources[row + count] == source &&
+                   s.contributions[row + count] == s.contributions[row] + count)
+              ++count;
             if (issued - completed == kNetworkPending)
               retire();
             const auto channel =
@@ -89,7 +93,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
             endpoint.gin.put(
                 ncclTeamWorld(endpoint.gin.comm), source, a.gin_window,
                 a.static_network.contribution + s.contributions[row] * bytes,
-                a.gin_window, task.offset + std::uint64_t(packed) * bytes,
+                a.gin_window, task.offset + std::uint64_t(row) * bytes,
                 count * bytes,
                 ncclGin_WeakVASignalAdd{
                     a.gin_window,
@@ -100,14 +104,16 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
                 ::cuda::thread_scope_block, ::cuda::thread_scope_system);
             auto &entry = s.pending[issued++ % kNetworkPending];
             entry.consumed = task.returned;
-            entry.rows = count;
+            entry.rows = 0U;
             endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm), source,
                                     &entry.request);
             ++packets;
             payload += count * bytes;
-            packed += count;
-            row = end;
+            row += count;
           }
+          // FIFO retirement has waited every earlier fragment before this
+          // final request. Recycle the M-slot once, not once per fragment.
+          s.pending[(issued - 1U) % kNetworkPending].rows = task.credit_rows;
           task.count = ~0U;
         }
         --remaining;

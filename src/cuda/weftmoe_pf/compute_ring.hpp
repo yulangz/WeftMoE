@@ -34,13 +34,14 @@ struct RingBlock {
   std::uint32_t local_rows; // No NIC reader for these direct source-C stores.
   std::uint64_t generation;
   std::uint64_t return_generation;
+  std::uint32_t return_slot;
 };
 
 struct alignas(64) ReturnSlot {
   std::uint64_t published, consumed;
 };
 struct ReturnExpert {
-  std::uint32_t begin, depth, stride; // TX rows, slots, rows per slot on one rail.
+  std::uint32_t begin, depth; // M-slots on each rail.
 };
 
 // Single-window source metadata is pushed together, avoiding a peer gate
@@ -55,7 +56,7 @@ struct RingRow {
   std::uint32_t source;
   float gate;
   std::uint32_t token;
-  void *output; // Source contribution or source rail's bounded Return TX row.
+  void *output; // Source contribution or selected rail's bounded Return TX row.
   std::uint64_t contribution; // Source-owned compact Return row (network FWD).
 };
 
@@ -96,6 +97,7 @@ struct ReturnTask {
   std::uint64_t *returned;
   std::uint64_t target;
   std::uint32_t count; // ~0U after this static owner has issued every fragment.
+  std::uint32_t credit_rows;
 };
 
 struct SourceEpoch {

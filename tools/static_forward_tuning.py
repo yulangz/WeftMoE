@@ -30,8 +30,9 @@ DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
                 backward_return_pending=1, backward_wave_blocks=64,
                 network_credit_windows=1, network_get_workers=64,
                 backward_return_spans=0, backward_striped_signals=0,
-                network_private_dr=0, network_vector_pull=0)
+                network_private_dr=0, network_vector_pull=0, return_rails=1)
 MACROS = {
+    "return_rails": "WEFTMOE_PF_RETURN_RAILS",
     "network_private_dr": "WEFTMOE_PF_NETWORK_PRIVATE_DR",
     "network_vector_pull": "WEFTMOE_PF_NETWORK_VECTOR_PULL",
     "backward_return_spans": "WEFTMOE_PF_BWD_RETURN_SPANS",
@@ -74,6 +75,7 @@ def validate(config):
     require(all(type(x) is int and x >= 0 for x in v.values()),
             "V4 parameters must be nonnegative integers")
     choices = dict(local_prefill_streaming=(0, 1), local_prefill_fast_math=(0, 1),
+                   return_rails=(0, 1, 2, 4, 8),
                    local_pull_warps=(1, 2, 3),
                    local_compact_return=(0, 1),
                    ordered_dispatch=(0, 1), coalesce_get=(0, 1),
@@ -142,7 +144,7 @@ def expand(candidates, spec, benchmark):
         # Network geometry has no effect on the NVLink-only dataflow.
         for key in ("network_lanes", "packet_rows", "return_packet_rows",
                     "network_min_depth", "network_max_workers",
-                    "network_prefill_min_tokens"):
+                    "network_prefill_min_tokens", "return_rails"):
             axes[key] = axes[key][:1]
     require(len(candidates) * math.prod(map(len, axes.values())) <= 4096,
             "combined Forward/V4 grid exceeds 4096 candidates")

@@ -26,6 +26,17 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
           std::uint64_t(t.generation) * (t.fc2 ? kFc1Tiles : kM);
       while (ring::acquire(ready) < target) {
       }
+      if constexpr (Network && WEFTMOE_PF_RETURN_RAILS != 1U) {
+        if (t.fc2) {
+          // Pass TX ownership through the existing input-stage barrier;
+          // the math warpgroups need no extra epilogue rendezvous.
+          const auto &desc = a.ring.blocks[t.block];
+          while (ring::acquire<::cuda::thread_scope_system>(
+                     a.ring.return_slots[desc.return_slot].consumed) <
+                 (desc.return_generation - 1U) * kM) {
+          }
+        }
+      }
       WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, InputWaitEnd, Compute,
                                  unsigned(t.fc2), t.block, t.column);
       asm volatile("fence.proxy.async.global;" ::: "memory");
@@ -197,17 +208,6 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MathEnd, Compute, t.column,
                               t.block, 0U);
       if constexpr (Network) {
-        const auto &desc = a.ring.blocks[t.block];
-        const auto plan = a.ring.return_experts[
-            a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
-        const auto tx_slot = plan.begin +
-            (desc.tile.expert_row / kM % plan.depth) * plan.stride;
-        if (threadIdx.x == 0U)
-          while (ring::acquire<::cuda::thread_scope_system>(
-                     a.ring.return_slots[tx_slot].consumed) <
-                 (desc.return_generation - 1U) * kM) {
-          }
-        collective_scope_sync<kMathThreads, 7U>();
         static_v4_store_fc2_register_tile<kN>(a, accum, t.rows, t.column * kN,
                                               t.block);
       } else
@@ -226,17 +226,20 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         collective_scope_sync<kMathThreads, 7U>();
         if (threadIdx.x == 0U) {
           const auto &desc = a.ring.blocks[t.block];
-          const auto plan = a.ring.return_experts[
-              a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
-          auto &tx_slot = a.ring.return_slots[
-              plan.begin + (desc.tile.expert_row / kM % plan.depth) * plan.stride];
-          reduce_add_release_system(
-              reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
-          if (t.column == 0U) {
+          if constexpr (WEFTMOE_PF_RETURN_RAILS == 1U) {
+            arrive(slot.fc2_published, 1U);
+            if (t.column == 0U && desc.local_rows == t.rows)
+              arrive(slot.returned, t.rows);
+          } else {
+            auto &tx_slot = a.ring.return_slots[desc.return_slot];
             reduce_add_release_system(
-                reinterpret_cast<unsigned long long *>(&tx_slot.consumed),
-                desc.local_rows + kM - t.rows);
-            arrive(slot.returned, t.rows);
+                reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
+            if (t.column == 0U) {
+              reduce_add_release_system(
+                  reinterpret_cast<unsigned long long *>(&tx_slot.consumed),
+                  desc.local_rows + kM - t.rows);
+              arrive(slot.returned, t.rows);
+            }
           }
         }
         collective_scope_sync<kMathThreads, 7U>();

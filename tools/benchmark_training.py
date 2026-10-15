@@ -163,17 +163,15 @@ def main():
         communication = None
         if args.report_communication:
             local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world))
-            # Route-derived payload, not NIC counters. FWD Return now leaves
-            # the source's rail; BWD still leaves the computing expert rank.
-            traffic = torch.zeros((len(batches), world, 4), dtype=torch.int64)
+            # Route-derived payload, not NIC counters. BWD Return leaves the
+            # computing expert rank; this does not model FWD's rail assignment.
+            traffic = torch.zeros((len(batches), world, 3), dtype=torch.int64)
             for step, (routes, _) in enumerate(batches):
                 destination = routes.long() // owned
                 nodes = destination // local_world
                 for node in range(world // local_world):
                     if node != rank // local_world:
                         traffic[step, rank, 0] += (nodes == node).any(dim=1).sum()
-                        rail = node * local_world + rank % local_world
-                        traffic[step, rail, 3] += (nodes == node).sum()
                 remote = destination[nodes != rank // local_world]
                 traffic[step, :, 1] = torch.bincount(remote, minlength=world)
                 peers = destination[destination != rank]
@@ -183,7 +181,7 @@ def main():
             communication = dict(
                 rows_per_step_rank=traffic[args.warmups:].cpu().tolist(),
                 columns=["dispatch_rdma_rows", "backward_return_rdma_rows",
-                         "off_rank_expert_rows", "forward_return_rdma_rows"],
+                         "off_rank_expert_rows"],
                 dispatch_bytes_per_row=2 * args.hidden,
                 forward_return_bytes_per_row=2 * args.hidden,
                 backward_return_bytes_per_row=2 * args.hidden + 4)

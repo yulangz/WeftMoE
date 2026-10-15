@@ -677,9 +677,11 @@ static_ring_shape(const ActivationTransportPoolConfig &config) {
 }
 
 unsigned rail_return_slots(const ActivationTransportPoolConfig &config) {
-  const auto experts = config.max_owned_experts * config.max_world_size / config.max_nodes;
+  const auto experts =
+      config.max_owned_experts * config.max_world_size / config.max_nodes;
   return static_cast<unsigned>(std::max<std::uint64_t>(
-      2U * experts, static_ring_shape(config).compute_slots(config.max_owned_experts)));
+      2U * experts,
+      static_ring_shape(config).compute_slots(config.max_owned_experts)));
 }
 
 static_forward::SourceMetadataLayout
@@ -816,7 +818,8 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.return_rows = std::max(
         network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
         shape.compute_slots(config.max_owned_experts) * shape.tile_m);
-    network.return_rows = std::max(network.return_rows,
+    network.return_rows = std::max(
+        network.return_rows,
         std::uint64_t(rail_return_slots(config)) * shape.tile_m);
     network.ring_region = append(
         cursor, 1U,
@@ -1083,10 +1086,14 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
                sizeof(std::uint64_t), "window expert blocks");
     if (config.max_nodes > 1U) {
-      ring.return_capacity = rail_return_slots(config) * ring.shape.tile_m;
-      ring.return_slots = append(cursor, ring.return_capacity,
+      ring.return_capacity = rail_return_slots(config);
+      ring.return_slots = append(
+          cursor,
+          std::uint64_t(ring.return_capacity) *
+              (config.max_world_size / config.max_nodes),
           sizeof(static_forward::ReturnSlot), "expert Return slot credits");
-      ring.return_experts = append(cursor,
+      ring.return_experts = append(
+          cursor,
           config.max_owned_experts * (config.max_world_size / config.max_nodes),
           sizeof(static_forward::ReturnExpert), "expert Return slot partition");
       ring.window_compute = append(

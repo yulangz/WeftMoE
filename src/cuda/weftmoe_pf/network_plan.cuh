@@ -180,7 +180,7 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
                                 contribution * a.hidden * 2U,
               source % a.local_world_size);
         else
-          output = nullptr; // Installed after the exact rail row spans are known.
+          output = nullptr; // Installed after the node-wide TX partition.
         r.rows[physical] = {unsigned(route), source, gate,
                              unsigned(route / p.shape.top_k), output,
                              contribution};
