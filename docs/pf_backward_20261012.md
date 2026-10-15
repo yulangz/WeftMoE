@@ -4,6 +4,219 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M16：Qwen / Flash 性能偏移的单项归因（完成，2026-10-15）
+
+代码检查点为 `84a9424`，包含 `6a78343` / `3539cea` 的实现。开始本轮时
+工作区已经干净，不创建空提交。本轮**不修改算子源码或生产默认配置**，
+只用现有配置轴做反事实测量，并读取已有 timeline / BWD 状态时间戳。
+
+结论先行：
+
+- Flash 单机的主要回退来自 **warp 独占整个 M-block 搬运**，不是 compact
+  contribution，也不是 vector 指令本身。固定 bulk 指令与 compact 布局，
+  首次 WGMMA 的前置等待从约 21 us 增至 1.16 ms；8K FWD 从 6.083
+  变成 7.059 ms。只启用 compact、保留逐行 bulk，Flash FWD 反而有收益。
+- Flash 多机 FWD 的主要回退来自 **B2048→B1024**：原有逐窗口 M-padding
+  被放大。其余新策略保留，非均衡 FWD 只恢复 B2048 就从
+  14.237/33.282 降至 11.789/27.495 ms。BWD 已不按通信窗口补齐 GEMM，
+  不能把这个解释原样套给 BWD。
+- **全 CTA BWD reduce 是阶段调度取舍，不是通用优化**。Flash 的 reduce
+  原本可以完全藏在 dW 里；Qwen 的 reduce 大部分位于 dW 之后。
+  当前代码上的配对测试确认：Flash 四项都适合 96 线程重叠 reduce，
+  Qwen 四项都适合全 CTA reduce。
+
+### 口径与两种 shape 的结构差异
+
+沿用 M15 的变化 token 数、每调用重生成的合成热点/均衡路由、seed123、
+完整 prime trace + 4 warmups / 16 samples；取逐步最慢 rank 的 p50。
+FWD 带训练缓存且包含重排/notify/分配，BWD 使用当次已就绪的新 tape；
+固定 pool 已预热。66 项正式计时全部完成，Flash 的 workload SHA 与
+M15 一致；同 shape/拓扑/路由/规模的各候选逐 rank SHA 一致。
+这不是无缓存 inference、DT 或整个模型的训练吞吐测试。
+
+| 单层 routed MoE 几何 | Qwen | Flash |
+|---|---:|---:|
+| H / I / E / top-k | 2048 / 512 / 256 / 8 | 4096 / 2048 / 256 / 6 |
+| 每原始 token 的 FWD GEMM FLOPs，`6*H*I*topk` | 50.33 M | 301.99 M |
+| 每原始 token 的 BF16 contribution，`2*H*topk` | 32 KiB | 48 KiB |
+| 每原始 token 的 saved X + G/U，`(2*H+4*I)*topk` | 48 KiB | 96 KiB |
+| 每专家 BF16 W1+W2，`6*H*I` | 6 MiB | 48 MiB |
+| 每 M-block 的 FC1 / FC2 N tiles，N256 | 4 / 8 | 16 / 16 |
+| 每 FC1 / FC2 tile 的 K64 迭代数 | 32 / 8 | 64 / 32 |
+| B1024、8 个 source 的完整窗口，平均每专家有效行 | 256 | 192 |
+
+Flash 的计算量是 Qwen 的 6 倍，但 contribution 只有 1.5 倍、保存激活
+只有 2 倍；计算/写回字节比高 4 倍。Qwen 因此更容易暴露短 GEMM 的
+写回、控制和启动等待；Flash 更需要避免额外算术，以及损失已有的重叠。
+不能把整个算子简单归为一种瓶颈：FC1、FC2、dW 和通信尾部各不相同。
+
+当前 GPU 查询得到 L2 为 60 MiB；Flash 一个专家的权重就有 48 MiB，
+Qwen 为 6 MiB。这说明权重复用的工作集不同，但本轮没有取得可靠的
+L2/TLB miss 计数器，**不据此给回退做硬件计数器级归因**。
+
+同样的 M/N/K 也不代表同样的任务规模：EP8、理想均衡 8K 下，Qwen
+每专家约有 16 个 M-block × 4 个 FC1 N tiles = 64 个 FC1 CTA 任务；
+Flash 为 12 × 16 = 192，grid 均为 132 CTA。Qwen 更容易在
+FC1→FC2 依赖处暴露等待；这不是声称所有时间都只有 64 CTA 能工作。
+20K 时 Qwen 已约有 160 个 FC1 任务/专家，最优取舍还会随 token 数改变。
+
+本轮 GEMM 均保持 M128/N256/K64、3 stages、cluster-N2；Flash dW
+chunk 仍为 4/1，Qwen 为 1/1。没有把后者的 dW chunk 一并迁移给 Flash。
+
+### 单机：是整块搬运延后 ready，不是 compact 写回有害
+
+Flash EP8、均衡路由，所有数值为 ms；8K / 20K 顺序。除表列选项外
+保持同一 CUDA 源码、GEMM、任务 grid 和资源配额。`bulk` 是现有
+G2S→S2G bulk copy，不是直接 GM→GM 的单条指令。
+
+| pull / contribution 配置 | FWD 8K / 20K | BWD 8K / 20K |
+|---|---:|---:|
+| 2 warps，逐行 bulk，原 C | 6.555 / 14.629 | 10.480 / 25.495 |
+| 3 warps，逐行 bulk，原 C | 6.583 / 14.796 | 10.412 / 25.277 |
+| 3 warps，M-block vector，原 C | 7.420 / 15.458 | 11.340 / 25.604 |
+| 3 warps，逐行 bulk，compact C | **6.083 / 13.884** | **10.456 / 25.122** |
+| 3 warps，M-block bulk，compact C | 7.059 / 15.176 | 11.204 / 25.698 |
+| 3 warps，M-block vector，compact C | 7.045 / 14.747 | 11.398 / 25.808 |
+
+2→3 warps 没有复现约 7% 的回退；新增的是原来空闲的 control warp，
+没有减少 math warp 或 math 寄存器配额。compact C 在两种 pull 组织下
+都改善了 FWD。固定 3 warps + compact，只把逐行 bulk 换成整块 bulk，
+8K/20K FWD 耗时增加约 16.0%/9.3%；再改 vector，20K 反而挽回约 2.8%。
+因此不能把“整块 vector”作为一个不可拆分的 copy 指令优化解释。
+
+`local_kernel.cuh::pull()` 按行在 worker 间条带化；`pull_blocks()`
+则让一个 warp 独占 M128，批量解码元数据，再连续搬 128 行。
+132 × 3 = 396 个 worker 在旧方案里先共同填前几个块，新方案里先
+各自填不同的块。producer 必须等某块的 128 行全部 ready 才能发 TMA。
+Flash 每个 warp 独占的 X payload 为 1 MiB，Qwen 为 512 KiB。
+新方案节省部分元数据/发布工作，却显著拓宽预取范围、降低首块搬运并行度；
+它也改变了 peer 访问顺序，不是对同一地址流简单替换一条 copy 指令。
+
+用现有 timeline、同一份 6-step 均衡路由做独立诊断，4 warmups + 2
+samples，仅下载最后一份 tape。下表为 8 个 rank 的中位数，单位 us：
+
+| Flash / bulk / compact C | 首次 producer InputWaitBegin → 首次 WGMMA：8K | 20K |
+|---|---:|---:|
+| 逐行领取 | 20.992 | 21.888 |
+| 整块领取 | 1157.104 | 1190.080 |
+
+起点是每 GPU 最早的 producer InputWaitBegin，**不是 kernel entry**。
+32 份 trace 均无 overflow，每份都有 132 个 producer CTA。整块领取增加
+约 1.1 ms 的启动等待，与 8K 的约 1 ms 正式回退一致；不能把插桩结果
+当作正式端到端 p50。producer 等 ready 和 math 等 operand 的计数同时
+增长，它们覆盖同一等待区间，不能相加，也不是 GEMM 算术指令变慢的证据。
+
+逐行 bulk + compact 在 Flash 非均衡 8K/20K 的补测为：
+FWD **7.393/16.290**，BWD **12.530/30.685** ms。作为跨批次参考，
+M15 同 trace 的原配置为 7.748/17.828、12.874/31.659 ms；不把这个
+跨批次对比冒充新的单因素消融。M14 的 Qwen 单项消融同样显示 compact
+是主要收益来源，而且 Qwen 8K FWD 也曾是逐行 bulk 更快，20K 更适合
+整块 vector：不是两个模型在任何 token 数下都应选择相反方案。
+
+### 多机窗口：FWD 的算术切分仍与通信窗口耦合
+
+`window_geometry.cuh::build_window_counts()` 对每个窗口/专家执行
+`ceil(rows / 128)`，`ring_plan.cuh` 将这些块相加。因此 FWD 的物理行数是
+`sum(window, expert, 128 * ceil(rows[window, expert] / 128))`。
+BWD 已按完整专家行做 canonical M128，不重复这个逐窗口补齐。
+M3 消除的是 **BWD** padding；FWD 原来就有，缩小窗口将其放大。
+
+只改变 B，其余新策略均开启、credit 固定 4，CLI 均传 `--ring-depth 2`。
+多机 contribution 实际按整次调用容量扩展，不能把这个 CLI 值当作
+实际 C 槽数或 wire credit：
+
+| EP16 case | FWD B1024 / B2048 | BWD B1024 / B2048 |
+|---|---:|---:|
+| Flash 均衡 8K | 10.659 / 9.555 | 11.676 / 11.790 |
+| Flash 均衡 20K | 23.875 / 20.794 | 27.700 / 26.268 |
+| Flash 非均衡 8K | 14.237 / 11.789 | 16.184 / 15.773 |
+| Flash 非均衡 20K | 33.282 / 27.495 | 39.553 / 38.838 |
+| Qwen 非均衡 8K | 5.777 / 5.911 | 6.648 / 6.998 |
+| Qwen 非均衡 20K | 12.688 / 12.666 | 15.730 / 15.964 |
+
+Flash 非均衡 FWD 的 8K/20K 全局执行行数/有效行数，从 B2048 的
+**1.2304/1.2218** 增至 B1024 的 **1.4734/1.4636**。
+Qwen 对应为 **1.1692/1.1622 → 1.3378/1.3303**。
+总体均衡也不意味着每个随机打乱后的窗口均衡，变化长度的末窗口还会
+增加尾块。保持 B2048、只把 credit4 改回 credit2，Flash 非均衡 FWD 为
+11.842/27.527 ms，与 credit4 的 11.789/27.495 基本相同。
+
+窗口参数的回退有直接配对证据，但不能把全部时间差精确归给 padding：
+它还改变窗口/阶段切换次数、prefetch 与 X/S ring 容量。尤其非均衡
+8K 的最大 rank 执行行数中位数只从 90368 增至 101760（约 12.6%），
+而 FWD 延迟增加约 20.8%。全局多算的行数比例不是关键路径延迟比例。
+相反，Qwen 计算行数明显减少，FWD 却基本不变或略慢，说明减少计算
+与流水启动/通信时序的取舍确实不同，不能只用一个 padding 比例选参数。
+
+### BWD reduce：加快独立阶段，不等于缩短关键路径
+
+固定每个 shape 的窗口（Flash B2048，Qwen B1024）、credit4 和其余
+所有策略，仅切换 `backward_full_reduce`。单位 ms：
+
+| EP16 case | 全 CTA reduce：8K / 20K | 96 通信线程重叠 reduce：8K / 20K |
+|---|---:|---:|
+| Flash 均衡 | 11.790 / 26.268 | **11.137 / 25.697** |
+| Flash 非均衡 | 15.773 / 38.838 | **15.127 / 37.825** |
+| Qwen 均衡 | **5.646 / 12.512** | 5.947 / 13.128 |
+| Qwen 非均衡 | **6.648 / 15.730** | 6.873 / 16.430 |
+
+旧路径的 96 个通信线程在 Return 完成后做 reduce，和 math/producer 的
+dW 重叠；全 CTA 路径等 dW/通信全部 join，再由 384 个线程做 reduce。
+令 D 为 dW 完成时刻、R 为通信就绪时刻、r 为 reduce 耗时，可近似理解为
+`max(D, R + r96)` 与 `max(D, R) + r384` 的取舍，不是只比较 r96/r384。
+
+另用既有 BWD 状态时间戳诊断 96 线程路径：均衡路由，1 warmup + 2
+samples，每项 16 ranks × 2 samples；下表均为同 GPU 时钟相减后的中位数，
+单位 ms。负值表示该事件发生在本 GPU dW1 完成前：
+
+| shape / tokens | reduce 开始 − dW 完成 | reduce 结束 − dW 完成 |
+|---|---:|---:|
+| Flash 8K | -2.464 | -1.702 |
+| Flash 20K | -6.342 | -4.597 |
+| Qwen 8K | +0.903 | +1.240 |
+| Qwen 20K | +0.633 | +1.454 |
+
+Flash 两个规模各 32 个 rank-samples 的 reduce 均在 dW 完成前结束；
+Qwen 均在 dW 之后结束（20K 有 8/32 个在 dW 结束前略早开始）。
+因此 Flash 把可隐藏的阶段搬到了末尾，而 Qwen 是在加速不可隐藏的尾部。
+诊断含状态输出、不作正式性能计时，也不能将不同 rank 的阶段极值相加。
+
+### 哪些结论可以保留，哪些仍不能外推
+
+- compact contribution 是数据布局改善，在本轮两种 shape 的证据中有用；
+  “2→3 pull warps”“M-block 领取”“vector copy”必须分开看，不能整组归功。
+- B、搬运粒度、是否牺牲 dW/reduce 重叠，是 shape/负载相关策略。应按
+  每专家每窗口行数、算术/字节比、阶段尾部选择，而不是按模型名字硬编码。
+- 节点去重不是新能力；本轮不把有序目录/合并 Get、pending4、预计算 spans、
+  striped signals 等剩余组合的净效果，拆成未经测量的单项收益。
+- 新构建的主 kernel/helper 没有新增 spill；现有 count-notify 的 28/28 B
+  spill 保持不变。GEMM 几何和 math 资源没变，不能用 spill 或 MNK 变化解释
+  本轮主要回退。也不能由“有 SM 等待”直接断言必须恢复动态领任务：仅改变
+  静态搬运分工，已经能消除约 1 ms 的启动等待。
+- 后续值得做的是将 copy 指令与领取行数解耦，避免一次预取太多后续块；
+  长期再考虑解耦 FWD 通信窗口与 GEMM 尾块。这里只提出方向，**尚未实现**。
+  Flash 的逐行 bulk + compact、B2048、重叠 reduce 已分别有实验支持，
+  但本轮不发布组合后的新默认或声称完成其新的全矩阵验收。
+
+数值验证覆盖 Flash 单机逐行 bulk + compact、双机 B2048/96 线程 reduce
+两组候选，各 129/8K/20K、每规模两份新 tape，output/dX/dGate/dW1/dW2
+全部通过；最大 relative-L2 分别约 4.66e-4 / 8.39e-4 / 1.54e-4 /
+3.39e-4 / 3.39e-4。没有新增单测，不把这两个候选的验证说成所有消融
+配置都做过完整数值验收。
+
+沿用两节点 1620 MHz 锁频请求，正式计时稀疏采样覆盖 17/66 项、144 个
+rank 观测，其中 20 个低于目标，范围 1455–1605 MHz，全部保留。
+未覆盖的短区间不能断言全程恒频；约 1% 的差异不作稳定收益结论。
+无编译与正式 GPU 测量重叠，GPU 测量全部串行。
+
+完整原始样本、配置、二进制/workload hashes、时钟及诊断摘要见
+[单项归因结果 JSON](../benchmarks/results/pf_shape_diagnosis_20261015.json)。
+生成配置、driver、日志和原始 timeline 位于
+`build/shape_diagnosis_20261015/`；未替换 M14/M15 的历史结果。
+构建仍复用 `benchmarks/build_pf_main_timeline.py --profile DIR`，性能/数值
+测试复用 `benchmarks/run_pf_network.py` 与 `tools/benchmark_training.py`，
+没有新增生产实现或另一套 benchmark 测量口径。
+
 ## M15：Flash 全量策略迁移测试（完成，2026-10-15）
 
 结论：**不能把 Qwen 的整组新策略直接作为 Flash 默认配置**。64 项主矩阵
@@ -30,8 +243,9 @@ dW chunk 4/1），不将 Qwen 的 dW chunk 1/1 一并照搬。
 `strategy` 开启紧凑 contribution、3 个 vector pull warp、有序 dispatch /
 合并 Get、窗口顺序 tape、pending4 / 预计算 fragment / 分散完成计数器、
 full-CTA BWD reduce、private dR；EP8 B2048，EP16 B1024/credit4。
-`old/default` 为 B2048/credit2。各组 contribution ring-depth=2，与 wire
-credit 不是同一参数。只新增实验配置，不替换 Flash 生产默认配置。
+`old/default` 为 B2048/credit2。各组 CLI ring-depth=2；多机 contribution
+按整次调用容量扩展，不能将 CLI D 当作实际 C 槽数，与 wire credit 也
+不是同一参数。只新增实验配置，不替换 Flash 生产默认配置。
 
 两机已请求 `nvidia-smi -lgc 1620,1620`，功耗上限保持默认 700W；保留
 运行时钟采样，不预先假定实际频率全程恒定。编译、完整梯度校验和性能
@@ -328,7 +542,8 @@ ready 推送为 6.906/9.710 ms。逐包 ready 则为 9.356/12.023 ms。
    不增加 pack buffer，不多发送未命中节点的 token，不改变 RX credit。
 2. 训练 tape 从 `[expert][source][source 的所有窗口]` 改为
    `[expert][window/group][source][ordinal]`，FWD/BWD 使用同一稳定行序。
-   cache 仍按 expert 紧凑、不恢复窗口 M-padding、不增加激活容量。
+   cache 仍按 expert 紧凑，BWD GEMM 不恢复窗口 M-padding，不增加激活缓存
+   容量；FWD 仍按窗口切 M128，不能将 BWD 的 padding 结论外推给 FWD（见 M16）。
    原来的 M-block 可能跨越一个 source 的末窗口和下一个 source 的首窗口，
    从而使首窗口部分行一直等到最后才完成。新顺序解除这类跨窗口依赖。
    dW 的 K 行遍历顺序改变，不能仅验证 dX；129/8K/20K、两次新 tape 的

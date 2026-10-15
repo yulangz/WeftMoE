@@ -11,9 +11,11 @@ striped completion signals, full-CTA BWD reduce, private dR and credit4.
 Keep Flash's original M128/N256/K64, three stages, cluster-N2 and dW chunks 4/1.
 Node deduplication already existed before these switches.
 
-Use B2048 on EP8 (one eight-GPU node), B1024 on EP16 (two nodes). Contribution
-ring-depth is 2; compiled wire credit is 4. Do not override the latter with
-the old profile's credit2 environment setting.
+Use B2048 on EP8 (one eight-GPU node), B1024 on EP16 (two nodes), and pass
+`--ring-depth 2`. Network contribution capacity covers the invocation; its
+actual window count is derived from prepared token capacity and B, not this
+CLI D. Compiled wire credit is 4. Do not override the latter with the old
+profile's credit2 environment setting.
 
 Build with the existing helper:
 
@@ -44,3 +46,9 @@ Results, reverse-order checks and clock caveats are recorded in
 [the PF optimization record](../../docs/pf_backward_20261012.md), with raw samples
 and binary/workload hashes in
 [the result JSON](../../benchmarks/results/flash_pf_strategy_20261015.json).
+
+M16 in the same record subsequently isolates the regressions: M-block-owned
+local pull, the smaller Forward window, and full-CTA Backward reduce. Compact
+contributions also help Flash when row-striped bulk pull is retained. These
+diagnostic counterfactuals do not change this frozen whole-profile experiment
+or select a new production default.
