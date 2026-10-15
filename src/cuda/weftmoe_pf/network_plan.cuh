@@ -126,7 +126,7 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
       r.blocks[block] = {
           {expert, unsigned(ordinal * m),
            unsigned(min(std::uint64_t(m), plan.total_rows - ordinal * m))},
-          unsigned(w), slot, generation};
+          unsigned(w), slot, 0U, generation};
       const auto &arrival = r.window_compute[start * owned + expert];
       r.start_blocks[arrival.start_begin + ordinal -
                      static_forward::ceil_div(arrival.row_begin, m)] =

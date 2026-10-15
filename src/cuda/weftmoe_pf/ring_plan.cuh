@@ -157,6 +157,7 @@ __device__ __forceinline__ void build_blocks(const ForwardKernelArgs &a,
                                     r.source.shape.tile_m)},
         static_cast<unsigned>(window),
         static_cast<unsigned>(seq % r.depth),
+        0U,
         seq / r.depth + 1U};
   }
 }

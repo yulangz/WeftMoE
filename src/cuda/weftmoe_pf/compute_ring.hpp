@@ -31,6 +31,7 @@ struct RingBlock {
   WindowMblock tile;
   std::uint32_t window;
   std::uint32_t slot;
+  std::uint32_t return_issued; // Private to this block's static Return owner.
   std::uint64_t generation;
 };
 static_assert(sizeof(RingBlock) == 32U);

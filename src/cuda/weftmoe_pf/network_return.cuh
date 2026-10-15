@@ -19,8 +19,8 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
   Endpoint endpoint(a, kGetWorkers + worker);
   const auto &r = a.ring;
   const auto bytes = a.hidden * 2U;
-  const auto tx = a.static_network.ring_region +
-                  endpoint.layout().return_payload(0U, 0U);
+  const auto tx =
+      a.static_network.ring_region + endpoint.layout().return_payload(0U, 0U);
   unsigned issued = 0U, completed = 0U;
   std::uint64_t packets = 0U, payload = 0U;
   auto retire = [&]() {
@@ -31,59 +31,71 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
                    r.blocks[entry.block].tile.rows);
     ++completed;
   };
-  for (auto block = std::uint64_t(worker); block < r.state->blocks;
-       block += kPutWorkers) {
-    const auto desc = r.blocks[block];
-    auto &slot = r.slots[desc.slot];
-    while (ring::acquire(slot.generation) != desc.generation ||
-           ring::acquire(slot.fc2_published) < desc.generation * local::kFc2Tiles)
-      if (completed != issued)
-        retire();
-    const auto first_request = issued;
-    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady, GinReturn,
-                               worker, block, 0U);
-    const auto *rows = r.rows + block * local::kM;
-    for (unsigned row = 0U; row < desc.tile.rows;) {
-      const auto identity = rows[row];
-      unsigned count = 1U;
-      while (row + count < desc.tile.rows &&
-             rows[row + count].source == identity.source &&
-             rows[row + count].contribution == identity.contribution + count)
-        ++count;
-      const auto node = identity.source / a.local_world_size;
-      if (node != a.node) {
-        if (issued - completed == kNetworkPending)
-          retire();
-        const auto channel = endpoint.layout().channel(
-            node, a.node, worker % endpoint.layout().lanes);
-        WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart, GinReturn,
-                                   channel, block, count);
-        endpoint.gin.put(
-            ncclTeamWorld(endpoint.gin.comm), identity.source, a.gin_window,
-            a.static_network.contribution + identity.contribution * bytes,
-            a.gin_window,
-            tx + (std::uint64_t(desc.slot) * local::kM + row) * bytes,
-            count * bytes,
-            ncclGin_WeakVASignalAdd{
-                a.gin_window,
-                endpoint.control(true, channel, 0U) +
-                    offsetof(static_forward::NetworkSlot, ready_signal),
-                count},
-            ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-            ::cuda::thread_scope_block, ::cuda::thread_scope_system);
-        auto &entry = pending[issued++ % kNetworkPending];
-        entry.block = ~0ULL;
-        endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm),
-                                identity.source, &entry.request);
-        ++packets;
-        payload += count * bytes;
+  auto remaining =
+      r.state->blocks > worker
+          ? (r.state->blocks - worker + kPutWorkers - 1U) / kPutWorkers
+          : 0U;
+  while (remaining) {
+    for (auto block = std::uint64_t(worker); block < r.state->blocks;
+         block += kPutWorkers) {
+      if (r.blocks[block].return_issued)
+        continue;
+      const auto desc = r.blocks[block];
+      auto &slot = r.slots[desc.slot];
+      if (ring::acquire(slot.generation) != desc.generation ||
+          ring::acquire(slot.fc2_published) <
+              desc.generation * local::kFc2Tiles)
+        continue;
+      const auto first_request = issued;
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady,
+                                 GinReturn, worker, block, 0U);
+      const auto *rows = r.rows + block * local::kM;
+      for (unsigned row = 0U; row < desc.tile.rows;) {
+        const auto identity = rows[row];
+        unsigned count = 1U;
+        while (row + count < desc.tile.rows &&
+               rows[row + count].source == identity.source &&
+               rows[row + count].contribution == identity.contribution + count)
+          ++count;
+        const auto node = identity.source / a.local_world_size;
+        if (node != a.node) {
+          if (issued - completed == kNetworkPending)
+            retire();
+          const auto channel = endpoint.layout().channel(
+              node, a.node, worker % endpoint.layout().lanes);
+          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
+                                     GinReturn, channel, block, count);
+          endpoint.gin.put(
+              ncclTeamWorld(endpoint.gin.comm), identity.source, a.gin_window,
+              a.static_network.contribution + identity.contribution * bytes,
+              a.gin_window,
+              tx + (std::uint64_t(desc.slot) * local::kM + row) * bytes,
+              count * bytes,
+              ncclGin_WeakVASignalAdd{
+                  a.gin_window,
+                  endpoint.control(true, channel, 0U) +
+                      offsetof(static_forward::NetworkSlot, ready_signal),
+                  count},
+              ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+              ::cuda::thread_scope_block, ::cuda::thread_scope_system);
+          auto &entry = pending[issued++ % kNetworkPending];
+          entry.block = ~0ULL;
+          endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm),
+                                  identity.source, &entry.request);
+          ++packets;
+          payload += count * bytes;
+        }
+        row += count;
       }
-      row += count;
+      if (first_request != issued)
+        pending[(issued - 1U) % kNetworkPending].block = block;
+      else
+        ring::arrive(slot.returned, desc.tile.rows);
+      r.blocks[block].return_issued = 1U;
+      --remaining;
     }
-    if (first_request != issued)
-      pending[(issued - 1U) % kNetworkPending].block = block;
-    else
-      ring::arrive(slot.returned, desc.tile.rows);
+    if (completed != issued)
+      retire();
   }
   while (completed != issued)
     retire();
