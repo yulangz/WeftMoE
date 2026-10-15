@@ -1,11 +1,17 @@
 # Qwen3.5-35B-A3B compact PF profile
 
-M18 follow-up: canonical network FWD removes per-window M padding, but the
-current EP16 cached FWD still regresses against this profile's historical
-Qwen results. B2048 and route-adaptive tail-bank partitioning did not restore
-them. The Flash-first tradeoff, exact measurements and Return-tail diagnostics
-are recorded in M18 of [the optimization record](../../docs/pf_backward_20261012.md).
-Do not treat the historical 15% target below as a result for the current code.
+Current M19 profile uses `return_rails=0`: whole canonical M-blocks are striped
+across the node's rails, with FC2 writing their bounded TX rings directly.
+Return workers scan statically owned ready blocks; no payload gather kernel
+or dynamic task claiming is added. Compiled ID `2baa8b3fdd47`, candidate digest
+`68f1ee652693`; the capacity table was regenerated with the matching IDs.
+See M19 of [the optimization record](../../docs/pf_backward_20261012.md) for
+fresh cached-FWD comparisons against M18. The historical Megatron 15% target
+below is **not** a result for this revised code; BWD is not retimed this round.
+This all-rail choice favors the measured skewed routes: it improves their
+8K/20K latency by 8.5%/14.8%, but regresses balanced routes by 6.9%/6.6%.
+It is not a universal winner. `return_rails=1` is the conservative global
+default; topology should be selected using the application's route trace.
 
 Update after M17: the current header/candidate have removed M-block-owned
 pull and full-CTA BWD reduce (compiled ID `4d5985a6feb9`), prioritizing Flash.

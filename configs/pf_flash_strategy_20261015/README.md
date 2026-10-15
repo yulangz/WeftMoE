@@ -1,12 +1,14 @@
 # Flash PF dataflow profile
 
-Current M18 configuration: use **B2048 on both EP8 and EP16**, contribution
-CLI depth 2 and network credit4. Candidate digest `de91f52ad9e3`; changing
-the prepare-time window does not change compiled ID `e8955a4e0df6` or the
-generated header. Network FWD now uses canonical M128 blocks across windows
-and bounded Return M-slots. Local row-striped bulk and overlapping 96-thread
-BWD reduce are retained. See M18 in [the optimization record](../../docs/pf_backward_20261012.md)
-and [matched measurements](../../benchmarks/results/pf_canonical_forward_20261015.json).
+Current M19 configuration: use **B2048 on both EP8 and EP16**, contribution
+CLI depth 2 and network credit4. `return_rails=1` keeps FC2 TX on the computing
+GPU and reuses its compute-slot credit; Put workers now scan their statically
+owned ready blocks instead of waiting on the first unfinished block.
+Candidate digest `14727edb3f32`, compiled ID `3172e19487b0`.
+Canonical cross-window M128, local row-striped bulk and overlapping 96-thread
+BWD reduce are retained. See M19 in [the optimization record](../../docs/pf_backward_20261012.md)
+for the paired measurements and the negative all-rail ablation. Do not apply
+Qwen's all-rail choice to Flash without measuring it.
 
 ## Historical whole-profile experiment (before M17)
 

@@ -4,6 +4,130 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M19：Return 就绪扫描与可调 rail 分流（2026-10-15）
+
+本轮保留跨窗口 canonical M128，不恢复逐窗口 padding，不改 MNK、
+gate/up、Dispatch 或 BWD 算法。**单独解除队头等待没有显著收益；
+恢复 rail 中转有利于 Qwen，却不能无条件应用到 Flash。**
+实现不按模型名分支，Return 拓扑通过 `v4.return_rails` 调整。
+
+### 保留版本与配对结果
+
+实现提交 `b7e4257`。以下是**修复前 PF 与当前 PF** 的比较，不是 Megatron
+比较；均为 EP16、每 rank 的名义 tokens，完整带缓存 FWD，单位 ms。
+正数代表延迟下降。原始样本、workload/二进制 hash、时钟和消融记录见
+`benchmarks/results/pf_return_rail_20261015.json`。
+
+| 模型 / 路由 | tokens | 修复前 | 当前 | 延迟下降 |
+|---|---:|---:|---:|---:|
+| Qwen / 均衡 | 8K | 6.179 | 6.604 | -6.88% |
+| Qwen / 均衡 | 20K | 13.755 | 14.668 | -6.63% |
+| Qwen / 非均衡 | 8K | 7.201 | 6.591 | +8.47% |
+| Qwen / 非均衡 | 20K | 17.041 | 14.525 | +14.77% |
+| Flash / 均衡 | 8K | 9.557 | 9.529 | +0.30% |
+| Flash / 均衡 | 20K | 20.279 | 20.295 | -0.08% |
+| Flash / 非均衡 | 8K | 11.232 | 11.184 | +0.43% |
+| Flash / 非均衡 | 20K | 25.040 | 25.294 | -1.01% |
+
+所有前后配对的逐 rank workload SHA 一致。均衡和 Flash 非均衡采用
+current→baseline 测试顺序。Flash 非均衡首轮 baseline→current 为
+11.118→11.105 / 25.018→25.304 ms，20K 两轮都约回退 1%，**不能写成
+全面无回退**。Qwen 非均衡采用首轮配对；没有按不同版本挑选最快样本。
+
+Qwen 的 all-rail 选择有明确适用范围：热点路由可以让空闲 rail 分担
+发送，均衡路由则测到 6–7% 回退。这与“均衡时原本不缺发送负载均衡、
+中转和独立 credit 的成本仍在”相符，但不是逐指令因果证明。当前全局
+默认和 Flash profile 保留 `return_rails=1`；Qwen profile 的 0 是面向
+本轮非均衡 workload 的选择，不是全 case 最优，也不是逐调用自适应。
+
+### 消融与测量口径
+
+双机 EP16、带 saved X/GU 的完整 FWD；固定 pool 已预热，包含 notify、
+缓存申请和当次权重重排。tokens 正态变化，标准差 10%，每调用新路由；
+随机路由 shared bias=0.5。4 warmups / 16 samples，完整 prime trace，
+取每步最慢 rank 的 p50。时钟设置 1620 MHz，保留全部采样时钟，不删除
+低频样本；稀疏时钟采样不等于证明每个计时区间都恒定 1620 MHz。
+正式 GPU 计时不与编译重叠。同一 case 逐 rank workload SHA 必须一致。
+
+本轮重跑 M18 基线；单位 ms，8K / 20K。以下是逐步实验，不是各项
+可相加的独立收益，也不是 Megatron 对比：
+
+| Return 实现 | Qwen 随机 | Flash 随机 |
+|---|---:|---:|
+| M18，计算卡直发 | 7.201 / 17.041 | 11.118 / 25.018 |
+| 仅扫描后续就绪 block（`1aa35be`） | 7.323 / 16.987 | 11.094 / 25.063 |
+| Put warp gather 到 rail staging 后发送 | 11.127 / 27.192 | 17.215 / 37.553 |
+| FC2 直写 source rail，专家等分 TX | 7.457 / 22.287 | 12.681 / 32.771 |
+| 同上，128-row 检查/合并 | 8.040 / 29.345 | 12.803 / 34.505 |
+| 按实际专家 block 数分 TX，逐行检查 | 6.249 / 15.804 | 11.202 / 26.537 |
+| 按 M-block 检查（`289ad33`） | 6.732 / 14.769 | 11.145 / 26.513 |
+| FC2 直接压紧 source-rail TX（`6d81411`） | 6.433 / 14.374 | 11.368 / 26.371 |
+| 整个 M-block 轮转 rail | 6.504 / 14.355 | 11.120 / 26.330 |
+| TX credit 检查前移至 TMA producer | 6.523 / 14.455 | 10.976 / 26.124 |
+| 每 M-block 只回传一次 TX credit | 6.580 / 14.324 | 11.061 / 26.041 |
+| 仅改成本地 TX，仍独立 TX credit | — | 11.439 / 25.786 |
+
+失败的 payload gather、等分 TX 和 source-rail 紧凑布局没有作为多套
+生产实现保留。固定 source rail 会把一个 M-block 的容量分散/重复预留
+在多个 rail；当前按整块选择 rail，一块只占一个发送 GPU 的 TX 槽。
+这不是恢复历史 source-window packet，也不重新引入冷专家尾块对整个
+输入窗口的 reservation 依赖。有效 RDMA 字节不变，没有 pre-reduce。
+
+### 当前实现
+
+- `return_rails=1`（默认、Flash profile）：FC2 仍写计算 GPU 的 TX；
+  复用原 compute slot 的 publication/returned credit，没有新增跨卡
+  TX 同步。仍使用就绪扫描，保留每 worker 的原静态 block residue。
+- `return_rails=0`（Qwen profile）：使用本节点全部 rail。也可以搜索
+  2/4/8；按连续 GPU 分组，末组可以较小。专家的第 q 个 M-block 在组内
+  静态轮转，FC2 从寄存器直接写选定 rail 的 TX，Put warp 不拷贝 payload。
+  这是 **M-block rail 分流**，不是每个 source rank 固定一个 rail。
+- 分流路径按本次实际专家 block 数，在原有 TX arena 内静态分配各专家
+  槽位；非空专家保证至少一个槽，其余按需求分配。TX 与 X/S 的生命周期
+  分开，producer 先获得上一代 TX credit，再用已有 TMA stage barrier
+  向 math 传递可写条件，不在 FC2 epilogue 额外加入整个 math WG 的等待。
+- 全部 FC2 N-tiles 完成系统级发布后，rail 才读取 TX。机内行和末尾
+  padding 在计算卡归还 credit，所有远端 fragments 的本地 NIC completion
+  都完成后再一次性归还剩余 credit。pending FIFO 保证最后一个请求退役
+  时，前面的请求也已经等完。padding 只参与槽位计数，不跨网传输。
+- 两种拓扑共用 Return worker：静态分配 owner，warp 一次检查 32 个
+  M-block，跳过未 ready 的 block，先发 ready 的；没有动态 claim 队列。
+  分流模式交错不同计算 GPU 的任务，只有 ready 后才读取 reverse-row
+  元数据，合并 source、TX 和目标 C 都连续的行。它解除的是软件上的
+  FC2-ready 队头等待，不声称消除了 NIC 的 FIFO 或 credit 背压。
+- 每 worker pending=4。源端 C 仍是调用级独占空间，exact-row signal、
+  writer join、reduce 与 terminal barrier 保持不变，不增加逐包远端
+  RX credit。跨调用可改变 TX 的专家划分：上一调用排空后，从物理控制
+  槽累计 publication 推导新 generation。BWD 不清零独立 FWD TX 计数。
+- FC2 的同一 M-block 全部 N-tiles 排在后续 block 之前，避免后继 TX
+  等待挡住前驱未执行的列。两套当前 N256 配置本来已满足该次序。
+
+主 kernel 仍为 168 registers，Return/planner 无 spill；沿用原来的
+48 个 Put warp 和 shared scratch，无新增 warp 或 payload pack kernel。
+当前 8K/20K 的 GIN payload 容量不变，只增加少量控制和任务元数据。
+每卡新增约 4.4–11.0 MiB；原 training count notify 的既有 spill 未改，
+不能将 main/Return 的零 spill 写成整个训练前置流程零 spill。
+BWD/单机算法未改；其性能不能由这轮多机 FWD 结果外推。
+`--report-communication` 的逐 rank Return 列明确仅描述 BWD 计算卡，
+不再把按 source rail 推导的流量误当作当前 FWD 的实际 NIC 分布。
+
+Autotune 轴 `return_rails` 支持 0/1/2/4/8，参与生成 header 与 compiled ID；
+单机搜索折叠此无效轴。当前 Flash ID 为 `3172e19487b0`，Qwen 为
+`2baa8b3fdd47`。这是本轮实测配置选择，不宣称完成全空间最优搜索。
+
+### 验证
+
+- 最终两套 profile：EP16、129/8192/20480，每个规模两份新路由，
+  output/dX/dGate/dW1/dW2 全部通过；包含 FWD→BWD→FWD 的 pool 复用。
+- 两种模型另测 EP16、B128/D2、8K、bias std=10 的强热点路由，各两份
+  tape，五项数值检查全部通过。实际反复使用有界 ring，不依赖一次性
+  分配足够存下全部中间激活。
+- 无中间缓存的 inference：Qwen EP16、Flash EP8，8K 各两份路由通过，
+  使用 `--verify-kernel` 检查 PF kernel 路径。这里只作数值回归，不是
+  inference 或单机性能测试；三机以上没有硬件测试。
+- 现有 autotune/unified-tuning 检查通过（15 tests、6 subtests），未增加
+  碎片化单测。主 kernel/Return/planner 的资源报告保存在构建日志中。
+
 ## M18：FWD 跨窗口 canonical M128 与静态通信均衡（2026-10-15）
 
 实现不改变 MNK、WGMMA pipeline 或 gate/up 布局，也不引入动态任务领用。
