@@ -14,7 +14,7 @@ __device__ void canonical_geometry(const ForwardKernelArgs &a) {
   const auto &r = a.ring;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto m = r.source.shape.tile_m;
-  std::uint64_t canonical = 0U;
+  std::uint64_t canonical = 0U, max_tails = 0U;
   for (unsigned e = 0U; e < owned; ++e) {
     std::uint64_t total = 0U;
     for (std::uint64_t w = 0U; w < r.state->windows; ++w)
@@ -33,9 +33,12 @@ __device__ void canonical_geometry(const ForwardKernelArgs &a) {
       row = end;
     }
     canonical += static_forward::ceil_div(total, m);
+    max_tails = max(max_tails, tails);
   }
   std::uint64_t blocks = 0U, full = 0U, starts = 0U, rows = 0U;
+  std::uint64_t max_full_window = 0U;
   for (std::uint64_t w = 0U; w < r.state->windows; ++w) {
+    const auto full_begin = full;
     r.window_prefix[w] = blocks;
     r.start_prefix[w] = starts;
     r.pull_prefix[w] = rows;
@@ -56,7 +59,16 @@ __device__ void canonical_geometry(const ForwardKernelArgs &a) {
       rows += r.expert_rows[w * owned + e];
     }
     prefix[owned] = blocks - r.window_prefix[w];
+    max_full_window = max(max_full_window, full - full_begin);
   }
+  // Balance the two banks' prefetch horizon, rather than fixing their ratio
+  // for one model/window size. This is a static per-call slot assignment;
+  // neither capacity nor runtime task ownership changes. Two tails/expert
+  // allow a predecessor to finish in the same window its successor starts.
+  r.state->tail_slots = max_tails == 0U ? 0U :
+      min(max_tails, min((r.depth - max_full_window) / owned,
+          max(min(std::uint64_t(2U), max_tails),
+              r.depth * max_tails / (full + owned * max_tails))));
   r.window_prefix[r.state->windows] = blocks;
   r.start_prefix[r.state->windows] = starts;
   r.pull_prefix[r.state->windows] = rows;
@@ -75,13 +87,14 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   const auto m = p.shape.tile_m;
-  const auto full_depth = r.depth - r.tail_slots * owned;
   const auto tid = threadIdx.x;
   const auto worker = std::uint64_t(blockIdx.x) * Threads + tid;
   const auto workers = std::uint64_t(gridDim.x) * Threads;
   if (!worker)
     canonical_geometry(a);
   grid_sync<0U, Threads>(a);
+  const auto tail_slots = r.state->tail_slots;
+  const auto full_depth = r.depth - tail_slots * owned;
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
        task += gridDim.x) {
     const auto w = task / owned;
@@ -99,8 +112,8 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
       if (tail && b == 0U) {
         while (ordinal * m < r.window_compute[start * owned + expert].row_begin)
           --start;
-        slot = full_depth + r.tail_slots * expert + plan.tail_index % r.tail_slots;
-        reuse = plan.tail_index / r.tail_slots;
+        slot = unsigned(full_depth + tail_slots * expert + plan.tail_index % tail_slots);
+        reuse = plan.tail_index / tail_slots;
       } else {
         const auto index = plan.full_begin + b - unsigned(tail);
         slot = unsigned(index % full_depth);

@@ -4795,7 +4795,6 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const auto &l = layout.static_ring;
     auto &r = args.ring;
     r.depth = l.depth;
-    r.tail_slots = l.tail_slots;
     r.contribution_depth = l.contribution_depth;
     r.contribution_stride =
         std::uint64_t(l.shape.tokens) * state->config.max_top_k;

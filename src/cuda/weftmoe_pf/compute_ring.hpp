@@ -75,6 +75,7 @@ struct RingState {
   std::uint64_t blocks;
   std::uint64_t rows;
   std::uint64_t admitted_windows;
+  std::uint64_t tail_slots;
 };
 
 struct SourceEpoch {
@@ -135,7 +136,6 @@ struct ComputeRingView {
   ReturnPlanView returning{};
   RouteLocation *locations = nullptr;
   std::uint32_t depth = 0;
-  std::uint32_t tail_slots = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t contribution_stride = 0;
   RingState *state = nullptr;
@@ -164,7 +164,6 @@ struct ComputeRingLayout {
   SourceMetadataLayout source;
   std::size_t metadata = 0;
   std::uint32_t depth = 0;
-  std::uint32_t tail_slots = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t max_windows = 0;
   std::uint64_t max_blocks = 0;
