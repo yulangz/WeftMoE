@@ -18,7 +18,7 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
   if (role < kGetWorkers) {
     dispatch(a, pending, role);
   } else if (role < kGetWorkers + kPutWorkers) {
-    return_blocks(a, reinterpret_cast<ReturnPending *>(pending),
+    return_blocks(a, *reinterpret_cast<ReturnScratch *>(pending),
                    role - kGetWorkers);
   } else if (role < kNetworkOwners - 1U) {
     receive_blocks(a, role - kGetWorkers - kPutWorkers);

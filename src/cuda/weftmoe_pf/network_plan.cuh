@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/weftmoe_pf/return_plan.cuh"
+
 namespace weftmoe_pf::ring {
 
 __device__ __forceinline__ std::uint64_t completed_blocks(
@@ -92,7 +94,8 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
   const auto workers = std::uint64_t(gridDim.x) * Threads;
   if (!worker)
     canonical_geometry(a);
-  grid_sync<0U, Threads>(a);
+  rank_barrier<0U, Threads, true, true, true>(a);
+  prepare_return_capacity<Threads>(a);
   const auto tail_slots = r.state->tail_slots;
   const auto full_depth = r.depth - tail_slots * owned;
   for (auto task = std::uint64_t(blockIdx.x); task < r.state->windows * owned;
@@ -123,10 +126,17 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
           r.slots[slot].fc1_target /
               (2U * forward_tuning::kMainIntermediate / forward_tuning::kFc1TileN) +
           reuse + 1U;
+      const auto return_plan = r.return_experts[
+          a.rank % a.local_world_size * owned + expert];
+      const auto return_slot = return_plan.begin + ordinal % return_plan.depth;
+      const auto return_generation =
+          r.return_slots[return_slot].published /
+              (forward_tuning::kMainHidden / forward_tuning::kFc1TileN) +
+          ordinal / return_plan.depth + 1U;
       r.blocks[block] = {
           {expert, unsigned(ordinal * m),
            unsigned(min(std::uint64_t(m), plan.total_rows - ordinal * m))},
-          unsigned(w), slot, 0U, generation};
+          unsigned(w), slot, 0U, generation, return_generation};
       const auto &arrival = r.window_compute[start * owned + expert];
       r.start_blocks[arrival.start_begin + ordinal -
                      static_forward::ceil_div(arrival.row_begin, m)] =
@@ -177,12 +187,18 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
               a.gin_window, a.static_network.contribution +
                                 contribution * a.hidden * 2U,
               source % a.local_world_size);
-        else
-          output = peer_at<char>(
-              a.gin_window_base,
+        else {
+          const auto return_plan = r.return_experts[
+              a.rank % a.local_world_size * owned + expert];
+          output = ncclGetLsaPointer(
+              a.gin_window,
               a.static_network.ring_region +
                   a.static_network.rings.return_payload(0U, 0U) +
-                  (std::uint64_t(desc.slot) * m + canonical % m) * a.hidden * 2U);
+                  ((return_plan.begin + canonical / m % return_plan.depth) * m +
+                   canonical % m) *
+                      a.hidden * 2U,
+              source % a.local_world_size);
+        }
         r.rows[physical] = {unsigned(route), source, gate,
                              unsigned(route / p.shape.top_k), output,
                              contribution};
@@ -234,6 +250,7 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
   }
   grid_sync<0U, Threads>(a);
   rank_barrier<0U, Threads, true, false, true>(a);
+  prepare_return<Threads>(a);
   WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanReady, Kernel,
                              0U, 0U, 0U);
 }

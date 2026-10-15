@@ -196,10 +196,20 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
     if (t.fc2) {
       WEFTMOE_TIMELINE_RECORD(a.timeline, Fc2MathEnd, Compute, t.column,
                               t.block, 0U);
-      if constexpr (Network)
+      if constexpr (Network) {
+        const auto &desc = a.ring.blocks[t.block];
+        const auto plan = a.ring.return_experts[
+            a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
+        const auto tx_slot = plan.begin + desc.tile.expert_row / kM % plan.depth;
+        if (threadIdx.x == 0U)
+          while (ring::acquire<::cuda::thread_scope_system>(
+                     a.ring.return_slots[tx_slot].consumed) <
+                 (desc.return_generation - 1U) * kM) {
+          }
+        collective_scope_sync<kMathThreads, 7U>();
         static_v4_store_fc2_register_tile<kN>(a, accum, t.rows, t.column * kN,
                                               t.block);
-      else
+      } else
         static_v4_push_fc2_tile<Mma, kN, kM, kMathThreads, true>(
             a, s.output, accum, t.row, t.rows, t.column * kN, t.block);
       // This is an S read-retirement credit, not contribution publication.
@@ -209,11 +219,25 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
       if (threadIdx.x == 0U)
         atomicAdd(reinterpret_cast<unsigned long long *>(&slot.fc2_done), 1ULL);
       if constexpr (Network) {
-        // Publish NIC-readable output separately from the S input credit.
+        // Publish rail-visible output separately from X/S retirement. Every
+        // remote row holds TX credit until its rail's local NIC completion.
         __threadfence_system();
         collective_scope_sync<kMathThreads, 7U>();
-        if (threadIdx.x == 0U)
-          arrive(slot.fc2_published, 1U);
+        if (threadIdx.x == 0U) {
+          const auto &desc = a.ring.blocks[t.block];
+          const auto plan = a.ring.return_experts[
+              a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
+          auto &tx_slot = a.ring.return_slots[
+              plan.begin + desc.tile.expert_row / kM % plan.depth];
+          reduce_add_release_system(
+              reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
+          if (t.column == 0U) {
+            reduce_add_release_system(
+                reinterpret_cast<unsigned long long *>(&tx_slot.consumed),
+                desc.local_rows + kM - t.rows);
+            arrive(slot.returned, t.rows);
+          }
+        }
         collective_scope_sync<kMathThreads, 7U>();
       }
     } else {

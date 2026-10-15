@@ -4831,6 +4831,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       r.start_blocks = at<std::uint32_t>(slot.device, l.start_blocks);
       r.canonical_blocks = at<std::uint32_t>(slot.device, l.canonical_blocks);
       r.pull_order = at<std::uint32_t>(slot.device, l.pull_order);
+      r.return_tasks = at<static_forward::ReturnTask>(slot.device, l.return_tasks);
+      r.return_capacity = l.return_capacity;
+      r.return_slots = at<static_forward::ReturnSlot>(slot.device, l.return_slots);
+      r.return_experts = at<static_forward::ReturnExpert>(slot.device, l.return_experts);
     }
     const auto &m = l.source;
     auto *metadata =

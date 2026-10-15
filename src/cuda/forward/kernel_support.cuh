@@ -676,6 +676,12 @@ static_ring_shape(const ActivationTransportPoolConfig &config) {
           config.max_top_k};
 }
 
+unsigned rail_return_slots(const ActivationTransportPoolConfig &config) {
+  const auto experts = config.max_owned_experts * config.max_world_size / config.max_nodes;
+  return static_cast<unsigned>(std::max<std::uint64_t>(
+      2U * experts, static_ring_shape(config).compute_slots(config.max_owned_experts)));
+}
+
 static_forward::SourceMetadataLayout
 make_source_metadata_layout(const ActivationTransportPoolConfig &config,
                             static_forward::WindowShape shape,
@@ -810,6 +816,8 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.return_rows = std::max(
         network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
         shape.compute_slots(config.max_owned_experts) * shape.tile_m);
+    network.return_rows = std::max(network.return_rows,
+        std::uint64_t(rail_return_slots(config)) * shape.tile_m);
     network.ring_region = append(
         cursor, 1U,
         network.rings.return_payload(0U, 0U) +
@@ -1075,6 +1083,12 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
                sizeof(std::uint64_t), "window expert blocks");
     if (config.max_nodes > 1U) {
+      ring.return_capacity = rail_return_slots(config);
+      ring.return_slots = append(cursor, ring.return_capacity,
+          sizeof(static_forward::ReturnSlot), "expert Return slot credits");
+      ring.return_experts = append(cursor,
+          config.max_owned_experts * (config.max_world_size / config.max_nodes),
+          sizeof(static_forward::ReturnExpert), "expert Return slot partition");
       ring.window_compute = append(
           cursor, ring.max_windows * config.max_owned_experts,
           sizeof(static_forward::WindowCompute), "canonical window geometry");
@@ -1088,6 +1102,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                                       sizeof(std::uint32_t), "canonical blocks");
       ring.pull_order = append(cursor, ring.max_blocks * ring.shape.tile_m,
                                 sizeof(std::uint32_t), "arrival row order");
+      ring.return_tasks = append(cursor,
+          ring.max_blocks * (config.max_world_size / config.max_nodes),
+          sizeof(static_forward::ReturnTask), "rail Return blocks");
     }
     ring.blocks =
         append(cursor, ring.max_blocks, sizeof(static_forward::RingBlock),

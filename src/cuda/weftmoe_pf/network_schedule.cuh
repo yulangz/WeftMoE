@@ -27,7 +27,10 @@ struct Schedule {
         const bool fc2 = index >= fc1;
         const auto linear = fc2 ? index - fc1 : index;
         const auto columns = fc2 ? local::kFc2Tiles : local::kFc1Tiles;
-        constexpr unsigned Group = 16U;
+        // All columns of an FC2 block precede the next block. A later TX
+        // generation may wait for NIC credit without hiding an older block's
+        // remaining columns behind that wait on the same static CTA.
+        const unsigned Group = fc2 ? local::kFc2Tiles : 16U;
         const auto group = linear / (blocks * Group);
         const auto width = min(Group, columns - group * Group);
         const auto within = linear - group * blocks * Group;

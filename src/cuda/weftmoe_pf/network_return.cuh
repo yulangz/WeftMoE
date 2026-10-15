@@ -4,108 +4,125 @@ namespace weftmoe_pf::network {
 
 struct ReturnPending {
   ncclGinRequest_t request;
-  std::uint64_t block;
+  std::uint64_t *consumed;
+  unsigned rows;
 };
-static_assert(kNetworkPending * sizeof(ReturnPending) <= 4096U);
+struct ReturnScratch {
+  ReturnPending pending[kNetworkPending];
+  unsigned sources[local::kM];
+  std::uint64_t contributions[local::kM];
+};
+static_assert(sizeof(ReturnScratch) <= 4096U);
 
-// FC2 writes its own bounded M-slot, not a source-window packet. A cold tail
-// can therefore wait for a later input window without pinning unrelated TX
-// packets. The last local NIC completion releases this slot for reuse.
+// Each owner scans 32 interleaved expert blocks at once. One readiness probe
+// per M-block replaces repeated remote probes for every source-ordered row.
+// FC2 already wrote this rail's TX ring; only metadata is gathered here.
 __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
-                                           ReturnPending *pending,
-                                           unsigned worker) {
-  if (threadIdx.x % 32U)
-    return;
+                                           ReturnScratch &s, unsigned worker) {
   Endpoint endpoint(a, kGetWorkers + worker);
   const auto &r = a.ring;
+  const auto lane = threadIdx.x % 32U;
   const auto bytes = a.hidden * 2U;
-  const auto tx =
-      a.static_network.ring_region + endpoint.layout().return_payload(0U, 0U);
   unsigned issued = 0U, completed = 0U;
-  std::uint64_t packets = 0U, payload = 0U;
+  std::uint64_t packets = 0U, payload = 0U, remaining = 0U;
+  for (auto base = std::uint64_t(worker) * 32U; base < r.state->return_tasks;
+       base += kPutWorkers * 32U)
+    remaining += min(std::uint64_t(32U), r.state->return_tasks - base);
   auto retire = [&]() {
-    auto &entry = pending[completed % kNetworkPending];
+    auto &entry = s.pending[completed++ % kNetworkPending];
     endpoint.gin.wait(entry.request);
-    if (entry.block != ~0ULL)
-      ring::arrive(ring::slot(a, entry.block).returned,
-                   r.blocks[entry.block].tile.rows);
-    ++completed;
+    reduce_add_release_system(
+        reinterpret_cast<unsigned long long *>(entry.consumed), entry.rows);
   };
-  auto remaining =
-      r.state->blocks > worker
-          ? (r.state->blocks - worker + kPutWorkers - 1U) / kPutWorkers
-          : 0U;
   while (remaining) {
-    for (auto block = std::uint64_t(worker); block < r.state->blocks;
-         block += kPutWorkers) {
-      if (r.blocks[block].return_issued)
-        continue;
-      const auto desc = r.blocks[block];
-      auto &slot = r.slots[desc.slot];
-      if (ring::acquire(slot.generation) != desc.generation ||
-          ring::acquire(slot.fc2_published) <
-              desc.generation * local::kFc2Tiles)
-        continue;
-      const auto first_request = issued;
-      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, Fc2MblockReturnReady,
-                                 GinReturn, worker, block, 0U);
-      const auto *rows = r.rows + block * local::kM;
-      for (unsigned row = 0U; row < desc.tile.rows;) {
-        const auto identity = rows[row];
-        unsigned count = 1U;
-        while (row + count < desc.tile.rows &&
-               rows[row + count].source == identity.source &&
-               rows[row + count].contribution == identity.contribution + count)
-          ++count;
-        const auto node = identity.source / a.local_world_size;
-        if (node != a.node) {
-          if (issued - completed == kNetworkPending)
-            retire();
-          const auto channel = endpoint.layout().channel(
-              node, a.node, worker % endpoint.layout().lanes);
-          WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
-                                     GinReturn, channel, block, count);
-          endpoint.gin.put(
-              ncclTeamWorld(endpoint.gin.comm), identity.source, a.gin_window,
-              a.static_network.contribution + identity.contribution * bytes,
-              a.gin_window,
-              tx + (std::uint64_t(desc.slot) * local::kM + row) * bytes,
-              count * bytes,
-              ncclGin_WeakVASignalAdd{
-                  a.gin_window,
-                  endpoint.control(true, channel, 0U) +
-                      offsetof(static_forward::NetworkSlot, ready_signal),
-                  count},
-              ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-              ::cuda::thread_scope_block, ::cuda::thread_scope_system);
-          auto &entry = pending[issued++ % kNetworkPending];
-          entry.block = ~0ULL;
-          endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm),
-                                  identity.source, &entry.request);
-          ++packets;
-          payload += count * bytes;
-        }
-        row += count;
+    for (auto base = std::uint64_t(worker) * 32U; base < r.state->return_tasks;
+         base += kPutWorkers * 32U) {
+      const auto index = base + lane;
+      bool empty = false, ready = false;
+      if (index < r.state->return_tasks) {
+        auto &task = r.return_tasks[index];
+        empty = task.count == 0U;
+        if (empty)
+          task.count = ~0U;
+        else if (task.count != ~0U)
+          ready = ring::acquire<::cuda::thread_scope_system>(*task.published) >=
+                  task.target;
       }
-      if (first_request != issued)
-        pending[(issued - 1U) % kNetworkPending].block = block;
-      else
-        ring::arrive(slot.returned, desc.tile.rows);
-      r.blocks[block].return_issued = 1U;
-      --remaining;
+      remaining -= __popc(__ballot_sync(0xffffffffU, empty));
+      auto active = __ballot_sync(0xffffffffU, ready);
+      while (active) {
+        const auto task_id = base + unsigned(__ffs(active) - 1);
+        auto &task = r.return_tasks[task_id];
+        for (unsigned row = lane; row < task.count; row += 32U) {
+          const auto identity = task.rows[row];
+          s.sources[row] = identity.source;
+          s.contributions[row] = identity.contribution;
+        }
+        __syncwarp();
+        if (!lane) {
+          for (unsigned row = 0U; row < task.count;) {
+            const auto source = s.sources[row];
+            if (source / a.local_world_size == a.node ||
+                source % a.local_world_size != a.rank % a.local_world_size) {
+              ++row;
+              continue;
+            }
+            unsigned count = 1U;
+            while (row + count < task.count &&
+                   s.sources[row + count] == source &&
+                   s.contributions[row + count] == s.contributions[row] + count)
+              ++count;
+            if (issued - completed == kNetworkPending)
+              retire();
+            const auto channel =
+                endpoint.layout().channel(source / a.local_world_size, a.node,
+                                          worker % endpoint.layout().lanes);
+            WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnPutStart,
+                                       GinReturn, channel, task_id, count);
+            endpoint.gin.put(
+                ncclTeamWorld(endpoint.gin.comm), source, a.gin_window,
+                a.static_network.contribution + s.contributions[row] * bytes,
+                a.gin_window, task.offset + std::uint64_t(row) * bytes,
+                count * bytes,
+                ncclGin_WeakVASignalAdd{
+                    a.gin_window,
+                    endpoint.control(true, channel, 0U) +
+                        offsetof(static_forward::NetworkSlot, ready_signal),
+                    count},
+                ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                ::cuda::thread_scope_block, ::cuda::thread_scope_system);
+            auto &entry = s.pending[issued++ % kNetworkPending];
+            entry.consumed = task.returned;
+            entry.rows = count;
+            endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm), source,
+                                    &entry.request);
+            ++packets;
+            payload += count * bytes;
+            row += count;
+          }
+          task.count = ~0U;
+        }
+        --remaining;
+        active &= active - 1U;
+        __syncwarp();
+      }
     }
-    if (completed != issued)
+    if (!lane && completed != issued)
       retire();
+    __syncwarp();
   }
-  while (completed != issued)
-    retire();
-  auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
-  atomicAdd(&status->gin_return_put_count, packets);
-  atomicAdd(&status->gin_return_payload_bytes, payload);
+  if (!lane) {
+    while (completed != issued)
+      retire();
+    auto *status =
+        peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    atomicAdd(&status->gin_return_put_count, packets);
+    atomicAdd(&status->gin_return_payload_bytes, payload);
+  }
 }
 
 // Immutable invocation-sized source C storage has no RX overwrite until the
-// terminal barrier. Only the bounded sender M-slot needs per-fragment credit.
+// terminal barrier. Only bounded sender staging needs local NIC credit.
 __device__ __noinline__ void receive_blocks(const ForwardKernelArgs &a,
                                             unsigned worker) {
   Endpoint endpoint(a, kGetWorkers + kPutWorkers + worker);
