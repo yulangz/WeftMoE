@@ -56,6 +56,7 @@ struct alignas(64) NetworkChannel {
   std::uint64_t credit_signal;
   std::uint64_t tx_packed_head;
   std::uint64_t backward_rows;
+  std::uint64_t forward_rows;
 };
 static_assert(sizeof(NetworkChannel) == 128U);
 
@@ -148,18 +149,18 @@ struct NetworkRings {
                          2U * slots() * sizeof(NetworkSlot));
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t
-  dispatch_payload(bool receive, std::uint64_t channel_id,
+  dispatch_payload(std::uint64_t channel_id,
                    std::uint64_t sequence) const {
-    return data_begin() + (receive ? slots() * dispatch_stride : 0U) +
+    return data_begin() +
            (channel_id * depth + sequence % depth) * dispatch_stride;
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t
   return_payload(std::uint64_t channel_id, std::uint64_t sequence) const {
-    return data_begin() + 2U * slots() * dispatch_stride +
+    return data_begin() + slots() * dispatch_stride +
            (channel_id * depth + sequence % depth) * return_stride;
   }
   WEFTMOE_STATIC_RING_HD constexpr std::size_t bytes() const {
-    return data_begin() + slots() * (2U * dispatch_stride + return_stride);
+    return data_begin() + slots() * (dispatch_stride + return_stride);
   }
 };
 

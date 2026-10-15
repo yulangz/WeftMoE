@@ -523,8 +523,7 @@ __device__ __forceinline__ void network_workers(const ForwardKernelArgs &f,
   const auto role =
       warp == 0U && blockIdx.x < kNetworkOwners ? blockIdx.x : ~0U;
   if (role < kGetWorkers)
-    network::transfer<true>(f, reinterpret_cast<network::Pending *>(s.pull[0]),
-                            role);
+    network::dispatch(f, reinterpret_cast<network::Pending *>(s.pull[0]), role);
   else if (role < kGetWorkers + kPutWorkers)
     return_canonical(f, a, role - kGetWorkers, s.pull[0]);
   else if (role < kNetworkOwners - 1U)

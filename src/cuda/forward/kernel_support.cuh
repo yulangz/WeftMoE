@@ -771,8 +771,8 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         static_forward::packet_bytes(packets.rows, config.max_hidden_size);
     const auto returning = static_forward::packet_bytes(
         static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
-    // Each channel reserves a whole worst-case Return window before FC2 can
-    // write TX. This capacity depends on B/K/Q/L, not the total token count.
+    // Retain the measured channel-depth heuristic for RX prefetch. Canonical
+    // FC2 no longer reserves source-window packets before writing its TX slot.
     const auto window_packets =
         static_forward::kNetworkReturnPackets.lane_packets(
             std::uint64_t(config.static_forward_window_tokens) *
@@ -785,8 +785,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         if (!minimum_depth)
           throw std::invalid_argument("PF minimum ring depth must be positive");
       }
-    // Admission reserves a complete worst-case Return window; reducing the
-    // heuristic floor must never reduce that correctness bound.
+    // This is a capacity heuristic, not a per-window FC2 admission condition.
     const auto depth = static_cast<unsigned>(
         std::max<std::uint64_t>(minimum_depth, window_packets));
     network.rings = {config.max_nodes, packets.lanes, depth, packet, returning};
@@ -808,8 +807,14 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
                              "registered pull input"),
                  sizeof(transport::BFloat16), "immutable pull input");
     }
-    network.ring_region =
-        append(cursor, 1U, network.rings.bytes(), "static network rings");
+    network.return_rows = std::max(
+        network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
+        shape.compute_slots(config.max_owned_experts) * shape.tile_m);
+    network.ring_region = append(
+        cursor, 1U,
+        network.rings.return_payload(0U, 0U) +
+            network.return_rows * config.max_hidden_size * 2U,
+        "static network rings");
     const auto contribution_rows =
         checked_mul(checked_mul(contribution_windows(config), shape.tokens,
                                 "contribution windows"),
@@ -821,7 +826,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
                sizeof(transport::BFloat16), "registered contribution ring");
     network.gradient_tx = append(
         cursor,
-        network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
+        network.return_rows,
         sizeof(float), "PF Backward router-gradient TX ring");
     network.gradient_contribution =
         append(cursor, contribution_rows, sizeof(float),
@@ -1024,7 +1029,10 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     if (ring.max_windows > UINT32_MAX ||
         window_blocks > UINT32_MAX / (2ULL * ring.shape.tile_m))
       throw std::invalid_argument("static ring window exceeds device indices");
-    ring.depth = static_cast<unsigned>(2U * window_blocks);
+    ring.depth = static_cast<unsigned>(config.max_nodes > 1U
+        ? ring.shape.compute_slots(config.max_owned_experts) : 2U * window_blocks);
+    if (config.max_nodes > 1U)
+      ring.tail_slots = ring.shape.tail_slots(config.max_owned_experts);
     ring.contribution_depth = contribution_windows(config);
     ring.state =
         append(cursor, 1, sizeof(static_forward::RingState), "ring state");
@@ -1036,11 +1044,6 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                "source reservation heads");
     ring.slots = append(cursor, ring.depth, sizeof(static_forward::ComputeSlot),
                         "X/S/C slot controls");
-    if (config.max_nodes > 1U)
-      ring.return_ready = append(
-          cursor,
-          std::uint64_t(config.max_world_size / config.max_nodes) * ring.depth,
-          sizeof(std::uint64_t), "rail-local C generations");
     ring.contributions = append(cursor, ring.contribution_depth,
                                 sizeof(static_forward::ContributionSlot),
                                 "contribution window controls");
@@ -1073,6 +1076,21 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
     ring.expert_blocks =
         append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
                sizeof(std::uint64_t), "window expert blocks");
+    if (config.max_nodes > 1U) {
+      ring.window_compute = append(
+          cursor, ring.max_windows * config.max_owned_experts,
+          sizeof(static_forward::WindowCompute), "canonical window geometry");
+      ring.start_prefix = append(cursor, ring.max_windows + 1U,
+                                  sizeof(std::uint64_t), "block start prefixes");
+      ring.pull_prefix = append(cursor, ring.max_windows + 1U,
+                                 sizeof(std::uint64_t), "arrival row prefixes");
+      ring.start_blocks = append(cursor, ring.max_blocks, sizeof(std::uint32_t),
+                                  "block admission order");
+      ring.canonical_blocks = append(cursor, ring.max_blocks,
+                                      sizeof(std::uint32_t), "canonical blocks");
+      ring.pull_order = append(cursor, ring.max_blocks * ring.shape.tile_m,
+                                sizeof(std::uint32_t), "arrival row order");
+    }
     ring.blocks =
         append(cursor, ring.max_blocks, sizeof(static_forward::RingBlock),
                "immutable compute blocks");

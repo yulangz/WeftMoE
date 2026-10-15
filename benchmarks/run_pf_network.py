@@ -52,6 +52,9 @@ def main():
         environment=env, benchmark=str(benchmark), benchmark_args=cli,
         master_addr=args.master_addr, master_port=args.master_port,
         nodes=args.nodes, gpus_per_node=args.gpus_per_node)
+    build_manifest = args.artifact / "build_manifest.json"
+    if build_manifest.exists():
+        manifest["build"] = json.loads(build_manifest.read_text())
     with (args.output / f"{args.label}.manifest.json").open("x") as file:
         json.dump(manifest, file, indent=2)
     processes, logs, clocks = [], [], []

@@ -1,5 +1,7 @@
 """Build matched diagnostic/production artifacts for the borrowed-warp PF path."""
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -25,6 +27,12 @@ flags = ["-lineinfo", "-Xptxas=-v,--warn-on-spills",
 env = dict(os.environ, NVCCFLAGS=" ".join(flags),
            WEFTMOE_DEVICE_TIMELINE=str(int(args.timeline)))
 library = output / "libweftmoe.so"
+manifest = dict(
+    source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                                          text=True).strip(),
+    source_diff_sha256=hashlib.sha256(subprocess.check_output(
+        ["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
+    flags=flags, timeline=args.timeline)
 with (output / "build.log").open("w") as log:
     subprocess.run([sys.executable, str(ROOT / "build_native.py"), "lib",
                     "--output", str(library), "--jobs", "4"],
@@ -32,4 +40,6 @@ with (output / "build.log").open("w") as log:
     subprocess.run([sys.executable, str(ROOT / "tools/build_tensor_runtime.py"),
                     "--library", str(library)], cwd=ROOT, env=env,
                    stdout=log, stderr=subprocess.STDOUT, check=True)
+manifest["library_sha256"] = hashlib.file_digest(library.open("rb"), "sha256").hexdigest()
+(output / "build_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 print(output, flush=True)

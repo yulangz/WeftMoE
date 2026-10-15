@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/weftmoe_pf/network_plan.cuh"
+
 namespace weftmoe_pf::ring {
 
 __device__ __forceinline__ void finish_network(const ForwardKernelArgs &a) {
@@ -81,7 +83,7 @@ __device__ __forceinline__ void build_pull_packet(const ForwardKernelArgs &a,
          source_metadata(a, source, r.locations),
          ncclGetLsaPointer(a.gin_window,
                            network.ring_region + network.rings.dispatch_payload(
-                                                     true, channel, sequence),
+                                                     channel, sequence),
                            source % a.local_world_size),
          &control->visible_generation,
          &control->consumed_total,
@@ -155,8 +157,6 @@ __device__ __forceinline__ void build_blocks(const ForwardKernelArgs &a,
                                     r.source.shape.tile_m)},
         static_cast<unsigned>(window),
         static_cast<unsigned>(seq % r.depth),
-        0U,
-        0U,
         seq / r.depth + 1U};
   }
 }
@@ -303,28 +303,18 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             static_cast<unsigned>(ordinal);
     }
     static_forward::build_source_packet_prefix(p, worker, workers);
-    if constexpr (!Backward)
-      static_forward::build_return_packet_prefix(p, r.returning, worker,
-                                                 workers);
     grid_sync<0U, Threads>(a);
     if (worker == 0U) {
       static_forward::build_channel_offsets(
           p.packet_prefix, p.nodes * p.packets.lanes, p.local_windows(),
           r.dispatch.channel_offsets);
-      if constexpr (!Backward)
-        static_forward::build_channel_offsets(
-            r.returning.packet_prefix, p.nodes * p.packets.lanes,
-            p.local_windows(), r.returning.channel_offsets);
     }
     grid_sync<0U, Threads>(a);
     static_forward::build_dispatch_packets(p, r.dispatch, worker, workers);
-    if constexpr (!Backward)
-      static_forward::build_return_packets(p, r.returning, worker, workers);
     grid_sync<0U, Threads>(a);
     WEFTMOE_TIMELINE_RECORD_IF(a.timeline, worker == 0U, RingPlanPacketsReady,
                                Kernel, 0U, 0U, 0U);
-    const auto metadata_bytes = Backward ? a.static_network.dispatch_bytes
-                                         : a.static_network.source_bytes;
+    const auto metadata_bytes = a.static_network.dispatch_bytes;
     if (blockIdx.x < a.static_network.contexts && tid == 0U) {
       const auto base = source_offset(a, a.rank);
       for (unsigned node = 0U; node < p.nodes; ++node)
@@ -425,6 +415,10 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
   }
   if (!single_window)
     grid_sync<0U, Threads>(a);
+  if constexpr (Network && !Backward) {
+    prepare_canonical<Training, Threads>(a, counts);
+    return;
+  }
   if (blockIdx.x == 0U && tid == 0U) {
     std::uint64_t blocks = 0U, rows = 0U;
     for (std::uint64_t w = 0; w < r.state->windows; ++w) {
@@ -528,29 +522,8 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
           gate = gates[route];
         }
         void *output = nullptr;
-        // Canonical dX resolves its own output; no Forward TX plan is needed.
-        if constexpr (!Network || !Backward) {
-          if (!Network || source / a.local_world_size == a.node) {
-            const auto &address = window_source(a, w, source);
-            if constexpr (Network) {
-              const auto output_row = address.row_base +
-                                      source_prefix[a.rank * owned + expert] +
-                                      ordinal;
-              output = ncclGetLsaPointer(a.gin_window,
-                                         a.static_network.contribution +
-                                             output_row * a.hidden *
-                                                 sizeof(transport::BFloat16),
-                                         source % a.local_world_size);
-            } else {
-              output = local_row_output(a, w, source, route);
-            }
-          } else {
-            const auto node_expert = a.node * a.local_world_size * owned;
-            const auto node_row = source_prefix[a.rank * owned + expert] +
-                                  ordinal - source_prefix[node_expert];
-            output = return_tx::row_output(a, source, local_window, node_row);
-          }
-        }
+        if constexpr (!Network)
+          output = local_row_output(a, w, source, route);
         r.rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m + row] = {
             static_cast<unsigned>(route), source, gate,
             static_cast<unsigned>(route / p.shape.top_k), output};
@@ -596,30 +569,6 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
       }
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
-    if constexpr (Network && !Backward) {
-      // The source identity is immutable. Compress publication destinations
-      // while this CTA still owns the complete row table, instead of making
-      // a single progress lane rescan M128 rows on the Return critical path.
-      for (auto b = std::uint64_t(tid / 32U);
-           b < prefix[expert + 1U] - prefix[expert]; b += Threads / 32U) {
-        const auto block = r.window_prefix[w] + prefix[expert] + b;
-        auto &desc = r.blocks[block];
-        unsigned local_rows = 0U, remote_sources = 0U;
-        for (unsigned m = tid % 32U; m < desc.tile.rows; m += 32U) {
-          const auto source = r.rows[block * p.shape.tile_m + m].source;
-          if (source / a.local_world_size == a.node)
-            ++local_rows;
-          else
-            remote_sources |= 1U << (source - first);
-        }
-        local_rows = __reduce_add_sync(0xffffffffU, local_rows);
-        remote_sources = __reduce_or_sync(0xffffffffU, remote_sources);
-        if (tid % 32U == 0U) {
-          desc.local_rows = static_cast<std::uint16_t>(local_rows);
-          desc.remote_sources = static_cast<std::uint16_t>(remote_sources);
-        }
-      }
-    }
   }
   grid_sync<0U, Threads>(a);
   if constexpr (Network)

@@ -2,7 +2,7 @@
 
 namespace weftmoe_pf::ring {
 
-// CTA 0's third communication warp has no blocking copy or Reduce task.
+// One static communication warp has no blocking copy or Reduce task.
 // It services source and destination capacity independently; reserving a
 // source window never depends on the destination's available X/S/C space.
 // Lanes own disjoint slot checks/publications, not independent task cursors.
@@ -43,10 +43,12 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
       }
     }
     if (window < r.state->windows) {
-      const auto begin = r.window_prefix[window];
-      const auto end = r.window_prefix[window + 1U];
+      const auto *prefix = Network ? r.start_prefix : r.window_prefix;
+      const auto begin = prefix[window];
+      const auto end = prefix[window + 1U];
       bool free = true;
-      for (auto block = begin + lane; block < end; block += 32U) {
+      for (auto index = begin + lane; index < end; index += 32U) {
+        const auto block = Network ? r.start_blocks[index] : index;
         auto &s = slot(a, block);
         if (acquire(s.fc1_done) < s.fc1_target ||
             acquire(s.fc2_done) < s.fc2_target ||
@@ -56,11 +58,9 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
           break;
         }
       }
-      if constexpr (Network)
-        if (__all_sync(0xffffffffU, free))
-          free = return_tx::reserved(a, window, lane, 32U);
       if (__all_sync(0xffffffffU, free)) {
-        for (auto block = begin + lane; block < end; block += 32U) {
+        for (auto index = begin + lane; index < end; index += 32U) {
+          const auto block = Network ? r.start_blocks[index] : index;
           auto &s = slot(a, block);
           s.fc1_target += fc1;
           s.fc2_target += fc2;

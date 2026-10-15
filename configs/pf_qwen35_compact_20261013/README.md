@@ -1,5 +1,13 @@
 # Qwen3.5-35B-A3B compact PF profile
 
+Update after M17: the current header/candidate have removed M-block-owned
+pull and full-CTA BWD reduce (compiled ID `4d5985a6feb9`), prioritizing Flash.
+Local pull is row-striped bulk; 96 communication threads reduce during dW.
+The M14 results and strategy description below refer to the historical
+`23023d511ccf` binary, preserved in the result JSON and git history, not to
+the updated implementation. Do not infer its 15% target confirmation for
+this revised profile without remeasurement.
+
 H2048/I512/E256/top8, BF16, DP-layout inputs, TP/ETP1, NVIDIA L20X at
 1620 MHz. EP8 means one eight-GPU node; EP16 means two nodes. This profile
 targets cached training FWD and separately measured fresh-tape BWD, not DT

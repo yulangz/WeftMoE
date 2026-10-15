@@ -31,8 +31,6 @@ struct RingBlock {
   WindowMblock tile;
   std::uint32_t window;
   std::uint32_t slot;
-  std::uint16_t local_rows;
-  std::uint16_t remote_sources;
   std::uint64_t generation;
 };
 static_assert(sizeof(RingBlock) == 32U);
@@ -49,7 +47,16 @@ struct RingRow {
   std::uint32_t source;
   float gate;
   std::uint32_t token;
-  void *output; // Reserved source contribution or rail Return TX row.
+  void *output; // Source contribution or this GPU's canonical Return TX row.
+  std::uint64_t contribution; // Source-owned compact Return row (network FWD).
+};
+
+// Communication windows describe arrivals, not GEMM padding. Complete blocks
+// use the ordinary ring; cross-window blocks use a reserved tail ring/expert.
+struct WindowCompute {
+  std::uint64_t row_begin, total_rows;
+  std::uint64_t pull_begin, full_begin, start_begin;
+  std::uint64_t tail_index, block_begin;
 };
 
 // The source address is constant for all routes in a (window, source) pair.
@@ -128,6 +135,7 @@ struct ComputeRingView {
   ReturnPlanView returning{};
   RouteLocation *locations = nullptr;
   std::uint32_t depth = 0;
+  std::uint32_t tail_slots = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t contribution_stride = 0;
   RingState *state = nullptr;
@@ -137,7 +145,6 @@ struct ComputeRingView {
   ContributionSlot *contributions = nullptr;
   std::uint64_t *contribution_ready = nullptr;
   std::uint32_t *contribution_rows = nullptr; // [route] -> row within its window.
-  std::uint64_t *return_ready = nullptr; // Rail-local [destination, C slot].
   std::uint64_t *window_prefix = nullptr;
   WindowSource *window_sources = nullptr; // [windows, bounded source group]
   std::uint64_t *expert_rows = nullptr;   // [windows, owned]
@@ -145,6 +152,10 @@ struct ComputeRingView {
   RingBlock *blocks = nullptr;
   RingRow *rows = nullptr; // Immutable reverse metadata, not stored in X.
   PullPacket *pull_packets = nullptr;
+  WindowCompute *window_compute = nullptr;
+  std::uint64_t *start_prefix = nullptr, *pull_prefix = nullptr;
+  std::uint32_t *start_blocks = nullptr, *canonical_blocks = nullptr;
+  std::uint32_t *pull_order = nullptr;
 };
 
 struct ComputeRingLayout {
@@ -153,12 +164,12 @@ struct ComputeRingLayout {
   SourceMetadataLayout source;
   std::size_t metadata = 0;
   std::uint32_t depth = 0;
+  std::uint32_t tail_slots = 0;
   std::uint32_t contribution_depth = 2;
   std::uint64_t max_windows = 0;
   std::uint64_t max_blocks = 0;
   std::size_t state = 0, slots = 0, contributions = 0, contribution_ready = 0;
   std::size_t contribution_rows = 0;
-  std::size_t return_ready = 0;
   std::size_t source_epochs = 0;
   std::size_t source_reserved = 0;
   std::size_t window_prefix = 0, expert_rows = 0, expert_blocks = 0;
@@ -166,6 +177,8 @@ struct ComputeRingLayout {
   std::size_t blocks = 0, rows = 0;
   std::size_t tape_rows = 0;
   std::size_t pull_packets = 0;
+  std::size_t window_compute = 0, start_prefix = 0, pull_prefix = 0;
+  std::size_t start_blocks = 0, canonical_blocks = 0, pull_order = 0;
 };
 
 } // namespace weftmoe::cuda::static_forward

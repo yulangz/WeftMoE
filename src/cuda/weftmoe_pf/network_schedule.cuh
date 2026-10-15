@@ -7,8 +7,8 @@ using Resources =
     unified_worker_tuning::Resources<384, 96, 288, 208, 88, 88, 4096, 1>;
 using Mma = hopper::BF16Mma<local::kN>;
 
-// Static residues of full M/N tiles, paired for TMA multicast. A source window
-// bounds RX/Return lifetimes; it does not split GEMM at network packet edges.
+// Static residues of full M/N tiles, paired for TMA multicast. Windows order
+// blocks by their last required arrival, never pad an expert at each boundary.
 struct Schedule {
   const ForwardKernelArgs &a;
   unsigned window = 0U, expert = 0U, index = blockIdx.x;

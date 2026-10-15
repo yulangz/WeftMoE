@@ -4,6 +4,80 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M18：FWD 跨窗口 canonical M128 与静态通信均衡（2026-10-15）
+
+实现不改变 MNK、WGMMA pipeline 或 gate/up 布局，也不引入动态任务领用。
+完整性能确认正在补充；以下先记录实现与已确认的同步约束。
+
+### 去掉逐窗口 padding，但保留有界 payload ring
+
+Notify 对每专家累计所有窗口的有效行，M-block 数由原来的
+`sum_window ceil(rows[window, expert] / 128)` 改为
+`ceil(sum_window rows[window, expert] / 128)`。最后一个不足 M128 的专家尾块
+仍然补齐，其余不在通信窗口或源节点边界额外补齐。
+
+- `WindowCompute` 保存累计行与静态前缀；`start_blocks/start_prefix`
+  按首次到达窗口准入，`blocks/window_prefix/expert_blocks` 按最后一个
+  必需到达窗口安排 FC1/FC2。`canonical_blocks` 只在规划时做地址映射。
+- 普通 M-block 在一个窗口内收齐，使用普通 circular ring。跨窗口的
+  M-block 使用每专家的 tail ring，冷门专家的半块不会占住普通 ring 的
+  FIFO 头部。两者仍是静态槽位映射，不在运行中申请或领取任务。
+- 至少两个 tail slot/专家保证跨窗口接续；**但只有两个不够快**。
+  第一版在 Flash 均衡 8K/20K 退化到 13.151/31.492 ms，随机为
+  14.866/38.222 ms。8K timeline 的 Get 已在约 2.45 ms 结束，窗口准入
+  却拖到约 9.82 ms、本地 pull 到约 10.10 ms，暴露的是预取深度不足，
+  不是新增 spill。第一版主 kernel 与原版同为 168 registers，0 spill。
+- 修订版从原有总槽位中划出约四分之一给 tails，保留至少一个最坏窗口
+  的普通块容量。Flash EP16/B2048：最坏窗口 784 blocks，总计仍为
+  1568 slots，其中普通区 1184、tail 区 16 experts × 24 slots。
+  X/S payload 总容量不增加；小窗口容量下仍保留两个 tail/专家。
+
+每个槽位的 generation 从其已有 FC1 target 推导，允许不同槽位的
+复用次数不同。准入必须看到上一代 FC1、FC2、Return 都退役；pull 每
+完成一行发布 X-ready，RX reader credit 不等待该专家未来窗口的尾块
+收齐。每次调用会重新规划 routes，绝不复用前一批的路由结果。
+
+### Return 与窗口解耦
+
+原来的 source-window Return packet 可能包含一个很晚才收齐的冷门
+专家尾块；继续用整个窗口的 TX reservation 会把这个等待传回 Dispatch。
+新 FWD 复用 BWD 的 canonical Return 思路：FC2 对远端行写本 GPU 的
+有界 TX M-slot，本地行仍直接写 source contribution；静态 Put worker
+在所有 FC2 N-tiles 发布后，把 source 与 contribution 地址连续的片段
+直接 Put 到源端 C。没有额外激活 pack kernel。
+
+每 worker 最多 pending=4。只有最后一个 fragment 的本地 NIC completion
+退役，才释放该 M-slot；FIFO 同时覆盖发给其它 peer 的前序请求。
+源端沿用调用级 C 空间，精确 expected rows 由本次 route prefix 求和，
+每个 Put worker 的独立完成信号相加达到该目标后，才进入 writer join
+与 reduce。源端 C 跨调用的复用仍受 terminal barrier 保护。
+
+注册 TX arena 覆盖 compute slots；同时删除 Get 已不使用的 Dispatch
+TX plane，以及旧 Return packet reservation/publication 的设备分支。
+不是增加一份全量中间激活缓存；RX、X/S、TX 都仍是容量有界的 ring。
+
+### 同一 wave 的静态目标均衡
+
+本地 PF 已恢复逐行 bulk，原有 source round-robin 保留。网络 FWD 的
+`pull_order` 将机内读按 source round-robin 交错，但 GEMM/saved-X/GU
+仍按 canonical 专家行布局，只有索引映射不同，不多搬一遍数据。
+远端 RX 的 packet 本来就是 ordinal/source 交错，由静态 residue warp
+消费；读完后才按精确 fanout 回收 credit。
+
+Get worker 的 channel 遍历从 node-major 改为 lane-major：线性任务
+`i` 映射到 `(i % remote_nodes) * lanes + i / remote_nodes`。这是一个
+双射，保持每条 channel 的唯一 owner 与 FIFO，却让一批 CTA 尽量发往
+不同远端节点。两机只有一个远端节点，此项映射完全相同，不能用两机
+结果宣称多目标 RDMA 收益；三机以上仅完成映射/协议检查，未做硬件测试。
+机内 source-order 的独立性能消融另行列出，不把整体收益归给均衡。
+
+### 验证进度
+
+最终 retained 构建已通过 Flash EP16 随机 129/8K/20K、每档两个新 tape
+的 output/dX/dGate/dW1/dW2 校验。此前同同步方案的 B128、route bias=10
+强热点 129/8K 检查也通过，覆盖大量空专家和强制复用。没有新增碎片单测；
+现有 host 17 项、autotune 51 项及 48 subtests 通过。
+
 ## M17：恢复 Flash 优先的数据流（2026-10-15）
 
 按 M16 的单项归因撤销两条分支：本地搬运恢复逐行分配的 bulk copy，

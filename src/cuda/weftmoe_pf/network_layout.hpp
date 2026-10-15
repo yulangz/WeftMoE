@@ -40,10 +40,10 @@ struct NetworkLayout {
   std::size_t gradient_tx = 0, gradient_contribution = 0;
   static_forward::NetworkRings rings{};
   std::size_t ring_region = 0;
+  std::uint64_t return_rows = 0; // Shared bounded FWD/BWD canonical TX arena.
   std::size_t source_bytes =
       0; // Immutable sender metadata, excluding RX geometry.
-  std::size_t dispatch_bytes =
-      0; // Backward does not consume Forward Return plans.
+  std::size_t dispatch_bytes = 0; // FWD/BWD publish only the dispatch directory.
   unsigned ring_workers = 0;
 };
 

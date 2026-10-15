@@ -4795,6 +4795,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     const auto &l = layout.static_ring;
     auto &r = args.ring;
     r.depth = l.depth;
+    r.tail_slots = l.tail_slots;
     r.contribution_depth = l.contribution_depth;
     r.contribution_stride =
         std::uint64_t(l.shape.tokens) * state->config.max_top_k;
@@ -4824,7 +4825,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     if (use_gin) {
       r.pull_packets =
           at<static_forward::PullPacket>(slot.device, l.pull_packets);
-      r.return_ready = at<std::uint64_t>(slot.device, l.return_ready);
+      r.window_compute =
+          at<static_forward::WindowCompute>(slot.device, l.window_compute);
+      r.start_prefix = at<std::uint64_t>(slot.device, l.start_prefix);
+      r.pull_prefix = at<std::uint64_t>(slot.device, l.pull_prefix);
+      r.start_blocks = at<std::uint32_t>(slot.device, l.start_blocks);
+      r.canonical_blocks = at<std::uint32_t>(slot.device, l.canonical_blocks);
+      r.pull_order = at<std::uint32_t>(slot.device, l.pull_order);
     }
     const auto &m = l.source;
     auto *metadata =

@@ -38,7 +38,6 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 // Include order follows the device helpers' dependencies.
 #include "cuda/weftmoe_pf/network_access.cuh"
 #include "cuda/weftmoe_pf/ring_access.cuh"
-#include "cuda/weftmoe_pf/return_tx.cuh"
 #include "cuda/weftmoe_pf/network_ring.cuh"
 #include "cuda/forward/compute_kernel.cuh"
 

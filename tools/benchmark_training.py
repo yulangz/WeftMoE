@@ -98,7 +98,7 @@ def main():
     parser.add_argument("--trace-stage-kernels", action="store_true",
                         help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
     parser.add_argument("--report-window-padding", action="store_true",
-                        help="Estimate PF M128 padding for the default node-group windows, outside timing")
+                        help="Compare hypothetical per-window and canonical M128 padding, outside timing")
     parser.add_argument("--report-communication", action="store_true",
                         help="Count route-derived dispatch/return payloads outside timing")
     parser.add_argument("--timeline-dir", type=Path,
@@ -214,6 +214,7 @@ def main():
                     len(batches), nodes, windows, world, owned).sum((1, 2, 4))
                 assert torch.equal(counts.sum((1, 2)).cpu(), expert_rows)
             window_padding = dict(actual_rows=incoming[args.warmups:].tolist(),
+                                  scope="Route-derived estimates, not kernel counters: m128_rows is the former per-window policy; canonical_m128_rows is current PF FWD/BWD",
                                   m128_rows=padded[args.warmups:].tolist(),
                                   canonical_m128_rows=(
                                       ((expert_rows + 127) // 128 * 128)

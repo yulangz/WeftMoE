@@ -16,8 +16,8 @@
         "max_tokens": 10055,
         "interconnect": "nvlink"
       },
-      "compiled_digest": "23023d511ccf",
-      "config_digest": "52f6b805d446",
+      "compiled_digest": "4d5985a6feb9",
+      "config_digest": "5ebfaa630178",
       "window_tokens": 2048,
       "contribution_windows": 2,
       "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
@@ -37,8 +37,8 @@
         "max_tokens": 25820,
         "interconnect": "nvlink"
       },
-      "compiled_digest": "23023d511ccf",
-      "config_digest": "52f6b805d446",
+      "compiled_digest": "4d5985a6feb9",
+      "config_digest": "5ebfaa630178",
       "window_tokens": 2048,
       "contribution_windows": 2,
       "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
@@ -58,8 +58,8 @@
         "max_tokens": 10277,
         "interconnect": "nvlink+gin"
       },
-      "compiled_digest": "23023d511ccf",
-      "config_digest": "f16f5dc2e13f",
+      "compiled_digest": "4d5985a6feb9",
+      "config_digest": "ddef60596b24",
       "window_tokens": 1024,
       "contribution_windows": 2,
       "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"
@@ -79,8 +79,8 @@
         "max_tokens": 25820,
         "interconnect": "nvlink+gin"
       },
-      "compiled_digest": "23023d511ccf",
-      "config_digest": "f16f5dc2e13f",
+      "compiled_digest": "4d5985a6feb9",
+      "config_digest": "ddef60596b24",
       "window_tokens": 1024,
       "contribution_windows": 2,
       "header": "configs/pf_qwen35_compact_20261013/weftmoe_forward_tuning_generated.hpp"

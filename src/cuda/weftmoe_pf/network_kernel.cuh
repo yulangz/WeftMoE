@@ -2,13 +2,13 @@
 
 #include "cuda/weftmoe_pf/network_schedule.cuh"
 #include "cuda/weftmoe_pf/network_workers.cuh"
+#include "cuda/weftmoe_pf/network_return.cuh"
 
 namespace weftmoe_pf::network {
 
 constexpr std::size_t kSharedBytes = sizeof(local::Shared);
 
-template <bool Backward = false, unsigned Fc1Tiles = local::kFc1Tiles,
-          unsigned Fc2Tiles = local::kFc2Tiles, class Storage>
+template <class Storage>
 __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
                                         Storage &s) {
   const auto warp = (threadIdx.x - 288U) / 32U;
@@ -16,13 +16,14 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
       warp == 0U && blockIdx.x < kNetworkOwners ? blockIdx.x : ~0U;
   auto *pending = reinterpret_cast<Pending *>(s.pull[0]);
   if (role < kGetWorkers) {
-    transfer<true>(a, pending, role);
+    dispatch(a, pending, role);
   } else if (role < kGetWorkers + kPutWorkers) {
-    transfer<false, Backward>(a, pending, role - kGetWorkers);
+    return_blocks(a, reinterpret_cast<ReturnPending *>(pending),
+                   role - kGetWorkers);
   } else if (role < kNetworkOwners - 1U) {
-    progress<Backward>(a, role - kGetWorkers - kPutWorkers);
+    receive_blocks(a, role - kGetWorkers - kPutWorkers);
   } else if (role == kNetworkOwners - 1U) {
-    ring::admit<true>(a, Fc1Tiles, Fc2Tiles);
+    ring::admit<true>(a, local::kFc1Tiles, local::kFc2Tiles);
   } else {
     const auto worker = blockIdx.x < kNetworkOwners
                             ? 2U * blockIdx.x + warp - 1U

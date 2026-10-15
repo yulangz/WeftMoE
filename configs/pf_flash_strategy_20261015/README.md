@@ -1,5 +1,12 @@
 # Flash: Qwen dataflow strategy transfer experiment
 
+Update after M17: the current header/candidate have removed M-block-owned
+pull and full-CTA BWD reduce (compiled ID `e8955a4e0df6`). Local pull is again
+row-striped bulk; 96 communication threads reduce concurrently with dW.
+The original experiment described below used `6f3b9992e498`; its exact
+configuration is preserved in the linked result JSON and git history.
+The historical timings below do **not** describe the updated implementation.
+
 H4096/I2048/E256/top6 BF16. This is an explicit experimental profile, not a
 replacement of Flash's default configuration or a new autotune winner.
 Compiled ID: `6f3b9992e498`.

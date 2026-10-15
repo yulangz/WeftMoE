@@ -2111,19 +2111,16 @@ void test_static_forward_network_layout() {
             for (bool ret : {false, true}) {
               const auto control = rings.control(ret, channel, slot);
               ranges.emplace_back(control, control + sizeof(plan::NetworkSlot));
-              for (bool rx : {false, true}) {
-                if (ret && rx)
-                  continue; // Return lands in the source contribution window.
-                const auto payload = [&](unsigned sequence) {
-                  return ret ? rings.return_payload(channel, sequence)
-                             : rings.dispatch_payload(rx, channel, sequence);
-                };
-                const auto begin = payload(slot);
-                const auto bytes = ret ? returning : dispatch;
-                REQUIRE(begin % 128U == 0U);
-                REQUIRE(begin == payload(slot + rings.depth));
-                ranges.emplace_back(begin, begin + bytes);
-              }
+              // Get has only RX staging; Return lands directly in source C.
+              const auto payload = [&](unsigned sequence) {
+                return ret ? rings.return_payload(channel, sequence)
+                           : rings.dispatch_payload(channel, sequence);
+              };
+              const auto begin = payload(slot);
+              const auto bytes = ret ? returning : dispatch;
+              REQUIRE(begin % 128U == 0U);
+              REQUIRE(begin == payload(slot + rings.depth));
+              ranges.emplace_back(begin, begin + bytes);
             }
           }
         }

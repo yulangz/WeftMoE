@@ -79,6 +79,22 @@ struct WindowShape {
     return ceil_div(max_source_tokens, tokens) * groups();
   }
 
+  // Reserve roughly a quarter of the compute ring for cross-window tails.
+  // Two/expert ensures progress, but is too shallow for normal sparse loads:
+  // a worst-case window's capacity usually holds many actual input windows.
+  WEFTMOE_STATIC_PLAN_HD constexpr std::uint32_t
+  tail_slots(std::uint32_t owned) const {
+    const auto slots = max_mblocks(owned) / (2U * owned);
+    return static_cast<std::uint32_t>(slots > 2U ? slots : 2U);
+  }
+
+  WEFTMOE_STATIC_PLAN_HD constexpr std::uint64_t
+  compute_slots(std::uint32_t owned) const {
+    const auto blocks = max_mblocks(owned);
+    const auto tails = std::uint64_t(tail_slots(owned)) * owned;
+    return blocks + (blocks > tails ? blocks : tails);
+  }
+
   WEFTMOE_STATIC_PLAN_HD constexpr std::uint64_t
   max_mblocks(std::uint32_t owned_experts) const {
     const auto active_sources = sources < world ? sources : world;
