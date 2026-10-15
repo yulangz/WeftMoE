@@ -1,4 +1,14 @@
-# Flash: Qwen dataflow strategy transfer experiment
+# Flash PF dataflow profile
+
+Current M18 configuration: use **B2048 on both EP8 and EP16**, contribution
+CLI depth 2 and network credit4. Candidate digest `de91f52ad9e3`; changing
+the prepare-time window does not change compiled ID `e8955a4e0df6` or the
+generated header. Network FWD now uses canonical M128 blocks across windows
+and bounded Return M-slots. Local row-striped bulk and overlapping 96-thread
+BWD reduce are retained. See M18 in [the optimization record](../../docs/pf_backward_20261012.md)
+and [matched measurements](../../benchmarks/results/pf_canonical_forward_20261015.json).
+
+## Historical whole-profile experiment (before M17)
 
 Update after M17: the current header/candidate have removed M-block-owned
 pull and full-CTA BWD reduce (compiled ID `e8955a4e0df6`). Local pull is again

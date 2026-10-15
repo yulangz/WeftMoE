@@ -1,5 +1,12 @@
 # Qwen3.5-35B-A3B compact PF profile
 
+M18 follow-up: canonical network FWD removes per-window M padding, but the
+current EP16 cached FWD still regresses against this profile's historical
+Qwen results. B2048 and route-adaptive tail-bank partitioning did not restore
+them. The Flash-first tradeoff, exact measurements and Return-tail diagnostics
+are recorded in M18 of [the optimization record](../../docs/pf_backward_20261012.md).
+Do not treat the historical 15% target below as a result for the current code.
+
 Update after M17: the current header/candidate have removed M-block-owned
 pull and full-CTA BWD reduce (compiled ID `4d5985a6feb9`), prioritizing Flash.
 Local pull is row-striped bulk; 96 communication threads reduce during dW.

@@ -7,7 +7,11 @@ PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推
 ## M18：FWD 跨窗口 canonical M128 与静态通信均衡（2026-10-15）
 
 实现不改变 MNK、WGMMA pipeline 或 gate/up 布局，也不引入动态任务领用。
-完整性能确认正在补充；以下先记录实现与已确认的同步约束。
+`d72e3bf` 撤销整块搬运与全 CTA BWD reduce，`0ba7b21` 完成 canonical
+FWD/Return，`292ba7c` 改为按路由静态划分 ring 容量。Flash 为优先目标；
+**本轮保住了 Flash，但没有解决 Qwen 多机 FWD 的回退**，不能将下述
+Flash 收益推广到 Qwen。原始记录见
+`benchmarks/results/pf_canonical_forward_20261015.json`。
 
 ### 去掉逐窗口 padding，但保留有界 payload ring
 
@@ -27,10 +31,18 @@ Notify 对每专家累计所有窗口的有效行，M-block 数由原来的
   14.866/38.222 ms。8K timeline 的 Get 已在约 2.45 ms 结束，窗口准入
   却拖到约 9.82 ms、本地 pull 到约 10.10 ms，暴露的是预取深度不足，
   不是新增 spill。第一版主 kernel 与原版同为 168 registers，0 spill。
-- 修订版从原有总槽位中划出约四分之一给 tails，保留至少一个最坏窗口
-  的普通块容量。Flash EP16/B2048：最坏窗口 784 blocks，总计仍为
-  1568 slots，其中普通区 1184、tail 区 16 experts × 24 slots。
-  X/S payload 总容量不增加；小窗口容量下仍保留两个 tail/专家。
+- `0ba7b21` 从原有总槽位中划出约四分之一给 tails。Flash EP16/B2048：
+  最坏窗口 784 blocks，总计仍为 1568 slots，其中普通区 1184、tail 区
+  16 experts × 24 slots；已恢复 Flash 性能。但这个固定比例对 Qwen
+  B1024 不合适，不能作为通用的容量分区经验。
+- 当前由 notify 使用本次路由决定分区。令 `T` 为单专家最多的跨
+  窗口块数，`F` 为普通块总数，`D` 为已分配槽数，`E` 为本卡专家数，
+  tail slots/专家的目标为 `D*T/(F+E*T)`，使两区的预取进度大致一致。
+  同时上限不超过实际 `T`，普通区至少容纳一个实际到达窗口的全部普通
+  块；有多个 tail 时至少保留两个槽。无 tail 时全部容量归普通区。
+  仍然只有静态地址规划，既不重新分配 X/S，也不动态领取任务。
+  这项分区修订与四分之一区域版本的 Flash 配对差异不到 0.6%，没有显示额外
+  性能收益；也没有改善 Qwen 的回退，不能将该回退归因于尾区比例。
 
 每个槽位的 generation 从其已有 FC1 target 推导，允许不同槽位的
 复用次数不同。准入必须看到上一代 FC1、FC2、Return 都退役；pull 每
@@ -70,13 +82,133 @@ Get worker 的 channel 遍历从 node-major 改为 lane-major：线性任务
 不同远端节点。两机只有一个远端节点，此项映射完全相同，不能用两机
 结果宣称多目标 RDMA 收益；三机以上仅完成映射/协议检查，未做硬件测试。
 机内 source-order 的独立性能消融另行列出，不把整体收益归给均衡。
+没有额外 wave barrier；这里的“同一 wave”指相邻静态发起任务，不要求
+不同 CTA 锁步。它只能分散访问时机，不能消除热点路由的固有字节量倾斜。
 
-### 验证进度
+### Flash 性能与资源
 
-最终 retained 构建已通过 Flash EP16 随机 129/8K/20K、每档两个新 tape
-的 output/dX/dGate/dW1/dW2 校验。此前同同步方案的 B128、route bias=10
-强热点 129/8K 检查也通过，覆盖大量空专家和强制复用。没有新增碎片单测；
-现有 host 17 项、autotune 51 项及 48 subtests 通过。
+沿用 M16 的 workload：正态变化 token 数、每调用新路由，均衡或 shared
+bias=0.5 热点路由；完整 prime trace、4 warmups / 16 samples，最慢 rank
+p50。FWD 带 saved X/GU，包含 notify、缓存申请与当次权重重排，固定 pool
+已预热。以下前后逐 rank workload SHA 相同，正式计时期间没有编译。
+
+Flash EP16、B2048/C4，单位 ms。“修复前”已经恢复逐行搬运和 96-thread
+BWD reduce，只有 FWD 仍逐窗口补齐，因而不混入 M17 的回退收益。
+Flash profile 的 prepare-time `window_tokens` 也已从 1024 改为 2048，
+与实际保留的测量配置一致；config digest 为 `de91f52ad9e3`，生成的
+CUDA header 和 compiled ID `e8955a4e0df6` 不变，无需为容量重复编译。
+
+| 路由 / tokens | 修复前 `d72e3bf` | 当前 `292ba7c` | FWD 延迟下降 |
+|---|---:|---:|---:|
+| 均衡 8K | 9.665 | 9.533 | 1.36% |
+| 均衡 20K | 20.616 | 20.192 | 2.06% |
+| 非均衡 8K | 11.852 | 11.179 | 5.68% |
+| 非均衡 20K | 27.456 | 25.086 | 8.63% |
+
+非均衡 8K/20K 的全局 M128 执行行数/有效行数从 1.2304/1.2218 降到
+1.0205/1.0082；这只是根据同一条 trace 统计的计划几何，不是硬件 FLOP
+计数器，也不代表关键路径应按相同比例缩短。
+
+单机 EP8 本来已经每专家只补一个尾块，没有新增去 padding 收益：
+
+| 路由 / tokens | 修复前 FWD | 当前 FWD |
+|---|---:|---:|
+| 均衡 8K | 6.093 | 6.076 |
+| 均衡 20K | 13.793 | 13.846 |
+| 非均衡 8K | 7.345 | 7.494 |
+| 非均衡 20K | 16.613 | 16.535 |
+
+单机这组变化为 -0.5% 至 +2.0%，不宣称所有项完全不变。BWD 算法未因
+canonical FWD 改动；非均衡 EP8 的两轮测量中，第一轮 checkpoint 相对
+回退版慢约 1.3–1.5%，反向测试顺序复测则当前为 12.578/30.425 ms，
+回退版为 12.708/31.153 ms；没有一致方向的 BWD 回退证据。
+
+Flash EP16 的 compute+GIN+notify 持久空间相对修复前净增约
+**262 MiB/rank（8K）/278 MiB/rank（20K）**，主要是有界 canonical Return
+TX 与行映射，不是再留一份全量激活；X/S 总槽数不变。主 FWD/BWD kernel
+仍为 168 registers、0 spill；既有 count-notify 的 28/28-byte spill 未变。
+
+SM 时钟设置仍为 1620 MHz、power limit 未改。原始 1 Hz 采样已归档；
+不是每个毫秒级测量区间都有样本，少数区间还观察到降频，不能声称全程
+严格维持 1620。保留全部样本，不按频率或测量结果筛除。
+
+### 通信交错与 timeline 消融
+
+固定 `0ba7b21` 的四分之一 tail 分区，只改变机内 pull 次序，单位 ms：
+
+| EP16 / tokens | source-major | source 交错 |
+|---|---:|---:|
+| 均衡 8K | 9.524 | 9.541 |
+| 均衡 20K | 20.233 | 20.094 |
+| 非均衡 8K | 11.263 | 11.120 |
+| 非均衡 20K | 25.146 | 25.016 |
+
+此项延迟变化约 -0.2% 至 +1.3% 收益，只有小幅影响。保留交错，不增加
+wave 同步，也不将 canonical 整体加速归给它。
+
+当前 Flash EP16 的独立 timeline：2 warmups + 1 sample，均衡路由，
+每 GPU 内做时钟相减，表内为 16 ranks 中位数，单位 ms；不与正式端到端
+p50 混用。所有 trace 均无事件溢出。
+
+| 从 main 入口算起的事件 | 8K | 20K |
+|---|---:|---:|
+| 首次 WGMMA | 0.041 | 0.041 |
+| 最后窗口准入 | 0.246 | 0.614 |
+| 最后 Dispatch Get 完成 | 2.473 | 7.725 |
+| 最后远端 RX pull 完成 | 2.874 | 9.254 |
+| 最后 FC2 epilogue 完成 | 6.751 | 15.677 |
+| reduce 开始 | 7.712 | 17.260 |
+| reduce 段长度 | 0.233 | 0.541 |
+| main 结束 | 8.103 | 17.986 |
+
+相对最初两 tail/专家版本，8K 最后准入从约 9.82 ms 降到 0.246 ms，
+不再被该浅 ring 拖到计算尾部。当前最后 FC2 到 reduce 仍有约
+0.958/1.583 ms 的 Return 排空与 writer join 间隔，保留为后续优化点。
+
+### Qwen 保护测试：回退尚未恢复
+
+Qwen EP16/B1024 同 trace 的历史最终配置与本次当前 FWD，单位 ms：
+
+| 路由 / tokens | 历史 Qwen 最终版 | 当前 |
+|---|---:|---:|
+| 均衡 8K | 5.544 | 6.192 |
+| 均衡 20K | 12.406 | 13.774 |
+| 非均衡 8K | 5.741 | 7.189 |
+| 非均衡 20K | 12.729 | 17.131 |
+
+这是历史同 trace 对比，不冒充同批新跑的旧二进制。四分之一 tail 分区时
+对应为 6.230/13.707、7.211/17.063 ms；改为路由自适应没有解决问题。
+在固定分区下只放大至 B2048，则为 6.081/13.353、7.236/16.515 ms，
+同样没有恢复历史水平。因此不能把剩余问题归为窗口大小或 tail 容量。
+Flash 优先的当前方案予以保留，但 Qwen 的这一退化是明确的未解决项。
+
+进一步做 Qwen 非均衡独立 timeline：8K 最后 FC2→reduce 的各 rank
+间隔为 3.011–4.370 ms，中位数 4.131 ms；20K 为 2.226–7.261 ms，
+中位数 6.929 ms。对应 main 中位数为 7.153/14.818 ms。它显示 Return
+与跨 rank 收尾在短 GEMM shape 下明显暴露，不支持把剩余时间都归给
+GEMM 或 tail ring；也不能把这些间隔全部算作纯 RDMA 时间，里面包含
+rank 完成时刻不同、发送排空、源端收齐与 writer join。
+
+当前 canonical Return 每 Put 只能合并同一个 M-slot 内连续 source/C
+行；该 Qwen trace 的平均请求为约 100/104 KiB，Flash 均衡 trace 为
+257/272 KiB。两种 shape/路由不同，这不是请求大小的受控单项消融，
+但提示了下一步应分析的 Return 粒度与跨 rank 完成偏斜。本轮不再用
+扩大 tail ring 冒充解决方案，也不为 Qwen 恢复被明确撤销的整块搬运。
+
+### 正确性验证
+
+`0ba7b21` Flash EP16 随机 129/8K/20K、每档两个新 tape 的
+output/dX/dGate/dW1/dW2 已通过。最终 `292ba7c` 又完成以下各档两个新
+tape 的训练校验：Flash EP16/B128/bias10 强热点、Qwen EP16/B1024、
+Flash EP8/B2048，均覆盖 129/8K/20K。三组共 18 次全 rank 校验中最大
+relative L2 小于 0.001，包含大量空专家与小容量强制复用。
+
+同一最终代码的无缓存 inference 在 Flash EP8/EP16 的 129/8K/20K，
+每档两次调用也均通过，最大 relative L2 为 0.000469。复用同一 main
+kernel，不以训练缓存绕开 inference 协议。未新增细碎单测；现有 host
+17 项通过，前一轮 autotune 51 项及 48 subtests 通过，最终重新运行
+static-forward autotune 的 5 项也通过。另作 3000 组随机/稀疏路由的
+CPU 槽位生命周期诊断，未发现同时占用同一物理槽的冲突。
 
 ## M17：恢复 Flash 优先的数据流（2026-10-15）
 
@@ -91,6 +223,11 @@ M14–M16 的历史配置与原始测量仍在各自的结果 JSON 中，不受�
 这不是“96 线程提前读未完成的 Return”：仍须先完成通信与节点内
 writer join；仅不再等待与 dX/Return 无数据依赖的 dW。暂不引入空闲
 math warp 动态领取 reduce 任务的调度。
+
+让 math warp 做完自身 dW 后处理固定的 reduce 切片，在共享的
+Return-ready 发布之后执行，理论上也可以保持静态分工，并非一定需要
+动态队列。但部分 reduce 会被绑定到最慢的 dW 切片，增加交接与终止
+同步；Flash 目前已能把 96-thread reduce 藏在 dW 内，本轮不加入此分支。
 
 独立回退构建 `flash_row_reduce96_20261015` 已通过 EP16 随机路由
 129/8K/20K、每规模两个新 tape 的 output/dX/dGate/dW1/dW2 校验。

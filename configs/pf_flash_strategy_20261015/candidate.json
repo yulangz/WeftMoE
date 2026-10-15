@@ -144,7 +144,7 @@
       "network_max_workers": 32,
       "source_group": 0,
       "network_prefill_min_tokens": 0,
-      "window_tokens": 1024,
+      "window_tokens": 2048,
       "contribution_windows": 2,
       "local_prefill_streaming": 1,
       "local_prefill_fast_math": 1,
@@ -164,5 +164,5 @@
     }
   },
   "compiled_digest": "e8955a4e0df6",
-  "config_digest": "4c365937f08d"
+  "config_digest": "de91f52ad9e3"
 }
