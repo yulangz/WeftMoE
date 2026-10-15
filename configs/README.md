@@ -11,6 +11,7 @@ Historical measurement IDs and reports are not rewritten.
 | `dt_flash_probe_20261009` | Stable single-node DT, same shape; collective capacity <=64 |
 | [`pf_qwen35_20261013`](pf_qwen35_20261013/README.md) | Tuned cached PF FWD+BWD, H2048/I512/E256/top-k8, EP8/EP16 |
 | [`pf_qwen35_compact_20261013`](pf_qwen35_compact_20261013/README.md) | Compact local contributions and window-ordered network tape; Qwen M14 candidate and validation status |
+| [`pf_flash_strategy_20261015`](pf_flash_strategy_20261015/README.md) | Flash transfer experiment with Qwen dataflow switches; mixed/negative results, **not a replacement default** |
 
 PF keeps M128/N256/K64, three input stages, two-CTA multicast, FC1 register-vector
 writeback and the retained FC2 epilogues. Both PF modes run standalone notify
