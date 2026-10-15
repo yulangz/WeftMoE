@@ -120,8 +120,8 @@ Autotune 轴 `return_rails` 支持 0/1/2/4/8，参与生成 header 与 compiled 
 - 最终两套 profile：EP16、129/8192/20480，每个规模两份新路由，
   output/dX/dGate/dW1/dW2 全部通过；包含 FWD→BWD→FWD 的 pool 复用。
 - 两种模型另测 EP16、B128/D2、8K、bias std=10 的强热点路由，各两份
-  tape，五项数值检查全部通过。实际反复使用有界 ring，不依赖一次性
-  分配足够存下全部中间激活。
+  tape，五项数值检查全部通过。通信与计算 scratch 反复使用有界 ring；
+  训练所需的 saved X/GU 仍按实际专家行数保存，不属于这些临时 ring。
 - 无中间缓存的 inference：Qwen EP16、Flash EP8，8K 各两份路由通过，
   使用 `--verify-kernel` 检查 PF kernel 路径。这里只作数值回归，不是
   inference 或单机性能测试；三机以上没有硬件测试。
