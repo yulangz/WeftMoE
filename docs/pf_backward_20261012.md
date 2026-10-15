@@ -4,6 +4,25 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M17：恢复 Flash 优先的数据流（2026-10-15）
+
+按 M16 的单项归因撤销两条分支：本地搬运恢复逐行分配的 bulk copy，
+不再由一个 warp 独占整个 M-block；多机 BWD 恢复 96 个通信线程在
+Return 完成后执行 reduce，与 math/producer 的 dW 重叠。删除对应
+`local_pull_mode` / `backward_full_reduce` 搜索轴，避免 autotune 再选回。
+保留 compact contribution、可调 pull warp 数、合并 Get、window-ordered
+tape、Return spans 和分片计数器。两个专属 profile 已重新生成摘要；
+M14–M16 的历史配置与原始测量仍在各自的结果 JSON 中，不受此修改影响。
+
+这不是“96 线程提前读未完成的 Return”：仍须先完成通信与节点内
+writer join；仅不再等待与 dX/Return 无数据依赖的 dW。暂不引入空闲
+math warp 动态领取 reduce 任务的调度。
+
+独立回退构建 `flash_row_reduce96_20261015` 已通过 EP16 随机路由
+129/8K/20K、每规模两个新 tape 的 output/dX/dGate/dW1/dW2 校验。
+GPU 资源与 GEMM tile 未改；性能归因采用上节同指令、同布局的 M16
+配对数据，后续 padding 修复将另做端到端复测，不混作本次收益。
+
 ## M16：Qwen / Flash 性能偏移的单项归因（完成，2026-10-15）
 
 代码检查点为 `84a9424`，包含 `6a78343` / `3539cea` 的实现。开始本轮时

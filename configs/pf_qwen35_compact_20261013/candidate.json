@@ -149,14 +149,12 @@
       "local_prefill_streaming": 1,
       "local_prefill_fast_math": 1,
       "local_pull_warps": 3,
-      "local_pull_mode": 2,
       "local_compact_return": 1,
       "ordered_dispatch": 1,
       "coalesce_get": 1,
       "window_ordered_tape": 1,
       "backward_return_pending": 4,
       "backward_wave_blocks": 64,
-      "backward_full_reduce": 1,
       "network_credit_windows": 4,
       "network_get_workers": 64,
       "backward_return_spans": 1,
@@ -165,6 +163,6 @@
       "network_vector_pull": 0
     }
   },
-  "compiled_digest": "23023d511ccf",
-  "config_digest": "f16f5dc2e13f"
+  "compiled_digest": "4d5985a6feb9",
+  "config_digest": "ddef60596b24"
 }

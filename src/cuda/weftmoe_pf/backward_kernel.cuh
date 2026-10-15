@@ -20,9 +20,6 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 128
 #endif
-#ifndef WEFTMOE_PF_BWD_FULL_REDUCE
-#define WEFTMOE_PF_BWD_FULL_REDUCE 0
-#endif
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -606,8 +603,7 @@ __global__ __launch_bounds__(384U, 1) void kernel(
         auto &comm =
             *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
         network_workers(f, a, comm);
-        if constexpr (!WEFTMOE_PF_BWD_FULL_REDUCE)
-          finish_network<>(f, a);
+        finish_network<>(f, a);
       } else {
         if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
           local::pull<kDxTiles, true>(f, s);
@@ -629,15 +625,10 @@ __global__ __launch_bounds__(384U, 1) void kernel(
       // Communication-only Reduce overlaps dW. Its terminal barrier must
       // still protect metadata until every rank finishes weight gradients.
       if constexpr (Network) {
-        if constexpr (!WEFTMOE_PF_BWD_FULL_REDUCE)
-          network_barrier<288U, 96U>(f, 1U);
+        network_barrier<288U, 96U>(f, 1U);
       } else
         rank_barrier<288U, 96U>(f);
     }
-  }
-  if constexpr (Network && WEFTMOE_PF_BWD_FULL_REDUCE) {
-    finish_network<0U, 384U>(f, a);
-    network_barrier<0U, 384U>(f, 1U);
   }
 #endif
 }
