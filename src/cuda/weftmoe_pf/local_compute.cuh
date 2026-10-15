@@ -13,6 +13,9 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
   Scheduler schedule(a);
   Task t;
   unsigned stage = 0U, phase = 0U;
+#if WEFTMOE_DEVICE_TIMELINE
+  std::uint64_t tx_wait_ns = 0U, tx_wait_tiles = 0U;
+#endif
   while (schedule.next(t)) {
     auto &slot = a.ring.slots[t.row / kM];
     if (cute::elect_one_sync()) {
@@ -26,14 +29,23 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
           std::uint64_t(t.generation) * (t.fc2 ? kFc1Tiles : kM);
       while (ring::acquire(ready) < target) {
       }
-      if constexpr (Network && WEFTMOE_PF_RETURN_RAILS != 1U) {
+      if constexpr (Network && WEFTMOE_PF_RETURN_INDEPENDENT_TX) {
         if (t.fc2) {
           // Pass TX ownership through the existing input-stage barrier;
           // the math warpgroups need no extra epilogue rendezvous.
           const auto &desc = a.ring.blocks[t.block];
-          while (ring::acquire<::cuda::thread_scope_system>(
-                     a.ring.return_slots[desc.return_slot].consumed) <
-                 (desc.return_generation - 1U) * kM) {
+          const auto &consumed = a.ring.return_slots[desc.return_slot].consumed;
+          const auto target = (desc.return_generation - 1U) * kM;
+          if (ring::acquire<::cuda::thread_scope_system>(consumed) < target) {
+#if WEFTMOE_DEVICE_TIMELINE
+            const auto begin = ::weftmoe::cuda::profiling::read_globaltimer_ns();
+#endif
+            while (ring::acquire<::cuda::thread_scope_system>(consumed) < target) {
+            }
+#if WEFTMOE_DEVICE_TIMELINE
+            tx_wait_ns += ::weftmoe::cuda::profiling::read_globaltimer_ns() - begin;
+            ++tx_wait_tiles;
+#endif
           }
         }
       }
@@ -60,6 +72,10 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
       phase ^= stage == 0U;
     }
   }
+#if WEFTMOE_DEVICE_TIMELINE
+  WEFTMOE_TIMELINE_RECORD_IF(a.timeline, cute::elect_one_sync(), TxCreditWaitNs,
+                             Compute, 0U, tx_wait_ns, tx_wait_tiles);
+#endif
 }
 
 template <class Scheduler = Schedule, bool Network = false, class Matrix = Mma,
@@ -226,7 +242,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         collective_scope_sync<kMathThreads, 7U>();
         if (threadIdx.x == 0U) {
           const auto &desc = a.ring.blocks[t.block];
-          if constexpr (WEFTMOE_PF_RETURN_RAILS == 1U) {
+          if constexpr (!WEFTMOE_PF_RETURN_INDEPENDENT_TX) {
             arrive(slot.fc2_published, 1U);
             if (t.column == 0U && desc.local_rows == t.rows)
               arrive(slot.returned, t.rows);

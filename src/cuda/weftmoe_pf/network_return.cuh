@@ -24,10 +24,13 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
   const auto lane = threadIdx.x % 32U;
   const auto bytes = a.hidden * 2U;
   constexpr unsigned task_stride =
-      WEFTMOE_PF_RETURN_RAILS == 1U ? kPutWorkers : 1U;
+      !WEFTMOE_PF_RETURN_EXPERT_TX ? kPutWorkers : 1U;
   const auto first = std::uint64_t(worker) * (task_stride == 1U ? 32U : 1U);
   unsigned issued = 0U, completed = 0U;
   std::uint64_t packets = 0U, payload = 0U, remaining = 0U;
+#if WEFTMOE_DEVICE_TIMELINE
+  std::uint64_t nic_wait_ns = 0U;
+#endif
   for (auto base = first; base < r.state->return_tasks;
        base += kPutWorkers * 32U)
     remaining += min(
@@ -35,9 +38,15 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         static_forward::ceil_div(r.state->return_tasks - base, task_stride));
   auto retire = [&]() {
     auto &entry = s.pending[completed++ % kNetworkPending];
+#if WEFTMOE_DEVICE_TIMELINE
+    const auto begin = ::weftmoe::cuda::profiling::read_globaltimer_ns();
+#endif
     endpoint.gin.wait(entry.request);
+#if WEFTMOE_DEVICE_TIMELINE
+    nic_wait_ns += ::weftmoe::cuda::profiling::read_globaltimer_ns() - begin;
+#endif
     if (entry.rows) {
-      if constexpr (WEFTMOE_PF_RETURN_RAILS == 1U)
+      if constexpr (!WEFTMOE_PF_RETURN_INDEPENDENT_TX)
         ring::arrive(*entry.consumed, entry.rows);
       else
         reduce_add_release_system(
@@ -55,7 +64,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         if (empty)
           task.count = ~0U;
         else if (task.count != ~0U)
-          ready = ring::acquire<(WEFTMOE_PF_RETURN_RAILS == 1U
+          ready = ring::acquire<(!WEFTMOE_PF_RETURN_INDEPENDENT_TX
                                      ? ::cuda::thread_scope_device
                                      : ::cuda::thread_scope_system)>(
                       *task.published) >= task.target;
@@ -132,6 +141,12 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
     atomicAdd(&status->gin_return_put_count, packets);
     atomicAdd(&status->gin_return_payload_bytes, payload);
+#if WEFTMOE_DEVICE_TIMELINE
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnWorkerBytes, GinReturn,
+                               worker, payload, packets);
+    WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, ReturnNicWaitNs, GinReturn,
+                               worker, nic_wait_ns, completed);
+#endif
   }
 }
 

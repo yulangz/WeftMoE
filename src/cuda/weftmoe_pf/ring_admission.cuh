@@ -13,6 +13,10 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
   const auto lane = threadIdx.x & 31U;
   const auto source_windows = r.source.local_windows();
   std::uint64_t source_window = 0U, window = 0U;
+#if WEFTMOE_DEVICE_TIMELINE
+  std::uint64_t wait_ns[8] = {}, wait_begin = 0U;
+  unsigned wait_reason = 0U;
+#endif
   while (source_window < source_windows || window < r.state->windows) {
     if (source_window < source_windows) {
       const auto seq = r.state->source_base + source_window;
@@ -47,9 +51,22 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
       const auto begin = prefix[window];
       const auto end = prefix[window + 1U];
       bool free = true;
+#if WEFTMOE_DEVICE_TIMELINE
+      unsigned blocked = 0U;
+#endif
       for (auto index = begin + lane; index < end; index += 32U) {
         const auto block = Network ? r.start_blocks[index] : index;
         auto &s = slot(a, block);
+#if WEFTMOE_DEVICE_TIMELINE
+        // Check every needed slot, so Return-only means FC1/FC2 are ready
+        // throughout this window, not just at the first blocked entry.
+        blocked |= (acquire(s.fc1_done) < s.fc1_target ? 1U : 0U) |
+                   (acquire(s.fc2_done) < s.fc2_target ? 2U : 0U) |
+                   (acquire<Network ? ::cuda::thread_scope_system
+                                    : ::cuda::thread_scope_device>(s.returned) <
+                            s.return_target ? 4U : 0U);
+        free = blocked == 0U;
+#else
         if (acquire(s.fc1_done) < s.fc1_target ||
             acquire(s.fc2_done) < s.fc2_target ||
             acquire<Network ? ::cuda::thread_scope_system
@@ -57,7 +74,18 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
           free = false;
           break;
         }
+#endif
       }
+#if WEFTMOE_DEVICE_TIMELINE
+      const auto reason = __reduce_or_sync(0xffffffffU, blocked);
+      if (lane == 0U && reason != wait_reason) {
+        const auto now = ::weftmoe::cuda::profiling::read_globaltimer_ns();
+        if (wait_reason)
+          wait_ns[wait_reason] += now - wait_begin;
+        wait_begin = now;
+        wait_reason = reason;
+      }
+#endif
       if (__all_sync(0xffffffffU, free)) {
         for (auto index = begin + lane; index < end; index += 32U) {
           const auto block = Network ? r.start_blocks[index] : index;
@@ -77,6 +105,12 @@ __device__ __noinline__ void admit(const ForwardKernelArgs &a, unsigned fc1,
       }
     }
   }
+#if WEFTMOE_DEVICE_TIMELINE
+  if (lane == 0U)
+    for (unsigned reason = 1U; reason < 8U; ++reason)
+      WEFTMOE_TIMELINE_RECORD_IF(a.timeline, true, AdmitWaitNs, Kernel,
+                                 reason, wait_ns[reason], window);
+#endif
 }
 
 } // namespace weftmoe_pf::ring

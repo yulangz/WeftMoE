@@ -25,6 +25,14 @@
 #ifndef WEFTMOE_PF_RETURN_RAILS
 #define WEFTMOE_PF_RETURN_RAILS 1
 #endif
+// Keep sender placement, TX lifetime and TX partition independently measurable.
+// Defaults preserve the retained compute-local and striped-rail protocols.
+#ifndef WEFTMOE_PF_RETURN_INDEPENDENT_TX
+#define WEFTMOE_PF_RETURN_INDEPENDENT_TX (WEFTMOE_PF_RETURN_RAILS != 1)
+#endif
+#ifndef WEFTMOE_PF_RETURN_EXPERT_TX
+#define WEFTMOE_PF_RETURN_EXPERT_TX (WEFTMOE_PF_RETURN_RAILS != 1)
+#endif
 
 #ifndef WEFTMOE_FWD_MAIN_HIDDEN
 #define WEFTMOE_FWD_MAIN_HIDDEN 7168

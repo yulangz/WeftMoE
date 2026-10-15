@@ -84,9 +84,8 @@ __device__ __noinline__ void prepare_return(const ForwardKernelArgs &a) {
   constexpr auto m = forward_tuning::kTileM;
   constexpr auto tiles =
       forward_tuning::kMainHidden / forward_tuning::kFc1TileN;
-  if constexpr (WEFTMOE_PF_RETURN_RAILS == 1U) {
-    // No NVLink relay: retain the original shared X/S/TX lifetime and avoid
-    // adding a second credit protocol for a single-GPU sender.
+  if constexpr (!WEFTMOE_PF_RETURN_EXPERT_TX) {
+    // Preserve the compute-slot address mapping when isolating TX lifetime.
     for (auto block = worker / 32U; block < r.state->blocks;
          block += workers / 32U) {
       auto &desc = r.blocks[block];
@@ -114,6 +113,21 @@ __device__ __noinline__ void prepare_return(const ForwardKernelArgs &a) {
             desc.generation * tiles,
             desc.tile.rows == local_rows ? 0U : desc.tile.rows,
             desc.tile.rows};
+        if constexpr (WEFTMOE_PF_RETURN_INDEPENDENT_TX) {
+          desc.return_slot = desc.slot * a.local_world_size + local_rank;
+          auto &tx = r.return_slots[desc.return_slot];
+          constexpr auto fc1_tiles =
+              2U * forward_tuning::kMainIntermediate / forward_tuning::kFc1TileN;
+          // Compute counters may also advance in BWD. Independent TX epochs
+          // must start from this physical TX slot's own completed invocation.
+          desc.return_generation = tx.published / tiles + desc.generation -
+                                   slot.fc1_target / fc1_tiles;
+          auto &task = r.return_tasks[block];
+          task.published = &tx.published;
+          task.returned = &tx.consumed;
+          task.target = desc.return_generation * tiles;
+          task.credit_rows = desc.tile.rows - local_rows;
+        }
       }
     }
     if (!worker)
