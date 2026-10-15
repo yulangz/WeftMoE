@@ -1083,7 +1083,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         append(cursor, ring.max_windows * (config.max_owned_experts + 1U),
                sizeof(std::uint64_t), "window expert blocks");
     if (config.max_nodes > 1U) {
-      ring.return_capacity = rail_return_slots(config);
+      ring.return_capacity = rail_return_slots(config) * ring.shape.tile_m;
       ring.return_slots = append(cursor, ring.return_capacity,
           sizeof(static_forward::ReturnSlot), "expert Return slot credits");
       ring.return_experts = append(cursor,

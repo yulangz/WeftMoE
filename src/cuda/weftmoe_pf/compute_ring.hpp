@@ -40,7 +40,7 @@ struct alignas(64) ReturnSlot {
   std::uint64_t published, consumed;
 };
 struct ReturnExpert {
-  std::uint32_t begin, depth;
+  std::uint32_t begin, depth, stride; // TX rows, slots, rows per slot on one rail.
 };
 
 // Single-window source metadata is pushed together, avoiding a peer gate

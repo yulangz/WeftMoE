@@ -60,18 +60,25 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         }
         __syncwarp();
         if (!lane) {
-          for (unsigned row = 0U; row < task.count;) {
+          for (unsigned row = 0U, packed = 0U; row < task.count;) {
             const auto source = s.sources[row];
             if (source / a.local_world_size == a.node ||
                 source % a.local_world_size != a.rank % a.local_world_size) {
               ++row;
               continue;
             }
-            unsigned count = 1U;
-            while (row + count < task.count &&
-                   s.sources[row + count] == source &&
-                   s.contributions[row + count] == s.contributions[row] + count)
-              ++count;
+            unsigned count = 1U, end = row + 1U;
+            while (end < task.count) {
+              const auto next = s.sources[end];
+              if (next / a.local_world_size != a.node &&
+                  next % a.local_world_size == a.rank % a.local_world_size) {
+                if (next != source ||
+                    s.contributions[end] != s.contributions[row] + count)
+                  break;
+                ++count;
+              }
+              ++end;
+            }
             if (issued - completed == kNetworkPending)
               retire();
             const auto channel =
@@ -82,7 +89,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
             endpoint.gin.put(
                 ncclTeamWorld(endpoint.gin.comm), source, a.gin_window,
                 a.static_network.contribution + s.contributions[row] * bytes,
-                a.gin_window, task.offset + std::uint64_t(row) * bytes,
+                a.gin_window, task.offset + std::uint64_t(packed) * bytes,
                 count * bytes,
                 ncclGin_WeakVASignalAdd{
                     a.gin_window,
@@ -98,7 +105,8 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
                                     &entry.request);
             ++packets;
             payload += count * bytes;
-            row += count;
+            packed += count;
+            row = end;
           }
           task.count = ~0U;
         }

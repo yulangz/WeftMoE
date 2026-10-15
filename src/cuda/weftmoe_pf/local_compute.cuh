@@ -200,7 +200,8 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
         const auto &desc = a.ring.blocks[t.block];
         const auto plan = a.ring.return_experts[
             a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
-        const auto tx_slot = plan.begin + desc.tile.expert_row / kM % plan.depth;
+        const auto tx_slot = plan.begin +
+            (desc.tile.expert_row / kM % plan.depth) * plan.stride;
         if (threadIdx.x == 0U)
           while (ring::acquire<::cuda::thread_scope_system>(
                      a.ring.return_slots[tx_slot].consumed) <
@@ -228,7 +229,7 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
           const auto plan = a.ring.return_experts[
               a.rank % a.local_world_size * a.dispatch.sizes.owned_expert_count + t.expert];
           auto &tx_slot = a.ring.return_slots[
-              plan.begin + desc.tile.expert_row / kM % plan.depth];
+              plan.begin + (desc.tile.expert_row / kM % plan.depth) * plan.stride];
           reduce_add_release_system(
               reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
           if (t.column == 0U) {
