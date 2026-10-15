@@ -3,11 +3,26 @@ import argparse
 from collections import defaultdict
 import json
 from pathlib import Path
+import random
 import statistics
 
 
 def distribution(values):
     return dict(min=min(values), p50=statistics.median(values), max=max(values))
+
+
+def paired_latency_change(baseline, candidate):
+    a = list(map(max, zip(*baseline["raw"]["per_rank_forward_ready_us"])))
+    b = list(map(max, zip(*candidate["raw"]["per_rank_forward_ready_us"])))
+    rng = random.Random(123)
+    changes = []
+    for _ in range(4000):
+        indices = rng.choices(range(len(a)), k=len(a))
+        changes.append(100 * (1 - statistics.median(b[i] for i in indices) /
+                              statistics.median(a[i] for i in indices)))
+    changes.sort()
+    return dict(latency_reduction_percent=100 * (1 - candidate["ms"] / baseline["ms"]),
+                paired_bootstrap_95_percent=[changes[100], changes[3899]])
 
 
 def analyze_trace(path):
@@ -50,31 +65,52 @@ def main():
     p.add_argument("directory", type=Path)
     p.add_argument("--output", type=Path)
     args = p.parse_args()
-    result = dict(measurements=[], diagnostics={})
+    result = dict(measurements=[], diagnostics={}, runs={}, parity={}, comparisons=[])
     workload_hashes = {}
+    workspaces = {}
     for log in sorted(args.directory.glob("*_ep16_node0.log")):
         label = log.name.removesuffix("_ep16_node0.log")
-        if not label.endswith("_measure"):
-            continue
         manifest = json.loads((args.directory / f"{label}.manifest.json").read_text())
+        clock_file = args.directory / f"{label}.clocks.json"
+        result["runs"][label] = dict(manifest=manifest,
+            clocks=json.loads(clock_file.read_text()) if clock_file.exists() else [])
         for line in log.read_text().splitlines():
+            if line.startswith("TRAINING_PARITY_JSON "):
+                result["parity"].setdefault(label, []).append(json.loads(line.split(" ", 1)[1]))
             if not line.startswith("TRAINING_CYCLE_JSON "):
                 continue
             raw = json.loads(line.split(" ", 1)[1])
             shape = "qwen" if "_qwen_" in label else "flash"
             variant = next(v for v in ("bound", "split", "weighted", "rail") if f"_{v}_" in label)
             route, tokens = raw["route_distribution"], raw["nominal_tokens_per_rank"]
-            key = (shape, route, tokens)
+            mode = label.rsplit("_", 1)[1]
+            key = (mode, shape, route, tokens, raw["warmups"], raw["samples"])
             hashes = raw["workload_sha256_per_rank"]
             if key in workload_hashes and hashes != workload_hashes[key]:
                 raise ValueError(f"Unmatched workload: {label}, {tokens}")
             workload_hashes[key] = hashes
+            if key in workspaces and workspaces[key] != raw["per_rank_workspace"]:
+                raise ValueError(f"Unmatched persistent capacity: {label}, {tokens}")
+            workspaces[key] = raw["per_rank_workspace"]
+            if mode == "trace":
+                result["runs"][label].setdefault("workloads", []).append(raw)
+                continue
             result["measurements"].append(dict(label=label, shape=shape, variant=variant,
                 route=route, tokens=tokens,
                 ms=raw["forward_ready_slowest_rank_p50_us"] / 1000,
                 manifest=manifest, raw=raw))
+    for row in result["measurements"]:
+        if row["variant"] == "bound":
+            continue
+        baseline = next((other for other in result["measurements"]
+                         if other["variant"] == "bound" and
+                         all(other[key] == row[key] for key in ("shape", "route", "tokens"))
+                         and other["label"].split("_", 1)[0] == row["label"].split("_", 1)[0]), None)
+        if baseline:
+            result["comparisons"].append(dict(label=row["label"], tokens=row["tokens"],
+                baseline=baseline["label"], **paired_latency_change(baseline, row)))
     for directory in sorted(args.directory.glob("*_trace")):
-        if not directory.is_dir():
+        if not directory.is_dir() or not (args.directory / f"{directory.name}.clocks.json").exists():
             continue
         cases = defaultdict(list)
         for path in sorted(directory.glob("t*.rank*.json")):
@@ -95,6 +131,16 @@ def main():
                 "fc2_to_reduce_ms", "admit_return_only_ms", "admit_any_return_ms")}
             diagnostics[case] = dict(ranks=ranks, nodes=nodes, summary=summary)
         result["diagnostics"][directory.name] = diagnostics
+    traffic = {}
+    for label, cases in result["diagnostics"].items():
+        shape = "qwen" if "_qwen_" in label else "flash"
+        route = "balanced" if "_balanced_" in label else "random"
+        for case, data in cases.items():
+            key = (shape, route, case)
+            totals = [sum(n["bytes"]) for n in data["nodes"]]
+            if key in traffic and totals != traffic[key]:
+                raise ValueError(f"Unmatched Return bytes: {label}/{case}")
+            traffic[key] = totals
     output = args.output or args.directory / "summary.json"
     output.write_text(json.dumps(result, indent=2) + "\n")
     for row in result["measurements"]:

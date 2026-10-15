@@ -102,6 +102,10 @@ EVENTS = {
     116: "dispatch_get_issued",
     117: "window_admitted",
     118: "tma_wait_ns",
+    119: "admit_wait_ns",
+    120: "tx_credit_wait_ns",
+    121: "return_worker_bytes",
+    122: "return_nic_wait_ns",
 }
 
 PAIRS = {

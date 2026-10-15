@@ -4,6 +4,169 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M20：分离 TX 生命周期与 Return 发送负载的消融（2026-10-15）
+
+**结论：Qwen 非均衡 FWD 的 rail 收益主要来自发送分流，不是仅将 TX
+与 X/S 解耦。TX 反压确实存在，但它不等于端到端关键路径；rail 自身
+也可能等待 TX credit。Flash 没有相同的通信尾部，强行统一成 rail 会
+回退。保留两种生产策略，默认及正式 profile 不变。**
+
+实验实现提交 `562fbb7`；完整样本、二进制/工作负载 hash、时钟、数值
+检查及逐 rank 诊断汇总见
+`benchmarks/results/pf_return_mechanism_20261015.json`。
+没有新增 GEMM、pack kernel、动态任务队列或持久 payload buffer。
+
+### 四组对照，先排除布局混杂
+
+| 配置 | 发送 GPU | TX 生命周期 | TX 地址/任务目录 |
+|---|---|---|---|
+| A / bound | 计算卡直发 | 绑定 compute slot | 原 compute-slot 映射、原静态 owner |
+| B / split | 计算卡直发 | 独立 | 与 A 完全相同 |
+| C / weighted | 计算卡直发 | 独立 | 按专家分区、交错任务目录，rail group=1 |
+| D / rail | 本节点所有 rail | 独立 | 同一专家分区算法、交错目录，rail group=8 |
+
+A→B 只隔离生命周期；B→C 检查分区和目录变化；C→D 检查发送拓扑。
+C/D 的物理总容量相同，但 group 宽度也会改变每专家的槽位分配及可借用
+的 rail 容量，不能把它叫作“所有槽位地址都相同的纯 NIC 指令消融”。
+所有对照的逐 rank workload SHA、实际持久 compute/GIN/notify 容量一致。
+MNK、GEMM 顺序、48 个 Put worker、pending=4、Dispatch、缓存和 reduce
+保持不变。B 不通过额外显存扩大预取深度。
+
+新增独立 TX 支持仍复用同一 main/GEMM/Return worker；不是复制一份算子。
+`WEFTMOE_PF_RETURN_INDEPENDENT_TX` 和 `WEFTMOE_PF_RETURN_EXPERT_TX` 是本轮
+编译期消融覆盖，默认均由 `return_rails != 1` 推导，保持 M19 行为。
+未修改正式 autotune candidate/table，也不宣称新增轴已做最优搜索。
+B 的 TX generation 从独立物理控制槽的累计 publication 推导，再加本次
+compute slot 的复用次数，不能直接复用会被 BWD 调整的 compute generation。
+
+### 正式性能：完整带缓存 FWD，ms
+
+双机 EP16，每 rank 的名义 tokens；Qwen H2048/I512/E256/top8/B1024，
+Flash H4096/I2048/E256/top6/B2048。沿用每调用新路由、tokens 正态波动
+10%、随机路由 bias std=0.5。完整 prime trace + 4 warmups / 16 samples，
+取每步最慢 rank 的 p50。包括 notify、saved X/GU 申请、权重重排、main
+及 device synchronize；固定 pool 已预热，不使用提前准备权重的计时。
+正式构建无插桩，编译和 GPU 计时不重叠。以下全是 PF 内部对照，**不是
+Megatron、V3 或无缓存 inference 的结果**。
+
+| shape / 路由 | tokens | A 绑定直发 | B 同布局独立 TX | C 专家分区直发 | D rail 分流 |
+|---|---:|---:|---:|---:|---:|
+| Qwen / 均衡 | 8K | 6.206 | 6.283 | 6.206 | 6.602 |
+| Qwen / 均衡 | 20K | 13.697 | 13.696 | 14.432 | 14.575 |
+| Qwen / 非均衡 | 8K | 7.255 | 7.245 | 7.468 | 6.547 |
+| Qwen / 非均衡 | 20K | 16.807 | 16.823 | 17.014 | 14.347 |
+| Flash / 均衡 | 8K | 9.568 | 9.661 | 9.572 | 10.371 |
+| Flash / 均衡 | 20K | 20.243 | 20.821 | 20.433 | 21.958 |
+| Flash / 非均衡 | 8K | 11.365 | 11.310 | 11.402 | 11.058 |
+| Flash / 非均衡 | 20K | 25.158 | 25.547 | 25.859 | 26.028 |
+
+- Qwen 非均衡 A→B 为 +0.14% / -0.10% 延迟收益，未恢复性能；A→D 为
+  **+9.76% / +14.63%**。均衡 A→D 则回退 6.37% / 6.41%。
+- Flash 非均衡 A→D 为 +2.71% / -3.46%；均衡回退 8.40% / 8.47%。
+  8K 的小幅正向点估计不作为稳定收益：4000 次配对 bootstrap 的 95%
+  区间为 -4.19% 至 +7.19%。Qwen A→B 的区间也跨 0，而 A→D 非均衡
+  两档区间均为正。该区间只描述本批样本，不代替多轮独立重复。
+- 两机均设置 1620 MHz；正式运行归档的 10,640 条 GPU 时钟观测均为
+  1620 MHz。仍是稀疏采样，不等于逐个毫秒区间的频率证明。
+
+### 机制证据：等待存在，但不能直接加到关键路径上
+
+诊断版与正式版分开。每组 2 warmups / 1 sample，使用同一份短 trace
+并 prime；诊断组之间 workload SHA 一致，但不是上表 16 个计时样本的
+逐样本阶段分解。各时间先在同一 GPU 的 globaltimer 域内相减。main
+取 16 ranks 中位数；准入等待取 rank 最大值；producer 等待取所有 CTA
+中最大的累计值。**这些并行/嵌套的时间不可相加。**
+
+`AdmitWaitNs` 同时检查窗口所需所有槽位，按 FC1=1、FC2=2、returned=4
+分类；mask=4 才是 FC1/FC2 都已退役的等待。A 的 returned 由 NIC 完成
+归还，B/C/D 则是 math 的早归还，后者的小残余不能叫 NIC 等待。
+`TxCreditWaitNs` 单独记录 producer 的 consumed 等待。另记录每个实际
+发送 GPU/worker 的有效字节及 completion 等待，不用路由推算的旧
+source-rail 字节代替当前 FWD 的发送分布。
+
+| Qwen 非均衡 | 配置 | main ms | returned-only 准入等待最大 ms | TX producer 累计等待最大 ms |
+|---|---|---:|---:|---:|
+| 8K | A | 7.077 | 1.262 | — |
+| 8K | B | 7.087 | 0.009 | 0.000 |
+| 8K | C | 7.209 | 0.012 | 0.000 |
+| 8K | D | 5.204 | 0.014 | 0.000 |
+| 20K | A | 14.768 | 11.249 | — |
+| 20K | B | 14.592 | 0.286 | 2.878 |
+| 20K | C | 14.590 | 0.252 | 4.097 |
+| 20K | D | 11.609 | 0.348 | 5.529 |
+
+A/20K 的 returned-only 准入等待 rank 中位数为 2.905 ms，反压是实际
+观察到的，不再只是代码推断。但是 B 大幅减少了这类等待，main 却基本
+不变；20K 的一部分等待移到了 producer，8K 的独立 TX 根本没有阻塞。
+D/20K 仍有 TX 等待，最大 CTA 累计值甚至高于 B/C，main 却更快。
+因此不能用“累计等待更少”替代端到端收益。
+
+### 发送负载确实摊平，且总有效字节没有减少
+
+下表是每节点“最忙 GPU 的实际 Return 字节 / 该节点 GPU 平均字节”。
+A/B/C 相同，D 改变发送分布；所有对照每节点的总有效 Return 字节完全
+相同。分流均衡的是整 M-block，跨机有效行数不完全相同，因此不是精确
+字节均分，也没有 pre-reduce。
+
+| shape / 非均衡 | tokens | 直发：节点 0 / 1 | rail：节点 0 / 1 |
+|---|---:|---:|---:|
+| Qwen | 8K | 2.260 / 1.254 | 1.070 / 1.030 |
+| Qwen | 20K | 1.571 / 1.662 | 1.066 / 1.017 |
+| Flash | 8K | 2.354 / 1.287 | 1.063 / 1.067 |
+| Flash | 20K | 1.618 / 1.727 | 1.020 / 1.019 |
+
+Qwen/8K 的 C→D：两者都没有 TX producer 阻塞；各 rank 相对自身 main
+入口的最晚 FC2 完成值由 4.056 变成 4.283 ms，最晚 Return worker 完成
+值却由 6.897 降至 4.886 ms，main 从 7.209 降至 5.204 ms。不是 GEMM
+变快，也不是靠 TX 不再耗尽来解释这约 2 ms 的通信收尾改善。上述是
+各 rank 的相对时刻统计，不将不同 GPU 的时间戳直接相减当成单条链路。
+
+Flash 的发送量同样变均衡，却未必缩短关键路径。20K 直发的最后计算
+rank=12 在 23.426 ms 完成 FC2，23.487 ms 完成自身 Return，尾部仅
+**0.061 ms**；发送大部分已藏在计算内。rail 下该 rank 的 FC2 延至
+25.103 ms，main 中位数从 24.225 变成 25.906 ms。额外机内写出、独立
+credit 和目录处理没有足够通信尾部可以抵消；未把这部分回退逐指令
+归因于某一种 store 或 atomic。
+
+均衡 Qwen 的直发字节比本来就是 1.000/1.000。20K 的 B 没有 producer
+TX 等待，C/D 却分别有最多 5.202/5.022 ms 的 CTA 累计等待，说明专家
+分区会改变容量约束；不能把均衡场景的全部回退都归给 NVLink 中转。
+也不把 rail 收益全部写成纯 NIC 带宽收益：它同时改变发送 worker 的
+负载、通信时序及各专家可用的 rail 容量。现有受控实验支持“发送分流
+是主导收益，单纯生命周期解耦不是”，不支持更细的收益百分比拆账。
+
+### 保留、验证与复现
+
+保留默认/Flash `return_rails=1` 和现有 Qwen 非均衡 profile 的 0。
+两者各有明显适用范围，不为了统一而牺牲性能。B/C 的显式编译覆盖可
+继续用于消融，但不替换生产默认，不增加按模型名称判断的分支。
+
+- 新增 B/C、两种 shape，EP16、129/8192/20480 × 两份新 tape，
+  output/dX/dGate/dW1/dW2 全部通过，覆盖 FWD→BWD→FWD。
+- 同四个组合另测 B128/D2、8K、bias std=10 × 两份 tape，五项通过，
+  覆盖小容量和强热点下的反复复用。没有新增碎片化单测。
+- 八个正式构建 main 均为 168 registers、0 stack、0 spill。诊断构建
+  有额外计数/trace 开销，不能拿其 main 时间替代正式性能。原 count
+  notify 的既有 spill 不在本轮修改范围内。现有 15 个 tuning 检查通过。
+- 本轮未测 BWD、单机或无缓存 inference 的性能，不外推这些路径。
+
+复现（build 与 measure 不并行；先将两机时钟设为 1620 MHz）：
+
+```bash
+python benchmarks/ablate_pf_return.py build
+python benchmarks/ablate_pf_return.py measure --label r1 --port 28800
+python benchmarks/ablate_pf_return.py build --timeline
+python benchmarks/ablate_pf_return.py trace --shapes qwen --routes random balanced \
+  --warmups 2 --samples 1 --label diag --port 28900
+python benchmarks/ablate_pf_return.py trace --shapes flash --variants bound split rail \
+  --routes random --warmups 2 --samples 1 --label diag --port 28920
+python benchmarks/analyze_pf_return.py build/pf_return_mechanism_20261015
+```
+
+已有目录重跑时用不同 `--label`/`--output`，不覆盖已归档的运行 manifest。
+运行器和诊断分析器分别为 `benchmarks/ablate_pf_return.py`、
+`benchmarks/analyze_pf_return.py`；原始设备 trace 保留于上述 build 目录。
+
 ## M19：Return 就绪扫描与可调 rail 分流（2026-10-15）
 
 本轮保留跨窗口 canonical M128，不恢复逐窗口 padding，不改 MNK、
