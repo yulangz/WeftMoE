@@ -60,7 +60,30 @@ DP 组同时出现 decode 与 prefill，当前 SGLang 的 `global_forward_mode`
 入口。现改用 SGLang 已有全组 MAX 汇总的 `is_extend_in_batch`：混合
 批次全部走 PF，纯 decode（含 idle rank）统一 DT，无新增 collective。
 原始日志、时钟与 `mixed_phase_rank{0,1}_stack.json` 保留，修正后的
-Weft trial 使用 `-r1`，baseline 原配置继续运行。
+第一次修正后重试 `-r1` 在服务启动期遇到 SGLang 派生握手端口占用，
+同样没有完成 update，不纳入性能。未修改 AReaL 端口分配器，也未终止
+未知端口占用者；清理本次失败任务、确认八张卡显存释放和 CUDA 检查
+通过后，以新自动端口启动 `-r2`。baseline 原配置继续运行。
+
+### 首轮端到端验收（中间结果，不作为稳态结论）
+
+`-r2` 完成首个 update、AWEX 权重同步和下一轮生成，无 OOM 或 kernel
+错误。首轮 LR=0，仍需后续非零 LR update 验证更新后的持续运行。
+
+|首个完整 update|baseline|当前 DT/PF|
+|---|---:|---:|
+|rollout，s|725.41|673.20|
+|train_step，s|239.11|205.98|
+|update_weights，s|16.657|27.415|
+|有效训练 token|5,313,900|5,603,300|
+|有效 token / rollout 秒|7,325|8,323|
+|有效 token / train_step 秒|22,224|27,203|
+
+有效 token 来自 `ppo_actor/update/n_valid_tokens`（loss mask），不是服务端
+所有生成 token；训练吞吐包含整个 actor step，不是单层 PF FWD/BWD。
+该轮实验组 token 多约 5.4%，rollout/训练归一化吞吐高约 13.6%/22.4%；
+但权重更新及恢复多约 10.76 s，不能省略此开销。首轮含编译和首次分配，
+需单列，后续按相同 update 编号排除首轮配对统计。
 
 ## 常驻通信缓存与共卡释放复测（2026-10-02）
 
