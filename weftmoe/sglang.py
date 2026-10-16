@@ -478,7 +478,12 @@ def patch_dp_attention_layout():
         global _decode_batch
         previous_decode = _decode_batch
         mode = forward_batch.global_forward_mode or forward_batch.forward_mode
-        _decode_batch = mode.is_decode()
+        # global_forward_mode is populated only by some SGLang schedules.
+        # is_extend_in_batch is the existing DP-wide phase agreement even
+        # when local ranks mix decode, prefill and idle work.
+        _decode_batch = not forward_batch.is_extend_in_batch and (
+            mode.is_decode() or mode.is_idle()
+        )
         try:
             return run_lm_forward(
                 self, input_ids, positions, forward_batch, input_embeds,

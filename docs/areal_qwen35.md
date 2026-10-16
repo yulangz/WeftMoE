@@ -52,6 +52,16 @@
 后分别报告 rollout 时间/有效生成 token 吞吐、训练时间及 update 间隔。
 W&B 与历史启动器一致暂为 disabled，仅本地日志，不声称已同步线上。
 
+首次整模型尝试在首批生成中停住，未完成任何 update，不纳入性能：
+DP 组同时出现 decode 与 prefill，当前 SGLang 的 `global_forward_mode`
+只在部分调度模式赋值，此时为 None；退回本 rank 的模式导致通信池
+不一致。采样显示 DT graph 回放分别停在约 3.7K/5.0K，py-spy 确认同组
+一张卡在 `forward_decode`、另一张在 `forward_extend`，都等在 native
+入口。现改用 SGLang 已有全组 MAX 汇总的 `is_extend_in_batch`：混合
+批次全部走 PF，纯 decode（含 idle rank）统一 DT，无新增 collective。
+原始日志、时钟与 `mixed_phase_rank{0,1}_stack.json` 保留，修正后的
+Weft trial 使用 `-r1`，baseline 原配置继续运行。
+
 ## 常驻通信缓存与共卡释放复测（2026-10-02）
 
 `ceec6a0` 将 PF Backward 的 peer payload 改为容量复用：一个 runtime
