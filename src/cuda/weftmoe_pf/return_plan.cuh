@@ -84,8 +84,8 @@ __device__ __noinline__ void prepare_return(const ForwardKernelArgs &a) {
   constexpr auto m = forward_tuning::kTileM;
   constexpr auto tiles =
       forward_tuning::kMainHidden / forward_tuning::kFc1TileN;
-  if constexpr (!WEFTMOE_PF_RETURN_EXPERT_TX) {
-    // Preserve the compute-slot address mapping when isolating TX lifetime.
+  if constexpr (WEFTMOE_PF_RETURN_RAILS == 1) {
+    // Direct Return keeps the compute-slot TX address mapping.
     for (auto block = worker / 32U; block < r.state->blocks;
          block += workers / 32U) {
       auto &desc = r.blocks[block];

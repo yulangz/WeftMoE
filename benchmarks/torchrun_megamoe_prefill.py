@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PF/DT/V3/MegaMoE inference on a shared route trace (MegaMoE/DT: one node).
+"""PF/DT/MegaMoE inference on a shared route trace (MegaMoE/DT: one node).
 
 Measures eager forward + device synchronize, including MegaMoE input staging.
 MegaMoE packs immutable weights once. PF eager packs on each call by default;

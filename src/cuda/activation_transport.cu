@@ -4989,12 +4989,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   if (network_prefill && forward_main_compute_ctas < weftmoe_pf::kNetworkOwners)
     throw std::invalid_argument("PF network requires a CTA per network owner");
   auto kStaticUnified = weftmoe_pf::local::kernel;
-  if (network_prefill)
-    kStaticUnified = weftmoe_pf::network::kernel;
   const bool decode = args.fused_inference_routes &&
                       weftmoe_dt::eligible(state->config, layout.static_ring);
-  if (local_prefill)
-    kStaticUnified = weftmoe_pf::local::kernel;
   if (network_prefill)
     kStaticUnified = weftmoe_pf::network::kernel;
   // Arithmetic variants share the same physical blocks and rank

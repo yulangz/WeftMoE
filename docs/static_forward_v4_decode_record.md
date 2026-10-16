@@ -1,5 +1,108 @@
 # 单机 decode 专属实现与验收记录
 
+## 2026-10-16：Qwen 小 batch，现版 PF / DT / SGLang 对比
+
+**结论：这次 Qwen 的 1/8/64/128/512 tokens，DT 均快于 PF。DT 相对
+SGLang 默认 Triton 基线，EP8 延迟降低 15.9%–48.9%，EP4 降低
+2.3%–23.6%；EP4 的 8 tokens 只是小幅优势。PF 在 EP8 的 128/512、
+EP4 的 512 tokens 才领先该基线，EP8 的 64 tokens 基本持平。**
+
+这轮是代码清理和性能测量，不修改生产切换阈值，不引入新的 GEMM 优化。
+不能将 Flash 下测出的 PF/DT 分界直接用于 Qwen。
+
+### 口径
+
+- Qwen3.5-35B-A3B：H2048/I512/E256/top-k8，BF16；仅 routed MoE，
+  不含 router、shared expert、attention 或完整模型推理。
+- 单机 DP4+EP4、DP8+EP8，attention/expert TP1。下表 tokens **每卡**计数，
+  全局分别乘 4/8；不是 TP4/TP8 复制输入口径，也没有跨机测试。
+- SGLang `0.5.10.post1`、Triton `3.5.1`、PyTorch `2.9.1+cu129`。
+  基线为 `moe_runner_backend=triton, moe_a2a_backend=none`，包含
+  all-gather、本地专家 GEMM、reduce-scatter；不是 DeepEP。安装目录没有
+  L20X 的 E32/E64、N512 专用 tuning 文件，实际使用默认 Triton 配置，
+  **不能称为已调优 SGLang 的性能上限**。
+- PF/DT 包含与 SGLang 接入相同的 fused input staging，以及完整
+  dispatch、FC1/FC2、return/reduce；PF 的独立 notify 也在计时内。
+  不保存训练中间结果。排除固定 buffer 初始化、权重重排和外部输入更新。
+- NVIDIA L20X，SM 锁 1620 MHz。精确 tokens；每个 sample 更新 X 和路由，
+  route bias std=0.5、seed100，各实现共享路由及权重；不是均衡专家负载。
+  每点 5 warmups、20 samples、每 sample 50 次 graph replay；两轮反转
+  backend 和 tokens 顺序。表中为两轮 **逐 sample 最慢 rank p50 的均值**，
+  单位 µs/调用；SGLang 列汇总与 PF/DT 配对的四轮基线 p50。
+- PF/DT 均固定 pool capacity512、B512/D2；计时中没有重新申请通信池。
+  **DT 的生产 eligibility 仍是 ≤64**。本次诊断构建仅通过
+  `WEFTMOE_DT_MAX_TOKENS=512` 放宽入口容量，并保留单窗口约束，计算和
+  通信实现不变。128/512 是强制 DT 的实测，不能解释成生产适配器已经
+  自动选择 DT。所有点均在计时外检查实际 kernel 名称，拒绝 PF fallback。
+
+### DP4 + EP4
+
+| tokens/rank | PF µs | DT µs | SGLang µs | DT 相对 SGLang 延迟降低 |
+|---:|---:|---:|---:|---:|
+| 1 | 105.68 | 50.02 | 65.46 | 23.58% |
+| 8 | 167.79 | 99.35 | 101.70 | 2.31% |
+| 64 | 256.58 | 182.58 | 212.39 | 14.04% |
+| 128 | 274.24 | 189.00 | 240.50 | 21.42% |
+| 512 | 373.69 | 314.95 | 402.08 | 21.67% |
+
+### DP8 + EP8
+
+| tokens/rank | PF µs | DT µs | SGLang µs | DT 相对 SGLang 延迟降低 |
+|---:|---:|---:|---:|---:|
+| 1 | 91.94 | 48.81 | 75.97 | 35.75% |
+| 8 | 152.92 | 103.50 | 123.06 | 15.89% |
+| 64 | 174.36 | 132.62 | 173.52 | 23.57% |
+| 128 | 197.35 | 174.02 | 233.61 | 25.51% |
+| 512 | 285.02 | 247.40 | 483.95 | 48.88% |
+
+DT 保留原始 BF16x2 FC1 写出，没有重新启用已撤回的 16B 写出实验。
+M16/M64 仍按现有规则选择：EP4 在 128/512 使用 M64，EP8 在
+64/128/512 使用 M64，其余点为 M16；PF 使用 M128/N256/K64。
+Qwen 每专家的平均输入行数是 `tokens × EP × top-k / E`；512 tokens
+在 EP4/EP8 下分别只有 64/128 行，且真实专家行数不均衡。这说明这里仍
+需要重视小 M 的效率，但本次没有分离消融 padding、N tile 或权重带宽，
+不能把全部差距归结为某一个因素，也不能直接推出通用切换阈值。
+
+### 清理与验证
+
+移除未采用的“专家分区直发”独立开关，布局直接由 `return_rails` 决定；
+保留同布局独立 TX、rail 分流和用于复测的绑定 lifetime 开关。历史四路
+消融可从 `7bd4d75` 恢复，历史结果未删除。删除 host 上重复的 kernel
+选择，更新过时说明；没有改 GEMM、warp 分工或同步协议。
+
+清理前后的 Qwen rail 构建，13 个 PF 设备函数的 SASS 指令编码逐函数
+一致，包括 local/network main；PF main 168 registers、DT M16/M64
+80/128 registers，均无 spill。39 项现有 autotune 检查通过，未增加细碎单测。
+正式采样中每次更换输入后都对照 SGLang 输出，最大绝对差为
+2.28882e-5，容差检查全部通过；额外用 bias std=10 的热点路由验证 DT
+扩展容量，EP8 覆盖全部五档，EP4 覆盖 128/512，共 96 个 rank/sample，
+最大 relative L2 为 2.57108e-4。正式计时前后采到的
+SM 频率均为 1620 MHz；这仍是采样核验，不是逐周期保证。
+
+原始样本、每轮 p50、路由 hash、入口验证、热点误差、binary manifest
+和时钟统计见 [结果 JSON](../benchmarks/results/qwen35_small_inference_20261016.json)。
+SGLang 与 PF/DT 的路由 hash 在每个 topology/token 点全部一致。
+
+复现（两种构建及 GPU 计时分开，不同时编译和测量）：
+
+```bash
+/opt/.venv/bin/python benchmarks/build_pf_main_timeline.py qwen_small_pf_20261016 \
+  --profile configs/pf_qwen35_compact_20261013
+/opt/.venv/bin/python benchmarks/build_pf_main_timeline.py qwen_small_dt_20261016 \
+  --profile configs/dt_qwen35_probe_20261016 --define WEFTMOE_DT_MAX_TOKENS=512
+
+# DT 换 artifact 和 --weft-backend；EP4 换 --gpus-per-node 4，并使用新 label/port。
+/opt/.venv/bin/python benchmarks/run_pf_network.py \
+  --artifact build/pf_main_timeline/qwen_small_pf_20261016 \
+  --label pf_dp8_recheck --output build/qwen_small_recheck \
+  --nodes 1 --gpus-per-node 8 --master-port 30226 \
+  --env WEFTMOE_STATIC_RING_TOKENS=512 \
+  --env WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS=2 \
+  --benchmark benchmarks/torchrun_sglang_decode.py -- \
+  --weft-backend pf --dp-attention --tokens 1 8 64 128 512 \
+  --fresh-routes --route-bias-std 0.5 --samples 20
+```
+
 ## 2026-10-09：DT 恢复原实现，后续优化重心转向 PF
 
 按用户要求，撤回 `d158eb9` 中 DT 的 FC1 128-bit写出改动，M16/M64均恢复

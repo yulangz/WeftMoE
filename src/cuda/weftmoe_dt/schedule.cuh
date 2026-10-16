@@ -13,6 +13,11 @@ namespace weftmoe_dt {
 #ifndef WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER
 #define WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER 0
 #endif
+// Keep production selection unchanged; diagnostic builds can compare larger
+// batches provided the complete invocation still fits a single source window.
+#ifndef WEFTMOE_DT_MAX_TOKENS
+#define WEFTMOE_DT_MAX_TOKENS 64
+#endif
 constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U;
 constexpr unsigned kStages = WEFTMOE_FWD_LOCAL_DECODE_STAGES;
 constexpr unsigned kSelectedM = WEFTMOE_FWD_LOCAL_DECODE_M;
@@ -30,7 +35,7 @@ using WarpMma = cute::SM80_16x8x16_F32BF16BF16F32_TN;
 using GroupMma = hopper::BF16Mma<kN>;
 
 // Selection uses collective capacity, never one source's actual batch size.
-// One window covers even the all-to-one-expert case. Larger pools keep V4.
+// One window covers even the all-to-one-expert case. Larger pools keep PF.
 inline bool eligible(const ActivationTransportPoolConfig &config,
                      const static_forward::ComputeRingLayout &ring) {
   return forward_tuning::kStaticV4PrefillEnabled &&
@@ -38,7 +43,8 @@ inline bool eligible(const ActivationTransportPoolConfig &config,
          forward_tuning::kTileM == kBlockM && forward_tuning::kTileK == kK &&
          forward_tuning::StaticV4Gemm<true>::kFc1N == kN &&
          forward_tuning::kFc2TileN == kN && config.max_nodes == 1U &&
-         !config.enable_backward_state && config.max_tokens_per_rank <= 64U &&
+         !config.enable_backward_state &&
+         config.max_tokens_per_rank <= WEFTMOE_DT_MAX_TOKENS &&
          ring.depth && ring.max_windows == 1U && config.max_world_size <= 32U &&
          config.max_owned_experts * config.max_world_size <= kMaxExperts;
 }

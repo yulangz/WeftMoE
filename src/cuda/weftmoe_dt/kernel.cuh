@@ -2,7 +2,7 @@
 
 // Single-node decode follows MegaMoE's fixed pull/TMA/math dataflow, using the
 // existing Weft numerical primitives and IPC allocation. Long-context and
-// network scheduling remain in static_v4; no dynamic task queue is shared.
+// network scheduling remain in weftmoe_pf; no dynamic task queue is shared.
 #include "cuda/weftmoe_dt/compute.cuh"
 
 namespace weftmoe_dt {

@@ -24,7 +24,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
   const auto lane = threadIdx.x % 32U;
   const auto bytes = a.hidden * 2U;
   constexpr unsigned task_stride =
-      !WEFTMOE_PF_RETURN_EXPERT_TX ? kPutWorkers : 1U;
+      WEFTMOE_PF_RETURN_RAILS == 1 ? kPutWorkers : 1U;
   const auto first = std::uint64_t(worker) * (task_stride == 1U ? 32U : 1U);
   unsigned issued = 0U, completed = 0U;
   std::uint64_t packets = 0U, payload = 0U, remaining = 0U;

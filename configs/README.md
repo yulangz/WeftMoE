@@ -11,7 +11,8 @@ Historical measurement IDs and reports are not rewritten.
 | `dt_flash_probe_20261009` | Stable single-node DT, same shape; collective capacity <=64 |
 | [`pf_qwen35_20261013`](pf_qwen35_20261013/README.md) | Tuned cached PF FWD+BWD, H2048/I512/E256/top-k8, EP8/EP16 |
 | [`pf_qwen35_compact_20261013`](pf_qwen35_compact_20261013/README.md) | Compact local contributions and window-ordered network tape; Qwen M14 candidate and validation status |
-| [`pf_flash_strategy_20261015`](pf_flash_strategy_20261015/README.md) | Flash transfer experiment with Qwen dataflow switches; mixed/negative results, **not a replacement default** |
+| [`pf_flash_strategy_20261015`](pf_flash_strategy_20261015/README.md) | Current Flash direct Return profile; B2048, independent TX credits; historical whole-profile experiments are documented separately |
+| [`dt_qwen35_probe_20261016`](dt_qwen35_probe_20261016/README.md) | Stable DT specialized to H2048/I512/E256/top-k8; small-batch inference comparison |
 
 PF keeps M128/N256/K64, three input stages, two-CTA multicast, FC1 register-vector
 writeback and the retained FC2 epilogues. Both PF modes run standalone notify
@@ -29,12 +30,15 @@ python tools/build_tensor_runtime.py --library build/current_pf/libweftmoe.so
 
 Select the printed extension with `WEFTMOE_TENSOR_EXTENSION`. Set ring capacity
 before preparing a runtime (`WEFTMOE_STATIC_RING_TOKENS`,
-`WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS`); the measured network configuration
-uses 4096 tokens and two contribution windows. Network contributions retain the
+`WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS`); use each profile's documented
+capacity (current Flash B2048/D2, Qwen EP16 B1024/D2). Network contributions retain the
 complete invocation, while dispatch RX and X/S/return TX remain bounded rings.
-`WEFTMOE_PF_MIN_RING_DEPTH=2` and `WEFTMOE_PF_CREDIT_WINDOWS=2` select the retained
+`WEFTMOE_PF_MIN_RING_DEPTH=2` and `WEFTMOE_PF_CREDIT_WINDOWS=4` select the current
 network capacity settings. Worker mode, publication-plan and return-deduplication
-switches have been removed: only the retained settings are compiled.
+switches have been removed: only the retained settings are compiled. Direct
+Return uses compute-slot TX addresses and independent credit; wider rail groups
+partition TX by expert. The experimental expert-partitioned direct layout is
+archived at `7bd4d75`, not a third production path.
 
 For PF inference timing, use `benchmarks/torchrun_megamoe_prefill.py --backend pf
 --prepared-weights`. For cached FWD or FWD+BWD, use `tools/benchmark_training.py

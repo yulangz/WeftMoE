@@ -1,7 +1,8 @@
-"""Separate PF Return lifetime, TX partition, and sender-placement effects.
+"""Compare retained PF Return lifetime and sender-placement choices.
 
 Builds and GPU measurements are separate commands: do not overlap them.
 All GPU jobs run serially using the existing two-node launcher.
+The retired expert-partitioned direct experiment is at commit 7bd4d75.
 """
 import argparse
 import copy
@@ -16,10 +17,9 @@ from autotune_common import candidate_digest
 from autotune_training import generated_header
 
 VARIANTS = {
-    "bound": (1, 0, 0),
-    "split": (1, 1, 0),
-    "weighted": (1, 1, 1),
-    "rail": (0, 1, 1),
+    "bound": (1, 0),
+    "split": (1, 1),
+    "rail": (0, 1),
 }
 SHAPES = {
     "qwen": (2048, 512, 8, 1024, "pf_qwen35_compact_20261013"),
@@ -58,10 +58,9 @@ def main():
             if args.action == "build":
                 config = copy.deepcopy(json.loads(
                     (ROOT / "configs" / profile / "candidate.json").read_text())["config"])
-                rails, independent, expert = VARIANTS[variant]
+                rails, independent = VARIANTS[variant]
                 config["v4"]["return_rails"] = rails
-                overrides = dict(WEFTMOE_PF_RETURN_INDEPENDENT_TX=independent,
-                                 WEFTMOE_PF_RETURN_EXPERT_TX=expert)
+                overrides = dict(WEFTMOE_PF_RETURN_INDEPENDENT_TX=independent)
                 experiment = dict(config=config, overrides=overrides)
                 digest = candidate_digest(experiment)
                 header = generated_header(config)
