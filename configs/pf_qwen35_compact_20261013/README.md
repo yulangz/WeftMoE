@@ -12,6 +12,8 @@ This all-rail choice favors the measured skewed routes: it improves their
 8K/20K latency by 8.5%/14.8%, but regresses balanced routes by 6.9%/6.6%.
 It is not a universal winner. `return_rails=1` is the conservative global
 default; topology should be selected using the application's route trace.
+M21 changes that direct fallback to same-layout independent TX by default;
+this profile's all-rail protocol/selection is unchanged.
 
 Update after M17: the current header/candidate have removed M-block-owned
 pull and full-CTA BWD reduce (compiled ID `4d5985a6feb9`), prioritizing Flash.

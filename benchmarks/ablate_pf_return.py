@@ -39,6 +39,8 @@ def main():
     p.add_argument("--warmups", type=int, default=4)
     p.add_argument("--timeline", action="store_true", help="Build an instrumented artifact")
     p.add_argument("--label", default="r1")
+    p.add_argument("--artifact-tag", default="20261015",
+                   help="Use a new tag when rebuilding; keep prior binaries immutable")
     p.add_argument("--port", type=int, default=28700)
     p.add_argument("--window", type=int)
     p.add_argument("--bias", type=float, default=0.5)
@@ -51,7 +53,7 @@ def main():
         for variant in args.variants:
             timeline = args.timeline or args.action == "trace"
             suffix = "_trace" if timeline else ""
-            name = f"return_mechanism_{shape}_{variant}_20261015{suffix}"
+            name = f"return_mechanism_{shape}_{variant}_{args.artifact_tag}{suffix}"
             artifact = ROOT / "build/pf_main_timeline" / name
             if args.action == "build":
                 config = copy.deepcopy(json.loads(

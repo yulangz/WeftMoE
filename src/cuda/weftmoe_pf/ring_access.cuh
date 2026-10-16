@@ -2,6 +2,12 @@
 
 namespace weftmoe_pf::ring {
 
+// Direct Return's math and NIC-completion owners are on the same GPU. Only
+// striped rails need system-visible TX control; payload publication is separate.
+constexpr auto kReturnScope = WEFTMOE_PF_RETURN_RAILS == 1
+                                  ? ::cuda::thread_scope_device
+                                  : ::cuda::thread_scope_system;
+
 template <::cuda::thread_scope Scope = ::cuda::thread_scope_device>
 __device__ __forceinline__ std::uint64_t acquire(const std::uint64_t &word) {
   return ::cuda::atomic_ref<std::uint64_t, Scope>(

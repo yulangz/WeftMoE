@@ -4,6 +4,148 @@
 旧静态 BWD 曾作为迁移期间的正确性/性能对照；M11 清理后只保留当前
 PF stream BWD，旧代码可从 `7b558e8` 恢复。不将新 FWD 的收益外推到 BWD。
 
+## M21：轻量化同布局独立 TX（2026-10-16）
+
+**采用第二阶段实现作为直发默认：本地作用域 TX 控制、整块 NIC 完成
+credit、X/S 只等待计算读完成。最终带缓存 FWD 八项变化为
+-1.00%～+0.57%；inference 基本持平，Qwen 8K 的首轮 +2.06% 在反向
+确认中为 +0.26%。这是协议解耦与开销精简，不是稳定吞吐加速，也不是
+严格零回退。保留绑定模式的编译开关，现有 Qwen rail profile 不变。**
+
+沿用 M20 的 compute-slot→TX-slot 地址映射、容量、静态 Put owner 和
+GEMM 顺序，不引入专家分区、额外 pack、动态领取或新的持久 buffer。
+目标是保留独立 TX 的依赖关系，降低 M20/B 通用 rail 控制协议的成本；
+不是通过扩大缓冲或改变发送 GPU 获得收益。
+
+### 两步实现
+
+1. **本地控制域、整块完成 credit。** `return_rails=1` 的 TX producer、
+   publication 和 NIC-completion owner 都在同一 GPU，控制计数改用
+   device scope；FC2 输出的 `__threadfence_system()` 及 writer 同步保持
+   不变。含远端行的 M-block，由唯一 Put owner 在 FIFO 中最后一个
+   fragment 的本地 NIC completion 后，release-store `generation×128`
+   到 consumed；无需 math 补加本地行/padding、NIC 再累加远端行。
+   全本地块没有 NIC 读者，由 column 0 归还整代 credit。计数仍使用
+   M-row 单位，publication 仍是 N-tile 数，不改变跨调用 counter 契约。
+2. **删除直发独立模式的冗余 compute-return plane。** admission 仅检查
+   FC1/FC2 的读完成，不再查询/递增 compute-slot 的 returned/return_target，
+   math 也不再发布提前 returned。旧计数留在已完成状态；切回绑定模式
+   无需转换。TX 覆盖仍由 FC2 producer 等待上一代独立 consumed，不能
+   因为 X/S 已释放而提前覆盖 NIC 正在读取的数据。此步不改变 rail 或
+   单机路径的准入条件。
+
+TX generation 继续从独立 publication 加本调用复用序号推导，不能
+直接使用会被 BWD 重置/推进的 compute generation。两步均复用原 main，
+没有额外 warp/kernel/CPU 同步。绑定模式仍可显式编译选择。
+
+### 第一阶段：本地 scope + 整块 credit
+
+EP16、1620 MHz、带缓存完整 FWD，口径同 M20：每调用变化的路由和
+正态波动 10% 的 tokens；prime trace + 4 warmups / 16 samples，取逐步
+最慢 rank 的 p50。包括 notify、缓存申请、权重重排、main 和 synchronize；
+固定 pool 已预热。旧绑定二进制也在本轮重测，不直接对历史表计算收益。
+
+| shape / 路由 | tokens | 旧绑定 ms | 第一阶段独立 TX ms |
+|---|---:|---:|---:|
+| Qwen / 均衡 | 8K | 6.193 | 6.246 |
+| Qwen / 均衡 | 20K | 13.716 | 13.697 |
+| Qwen / 非均衡 | 8K | 7.276 | 7.254 |
+| Qwen / 非均衡 | 20K | 16.908 | 16.889 |
+| Flash / 均衡 | 8K | 9.576 | 9.606 |
+| Flash / 均衡 | 20K | 20.149 | 20.269 |
+| Flash / 非均衡 | 8K | 11.037 | 11.203 |
+| Flash / 非均衡 | 20K | 25.105 | 25.244 |
+
+第一阶段不是稳定加速：Flash 仍有 0.31%–1.50% 的延迟回退点估计。
+该批样本中，均衡 20K、非均衡 8K 的配对 bootstrap 区间也落在回退侧，
+因此继续精简计算侧的冗余 credit，而没有直接将第一阶段设为默认。
+原始记录见 [第一阶段结果](../benchmarks/results/pf_return_direct_stage1_20261016.json)，独立 artifact
+tag 为 `20261016`；旧绑定 artifact 保留 `20261015`，未覆盖。
+
+### 第二阶段：再删除独立直发的 compute-return plane
+
+同样的工作负载与计时口径，改为先测新版本、再测旧绑定。下表的正数
+表示新版本更慢。两轮都重新测量基线，不把不同轮次的绝对差值当作
+某一条指令的收益。
+
+| shape / 路由 | tokens | 旧绑定 ms | 新独立 TX ms | 延迟变化 |
+|---|---:|---:|---:|---:|
+| Qwen / 均衡 | 8K | 6.327 | 6.264 | -1.00% |
+| Qwen / 均衡 | 20K | 13.792 | 13.793 | +0.01% |
+| Qwen / 非均衡 | 8K | 7.284 | 7.236 | -0.66% |
+| Qwen / 非均衡 | 20K | 16.860 | 16.935 | +0.44% |
+| Flash / 均衡 | 8K | 9.588 | 9.631 | +0.45% |
+| Flash / 均衡 | 20K | 20.352 | 20.183 | -0.83% |
+| Flash / 非均衡 | 8K | 11.088 | 11.103 | +0.13% |
+| Flash / 非均衡 | 20K | 25.094 | 25.238 | +0.57% |
+
+本轮整体为亚百分比的小幅变化，不宣称稳定加速或严格零开销。
+Flash 非均衡 20K 的本批配对 bootstrap 仍支持小幅回退，不能全部
+归为噪声；其余七项区间跨 0。Qwen 均衡 8K 的相对方向在两轮之间
+反转，也说明不能将单轮的小差异直接解释成新的瓶颈结论。
+第二阶段 artifact tag 为 `20261016_admit`，原始日志与二进制 manifest
+保存在 `build/pf_return_direct_admit_20261016`。
+
+### 无缓存 inference 与 rail 回归
+
+纯 inference API，不写 saved X/GU，仍包含每调用权重重排、notify、main
+与 synchronize；固定 pool 已预热。EP16、4 warmups / 16 samples、随机
+路由及 tokens 波动沿用上述配置。不是提前准备权重后的 main-only 数据。
+
+| shape / 轮次 | tokens | 旧绑定 ms | 新独立 TX ms | 延迟变化 |
+|---|---:|---:|---:|---:|
+| Qwen / 首轮 | 8K | 6.766 | 6.905 | +2.06% |
+| Qwen / 反向确认 | 8K | 6.766 | 6.784 | +0.26% |
+| Qwen / 首轮 | 20K | 16.204 | 16.281 | +0.48% |
+| Flash | 8K | 10.366 | 10.394 | +0.27% |
+| Flash | 20K | 24.288 | 24.279 | -0.04% |
+
+Qwen 8K 首轮的配对 bootstrap 95% 区间为 -1.62%～+7.47% 延迟变化，
+没有将 +2.06% 直接视为确定回退；反向确认先测旧绑定、后测新版本，
+使用相同的 16 个样本。保留两轮结果，不用第二轮覆盖首轮。
+inference 四个 case 的逐 rank workload 相同，benchmark 提供的 rank0
+workspace 也一致；训练矩阵另校验了逐 rank workspace 和 workload。
+
+Qwen 非均衡 rail 的独立回归：8K 由 6.505→6.552 ms，20K 由
+14.498→14.435 ms，分别 +0.71%/-0.43%。此轮未重调 rail，也没有
+将其切成直发；最终代码的 admission 精简仅在独立直发编译分支生效。
+
+### 默认、验证与复现
+
+- `WEFTMOE_PF_RETURN_INDEPENDENT_TX` 默认改为 1。`return_rails=1`
+  继续使用 compute-slot 地址映射，不启用专家分区。显式设为 0 可在
+  同一份 kernel 中选择绑定直发；该覆盖只用于 `return_rails=1`。
+- 最终实现通过两种 shape 的 129/8K/20K、两份变化 tape，以及
+  B128/D2、8K、bias std=10 的强热点检查，共 16 次训练 FWD/BWD
+  reference 校验，覆盖 output/dX/dGate/dW1/dW2，最大相对 L2
+  小于 0.000787。另通过两种 shape 的无缓存 B128、8K、bias std=10，
+  各两份新输入，output 最大相对 L2 小于 0.000071。
+- 两种 shape 的最终 main 均为 168 registers、0 stack、0 spill。
+  没有新增持久 payload、共享显存预留、kernel 或 warp；现有 39 项
+  autotune 检查通过，没有新增细碎单测。BWD 仅做数值验证，未重测
+  性能；单机与 DT 编译路径未修改，不宣称本轮测过其性能。
+- 两机请求锁定 SM 1620 MHz。正式性能运行的采样均为 1620 MHz；
+  最终阶段归档的 13,456 条观测也全部为 1620 MHz。第一阶段的一次
+  **数值检查**有两条低频观测（1530/1575），不在性能表内。采样并非
+  逐毫秒频率证明。所有 GPU 任务已结束，池与进程退出后两机显存回到 0 MiB。
+
+[最终阶段原始结果](../benchmarks/results/pf_return_direct_20261016.json)
+包含全部训练/inference 样本、验证误差、workload、容量、时钟和
+二进制 manifest。第一阶段和最终阶段使用不同 artifact tag，旧绑定
+与旧 rail 二进制没有被覆盖。源码默认与已测显式 `split` 配置一致；
+已有 profile 的几何/配置 ID 不变，重新编译后采用新实现，源码版本和
+library hash 区分二进制。
+
+使用新的 artifact tag 对当前两种协议做复测，编译和计时分开：
+
+```bash
+/opt/.venv/bin/python benchmarks/ablate_pf_return.py build \
+  --variants bound split --artifact-tag direct_tx_recheck --output build/direct_tx_recheck
+/opt/.venv/bin/python benchmarks/ablate_pf_return.py measure \
+  --variants bound split --artifact-tag direct_tx_recheck --output build/direct_tx_recheck
+/opt/.venv/bin/python benchmarks/analyze_pf_return.py build/direct_tx_recheck
+```
+
 ## M20：分离 TX 生命周期与 Return 发送负载的消融（2026-10-15）
 
 **结论：Qwen 非均衡 FWD 的 rail 收益主要来自发送分流，不是仅将 TX

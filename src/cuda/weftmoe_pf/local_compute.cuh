@@ -36,11 +36,11 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
           const auto &desc = a.ring.blocks[t.block];
           const auto &consumed = a.ring.return_slots[desc.return_slot].consumed;
           const auto target = (desc.return_generation - 1U) * kM;
-          if (ring::acquire<::cuda::thread_scope_system>(consumed) < target) {
+          if (ring::acquire<ring::kReturnScope>(consumed) < target) {
 #if WEFTMOE_DEVICE_TIMELINE
             const auto begin = ::weftmoe::cuda::profiling::read_globaltimer_ns();
 #endif
-            while (ring::acquire<::cuda::thread_scope_system>(consumed) < target) {
+            while (ring::acquire<ring::kReturnScope>(consumed) < target) {
             }
 #if WEFTMOE_DEVICE_TIMELINE
             tx_wait_ns += ::weftmoe::cuda::profiling::read_globaltimer_ns() - begin;
@@ -248,13 +248,23 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a, Shared &s,
               arrive(slot.returned, t.rows);
           } else {
             auto &tx_slot = a.ring.return_slots[desc.return_slot];
-            reduce_add_release_system(
-                reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
-            if (t.column == 0U) {
+            if constexpr (WEFTMOE_PF_RETURN_RAILS == 1)
+              arrive(tx_slot.published, 1U);
+            else
               reduce_add_release_system(
-                  reinterpret_cast<unsigned long long *>(&tx_slot.consumed),
-                  desc.local_rows + kM - t.rows);
-              arrive(slot.returned, t.rows);
+                  reinterpret_cast<unsigned long long *>(&tx_slot.published), 1ULL);
+            if (t.column == 0U) {
+              if constexpr (WEFTMOE_PF_RETURN_RAILS == 1) {
+                // One local owner retires the whole TX epoch. Blocks without
+                // NIC readers can retire here; otherwise the Put owner does it.
+                if (desc.local_rows == t.rows)
+                  ring::publish(tx_slot.consumed, desc.return_generation * kM);
+              } else {
+                reduce_add_release_system(
+                    reinterpret_cast<unsigned long long *>(&tx_slot.consumed),
+                    desc.local_rows + kM - t.rows);
+                arrive(slot.returned, t.rows);
+              }
             }
           }
         }

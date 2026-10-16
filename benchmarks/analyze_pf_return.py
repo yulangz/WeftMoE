@@ -65,7 +65,7 @@ def main():
     p.add_argument("directory", type=Path)
     p.add_argument("--output", type=Path)
     args = p.parse_args()
-    result = dict(measurements=[], diagnostics={}, runs={}, parity={}, comparisons=[])
+    result = dict(measurements=[], inference=[], diagnostics={}, runs={}, parity={}, comparisons=[])
     workload_hashes = {}
     workspaces = {}
     for log in sorted(args.directory.glob("*_ep16_node0.log")):
@@ -77,6 +77,8 @@ def main():
         for line in log.read_text().splitlines():
             if line.startswith("TRAINING_PARITY_JSON "):
                 result["parity"].setdefault(label, []).append(json.loads(line.split(" ", 1)[1]))
+            if line.startswith("MEGAMOE_PREFILL_JSON "):
+                result["inference"].append(dict(label=label, raw=json.loads(line.split(" ", 1)[1])))
             if not line.startswith("TRAINING_CYCLE_JSON "):
                 continue
             raw = json.loads(line.split(" ", 1)[1])

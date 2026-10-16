@@ -5,8 +5,8 @@
 
 namespace weftmoe::cuda::static_forward {
 
-// Cumulative counters survive invocations and profile changes. The admission
-// owner installs new targets only after all three old planes have retired.
+// Cumulative counters survive invocations and profile changes. Admission waits
+// for the required old planes; independent direct TX has its own retirement.
 struct alignas(64) ComputeSlot {
   std::uint64_t generation;
   std::uint64_t x_full;
@@ -38,6 +38,8 @@ struct RingBlock {
 };
 
 struct alignas(64) ReturnSlot {
+  // N-tile publication / M-row retirement. Direct TX has one completion owner
+  // per epoch; rails combine local/padding credits with remote NIC credits.
   std::uint64_t published, consumed;
 };
 struct ReturnExpert {

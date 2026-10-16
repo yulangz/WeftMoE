@@ -1,14 +1,22 @@
 # Flash PF dataflow profile
 
-Current M19 configuration: use **B2048 on both EP8 and EP16**, contribution
+Current configuration: use **B2048 on both EP8 and EP16**, contribution
 CLI depth 2 and network credit4. `return_rails=1` keeps FC2 TX on the computing
-GPU and reuses its compute-slot credit; Put workers now scan their statically
+GPU with the compute-slot address mapping. M21 separates TX retirement from
+X/S using local credit, without adding payload capacity. Put workers scan their statically
 owned ready blocks instead of waiting on the first unfinished block.
 Candidate digest `14727edb3f32`, compiled ID `3172e19487b0`.
 Canonical cross-window M128, local row-striped bulk and overlapping 96-thread
 BWD reduce are retained. See M19 in [the optimization record](../../docs/pf_backward_20261012.md)
 for the paired measurements and the negative all-rail ablation. Do not apply
 Qwen's all-rail choice to Flash without measuring it.
+
+M21's current-code default is `WEFTMOE_PF_RETURN_INDEPENDENT_TX=1`; rebuilt
+profiles inherit it without changing their geometry/tuning ID. Source revision
+and library hash identify the implementation. Use the build helper's
+`--define WEFTMOE_PF_RETURN_INDEPENDENT_TX=0` with this direct profile to compare
+the old bound lifetime. M21 records the cached-FWD/inference measurements;
+the change is not a claim of stable speedup or literally zero overhead.
 
 ## Historical whole-profile experiment (before M17)
 

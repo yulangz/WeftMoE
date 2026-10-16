@@ -5,7 +5,7 @@ namespace weftmoe_pf::network {
 struct ReturnPending {
   ncclGinRequest_t request;
   std::uint64_t *consumed;
-  unsigned rows;
+  std::uint64_t credit;
 };
 struct ReturnScratch {
   ReturnPending pending[kNetworkPending];
@@ -45,12 +45,14 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
 #if WEFTMOE_DEVICE_TIMELINE
     nic_wait_ns += ::weftmoe::cuda::profiling::read_globaltimer_ns() - begin;
 #endif
-    if (entry.rows) {
+    if (entry.credit) {
       if constexpr (!WEFTMOE_PF_RETURN_INDEPENDENT_TX)
-        ring::arrive(*entry.consumed, entry.rows);
+        ring::arrive(*entry.consumed, entry.credit);
+      else if constexpr (WEFTMOE_PF_RETURN_RAILS == 1)
+        ring::publish(*entry.consumed, entry.credit);
       else
         reduce_add_release_system(
-            reinterpret_cast<unsigned long long *>(entry.consumed), entry.rows);
+            reinterpret_cast<unsigned long long *>(entry.consumed), entry.credit);
     }
   };
   while (remaining) {
@@ -64,10 +66,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
         if (empty)
           task.count = ~0U;
         else if (task.count != ~0U)
-          ready = ring::acquire<(!WEFTMOE_PF_RETURN_INDEPENDENT_TX
-                                     ? ::cuda::thread_scope_device
-                                     : ::cuda::thread_scope_system)>(
-                      *task.published) >= task.target;
+          ready = ring::acquire<ring::kReturnScope>(*task.published) >= task.target;
       }
       remaining -= __popc(__ballot_sync(0xffffffffU, empty));
       auto active = __ballot_sync(0xffffffffU, ready);
@@ -113,7 +112,7 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
                 ::cuda::thread_scope_block, ::cuda::thread_scope_system);
             auto &entry = s.pending[issued++ % kNetworkPending];
             entry.consumed = task.returned;
-            entry.rows = 0U;
+            entry.credit = 0U;
             endpoint.gin.flushAsync(ncclTeamWorld(endpoint.gin.comm), source,
                                     &entry.request);
             ++packets;
@@ -122,7 +121,15 @@ __device__ __noinline__ void return_blocks(const ForwardKernelArgs &a,
           }
           // FIFO retirement has waited every earlier fragment before this
           // final request. Recycle the M-slot once, not once per fragment.
-          s.pending[(issued - 1U) % kNetworkPending].rows = task.credit_rows;
+          auto &last = s.pending[(issued - 1U) % kNetworkPending];
+          if constexpr (WEFTMOE_PF_RETURN_INDEPENDENT_TX &&
+                        WEFTMOE_PF_RETURN_RAILS == 1)
+            // Keep the same M-row counter units as striped TX. The producer
+            // acquired the preceding epoch, so this unique owner can store
+            // the completed epoch instead of combining row-wise atomics.
+            last.credit = task.target / local::kFc2Tiles * local::kM;
+          else
+            last.credit = task.credit_rows;
           task.count = ~0U;
         }
         --remaining;

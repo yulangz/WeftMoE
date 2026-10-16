@@ -25,10 +25,10 @@
 #ifndef WEFTMOE_PF_RETURN_RAILS
 #define WEFTMOE_PF_RETURN_RAILS 1
 #endif
-// Keep sender placement, TX lifetime and TX partition independently measurable.
-// Defaults preserve the retained compute-local and striped-rail protocols.
+// Direct TX keeps compute-slot addresses but retires independently of X/S.
+// Set INDEPENDENT_TX=0 with RETURN_RAILS=1 to compare the bound lifetime.
 #ifndef WEFTMOE_PF_RETURN_INDEPENDENT_TX
-#define WEFTMOE_PF_RETURN_INDEPENDENT_TX (WEFTMOE_PF_RETURN_RAILS != 1)
+#define WEFTMOE_PF_RETURN_INDEPENDENT_TX 1
 #endif
 #ifndef WEFTMOE_PF_RETURN_EXPERT_TX
 #define WEFTMOE_PF_RETURN_EXPERT_TX (WEFTMOE_PF_RETURN_RAILS != 1)
