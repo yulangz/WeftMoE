@@ -1,8 +1,8 @@
-"""Run the existing Qwen3.5 RL recipe with only the rollout MoE replaced.
+"""Run the existing Qwen3.5 RL recipe with WeftMoE rollout and optional actor.
 
 Provide the model/dataset paths, AREAL_FILEROOT and AWEX_SOURCE_ROOT required by
 AReaL's run_qwen35_comparison.sh. WeftMoE additionally needs the built tensor
-extension. Both arms keep the actor's original Megatron implementation.
+extension. --actor-weftmoe also enables PF training for the experiment arm.
 """
 
 import argparse
@@ -17,6 +17,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--areal-root", type=Path, required=True)
     parser.add_argument("--backend", choices=("baseline", "weftmoe"), required=True)
+    parser.add_argument("--actor-weftmoe", action="store_true",
+                        help="Also replace the Megatron actor's routed FWD/BWD")
     parser.add_argument(
         "--dp-attention", action="store_true",
         help="Use DP4/EP4 inside each existing four-GPU rollout instance",
@@ -25,7 +27,10 @@ def main():
     args, overrides = parser.parse_known_args()
     root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    env["BACKEND"] = "baseline"
+    if args.actor_weftmoe and args.backend != "weftmoe":
+        parser.error("--actor-weftmoe requires --backend weftmoe")
+    env["BACKEND"] = "weftmoe" if args.actor_weftmoe else "baseline"
+    env["WEFTMOE_SOURCE_ROOT"] = str(root)
     env.setdefault("TRIAL", f"qwen35-sglang-{args.backend}-{time.strftime('%Y%m%d-%H%M%S')}")
     env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
     enabled = args.backend == "weftmoe"
@@ -38,8 +43,8 @@ def main():
     if enabled:
         rollout_env.update(
             WEFTMOE_TENSOR_EXTENSION=env["WEFTMOE_TENSOR_EXTENSION"],
-            WEFTMOE_STATIC_RING_TOKENS=env.get("WEFTMOE_STATIC_RING_TOKENS", "512"),
-            WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS="8",
+            WEFTMOE_STATIC_RING_TOKENS=env.get("WEFTMOE_STATIC_RING_TOKENS", "2048"),
+            WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS="2",
             SGLANG_MEMORY_SAVER_CUDA_GRAPH="0",
         )
     if env.get("NODES", "1") == "2":

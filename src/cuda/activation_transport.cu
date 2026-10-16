@@ -585,23 +585,19 @@ struct ForwardWeightLease::Impl {
   CUtensorMap w1_map{};
   CUtensorMap w1_interleaved_map{};
   CUtensorMap w2_map{};
-  CUtensorMap prefill_w1_map{};
-  CUtensorMap prefill_w2_map{};
+  CUtensorMap decode_w1_map{};
+  CUtensorMap decode_w2_map{};
   CUtensorMap backward_w1_map{};
   CUtensorMap backward_w2_map{};
 
-  void initialize_prefill_maps() {
-    if constexpr (forward_tuning::kStaticV4PrefillEnabled) {
-      using Gemm = forward_tuning::StaticV4Gemm<true>;
-      prefill_w1_map = make_bf16_tma_map(
-          const_cast<transport::BFloat16 *>(w1_interleaved), hidden,
-          owned_experts * 2ULL * intermediate, Gemm::kFc1N,
-          "prefill interleaved W1", forward_tuning::kTileK);
-      prefill_w2_map =
-          make_bf16_tma_map(const_cast<transport::BFloat16 *>(w2), intermediate,
-                            owned_experts * hidden, Gemm::kFc2N, "prefill W2",
-                            forward_tuning::kTileK);
-    }
+  void initialize_decode_maps() {
+    decode_w1_map = make_bf16_tma_map(
+        const_cast<transport::BFloat16 *>(w1_interleaved), hidden,
+        owned_experts * 2ULL * intermediate, weftmoe_dt::kN,
+        "decode interleaved W1", weftmoe_dt::kK);
+    decode_w2_map = make_bf16_tma_map(
+        const_cast<transport::BFloat16 *>(w2), intermediate,
+        owned_experts * hidden, weftmoe_dt::kN, "decode W2", weftmoe_dt::kK);
   }
 };
 
@@ -968,7 +964,7 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
-    impl->initialize_prefill_maps();
+    impl->initialize_decode_maps();
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
@@ -1108,7 +1104,7 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         forward_tuning::kFc2TileN, "W2", forward_tuning::kTileK);
-    impl->initialize_prefill_maps();
+    impl->initialize_decode_maps();
     impl->backward_w1_map = make_bf16_tma_map_mn(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
@@ -1940,6 +1936,7 @@ ActivationTransportResourcePool prepare_activation_transport_pool(
             config.ring_slots_per_source_channel &&
         old.max_inflight_generations == config.max_inflight_generations &&
         old.enable_backward_state == config.enable_backward_state &&
+        old.decode_only == config.decode_only &&
         old.static_forward_window_tokens ==
             config.static_forward_window_tokens &&
         old.static_forward_contribution_windows ==
@@ -5124,7 +5121,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   if (decode)
     launch_forward = cudaLaunchKernelEx(
         &launch, decode_kernel, args, slot.decode_x_map[wide_decode],
-        slot.decode_s_map[wide_decode], weight.prefill_w1_map, weight.w2_map);
+        slot.decode_s_map[wide_decode], weight.decode_w1_map, weight.decode_w2_map);
   else
     launch_forward = cudaLaunchKernelEx(
         &launch, kStaticUnified, args, slot.forward_x_map, slot.forward_s_map,

@@ -45,6 +45,7 @@ class TensorRuntime:
         stream=None,
         input_layout: str = "dp",
         interconnect: str | None = None,
+        decode_only: bool = False,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -91,6 +92,7 @@ class TensorRuntime:
                 decision = dict(profile=tuning, key=key, error=None)
             except (OSError, ValueError, KeyError, AttributeError) as error:
                 decision = dict(profile=None, key=None, error=str(error))
+        decision["decode_only"] = decode_only
         decisions = [None] * self.world
         dist.all_gather_object(decisions, decision, group=group)
         if any(d["error"] for d in decisions):
@@ -118,6 +120,8 @@ class TensorRuntime:
             training,
             max_saved if training else 1,
         )
+        if decode_only:
+            tuning = dict(tuning or {}, decode_only=True, window_tokens=max_tokens)
         self.native = native.Runtime(*arguments, tuning) if tuning else native.Runtime(*arguments)
 
     def _check(self, x, routes, gates, w1, w2):

@@ -627,7 +627,7 @@ make_timeline_allocation_layout(std::uint32_t max_ctas) {
 #endif
 
 bool local_prefill_streaming(const ActivationTransportPoolConfig &config) {
-  return forward_tuning::kLocalPrefillStreaming &&
+  return !config.decode_only && forward_tuning::kLocalPrefillStreaming &&
          (forward_tuning::kFc1TileN == 128U ||
           forward_tuning::kFc1TileN == 256U) &&
          forward_tuning::kFc2TileN == forward_tuning::kFc1TileN &&

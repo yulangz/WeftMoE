@@ -1,5 +1,57 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-16：当前 PF/DT 重新接入，端到端对照进行中
+
+沿用 9 月 30 日的 Qwen3.5-35B-A3B-Base / DAPO-Math-17k 配方：每组
+独立单机 8×L20X、1620 MHz，rollout 为两个 DP4/EP4、attention TP1
+实例；actor 为 attention TP4/DP2、EP8。seed1、prompt batch32、每题
+16 samples、生成上限20480、context32768、training microbatch32768，
+完整 epoch/LR horizon 不变，20 次 update 后停止。训练重算保持
+`[core_attn,moe_act,layernorm,shared_experts,mlp]`。本轮 baseline 在
+10.10.19.233，WeftMoE 在 10.10.16.219，两组都是单机任务，不是 EP16。
+
+与旧对照不同，本轮实验组**同时替换 rollout 和 actor**：SGLang decode
+使用 DT，prefill 使用当前 PF；Megatron routed FWD/BWD 使用当前 PF，
+保留框架的 router、shared expert、优化器与 DDP。通过
+`benchmarks/run_areal_sglang.py --backend weftmoe --actor-weftmoe --dp-attention`
+启用；不加 `--actor-weftmoe` 仍兼容之前只替换 rollout 的行为。
+没有修改 AReaL 调度器或其已有 dirty worktree。
+
+接入修正：
+
+- 同一 native 库保留 tuned PF 与稳定 DT。`TensorRuntime(decode_only=True)`
+  显式选择独立的单节点 decode 池，窗口覆盖服务端 decode 容量；DT 的
+  N128/K64 权重 TMA descriptor 独立于 PF N256 配置。不改 DT/PF GEMM
+  数学或通信实现，也不再用 PF 编译 profile 间接决定能否进入 DT。
+- SGLang 按 collective forward phase / decode graph 选择 DT，不按本 rank
+  tokens 判断；取消 adapter 的 64-token 分界。PF 大池 B2048/D2，DT
+  单窗口按 decode 容量分配，二者均跨层复用，卸载时一起释放。
+- eager prefill 传入 layer ID，复用驻留期内 immutable packed weights；
+  AWEX 更新前 suspend 销毁图/缓存，恢复后重新准备。跨执行池边界排空
+  上一 eager generation，避免将待完成状态归给错误的池。
+
+构建产物：`build/pf_main_timeline/qwen_areal_pf_dt_20261016`，基于
+`configs/pf_qwen35_compact_20261013`；完整 build manifest 与编译日志留档。
+正式启动脚本、日志、5 秒时钟/显存采样在 `build/rl_pf_dt_20261016`，
+配置和训练产物在 `results/areal_pf_dt_20261016`，不覆盖旧记录。
+
+启动前复用现有 integration tests，未增加细碎单测：
+
+- SGLang EP4、E256/top8、T257：PF eager 对齐、强制确认 DT kernel、
+  变化输入/路由的图回放、权重变化后的两轮 residency 均通过。
+  原测试对 eager PF 与 graph DT 的逐位相等假设不再成立（最大差
+  4.76837e-7），保留原跨实现 BF16 容差，DT 自身重复 replay 仍逐位一致。
+  首次失败日志 `validation/sglang_ep4_ep4_node0.log` 保留，修正后为
+  `validation/sglang_ep4_r2_ep4_node0.log`。
+- Megatron TP4/EP8、E256/top8、T128、两层：FWD、dX、router/expert
+  梯度、两次 optimizer 更新、每步两次 DDP microbatch 累积、两轮
+  offload/rebuild 全部通过；释放约 0.74–1.04 GB/rank，实际驱动释放量
+  不小于 native pool 报告值。日志 `validation/megatron_ep8_ep8_node0.log`。
+
+以上是接入验收，不是端到端加速结论。两组 RL 已启动，性能待完整 update
+后分别报告 rollout 时间/有效生成 token 吞吐、训练时间及 update 间隔。
+W&B 与历史启动器一致暂为 disabled，仅本地日志，不声称已同步线上。
+
 ## 常驻通信缓存与共卡释放复测（2026-10-02）
 
 `ceec6a0` 将 PF Backward 的 peer payload 改为容量复用：一个 runtime

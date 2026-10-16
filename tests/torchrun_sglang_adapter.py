@@ -31,6 +31,7 @@ def main():
         moe_a2a_backend="none",
         chunked_prefill_size=max(512 * world, tokens),
         max_prefill_tokens=max(512 * world, tokens),
+        cuda_graph_max_bs=max(512, tokens),
     )
     set_global_server_args_for_scheduler(args)
     initialize_moe_config(args)
@@ -67,14 +68,18 @@ def main():
         with model_capture_mode():
             layer(x, topk)
             assert adapter._runtime.max_tokens > 64
-            if (tokens + world - 1) // world <= 64:
-                assert adapter._decode_runtime.max_tokens == 64
+            assert adapter._decode_runtime.max_tokens >= (tokens + world - 1) // world
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 captured = layer(x, topk)
         return graph, captured
 
     graph, captured = capture()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as probe:
+        graph.replay()
+        torch.cuda.synchronize()
+    kernels = [event.name for event in probe.events() if "weftmoe_dt" in event.name]
+    assert kernels, "decode capture did not use DT"
     for iteration in range(3):
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
@@ -104,7 +109,12 @@ def main():
     graph, captured = capture()
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured, restored, rtol=0, atol=0)
+    # Eager prefill uses PF; decode uses DT with a different GEMM reduction.
+    torch.testing.assert_close(captured, restored, rtol=0.02, atol=0.00002)
+    previous = captured.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, previous, rtol=0, atol=0)
     del graph, captured
     adapter.suspend(SimpleNamespace(graph_runner=None))
     print(rank, "SGLANG_PARITY_GRAPH_RESTART_PASS", flush=True)

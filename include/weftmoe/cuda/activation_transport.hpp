@@ -92,6 +92,9 @@ struct ActivationTransportPoolConfig {
   // reserves twice the source-route capacity. Payloads grow only on overflow;
   // changing the actual row count never shrinks their allocation or IPC maps.
   std::uint64_t backward_peer_capacity_rows = 0;
+  // Explicit single-node decode pool; independent of the compiled PF tiles.
+  // Its complete invocation must fit one source window.
+  bool decode_only = false;
 };
 
 struct ActivationTransportPoolUsage {

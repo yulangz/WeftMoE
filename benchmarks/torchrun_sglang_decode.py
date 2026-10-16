@@ -233,6 +233,7 @@ def main():
             intermediate=i, max_tokens=max_local_tokens,
             max_rows=max_local_tokens * world * k + (e // world) * 128,
             training=False,
+            decode_only=args.weft_backend == "dt",
         )
     mega_buffer = None
     if args.deepgemm_package:

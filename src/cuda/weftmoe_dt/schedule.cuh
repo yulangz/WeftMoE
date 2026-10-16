@@ -35,16 +35,16 @@ using WarpMma = cute::SM80_16x8x16_F32BF16BF16F32_TN;
 using GroupMma = hopper::BF16Mma<kN>;
 
 // Selection uses collective capacity, never one source's actual batch size.
-// One window covers even the all-to-one-expert case. Larger pools keep PF.
+// One window covers even the all-to-one-expert case. Explicit decode pools
+// cover the server's decode capacity; legacy DT profiles retain their limit.
 inline bool eligible(const ActivationTransportPoolConfig &config,
                      const static_forward::ComputeRingLayout &ring) {
-  return forward_tuning::kStaticV4PrefillEnabled &&
+  return (config.decode_only || forward_tuning::kStaticV4PrefillEnabled) &&
          forward_tuning::kClusterSize == 2U &&
          forward_tuning::kTileM == kBlockM && forward_tuning::kTileK == kK &&
-         forward_tuning::StaticV4Gemm<true>::kFc1N == kN &&
-         forward_tuning::kFc2TileN == kN && config.max_nodes == 1U &&
-         !config.enable_backward_state &&
-         config.max_tokens_per_rank <= WEFTMOE_DT_MAX_TOKENS &&
+         config.max_nodes == 1U && !config.enable_backward_state &&
+         (config.decode_only ||
+          config.max_tokens_per_rank <= WEFTMOE_DT_MAX_TOKENS) &&
          ring.depth && ring.max_windows == 1U && config.max_world_size <= 32U &&
          config.max_owned_experts * config.max_world_size <= kMaxExperts;
 }

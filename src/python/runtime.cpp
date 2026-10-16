@@ -145,6 +145,12 @@ public:
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
     capacity.enable_backward_state = training;
+    capacity.decode_only = tuning.contains("decode_only") &&
+                           tuning["decode_only"].cast<bool>();
+    if (capacity.decode_only &&
+        (training || nodes != 1 || max_tokens > ring_tokens))
+      throw std::invalid_argument(
+          "DT requires single-node inference in one source window");
     capacity.static_forward_window_tokens = ring_tokens;
     if (const auto *depth =
             std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))

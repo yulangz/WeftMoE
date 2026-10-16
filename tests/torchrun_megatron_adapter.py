@@ -26,6 +26,9 @@ def main():
     dist.init_process_group("nccl")
     world = dist.get_world_size()
     tp = int(os.environ.get("TEST_TP_SIZE", "1"))
+    experts = int(os.environ.get("TEST_EXPERTS", "16"))
+    top_k = int(os.environ.get("TEST_TOP_K", "4"))
+    tokens = int(os.environ.get("TEST_TOKENS", "16"))
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=tp,
         expert_model_parallel_size=world,
@@ -44,8 +47,8 @@ def main():
         num_attention_heads=8,
         ffn_hidden_size=512,
         moe_ffn_hidden_size=512,
-        num_moe_experts=16,
-        moe_router_topk=4,
+        num_moe_experts=experts,
+        moe_router_topk=top_k,
         expert_model_parallel_size=world,
         expert_tensor_parallel_size=1,
         bf16=True,
@@ -60,7 +63,7 @@ def main():
         recompute_modules=["moe_act"],
     )
     spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=16, moe_grouped_gemm=True, use_te_activation_func=True
+        num_experts=experts, moe_grouped_gemm=True, use_te_activation_func=True
     )
     model = torch.nn.ModuleList(
         [
@@ -101,11 +104,11 @@ def main():
         return x
 
     x = (
-        torch.randn(16, 1, 2048, device="cuda", dtype=torch.bfloat16) * 0.03
+        torch.randn(tokens, 1, 2048, device="cuda", dtype=torch.bfloat16) * 0.03
     ).requires_grad_()
     dy = torch.randn_like(x) * 0.03
     originals = [layer.forward for layer in model]
-    adapter = MegatronAdapter([ddp if ddp is not None else model], max_tokens=32)
+    adapter = MegatronAdapter([ddp if ddp is not None else model], max_tokens=max(32, tokens))
     adapter.prepare()
     adapted = [layer.forward for layer in model]
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)

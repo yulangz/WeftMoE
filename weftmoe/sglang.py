@@ -22,11 +22,12 @@ _dp_layout_patched = False
 # every rank's rows, so the transport must shard them itself.
 _rows_are_dp_sharded = False
 _layout_active = False
-_eager_pending = False
+_eager_pending = None
+_decode_batch = False
 _graph_inputs = {}
 
 
-def _prepare_runtime(layer, group, top_k, max_tokens):
+def _prepare_runtime(layer, group, top_k, max_tokens, *, decode_only=False):
     global _stream
     if _stream is None:
         _stream = torch.cuda.Stream()
@@ -40,6 +41,7 @@ def _prepare_runtime(layer, group, top_k, max_tokens):
         max_rows=max_tokens * top_k * 2 + layer.num_local_experts * 128,
         training=False,
         stream=_stream,
+        decode_only=decode_only,
     )
 
 
@@ -153,11 +155,11 @@ def install():
         # without invoking FusedMoE.forward in Python.  Finalize the last eager
         # generation once at the eager->graph boundary, before graph replay can
         # overwrite its status/diagnostic records.  Subsequent decode replays
-        # pay only this Python boolean branch.
+        # pay only this Python branch.
         global _eager_pending
-        if _eager_pending and _runtime is not None:
-            _runtime.native.drain_eager_inference()
-            _eager_pending = False
+        if _eager_pending is not None:
+            _eager_pending.native.drain_eager_inference()
+            _eager_pending = None
         return original_graph_replay(self, *args, **kwargs)
 
     CudaGraphRunner.replay = graph_replay
@@ -299,24 +301,33 @@ def install():
             layer.w13_weight,
             layer.w2_weight,
         )
+        runtime = _runtime
+        # Select by collective phase, never by a rank's actual token count.
+        # Decode uses the same DT implementation for every captured bucket;
+        # dynamic prefill and training retain the tuned PF specialization.
+        if capturing or _decode_batch:
+            if _decode_runtime is None:
+                capacity = max(
+                    args.cuda_graph_max_bs or 1, args.max_running_requests or 1
+                )
+                if not rows_are_dp_sharded:
+                    capacity = (capacity + world - 1) // world
+                _decode_runtime = _prepare_runtime(
+                    layer, group, k, capacity, decode_only=True
+                )
+            runtime = _decode_runtime
         if capturing:
-            if _eager_pending:
-                _runtime.native.drain_eager_inference()
-                _eager_pending = False
-            runtime = _runtime
-            # SGLang captures collective, equally padded decode buckets. Eager
-            # DP sources may have unequal lengths and must all use the general
-            # pool, never choose a transport independently from their row count.
-            if local_tokens <= 64:
-                if _decode_runtime is None:
-                    _decode_runtime = _prepare_runtime(layer, group, k, 64)
-                runtime = _decode_runtime
+            if _eager_pending is not None:
+                _eager_pending.native.drain_eager_inference()
+                _eager_pending = None
             output = runtime.inference(layer.layer_id, *inputs)
         elif _SYNC_EAGER:
-            output = _runtime.inference_eager(*inputs)
+            output = runtime.inference_eager(*inputs, layer=layer.layer_id)
         else:
-            output = _runtime.inference_eager_async(*inputs)
-            _eager_pending = True
+            if _eager_pending is not None and _eager_pending is not runtime:
+                _eager_pending.native.drain_eager_inference()
+            output = runtime.inference_eager_async(*inputs, layer=layer.layer_id)
+            _eager_pending = runtime
         if _DEBUG_SYNC and not get_is_capture_mode():
             print(
                 "[WEFTMOE] rank=%d layer=%s tokens=%d local=%d sync=%s cuda_err=%d"
@@ -464,6 +475,22 @@ def patch_dp_attention_layout():
         pp_proxy_tensors=None,
         input_deepstack_embeds=None,
     ):
+        global _decode_batch
+        previous_decode = _decode_batch
+        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
+        _decode_batch = mode.is_decode()
+        try:
+            return run_lm_forward(
+                self, input_ids, positions, forward_batch, input_embeds,
+                pp_proxy_tensors, input_deepstack_embeds,
+            )
+        finally:
+            _decode_batch = previous_decode
+
+    def run_lm_forward(
+        self, input_ids, positions, forward_batch, input_embeds,
+        pp_proxy_tensors, input_deepstack_embeds,
+    ):
         if (
             _layout_active
             and get_global_server_args().enable_dp_attention
@@ -522,7 +549,7 @@ def suspend(model_runner):
         _decode_runtime = None
     _runtime.close()
     _runtime = None
-    _eager_pending = False
+    _eager_pending = None
     _graph_inputs.clear()
     torch.cuda.empty_cache()
 
