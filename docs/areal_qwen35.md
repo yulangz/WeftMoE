@@ -48,8 +48,8 @@
   offload/rebuild 全部通过；释放约 0.74–1.04 GB/rank，实际驱动释放量
   不小于 native pool 报告值。日志 `validation/megatron_ep8_ep8_node0.log`。
 
-以上是接入验收，不是端到端加速结论。两组 RL 已启动，性能待完整 update
-后分别报告 rollout 时间/有效生成 token 吞吐、训练时间及 update 间隔。
+以上为最小接入验收；下面另列完整 RL update 的阶段性结果，20-update
+对照仍在运行，尚不能据小样本作最终稳态结论。
 W&B 与历史启动器一致暂为 disabled，仅本地日志，不声称已同步线上。
 
 首次整模型尝试在首批生成中停住，未完成任何 update，不纳入性能：
@@ -68,7 +68,7 @@ DP 组同时出现 decode 与 prefill，当前 SGLang 的 `global_forward_mode`
 ### 首轮端到端验收（中间结果，不作为稳态结论）
 
 `-r2` 完成首个 update、AWEX 权重同步和下一轮生成，无 OOM 或 kernel
-错误。首轮 LR=0，仍需后续非零 LR update 验证更新后的持续运行。
+错误。首轮 LR=0；后续已完成 LR=1e-6 的两次 update 及再次生成。
 
 |首个完整 update|baseline|当前 DT/PF|
 |---|---:|---:|
@@ -82,8 +82,60 @@ DP 组同时出现 decode 与 prefill，当前 SGLang 的 `global_forward_mode`
 有效 token 来自 `ppo_actor/update/n_valid_tokens`（loss mask），不是服务端
 所有生成 token；训练吞吐包含整个 actor step，不是单层 PF FWD/BWD。
 该轮实验组 token 多约 5.4%，rollout/训练归一化吞吐高约 13.6%/22.4%；
-但权重更新及恢复多约 10.76 s，不能省略此开销。首轮含编译和首次分配，
-需单列，后续按相同 update 编号排除首轮配对统计。
+但 `update_weights` 多约 10.76 s，不能省略此开销。该指标仅覆盖其
+框架计时区间，**不包含随后全部 Graph/KV 恢复**：AReaL 的
+`_export_stats_then_restore_awex_rollout()` 先打印统计，再恢复推理资源。
+因此同时统计相邻 update 日志的墙钟间隔，覆盖切换/恢复开销；不要简单
+相加 rollout、train_step、update_weights 后就称为完整端到端时间。
+首轮含编译和首次分配，需单列，后续按相同 update 编号排除首轮配对统计。
+
+### 前三轮配对结果（2026-10-16，阶段性快照）
+
+截至该快照 baseline 完成 5 次、WeftMoE 完成 3 次 update；只配对两组
+前 3 次，排除第 1 次，以下为 **updates 2–3**。两组仍继续跑到 20 次。
+这是在线 RL 采样，不是固定张量 replay；相同 seed/配方不代表相同的
+生成轨迹、长度或 reward。两轮有效 token 总量分别为 9,288,900 和
+8,975,300，不能直接把耗时下降全部当作吞吐收益。
+
+|指标|本轮 baseline|当前 DT/PF|变化|
+|---|---:|---:|---:|
+|rollout 平均耗时，s|552.76|516.28|-6.60%|
+|actor train_step 平均耗时，s|163.20|141.53|-13.28%|
+|update_weights 平均耗时，s|14.761|16.408|+11.15%|
+|相邻 update 墙钟间隔均值，s|736.893|701.443|-4.81%|
+|有效 token / rollout 秒|8,402|8,692|+3.45%|
+|有效 token / train_step 秒|28,459|31,709|+11.42%|
+|有效 token / 完整墙钟秒|6,303|6,398|+1.51%|
+
+吞吐统一采用 `sum(valid_tokens) / sum(seconds)`，不是平均单步加速比。
+墙钟区间为第 1 次统计到第 3 次统计，包含区间内的恢复、共卡切换等
+框架开销；不能与单独的 routed-MoE kernel 加速比混为一谈。当前观察是
+rollout 和训练都有收益，但完整 RL 的收益较小。第二轮框架未单列时间
+约 23.90 s，baseline 约 3.10 s；现有计时还不能将差额全归因于某个
+restore/IPC 操作，未做额外 profiler 消融，也未为改善数字修改框架调度。
+
+历史同一 **updates 2–3** 口径：
+
+|2026-09-30 版本|rollout 有效 token/s|训练有效 token/s|墙钟有效 token/s|
+|---|---:|---:|---:|
+|历史 baseline|8,265|25,563|6,057|
+|历史 rollout-only WeftMoE|9,053|27,767|6,468|
+
+旧 WeftMoE 的 actor 也是原版 Megatron。历史与本轮基线自身已有变化，
+不能拿历史较慢的训练基线计算本次 PF 接入收益；上述加速比均使用本轮
+新测 baseline。两轮样本不足以判定新旧 rollout 或完整 RL 的稳定排名。
+
+两组均设置 `-lgc 1620,1620`。截至快照，5 秒采样中 baseline 有 3 条、
+WeftMoE 有 1 条短暂低于 1620 MHz，其余为 1620；原始记录不删样。
+驱动显存峰值约 baseline 102,729 MiB、WeftMoE 107,823 MiB，包含整个
+框架及动态缓存，并非 native pool 单独占用。
+
+接入代码为 `159dbb8`，DP 混合批次修复为 `23f0a89`；按 AReaL
+`debug-distributed` 的跨 rank 堆栈检查定位后，只修正执行池选择，未改
+算子数学、训练配方或调度器。此阶段无源码热更新、无新的 GEMM autotune。
+原始日志、时钟、服务端 metrics，以及自动汇总的 `comparison.json`
+保存在 `build/rl_pf_dt_20261016/`；该三轮快照另存
+`comparison_first3_snapshot.json`，后续完整结果不要与此小样本表混用。
 
 ## 常驻通信缓存与共卡释放复测（2026-10-02）
 
