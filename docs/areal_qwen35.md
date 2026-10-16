@@ -50,7 +50,7 @@
 
 以上为最小接入验收；下面另列完整 RL update 的阶段性结果，20-update
 对照仍在运行，尚不能据小样本作最终稳态结论。
-W&B 与历史启动器一致暂为 disabled，仅本地日志，不声称已同步线上。
+启动时 W&B 为 disabled；随后按用户要求启用旁路补传和持续同步，见下文。
 
 首次整模型尝试在首批生成中停住，未完成任何 update，不纳入性能：
 DP 组同时出现 decode 与 prefill，当前 SGLang 的 `global_forward_mode`
@@ -136,6 +136,33 @@ WeftMoE 有 1 条短暂低于 1620 MHz，其余为 1620；原始记录不删样�
 原始日志、时钟、服务端 metrics，以及自动汇总的 `comparison.json`
 保存在 `build/rl_pf_dt_20261016/`；该三轮快照另存
 `comparison_first3_snapshot.json`，后续完整结果不要与此小样本表混用。
+
+### W&B 同步与 checkpoint 策略
+
+2026-10-16 按用户要求启动 `benchmarks/publish_areal_logs.py`，无需重启
+两组训练：补传已完成的 update，随后跟随日志持续同步到第 20 次。
+服务端 API 已核实收到 baseline 1–5、WeftMoE 1–3 的完整统计表，后续
+记录继续追加。项目 `sct-test/areal-qwen35`，group
+`qwen35-pfdt-dp4ep4-20261016`：
+
+- [baseline](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-pfdt-dp4ep4-20261016-baseline)
+- [DT/PF](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-pfdt-dp4ep4-20261016-weftmoe)
+
+只上传完整 console 指标和不含秘密的配方元数据，精度保持 console 输出；
+不上传 checkpoint、数据集或源码，密钥通过无回显输入提供，未写入代码。
+原始日志和首轮失败尝试仍保存在本地，不将失败尝试混入上述两条曲线。
+
+本轮实际配置已经是 `saver.freq_{epochs,steps,secs}=null`、
+`recover.mode=disabled`，检查时没有生成 checkpoint；`saver.mode=auto`
+只是同步/异步保存方式，不代表开启保存。后续 benchmark 入口在配置覆盖
+末尾显式固定上述策略，同时清空 recover 的三种频率，防止配方变更重新
+开启保存。若环境提供 `WANDB_API_KEY`，入口默认启用在线 W&B；地址从
+`WANDB_BASE_URL` 读取。
+
+本轮另有 `build/rl_pf_dt_20261016/cleanup_checkpoints_after_run.py` 等待
+20 次 update 完成及对应 trainer 退出，再复查/删除这两个 trial 各自的
+checkpoint 目录；不触碰日志、原始模型或其他 trial。检查/清理结果写入
+同目录的 `checkpoint_cleanup.log`。当前尚未删除任何文件。
 
 ## 常驻通信缓存与共卡释放复测（2026-10-02）
 

@@ -3,6 +3,8 @@
 Provide the model/dataset paths, AREAL_FILEROOT and AWEX_SOURCE_ROOT required by
 AReaL's run_qwen35_comparison.sh. WeftMoE additionally needs the built tensor
 extension. --actor-weftmoe also enables PF training for the experiment arm.
+Checkpoint saving stays disabled for benchmarks. Set WANDB_API_KEY and
+WANDB_BASE_URL in the environment to enable online metrics.
 """
 
 import argparse
@@ -61,11 +63,19 @@ def main():
     )
     command = [
         "bash", "examples/cpu_staged_offload/run_qwen35_comparison.sh", spec,
-        "stats_logger.wandb.mode=disabled",
+        "stats_logger.wandb.mode=" + (
+            "online" if env.get("WANDB_API_KEY") else "disabled"
+        ),
     ]
     if args.dp_attention:
         command.extend(("++sglang.enable_dp_attention=true", "++sglang.dp_size=4"))
     command.extend(overrides)
+    # Performance runs retain metrics, not model/optimizer checkpoints.
+    command.extend((
+        "saver.freq_epochs=null", "saver.freq_steps=null", "saver.freq_secs=null",
+        "recover.mode=disabled", "recover.freq_epochs=null",
+        "recover.freq_steps=null", "recover.freq_secs=null",
+    ))
     if args.dry_run:
         print(shlex.join(command))
         return
