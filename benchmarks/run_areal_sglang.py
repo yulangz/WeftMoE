@@ -3,8 +3,9 @@
 Provide the model/dataset paths, AREAL_FILEROOT and AWEX_SOURCE_ROOT required by
 AReaL's run_qwen35_comparison.sh. WeftMoE additionally needs the built tensor
 extension. --actor-weftmoe also enables PF training for the experiment arm.
-Checkpoint saving stays disabled for benchmarks. Set WANDB_API_KEY and
-WANDB_BASE_URL in the environment to enable online metrics.
+Checkpoint saving stays disabled for benchmarks. Set WANDB_API_KEY or NETRC,
+and WANDB_BASE_URL in the environment to enable native online metrics. Prefer
+NETRC when worker frameworks log their environment.
 """
 
 import argparse
@@ -64,7 +65,7 @@ def main():
     command = [
         "bash", "examples/cpu_staged_offload/run_qwen35_comparison.sh", spec,
         "stats_logger.wandb.mode=" + (
-            "online" if env.get("WANDB_API_KEY") else "disabled"
+            "online" if env.get("WANDB_API_KEY") or env.get("NETRC") else "disabled"
         ),
     ]
     if args.dp_attention:

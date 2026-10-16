@@ -1,41 +1,51 @@
 # Qwen3.5 接入 AReaL
 
-## 2026-10-16：两机分别排队长跑 1500 updates
+## 2026-10-16：两机分别长跑 1500 updates，原生 online W&B
 
 每台机器仍运行一组独立的单机 8 GPU 实验，不改成双机 EP16：
 
 |节点|长跑内容|W&B|
 |---|---|---|
-|10.10.19.233|原版 SGLang + 原版 Megatron|[baseline](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-pfdt-dp4ep4-1500-20261016-baseline)|
-|10.10.16.219|SGLang DT decode / PF prefill + Megatron PF FWD/BWD|[DT/PF](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/qwen35-pfdt-dp4ep4-1500-20261016-weftmoe)|
+|10.10.19.233|原版 SGLang + 原版 Megatron|[baseline](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-baseline-pfdt-dp4ep4-mb32-1500-20261016_train)|
+|10.10.16.219|SGLang DT decode / PF prefill + Megatron PF FWD/BWD|[DT/PF](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-weftmoe-pfdt-dp4ep4-mb32-1500-20261016_train)|
 
-截至 09:07 UTC，两台机器的后台接续进程已启动并核实存活，状态均为
-`queued`，**1500-step trainer 尚未启动**。保留正在运行的 20-update 短测：
-每台机器分别等待自己的短测完成 20 次完整统计、trainer 退出且 GPU
-进程清空，再自动开始长跑。不会终止其他 GPU 任务；前驱提前失败则不
-启动后续任务。GPU 查询超时/驱动暂未恢复时继续等待，不抢占资源。
+最初排队等待 20-update 短测，09:40 UTC 按用户要求改为立即启动，并
+切换到训练进程原生 W&B。停止旧排队进程、两组旁路 publisher 和短测；
+短测最终完成 baseline 10 次、WeftMoE 8 次 update，原始记录保留。
+先 SIGINT 正常清理，再按 PID＋创建时间仅清理本次遗留进程，确认 GPU
+释放后启动。baseline trainer 于 09:44:51 UTC 启动，WeftMoE 于
+09:47:00 UTC 启动；此时为初始化阶段，不表示已经完成第一个 update。
 
 两组长跑从相同初始模型和新 optimizer 开始，不续接短测。使用已验证
 的接入代码和 native 库（启动记录 commit `758f651`）；逐项对比旧、新
-resolved config，仅改变 trial、输出/name-resolve 目录及运行时认证
-插值，训练参数不变。仍设 1620 MHz，保留 5 秒时钟/显存采样。
+resolved config，训练参数不变，仅更新 trial、输出/name-resolve 目录、
+认证及 W&B 配置。仍设 1620 MHz，保留 5 秒时钟/显存采样。
 `total_train_epochs=1`、`total_train_steps=null` 和原 55,990-update LR
 horizon 不变，直接通过已有 Python 训练入口的
 `AREAL_STOP_AFTER_STEPS=1500` 停止；未修改 AReaL 的 launcher/scheduler。
 
-独立 W&B publisher 已建立两条新 run，随完整统计表持续上传至第 1500
-次；W&B 密钥不传入 trainer/worker，避免进入 AWEX 的环境日志。
-checkpoint 和 recover 仍全部关闭，完成后只检查对应 trial 的 checkpoint
+`stats_logger.wandb.mode=online`（不是无效值 `enabled`），由 AReaL
+`StatsLogger` 原生登录和上传；**不再运行独立上传进程**。新 group 为
+`qwen35-pfdt-dp4ep4-1500-native-20261016`，不要看之前空的旁路长跑 run。
+两节点使用各自 `/tmp` 下权限 0600 的 NETRC，已验证服务器认证；配置的
+`wandb_api_key` 留空、环境不传 `WANDB_API_KEY`，避免 AWEX 环境日志泄露
+密钥。仅关闭 W&B 自动 console 上传，原生数值指标和系统监控正常启用。
+后续 benchmark 入口同样支持通过 `NETRC` 开启原生 online W&B。
+
+checkpoint 和 recover 全部关闭：saver 三种频率均 null，recover 为
+disabled 且三种频率均 null。完成后只检查对应 trial 的 checkpoint
 目录，若意外产生则删除，不动原模型和日志。因此失败时没有 checkpoint
 可恢复。按当前约 12 分钟/update 粗估，单组约需 12 天，实际取决于后续
 生成长度和系统稳定性；这不是完成时间保证。
 
 配置、native SHA256、前驱 PID/创建时间、启动脚本、状态、console 日志及
-W&B 本地记录保存在 `build/rl_pf_dt_1500_20261016/`；训练输出独立使用
-`results/areal_pf_dt_1500_20261016/`。两份配置已通过 AReaL 的结构化配置
+旁路历史记录保存在 `build/rl_pf_dt_1500_20261016/`；训练输出和原生 W&B
+本地记录使用 `results/areal_pf_dt_1500_20261016/`。两份配置已通过 AReaL 的结构化配置
 解析，后台进程与 SSH 会话脱离；短测记录和下文历史结果不覆盖。
 
-## 2026-10-16：当前 PF/DT 重新接入，端到端对照进行中
+## 2026-10-16：当前 PF/DT 重新接入，阶段性短测记录
+
+下文为切换长跑前的过程和快照；短测现已按上文停止，不再继续到 20 次。
 
 沿用 9 月 30 日的 Qwen3.5-35B-A3B-Base / DAPO-Math-17k 配方：每组
 独立单机 8×L20X、1620 MHz，rollout 为两个 DP4/EP4、attention TP1
