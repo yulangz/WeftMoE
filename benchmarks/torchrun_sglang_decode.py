@@ -12,6 +12,8 @@ all-gather/reduce-scatter, while WeftMoE/MegaMoE return DP-local rows directly.
 fused staging, and rejects fallback by profiling its captured kernel. Native
 capacity is the largest requested local bucket. --fresh-routes changes routing
 and X between samples outside timing; all backends share each sample's inputs.
+Shape arguments default to Qwen3.5-35B-A3B. This synthetic routed-layer test
+does not load model weights or time the rest of a model.
 """
 
 import argparse
@@ -98,6 +100,24 @@ def make_dp_baseline(baseline, global_topk, x, world):
     return forward
 
 
+def check_outputs(outputs, expected, atol):
+    """Validate collectively so a failed rank cannot strand native peers."""
+    errors = {}
+    failed = torch.zeros((), dtype=torch.int32, device=expected.device)
+    target = expected.float()
+    for name, output in outputs.items():
+        delta = output.float() - target
+        relative_l2 = delta.norm() / target.norm().clamp_min(1e-30)
+        failed |= (~torch.isclose(output.float(), target, rtol=0.025, atol=atol).all()
+                   | ~(relative_l2 < 0.01)).int()
+        errors[name] = dict(max_abs=delta.abs().max().item(),
+                            relative_l2=relative_l2.item())
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if failed.item():
+        raise AssertionError(f"MoE parity failed (atol={atol}): {errors}")
+    return errors
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -111,18 +131,29 @@ def main():
         help="Bracket one warmed Weft graph for NCU application replay",
     )
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--hidden", type=int, default=2048)
+    parser.add_argument("--intermediate", type=int, default=512)
+    parser.add_argument("--experts", type=int, default=256)
+    parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--weft-backend", choices=("auto", "pf", "dt"), default="auto",
                         help="Use an explicit native profile and verify its captured kernel")
     parser.add_argument("--fresh-routes", action="store_true",
                         help="Change inputs and routes between timed samples, outside timing")
     parser.add_argument("--route-bias-std", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--atol", type=float, default=2e-5,
+                        help="Absolute BF16 parity tolerance; relative L2 must also be <1%%")
+    parser.add_argument("--reference-check", action="store_true",
+                        help="Diagnostic: also compare every sample against FP32 PyTorch (DP only)")
     parser.add_argument("--deepgemm-package", type=Path)
     parser.add_argument(
         "--dp-attention", action="store_true",
         help="Use DP=EP with distinct tokens per rank; --tokens is per DP rank",
     )
     args = parser.parse_args()
+    h, i, e, k = args.hidden, args.intermediate, args.experts, args.top_k
+    if args.reference_check and not args.dp_attention:
+        parser.error("--reference-check requires --dp-attention")
     # SGLang imports deep_gemm itself; select the frozen package first.
     if args.deepgemm_package:
         sys.path.insert(0, str(args.deepgemm_package.resolve()))
@@ -147,6 +178,8 @@ def main():
     card = pynvml.nvmlDeviceGetHandleByUUID(
         "GPU-" + str(torch.cuda.get_device_properties(local_rank).uuid)
     )
+    # ServerArgs supplies distributed/MoE policy only. CLI dimensions and
+    # synthetic weights below define the layer; no model is loaded here.
     server = ServerArgs(
         model_path="/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B-Base",
         tp_size=world,
@@ -172,7 +205,7 @@ def main():
         )
 
         initialize_dp_attention(
-            server, SimpleNamespace(hidden_size=2048, dtype=torch.bfloat16)
+            server, SimpleNamespace(hidden_size=h, dtype=torch.bfloat16)
         )
         set_dp_buffer_len(0, 0, True)
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -180,7 +213,7 @@ def main():
     from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
     layer = FusedMoE(
-        256, 2048, 512, layer_id=0, top_k=8, params_dtype=torch.bfloat16, inplace=False
+        e, h, i, layer_id=0, top_k=k, params_dtype=torch.bfloat16, inplace=False
     ).cuda()
     torch.manual_seed(37 + rank)
     layer.w13_weight.normal_(0, 0.03)
@@ -196,9 +229,9 @@ def main():
     weft_name = "weftmoe" if args.weft_backend == "auto" else args.weft_backend
     if args.weft_backend != "auto":
         runtime = TensorRuntime(
-            group=group.device_group, experts=256, top_k=8, hidden=2048,
-            intermediate=512, max_tokens=max_local_tokens,
-            max_rows=max_local_tokens * world * 8 + (256 // world) * 128,
+            group=group.device_group, experts=e, top_k=k, hidden=h,
+            intermediate=i, max_tokens=max_local_tokens,
+            max_rows=max_local_tokens * world * k + (e // world) * 128,
             training=False,
         )
     mega_buffer = None
@@ -207,8 +240,8 @@ def main():
             torch.cuda.get_device_properties(local_rank).multi_processor_count
         )
         mega_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-            group.device_group, 256, max(64, max_local_tokens),
-            8, 2048, 512, mma_type="bf16xbf16",
+            group.device_group, e, max(64, max_local_tokens),
+            k, h, i, mma_type="bf16xbf16",
         )
         mega_weights = deep_gemm.transform_weights_for_mega_moe(
             layer.w13_weight, layer.w2_weight
@@ -216,11 +249,11 @@ def main():
     for tokens in args.tokens:
         global_tokens = tokens * world if args.dp_attention else tokens
         torch.manual_seed(args.seed + global_tokens)
-        x = torch.randn(global_tokens, 2048, device="cuda", dtype=torch.bfloat16) * 0.03
-        bias = (torch.randn(256, device="cuda") * args.route_bias_std
-                if args.route_bias_std else torch.zeros(256, device="cuda"))
-        logits = torch.randn(global_tokens, 256, device="cuda") + bias
-        scores, ids = logits.topk(8, dim=-1)
+        x = torch.randn(global_tokens, h, device="cuda", dtype=torch.bfloat16) * 0.03
+        bias = (torch.randn(e, device="cuda") * args.route_bias_std
+                if args.route_bias_std else torch.zeros(e, device="cuda"))
+        logits = torch.randn(global_tokens, e, device="cuda") + bias
+        scores, ids = logits.topk(k, dim=-1)
         topk = StandardTopKOutput(scores.softmax(-1), ids.int(), logits)
         global_topk = topk
         baseline_call = baseline
@@ -236,9 +269,9 @@ def main():
         if runtime is not None:
             local_tokens = tokens if args.dp_attention else (tokens + world - 1) // world
             storage = (
-                x.new_empty((local_tokens, 2048)),
-                torch.empty((local_tokens, 8), dtype=torch.int32, device=x.device),
-                torch.empty((local_tokens, 8), dtype=torch.float32, device=x.device),
+                x.new_empty((local_tokens, h)),
+                torch.empty((local_tokens, k), dtype=torch.int32, device=x.device),
+                torch.empty((local_tokens, k), dtype=torch.float32, device=x.device),
             )
 
             def native_kernel():
@@ -271,14 +304,8 @@ def main():
             graphs[name] = graph
             graph.replay()
             torch.cuda.synchronize()
-        max_abs = {}
-        for name, output in outputs.items():
-            torch.testing.assert_close(
-                output, outputs["baseline"], rtol=0.025, atol=2e-5
-            )
-            max_abs[name] = (
-                (output.float() - outputs["baseline"].float()).abs().max().item()
-            )
+        errors = check_outputs(outputs, outputs["baseline"], args.atol)
+        reference_errors = []
         kernel_names = []
         if runtime is not None:
             with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as probe:
@@ -299,7 +326,7 @@ def main():
                 # is DP-local. Captured views retain their original addresses.
                 torch.manual_seed(args.seed + global_tokens + 1009 * (iteration + 1))
                 logits.copy_(torch.randn_like(logits) + bias)
-                scores, ids = logits.topk(8, dim=-1)
+                scores, ids = logits.topk(k, dim=-1)
                 global_topk.topk_ids.copy_(ids)
                 global_topk.topk_weights.copy_(scores.softmax(-1))
                 torch.manual_seed(args.seed + global_tokens + 9173 * (iteration + 1) + rank)
@@ -322,14 +349,24 @@ def main():
                     samples[name].append(begin.elapsed_time(end) * 1000 / 50)
                     after = pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
                     clocks.extend((before, after))
-            for name, output in outputs.items():
-                torch.testing.assert_close(output, outputs["baseline"], rtol=0.025, atol=2e-5)
-                max_abs[name] = max(max_abs[name],
-                    (output.float() - outputs["baseline"].float()).abs().max().item())
+            current_errors = check_outputs(outputs, outputs["baseline"], args.atol)
+            for name, metrics in current_errors.items():
+                for metric, value in metrics.items():
+                    errors[name][metric] = max(errors[name][metric], value)
+            if args.reference_check:
+                from benchmarks.torchrun_megamoe_prefill import reference
+
+                torch.backends.cuda.matmul.allow_tf32 = False
+                expected = reference(x.float(), topk.topk_ids, topk.topk_weights,
+                                     layer.w13_weight.float(), layer.w2_weight.float())
+                reference_errors.append(check_outputs(outputs, expected, args.atol))
         gathered = [None] * world
         dist.all_gather_object(gathered, samples)
         all_errors = [None] * world
-        dist.all_gather_object(all_errors, max_abs)
+        dist.all_gather_object(all_errors, errors)
+        all_reference = [None] * world
+        if args.reference_check:
+            dist.all_gather_object(all_reference, reference_errors)
         all_clocks = [None] * world
         dist.all_gather_object(all_clocks, clocks)
         if rank == 0:
@@ -352,8 +389,8 @@ def main():
                             "all_gather+reduce_scatter" if args.dp_attention
                             else "all_reduce"
                         ),
-                        "experts": 256, "top_k": 8,
-                        "hidden": 2048, "intermediate": 512,
+                        "experts": e, "top_k": k,
+                        "hidden": h, "intermediate": i,
                         "weft_backend": args.weft_backend,
                         "native_capacity": max_local_tokens if runtime is not None else None,
                         "kernel_names": kernel_names,
@@ -373,8 +410,13 @@ def main():
                         ),
                         "warmup": 5, "measured": args.samples, "replays": 50,
                         "rank_max_abs_vs_baseline": {
-                            name: max(row[name] for row in all_errors) for name in calls
+                            name: max(row[name]["max_abs"] for row in all_errors) for name in calls
                         },
+                        "rank_max_relative_l2_vs_baseline": {
+                            name: max(row[name]["relative_l2"] for row in all_errors) for name in calls
+                        },
+                        "parity_atol": args.atol, "parity_rtol": 0.025,
+                        "fp32_reference_errors": all_reference if args.reference_check else None,
                         "rank_max_p50_us": {
                             name: statistics.median(values)
                             for name, values in maximum.items()

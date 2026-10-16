@@ -1,0 +1,5369 @@
+{
+  "date": "2026-10-16",
+  "source_parent": "6c2e245",
+  "gpu": "NVIDIA L20X",
+  "sm_clock_mhz": 1620,
+  "shape": {
+    "hidden": 4096,
+    "intermediate": 2048,
+    "experts": 256,
+    "top_k": 6,
+    "dtype": "bfloat16"
+  },
+  "versions": {
+    "sglang": "0.5.10.post1",
+    "torch": "2.9.1+cu129",
+    "triton": "3.5.1"
+  },
+  "tokens_scope": "per DP rank; single-node DP=EP, expert TP1",
+  "timing": "Mean of two rank-max CUDA-event p50 values; SGLang averages four paired baseline p50 values",
+  "scope": "Synthetic routed MoE inference including fused staging, dispatch, GEMM, return/reduce and PF notify; no training cache; excludes router, shared expert, initialization and weight packing",
+  "pool_tokens": 512,
+  "ring_tokens": 512,
+  "ring_depth": 2,
+  "dt_production_capacity_limit": 64,
+  "dt_diagnostic_capacity_limit": 512,
+  "baseline": "SGLang Triton moe_a2a_backend=none, all-gather/reduce-scatter; stock fallback config (no L20X E32/E64,N2048 tuned file)",
+  "runs": {
+    "formal/dt_dp4_r1": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/dt_dp4_r1_ep4_node0.log",
+      "log_sha256": "1af08f6bdaddb9f017f276f249e3868a47b5be1db130a3f4688e56a9a26c713a",
+      "manifest": "build/flash_small_compare_20261016/dt_dp4_r1.manifest.json",
+      "manifest_sha256": "dfaa105c02f30c46cc28006d63e00c5812891332983672c586c415f6513b0589",
+      "benchmark_args": [
+        "--weft-backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 108
+      },
+      "memory_clock_observations": {
+        "3201": 108
+      },
+      "clock_query_failures": 0
+    },
+    "formal/dt_dp4_r2": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/dt_dp4_r2_ep4_node0.log",
+      "log_sha256": "826e88b6e408dbaffb28e6e090b5c25b47ea12d9fdce600d8e708f1393cd0e4f",
+      "manifest": "build/flash_small_compare_20261016/dt_dp4_r2.manifest.json",
+      "manifest_sha256": "49088bf0235a8d5a1156a4ab2769a1dcf73ec85d1fd8939f647054d71c54605b",
+      "benchmark_args": [
+        "--weft-backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "512",
+        "128",
+        "64",
+        "8",
+        "1",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 104
+      },
+      "memory_clock_observations": {
+        "3201": 104
+      },
+      "clock_query_failures": 0
+    },
+    "formal/dt_dp8_r1": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/dt_dp8_r1_ep8_node0.log",
+      "log_sha256": "a3eee2a6ade45189d761f3f620946247b83cee532536993d78b2e5ac589755a6",
+      "manifest": "build/flash_small_compare_20261016/dt_dp8_r1.manifest.json",
+      "manifest_sha256": "d33f9abb9c53b5ba31d3a316ae83bb2556de8782c00dad11e1aea8fd9d2899e0",
+      "benchmark_args": [
+        "--weft-backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 192
+      },
+      "memory_clock_observations": {
+        "3201": 192
+      },
+      "clock_query_failures": 0
+    },
+    "formal/dt_dp8_r2": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/dt_dp8_r2_ep8_node0.log",
+      "log_sha256": "1240e64bb26d27e5e555e172a8acb642a2b0c58e2882028a8a57ca00335c0807",
+      "manifest": "build/flash_small_compare_20261016/dt_dp8_r2.manifest.json",
+      "manifest_sha256": "e5079609f4999c1647e7b2b000b572d93d1373425b4bda64213a5167259ff529",
+      "benchmark_args": [
+        "--weft-backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "512",
+        "128",
+        "64",
+        "8",
+        "1",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 224
+      },
+      "memory_clock_observations": {
+        "3201": 224
+      },
+      "clock_query_failures": 0
+    },
+    "formal/pf_dp4_r1": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/pf_dp4_r1_ep4_node0.log",
+      "log_sha256": "d4960e54b8e92044657356147b243b8071c4c38dc7a9f7dbf5bf2d3d7ebf9da7",
+      "manifest": "build/flash_small_compare_20261016/pf_dp4_r1.manifest.json",
+      "manifest_sha256": "8261b5d7a839a67cdb47925fc44ff970c6f5ab5b89130c4a993b057f10d644c4",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 96
+      },
+      "memory_clock_observations": {
+        "3201": 96
+      },
+      "clock_query_failures": 0
+    },
+    "formal/pf_dp4_r2": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/pf_dp4_r2_ep4_node0.log",
+      "log_sha256": "b865036e74b1f31775693d8cab72786d28437be3a3746a6c673f2d143258e759",
+      "manifest": "build/flash_small_compare_20261016/pf_dp4_r2.manifest.json",
+      "manifest_sha256": "700bad29bdca832dcbd47cc53d64d96da596a8b0a05740f9feac08eb7018dd70",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "512",
+        "128",
+        "64",
+        "8",
+        "1",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 104
+      },
+      "memory_clock_observations": {
+        "3201": 104
+      },
+      "clock_query_failures": 0
+    },
+    "formal/pf_dp8_r1": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/pf_dp8_r1_ep8_node0.log",
+      "log_sha256": "f24dc07117e1aa24a3b63925c8ee822b047adc8c99cd221fa9d1cb8e50b468e4",
+      "manifest": "build/flash_small_compare_20261016/pf_dp8_r1.manifest.json",
+      "manifest_sha256": "9a0b2cd6de452673134a749b36150c75aa1ff4c8969d4bc4a36adaf02bcb2396",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 216
+      },
+      "memory_clock_observations": {
+        "3201": 216
+      },
+      "clock_query_failures": 0
+    },
+    "formal/pf_dp8_r2": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_compare_20261016/pf_dp8_r2_ep8_node0.log",
+      "log_sha256": "8e9b2f512196fac0f5bfefb03beaabd06628153a0f55ebe33f22fd3bbe8df709",
+      "manifest": "build/flash_small_compare_20261016/pf_dp8_r2.manifest.json",
+      "manifest_sha256": "f92c8a8278c44e5317bb74dbc5aeddfff86cf3f363e21f63dcff25f99e3dcd41",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "512",
+        "128",
+        "64",
+        "8",
+        "1",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001"
+      ],
+      "formal": true,
+      "local_active_gpu_clock_observations": {
+        "1620": 216
+      },
+      "memory_clock_observations": {
+        "3201": 216
+      },
+      "clock_query_failures": 0
+    },
+    "diagnostic/dt_ep4_verify": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "a5e9cb018bbae81a2923da116da812b2f64907eaa377d1560fe57a244c9cbcba",
+      "log": "build/flash_small_20261016/dt_ep4_verify_ep4_node0.log",
+      "log_sha256": "c04c24e3cb39d72519d5cbdd66c1e2d611be71e12a6c2e7a66f5f37adb6373c0",
+      "manifest": "build/flash_small_20261016/dt_ep4_verify.manifest.json",
+      "manifest_sha256": "7dc73683d6396ba0f92c699620c0a54c2eb3e9ae18c97cd54ac886b659d102a5",
+      "benchmark_args": [
+        "--backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--tokens",
+        "128",
+        "512",
+        "--pool-tokens",
+        "512",
+        "--ring-tokens",
+        "512",
+        "--ring-depth",
+        "2",
+        "--token-std-fraction",
+        "0",
+        "--route-bias-std",
+        "10",
+        "--verify",
+        "--verify-kernel",
+        "--warmups",
+        "0",
+        "--samples",
+        "2",
+        "--prepared-weights"
+      ],
+      "formal": false,
+      "local_active_gpu_clock_observations": {
+        "1620": 40
+      },
+      "memory_clock_observations": {
+        "3201": 40
+      },
+      "clock_query_failures": 0
+    },
+    "diagnostic/dt_ep8_verify": {
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "source_diff_sha256": "a5e9cb018bbae81a2923da116da812b2f64907eaa377d1560fe57a244c9cbcba",
+      "log": "build/flash_small_20261016/dt_ep8_verify_ep8_node0.log",
+      "log_sha256": "ac05b6a93ddaa1f859495c3711cea126b3290776eb5260d66e244856986ee8cc",
+      "manifest": "build/flash_small_20261016/dt_ep8_verify.manifest.json",
+      "manifest_sha256": "33a476f44365304f08d2112a2945fb11737d63a506470e37730dab35bdd942dc",
+      "benchmark_args": [
+        "--backend",
+        "dt",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--pool-tokens",
+        "512",
+        "--ring-tokens",
+        "512",
+        "--ring-depth",
+        "2",
+        "--token-std-fraction",
+        "0",
+        "--route-bias-std",
+        "10",
+        "--verify",
+        "--verify-kernel",
+        "--warmups",
+        "0",
+        "--samples",
+        "2",
+        "--prepared-weights"
+      ],
+      "formal": false,
+      "local_active_gpu_clock_observations": {
+        "1620": 136
+      },
+      "memory_clock_observations": {
+        "3201": 136
+      },
+      "clock_query_failures": 0
+    },
+    "diagnostic/pf_dp8_fp32_diagnostic": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "6c04ad414c977b9729e0c71543304df4c4fa6e85137f9e68766570b6dde0efea",
+      "log": "build/flash_small_20261016/pf_dp8_fp32_diagnostic_ep8_node0.log",
+      "log_sha256": "4fd392307e80d2c4002489c67f5ba11b018637c927ac994b999c8fdab85566ee",
+      "manifest": "build/flash_small_20261016/pf_dp8_fp32_diagnostic.manifest.json",
+      "manifest_sha256": "68ebc4068dbc5dfdebdf84eab9bbcb35e65c44d71c12dadfcb3ff85a98f32648",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "8",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20",
+        "--atol",
+        "0.0001",
+        "--reference-check"
+      ],
+      "formal": false,
+      "local_active_gpu_clock_observations": {
+        "1620": 176
+      },
+      "memory_clock_observations": {
+        "3201": 176
+      },
+      "clock_query_failures": 0
+    },
+    "diagnostic/pf_dp8_r1": {
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "source_diff_sha256": "a5e9cb018bbae81a2923da116da812b2f64907eaa377d1560fe57a244c9cbcba",
+      "log": "build/flash_small_20261016/pf_dp8_r1_ep8_node0.log",
+      "log_sha256": "634cdc3e883a2302fa0e36be6d12b63f8412119c562e4e2faea91993cc5346b4",
+      "manifest": "build/flash_small_20261016/pf_dp8_r1.manifest.json",
+      "manifest_sha256": "ba0448e9093295d30079e4b0fca80520ba1fac9ce45e8374d7140c0ecc1a8609",
+      "benchmark_args": [
+        "--weft-backend",
+        "pf",
+        "--hidden",
+        "4096",
+        "--intermediate",
+        "2048",
+        "--experts",
+        "256",
+        "--top-k",
+        "6",
+        "--dp-attention",
+        "--tokens",
+        "1",
+        "8",
+        "64",
+        "128",
+        "512",
+        "--fresh-routes",
+        "--route-bias-std",
+        "0.5",
+        "--samples",
+        "20"
+      ],
+      "formal": false,
+      "local_active_gpu_clock_observations": {
+        "1620": 400
+      },
+      "memory_clock_observations": {
+        "3201": 400
+      },
+      "clock_query_failures": 0
+    }
+  },
+  "builds": {
+    "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf": {
+      "source_commit": "6c2e245387ab0af22cfb7e571c37df96e78b2c63",
+      "source_diff_sha256": "59deff8e7308ca3103a9bd57b5fc04f77ac88fec3bf68ae26c9ecc6a4a50c4d4",
+      "flags": [
+        "-lineinfo",
+        "-Xptxas=-v,--warn-on-spills",
+        "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1",
+        "-I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/configs/dt_flash_probe_20261009",
+        "-DWEFTMOE_DT_MAX_TOKENS=512"
+      ],
+      "timeline": false,
+      "library_sha256": "cfda62cc6994806c0c167360a6fe0b7c7069d8ff9dbca9b3dc3832b85598d7bf",
+      "library": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/pf_main_timeline/flash_small_dt_20261016/libweftmoe.so",
+      "extension_sha256": "167d0fda036d399b95e676fdf5bf47cabdb96d575577a9781a4f2440ab50155c"
+    },
+    "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029": {
+      "source_commit": "6c2e245387ab0af22cfb7e571c37df96e78b2c63",
+      "source_diff_sha256": "59deff8e7308ca3103a9bd57b5fc04f77ac88fec3bf68ae26c9ecc6a4a50c4d4",
+      "flags": [
+        "-lineinfo",
+        "-Xptxas=-v,--warn-on-spills",
+        "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1",
+        "-I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/configs/pf_flash_strategy_20261015"
+      ],
+      "timeline": false,
+      "library_sha256": "2ac194b14046fd700c707e37c8a7a05c78646178b37c2b49fe4258c75bd1c029",
+      "library": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/pf_main_timeline/flash_small_pf_20261016/libweftmoe.so",
+      "extension_sha256": "167d0fda036d399b95e676fdf5bf47cabdb96d575577a9781a4f2440ab50155c"
+    }
+  },
+  "measurements": [
+    {
+      "run": "formal/dt_dp4_r1",
+      "world": 4,
+      "tokens": 1,
+      "weft_backend": "dt",
+      "routing_sha256": "e2c5285183ef22c3a49913e3a6da7513899255f001d601c2292914cdce097d8c",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.0000457763671875
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.0052924673072993755
+      },
+      "rank_max_p50_us": {
+        "baseline": 147.84832000732422,
+        "dt": 129.99615669250488
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          173.81183624267578,
+          174.10175323486328,
+          147.17120170593262,
+          145.88031768798828,
+          157.01824188232422,
+          134.92032051086426,
+          136.6329574584961,
+          146.7136001586914,
+          146.55872344970703,
+          148.52543830871582,
+          136.88447952270508,
+          158.853759765625,
+          172.80384063720703,
+          135.84383964538574,
+          145.74912071228027,
+          146.90815925598145,
+          157.76063919067383,
+          156.7033576965332,
+          156.56512260437012,
+          156.7916774749756
+        ],
+        "dt": [
+          164.31232452392578,
+          167.26783752441406,
+          129.4547176361084,
+          130.53759574890137,
+          135.44896125793457,
+          111.98080062866211,
+          115.07776260375977,
+          128.67648124694824,
+          126.36992454528809,
+          127.62687683105469,
+          112.73983955383301,
+          135.55392265319824,
+          163.16991806030273,
+          111.23519897460938,
+          128.26687812805176,
+          128.29440116882324,
+          132.66112327575684,
+          133.32544326782227,
+          131.55776023864746,
+          135.35039901733398
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r1",
+      "world": 4,
+      "tokens": 8,
+      "weft_backend": "dt",
+      "routing_sha256": "57e13d8ac845ca2ab3e407935a341c20984bca37a6c881eca58f820aac7df57e",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005028837826102972
+      },
+      "rank_max_p50_us": {
+        "baseline": 450.5238342285156,
+        "dt": 380.4934501647949
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          448.8172912597656,
+          470.5817413330078,
+          450.2489471435547,
+          450.20801544189453,
+          460.8665466308594,
+          412.65281677246094,
+          458.4755325317383,
+          453.52062225341797,
+          452.2227096557617,
+          468.79039764404297,
+          408.2495880126953,
+          441.1840057373047,
+          450.79872131347656,
+          439.09568786621094,
+          460.8531188964844,
+          409.3164825439453,
+          455.3190231323242,
+          408.3852767944336,
+          445.83614349365234,
+          459.4585418701172
+        ],
+        "dt": [
+          372.7257537841797,
+          427.2633743286133,
+          374.9651336669922,
+          371.2588882446289,
+          400.70465087890625,
+          354.54784393310547,
+          396.98814392089844,
+          386.2483215332031,
+          388.7846374511719,
+          423.58848571777344,
+          359.61151123046875,
+          361.50848388671875,
+          386.4575958251953,
+          366.8755340576172,
+          397.2537612915039,
+          358.3020782470703,
+          386.02176666259766,
+          357.8643035888672,
+          366.27647399902344,
+          398.7161636352539
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r1",
+      "world": 4,
+      "tokens": 64,
+      "weft_backend": "dt",
+      "routing_sha256": "8058a8825c98fd2fb2cc814cc5f15e2d4bd2a7eccb78849b218979019da55ff6",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00493271742016077
+      },
+      "rank_max_p50_us": {
+        "baseline": 1221.060791015625,
+        "dt": 860.6614303588867
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1221.6671752929688,
+          1213.7152099609375,
+          1224.5094299316406,
+          1206.1766052246094,
+          1227.175064086914,
+          1162.0947265625,
+          1215.9916687011719,
+          1233.8406372070312,
+          1217.5814056396484,
+          1228.70849609375,
+          1227.4642944335938,
+          1227.4726104736328,
+          1220.4544067382812,
+          1224.1580963134766,
+          1224.4493103027344,
+          1200.5721282958984,
+          1208.0274963378906,
+          1215.6352233886719,
+          1229.0585327148438,
+          1217.7375793457031
+        ],
+        "dt": [
+          865.0867462158203,
+          860.8633422851562,
+          872.7308654785156,
+          861.7228698730469,
+          820.830078125,
+          808.1190490722656,
+          830.3558349609375,
+          902.5145721435547,
+          860.4595184326172,
+          848.6252593994141,
+          876.6476440429688,
+          918.5420989990234,
+          849.4367980957031,
+          884.4505310058594,
+          859.1756439208984,
+          798.9510345458984,
+          827.2531127929688,
+          917.1315002441406,
+          839.9398040771484,
+          870.2899169921875
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r1",
+      "world": 4,
+      "tokens": 128,
+      "weft_backend": "dt",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.004916873294860125
+      },
+      "rank_max_p50_us": {
+        "baseline": 1292.8345489501953,
+        "dt": 1288.524169921875
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1318.4492492675781,
+          1274.5120239257812,
+          1314.3244934082031,
+          1268.055648803711,
+          1319.2218017578125,
+          1286.2931823730469,
+          1289.6357727050781,
+          1297.4592590332031,
+          1318.3258056640625,
+          1285.5999755859375,
+          1298.6259460449219,
+          1288.2777404785156,
+          1287.4508666992188,
+          1304.3321228027344,
+          1282.5177001953125,
+          1296.0333251953125,
+          1323.9801025390625,
+          1285.4106140136719,
+          1300.9677124023438,
+          1284.4415283203125
+        ],
+        "dt": [
+          1329.1392517089844,
+          1287.2633361816406,
+          1346.0397338867188,
+          1257.5917053222656,
+          1301.9366455078125,
+          1262.6656341552734,
+          1249.0803527832031,
+          1345.572509765625,
+          1309.5449829101562,
+          1243.1795501708984,
+          1230.706558227539,
+          1295.1699829101562,
+          1300.0639343261719,
+          1289.7850036621094,
+          1280.05126953125,
+          1278.7615966796875,
+          1385.3855895996094,
+          1266.5567779541016,
+          1305.2351379394531,
+          1271.2614440917969
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r1",
+      "world": 4,
+      "tokens": 512,
+      "weft_backend": "dt",
+      "routing_sha256": "b89da3def467f892675f10c22ba6410cdd2b8be64ac85c4f1fd1d103721b7d34",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.004902132321149111
+      },
+      "rank_max_p50_us": {
+        "baseline": 1720.8146667480469,
+        "dt": 1347.2268676757812
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1719.171142578125,
+          1721.7567443847656,
+          1728.9701843261719,
+          1698.0096435546875,
+          1712.2872924804688,
+          1726.78466796875,
+          1735.3567504882812,
+          1727.5672912597656,
+          1688.828125,
+          1723.2135009765625,
+          1749.8489379882812,
+          1691.5245056152344,
+          1700.3129577636719,
+          1720.3366088867188,
+          1738.1733703613281,
+          1713.6895751953125,
+          1733.4483337402344,
+          1717.0355224609375,
+          1715.3056335449219,
+          1721.292724609375
+        ],
+        "dt": [
+          1364.0013122558594,
+          1385.5763244628906,
+          1367.8291320800781,
+          1362.8793334960938,
+          1365.1417541503906,
+          1319.1590881347656,
+          1352.8544616699219,
+          1319.7926330566406,
+          1330.4856872558594,
+          1344.9888610839844,
+          1358.4378051757812,
+          1353.4144592285156,
+          1344.6514892578125,
+          1323.0828857421875,
+          1335.01953125,
+          1387.65625,
+          1347.3234558105469,
+          1347.1302795410156,
+          1330.7551574707031,
+          1345.8163452148438
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r2",
+      "world": 4,
+      "tokens": 512,
+      "weft_backend": "dt",
+      "routing_sha256": "b89da3def467f892675f10c22ba6410cdd2b8be64ac85c4f1fd1d103721b7d34",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.004902132321149111
+      },
+      "rank_max_p50_us": {
+        "baseline": 1719.697265625,
+        "dt": 1342.2281646728516
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1716.4218139648438,
+          1720.3353881835938,
+          1741.1878967285156,
+          1698.8819885253906,
+          1707.906494140625,
+          1724.34814453125,
+          1737.36572265625,
+          1729.3344116210938,
+          1690.55419921875,
+          1721.8559265136719,
+          1751.2083435058594,
+          1691.9474792480469,
+          1699.381103515625,
+          1720.9861755371094,
+          1737.6319885253906,
+          1712.3826599121094,
+          1731.73828125,
+          1718.7245178222656,
+          1713.0213928222656,
+          1719.0591430664062
+        ],
+        "dt": [
+          1362.5535583496094,
+          1383.1263732910156,
+          1365.2851867675781,
+          1363.5769653320312,
+          1366.1453247070312,
+          1320.9286499023438,
+          1346.4242553710938,
+          1315.2543640136719,
+          1337.9808044433594,
+          1332.9939270019531,
+          1361.0694885253906,
+          1344.1567993164062,
+          1340.8525085449219,
+          1313.8175964355469,
+          1334.3116760253906,
+          1382.6322937011719,
+          1332.7098083496094,
+          1343.6038208007812,
+          1330.3251647949219,
+          1330.684814453125
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r2",
+      "world": 4,
+      "tokens": 128,
+      "weft_backend": "dt",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.004916873294860125
+      },
+      "rank_max_p50_us": {
+        "baseline": 1292.0272064208984,
+        "dt": 1290.3506469726562
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1316.8902587890625,
+          1274.7968292236328,
+          1316.8998718261719,
+          1267.8451538085938,
+          1318.5958862304688,
+          1287.2639465332031,
+          1289.0194702148438,
+          1298.155517578125,
+          1319.3594360351562,
+          1281.317138671875,
+          1295.0349426269531,
+          1287.3318481445312,
+          1287.0291137695312,
+          1301.976318359375,
+          1280.3788757324219,
+          1296.7430114746094,
+          1321.8885803222656,
+          1284.6681213378906,
+          1303.0776977539062,
+          1283.0508422851562
+        ],
+        "dt": [
+          1332.5753784179688,
+          1285.3176879882812,
+          1342.8204345703125,
+          1262.2067260742188,
+          1299.2472839355469,
+          1263.6422729492188,
+          1243.0636596679688,
+          1345.1373291015625,
+          1306.9683837890625,
+          1240.1945495605469,
+          1225.5238342285156,
+          1299.5692443847656,
+          1301.9456481933594,
+          1295.3836059570312,
+          1278.8851165771484,
+          1274.4992065429688,
+          1384.3539428710938,
+          1265.3485107421875,
+          1303.123779296875,
+          1268.884506225586
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r2",
+      "world": 4,
+      "tokens": 64,
+      "weft_backend": "dt",
+      "routing_sha256": "8058a8825c98fd2fb2cc814cc5f15e2d4bd2a7eccb78849b218979019da55ff6",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00493271742016077
+      },
+      "rank_max_p50_us": {
+        "baseline": 1221.3520050048828,
+        "dt": 860.9600067138672
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1222.7871704101562,
+          1214.0409851074219,
+          1226.8902587890625,
+          1206.8236541748047,
+          1228.8800048828125,
+          1164.0223693847656,
+          1216.3321685791016,
+          1233.1187438964844,
+          1219.881591796875,
+          1229.7650909423828,
+          1228.2630157470703,
+          1228.7468719482422,
+          1220.9446716308594,
+          1221.7593383789062,
+          1226.6438293457031,
+          1201.2812805175781,
+          1209.8534393310547,
+          1215.9801483154297,
+          1228.3148956298828,
+          1218.4678649902344
+        ],
+        "dt": [
+          867.7561950683594,
+          859.0509033203125,
+          872.0301055908203,
+          859.4758605957031,
+          822.1395111083984,
+          813.9603424072266,
+          831.2620544433594,
+          904.3526458740234,
+          862.8959655761719,
+          848.0262756347656,
+          877.3785400390625,
+          920.3340911865234,
+          849.6672058105469,
+          886.0639953613281,
+          862.4441528320312,
+          799.7625732421875,
+          828.0006408691406,
+          917.3158264160156,
+          842.5612640380859,
+          873.4726715087891
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r2",
+      "world": 4,
+      "tokens": 8,
+      "weft_backend": "dt",
+      "routing_sha256": "57e13d8ac845ca2ab3e407935a341c20984bca37a6c881eca58f820aac7df57e",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005028837826102972
+      },
+      "rank_max_p50_us": {
+        "baseline": 450.66463470458984,
+        "dt": 378.52575302124023
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          449.9046325683594,
+          470.07999420166016,
+          449.9590301513672,
+          449.9929428100586,
+          460.73089599609375,
+          413.2294464111328,
+          457.9212951660156,
+          452.4544143676758,
+          451.3363265991211,
+          467.8937530517578,
+          407.7241516113281,
+          443.2089614868164,
+          452.5062561035156,
+          435.92639923095703,
+          460.0115203857422,
+          408.5356903076172,
+          454.6758270263672,
+          408.50879669189453,
+          445.85792541503906,
+          458.1779098510742
+        ],
+        "dt": [
+          371.0630416870117,
+          425.92830657958984,
+          374.0812683105469,
+          372.4339294433594,
+          395.6358337402344,
+          354.39807891845703,
+          396.9676971435547,
+          382.9702377319336,
+          384.34879302978516,
+          422.7519989013672,
+          356.8492889404297,
+          364.2041778564453,
+          383.93409729003906,
+          366.5798568725586,
+          397.8713607788086,
+          359.68639373779297,
+          383.46622467041016,
+          358.2304000854492,
+          365.2761459350586,
+          397.3177719116211
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp4_r2",
+      "world": 4,
+      "tokens": 1,
+      "weft_backend": "dt",
+      "routing_sha256": "e2c5285183ef22c3a49913e3a6da7513899255f001d601c2292914cdce097d8c",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.0000457763671875
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.0052924673072993755
+      },
+      "rank_max_p50_us": {
+        "baseline": 147.0252799987793,
+        "dt": 128.4771203994751
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          172.77311325073242,
+          173.33824157714844,
+          146.11328125,
+          145.6281566619873,
+          156.8454360961914,
+          134.44416046142578,
+          136.13183975219727,
+          145.0649642944336,
+          144.77248191833496,
+          147.11935997009277,
+          136.15103721618652,
+          158.26175689697266,
+          172.5606346130371,
+          135.50016403198242,
+          146.07872009277344,
+          146.93120002746582,
+          157.17951774597168,
+          156.67136192321777,
+          155.96416473388672,
+          155.99167823791504
+        ],
+        "dt": [
+          163.0201530456543,
+          164.3302345275879,
+          127.6915168762207,
+          129.2627239227295,
+          134.84864234924316,
+          111.55072212219238,
+          113.13216209411621,
+          127.44447708129883,
+          125.75488090515137,
+          126.2342357635498,
+          112.18048095703125,
+          133.505277633667,
+          160.45312881469727,
+          110.0864028930664,
+          127.45663642883301,
+          127.41696357727051,
+          132.09343910217285,
+          132.44352340698242,
+          130.92608451843262,
+          133.05791854858398
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r1",
+      "world": 8,
+      "tokens": 1,
+      "weft_backend": "dt",
+      "routing_sha256": "caf7d45240a73c62283fc1d3d307591fb3115784667265473fc926a6bf8c1b20",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005515082739293575
+      },
+      "rank_max_p50_us": {
+        "baseline": 155.74624061584473,
+        "dt": 128.80320072174072
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          147.2326374053955,
+          148.58495712280273,
+          194.3462371826172,
+          145.3376007080078,
+          148.59840393066406,
+          157.5551986694336,
+          157.36895561218262,
+          149.6396827697754,
+          147.46047973632812,
+          149.00863647460938,
+          169.86944198608398,
+          156.62015914916992,
+          194.70144271850586,
+          168.0089569091797,
+          155.25952339172363,
+          156.23295783996582,
+          156.38912200927734,
+          149.76192474365234,
+          147.96095848083496,
+          157.0470428466797
+        ],
+        "dt": [
+          111.41375541687012,
+          124.202880859375,
+          161.2486457824707,
+          110.79551696777344,
+          123.45664024353027,
+          130.84799766540527,
+          129.76896286010742,
+          127.55392074584961,
+          124.64192390441895,
+          124.7110366821289,
+          154.88832473754883,
+          131.47711753845215,
+          159.14175987243652,
+          155.03680229187012,
+          129.81951713562012,
+          128.2521629333496,
+          129.35423851013184,
+          125.38175582885742,
+          126.40255928039551,
+          130.50111770629883
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r1",
+      "world": 8,
+      "tokens": 8,
+      "weft_backend": "dt",
+      "routing_sha256": "add86d594aad35698862c4bb73b766e56bbc6e7802f0084d6f170fda9b884142",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005202468018978834
+      },
+      "rank_max_p50_us": {
+        "baseline": 538.9542388916016,
+        "dt": 328.09823989868164
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          539.1910552978516,
+          529.0956878662109,
+          557.388801574707,
+          558.6931228637695,
+          525.5955123901367,
+          540.7398223876953,
+          523.6217498779297,
+          557.3683166503906,
+          559.1801452636719,
+          522.9548645019531,
+          551.5993499755859,
+          523.6563110351562,
+          539.3619155883789,
+          545.5475234985352,
+          554.6956634521484,
+          524.705924987793,
+          538.3744049072266,
+          534.1439819335938,
+          523.1436920166016,
+          538.7174224853516
+        ],
+        "dt": [
+          309.32416915893555,
+          300.8691215515137,
+          347.1673583984375,
+          345.2403259277344,
+          303.2313537597656,
+          327.4873733520508,
+          329.61280822753906,
+          345.1833724975586,
+          345.1571273803711,
+          348.9139175415039,
+          380.316162109375,
+          309.6396827697754,
+          333.2748794555664,
+          309.04191970825195,
+          328.6822509765625,
+          301.7254447937012,
+          327.5142288208008,
+          311.24927520751953,
+          289.39008712768555,
+          333.06175231933594
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r1",
+      "world": 8,
+      "tokens": 64,
+      "weft_backend": "dt",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005064505618065596
+      },
+      "rank_max_p50_us": {
+        "baseline": 744.2889404296875,
+        "dt": 851.209602355957
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          764.5830535888672,
+          749.2947387695312,
+          744.7885131835938,
+          709.3856048583984,
+          744.2886352539062,
+          747.2978973388672,
+          734.2208099365234,
+          778.4159851074219,
+          744.2892456054688,
+          750.1261138916016,
+          739.6096038818359,
+          721.9744110107422,
+          732.1939086914062,
+          738.0198669433594,
+          750.8985900878906,
+          744.0704345703125,
+          759.3344116210938,
+          726.2445068359375,
+          777.2576141357422,
+          727.1488189697266
+        ],
+        "dt": [
+          850.7667541503906,
+          867.3651123046875,
+          878.9804840087891,
+          806.8185424804688,
+          828.9536285400391,
+          851.9705963134766,
+          817.496337890625,
+          904.1158294677734,
+          855.3612518310547,
+          848.2022094726562,
+          802.2335815429688,
+          860.4057312011719,
+          864.0831756591797,
+          844.3686676025391,
+          853.109130859375,
+          836.2866973876953,
+          881.0118103027344,
+          848.7891387939453,
+          851.6524505615234,
+          841.2633514404297
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r1",
+      "world": 8,
+      "tokens": 128,
+      "weft_backend": "dt",
+      "routing_sha256": "9d55e80dadeeb1c60ef234cdd611f036f0d169d8699212b48ffa4be6637b1850",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005042227450758219
+      },
+      "rank_max_p50_us": {
+        "baseline": 916.0166549682617,
+        "dt": 597.8739166259766
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          922.6387023925781,
+          895.6819152832031,
+          919.7151947021484,
+          902.4883270263672,
+          904.8691558837891,
+          916.3916778564453,
+          917.7766418457031,
+          888.3424377441406,
+          880.2009582519531,
+          919.2985534667969,
+          875.3587341308594,
+          917.4015808105469,
+          917.5968170166016,
+          930.9830474853516,
+          917.2358703613281,
+          913.3644866943359,
+          902.7974700927734,
+          915.6416320800781,
+          903.465576171875,
+          919.775390625
+        ],
+        "dt": [
+          595.4860687255859,
+          596.8153762817383,
+          597.7670288085938,
+          611.2499237060547,
+          596.124153137207,
+          596.5964889526367,
+          597.3772811889648,
+          598.7731170654297,
+          581.4278411865234,
+          692.1881866455078,
+          616.2854385375977,
+          597.9808044433594,
+          594.8076629638672,
+          595.9104156494141,
+          602.8787231445312,
+          591.3299179077148,
+          611.3702392578125,
+          622.2028732299805,
+          605.6032180786133,
+          607.4451065063477
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r1",
+      "world": 8,
+      "tokens": 512,
+      "weft_backend": "dt",
+      "routing_sha256": "239c6190d9f8e1d9d1a07035fbef10c6d97a94ba07a654cbb245dcf135aea566",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00503868144005537
+      },
+      "rank_max_p50_us": {
+        "baseline": 1533.7100982666016,
+        "dt": 1098.5734558105469
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1535.7728576660156,
+          1520.3392028808594,
+          1559.31396484375,
+          1545.7023620605469,
+          1515.4150390625,
+          1510.8134460449219,
+          1560.3558349609375,
+          1528.4378051757812,
+          1548.1465148925781,
+          1545.9359741210938,
+          1495.0553894042969,
+          1537.4835205078125,
+          1531.6473388671875,
+          1538.0793762207031,
+          1512.7218627929688,
+          1509.537353515625,
+          1523.228759765625,
+          1544.5426940917969,
+          1501.0713195800781,
+          1535.849609375
+        ],
+        "dt": [
+          1094.9529266357422,
+          1103.4905242919922,
+          1123.2147216796875,
+          1104.8614501953125,
+          1074.6771240234375,
+          1094.5625305175781,
+          1109.3907165527344,
+          1120.403823852539,
+          1090.044174194336,
+          1117.6294708251953,
+          1104.8140716552734,
+          1095.1929473876953,
+          1096.1933135986328,
+          1109.2249298095703,
+          1087.5647735595703,
+          1090.1881408691406,
+          1072.384033203125,
+          1109.6806335449219,
+          1069.1846466064453,
+          1100.953598022461
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r2",
+      "world": 8,
+      "tokens": 512,
+      "weft_backend": "dt",
+      "routing_sha256": "239c6190d9f8e1d9d1a07035fbef10c6d97a94ba07a654cbb245dcf135aea566",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00503868144005537
+      },
+      "rank_max_p50_us": {
+        "baseline": 1533.3676147460938,
+        "dt": 1105.510368347168
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1549.18212890625,
+          1524.4288635253906,
+          1560.9426879882812,
+          1550.7154846191406,
+          1519.932861328125,
+          1513.8272094726562,
+          1561.8336486816406,
+          1534.0626525878906,
+          1551.9392395019531,
+          1547.0906066894531,
+          1499.8310852050781,
+          1532.6725769042969,
+          1528.55224609375,
+          1540.3981018066406,
+          1524.3437194824219,
+          1511.436767578125,
+          1524.2579650878906,
+          1543.5775756835938,
+          1503.2383728027344,
+          1540.8851623535156
+        ],
+        "dt": [
+          1096.297607421875,
+          1113.8937377929688,
+          1125.8329772949219,
+          1107.2198486328125,
+          1076.3750457763672,
+          1096.2796783447266,
+          1110.3225708007812,
+          1120.3724670410156,
+          1094.2444610595703,
+          1111.1167907714844,
+          1106.1714935302734,
+          1095.3401947021484,
+          1104.8492431640625,
+          1106.2278747558594,
+          1089.0290832519531,
+          1092.6464080810547,
+          1073.8886260986328,
+          1109.6627044677734,
+          1072.1331024169922,
+          1114.1868591308594
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r2",
+      "world": 8,
+      "tokens": 128,
+      "weft_backend": "dt",
+      "routing_sha256": "9d55e80dadeeb1c60ef234cdd611f036f0d169d8699212b48ffa4be6637b1850",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005042227450758219
+      },
+      "rank_max_p50_us": {
+        "baseline": 914.351692199707,
+        "dt": 599.8182487487793
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          921.8035125732422,
+          898.4953308105469,
+          920.3366088867188,
+          903.9654541015625,
+          908.4992218017578,
+          917.1456146240234,
+          918.3628845214844,
+          888.6208343505859,
+          877.2275543212891,
+          919.3548583984375,
+          878.2073974609375,
+          918.4140777587891,
+          917.4489593505859,
+          931.1033630371094,
+          919.9897766113281,
+          911.5577697753906,
+          904.3385314941406,
+          905.8073425292969,
+          908.1452941894531,
+          920.250244140625
+        ],
+        "dt": [
+          604.8268890380859,
+          598.6777496337891,
+          599.7600173950195,
+          612.7353668212891,
+          596.0550308227539,
+          598.6854553222656,
+          601.9731140136719,
+          599.8764801025391,
+          580.7129669189453,
+          647.9411315917969,
+          615.3036880493164,
+          598.6643218994141,
+          593.4348678588867,
+          596.0332870483398,
+          600.7872009277344,
+          593.2761764526367,
+          612.0588684082031,
+          621.6147232055664,
+          604.3648147583008,
+          598.7865447998047
+        ]
+      },
+      "kernel_ids": [
+        0,
+        2
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r2",
+      "world": 8,
+      "tokens": 64,
+      "weft_backend": "dt",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005064505618065596
+      },
+      "rank_max_p50_us": {
+        "baseline": 744.1961288452148,
+        "dt": 850.3353881835938
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          764.1133117675781,
+          747.4591827392578,
+          745.4239654541016,
+          710.1010894775391,
+          742.9682922363281,
+          747.6441955566406,
+          731.6883087158203,
+          777.0604705810547,
+          742.3353576660156,
+          750.2047729492188,
+          729.8604583740234,
+          719.3305969238281,
+          729.0764617919922,
+          739.1474914550781,
+          751.448974609375,
+          746.0134124755859,
+          757.6569366455078,
+          727.7222442626953,
+          781.7894744873047,
+          725.6563568115234
+        ],
+        "dt": [
+          854.5388793945312,
+          864.4627380371094,
+          881.5020751953125,
+          805.9078216552734,
+          831.2083435058594,
+          855.0713348388672,
+          818.3590698242188,
+          901.1698913574219,
+          849.0150451660156,
+          850.5017852783203,
+          797.0400238037109,
+          867.3484802246094,
+          852.608642578125,
+          837.6428985595703,
+          856.6361236572266,
+          837.2198486328125,
+          885.0361633300781,
+          850.1689910888672,
+          848.9939117431641,
+          846.7462158203125
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r2",
+      "world": 8,
+      "tokens": 8,
+      "weft_backend": "dt",
+      "routing_sha256": "add86d594aad35698862c4bb73b766e56bbc6e7802f0084d6f170fda9b884142",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005202468018978834
+      },
+      "rank_max_p50_us": {
+        "baseline": 539.3337631225586,
+        "dt": 328.2927894592285
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          539.6851348876953,
+          528.3500671386719,
+          560.7308959960938,
+          559.5481491088867,
+          527.1206283569336,
+          539.4009780883789,
+          524.1587066650391,
+          558.221435546875,
+          558.7231826782227,
+          527.3638534545898,
+          551.539192199707,
+          524.9631881713867,
+          541.7497634887695,
+          539.2665481567383,
+          552.2092819213867,
+          527.6614379882812,
+          536.4352035522461,
+          538.408317565918,
+          524.189453125,
+          540.8422470092773
+        ],
+        "dt": [
+          309.86751556396484,
+          302.34752655029297,
+          347.23201751708984,
+          345.89183807373047,
+          303.3375930786133,
+          328.7308883666992,
+          330.8998489379883,
+          344.8825454711914,
+          344.15550231933594,
+          350.92288970947266,
+          378.05248260498047,
+          315.0662422180176,
+          330.40576934814453,
+          308.76352310180664,
+          328.22975158691406,
+          299.32735443115234,
+          328.35582733154297,
+          310.98560333251953,
+          289.25695419311523,
+          326.27777099609375
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/dt_dp8_r2",
+      "world": 8,
+      "tokens": 1,
+      "weft_backend": "dt",
+      "routing_sha256": "caf7d45240a73c62283fc1d3d307591fb3115784667265473fc926a6bf8c1b20",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "dt": 0.005515082739293575
+      },
+      "rank_max_p50_us": {
+        "baseline": 155.62399864196777,
+        "dt": 128.97632122039795
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          146.60096168518066,
+          149.12320137023926,
+          194.36031341552734,
+          146.12607955932617,
+          148.52543830871582,
+          158.48447799682617,
+          157.95904159545898,
+          149.5584011077881,
+          148.92288208007812,
+          150.05120277404785,
+          170.21055221557617,
+          157.30239868164062,
+          195.00736236572266,
+          168.71295928955078,
+          155.19231796264648,
+          156.05567932128906,
+          156.20223999023438,
+          149.06047821044922,
+          147.9321575164795,
+          156.7302417755127
+        ],
+        "dt": [
+          111.27872467041016,
+          124.92416381835938,
+          163.2454490661621,
+          110.8563232421875,
+          123.52704048156738,
+          131.98464393615723,
+          130.22784233093262,
+          125.03552436828613,
+          124.63680267333984,
+          126.20351791381836,
+          156.6579246520996,
+          132.77631759643555,
+          159.7824001312256,
+          155.81695556640625,
+          129.82463836669922,
+          128.12800407409668,
+          130.3936004638672,
+          124.9779224395752,
+          125.1142406463623,
+          129.91999626159668
+        ]
+      },
+      "kernel_ids": [
+        0,
+        1
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r1",
+      "world": 4,
+      "tokens": 1,
+      "weft_backend": "pf",
+      "routing_sha256": "e2c5285183ef22c3a49913e3a6da7513899255f001d601c2292914cdce097d8c",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.0000457763671875
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.0052924673072993755
+      },
+      "rank_max_p50_us": {
+        "baseline": 147.45728015899658,
+        "pf": 232.64991760253906
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          172.52607345581055,
+          174.19584274291992,
+          147.36191749572754,
+          146.2566375732422,
+          156.89855575561523,
+          134.4972801208496,
+          136.0262393951416,
+          146.14975929260254,
+          145.90847969055176,
+          147.55264282226562,
+          136.245756149292,
+          157.9315185546875,
+          173.05280685424805,
+          136.20991706848145,
+          145.5628776550293,
+          146.53440475463867,
+          157.4899196624756,
+          157.0854377746582,
+          156.99456214904785,
+          157.30112075805664
+        ],
+        "pf": [
+          284.96511459350586,
+          283.1097602844238,
+          232.6335906982422,
+          232.29120254516602,
+          235.0783920288086,
+          228.6240005493164,
+          229.7439956665039,
+          230.01792907714844,
+          230.2604866027832,
+          232.69184112548828,
+          230.3046417236328,
+          233.85536193847656,
+          288.39040756225586,
+          230.18047332763672,
+          231.08224868774414,
+          230.31295776367188,
+          232.70208358764648,
+          234.17152404785156,
+          234.97919082641602,
+          232.66624450683594
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r1",
+      "world": 4,
+      "tokens": 8,
+      "weft_backend": "pf",
+      "routing_sha256": "57e13d8ac845ca2ab3e407935a341c20984bca37a6c881eca58f820aac7df57e",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005028837826102972
+      },
+      "rank_max_p50_us": {
+        "baseline": 451.5683174133301,
+        "pf": 571.5539169311523
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          449.52064514160156,
+          470.52032470703125,
+          450.6060791015625,
+          449.8291015625,
+          472.61951446533203,
+          412.5331115722656,
+          458.0006408691406,
+          453.40991973876953,
+          452.6559829711914,
+          468.5977554321289,
+          408.5580825805664,
+          440.84606170654297,
+          452.53055572509766,
+          438.9516830444336,
+          458.8800048828125,
+          409.09374237060547,
+          455.5168151855469,
+          407.8553771972656,
+          444.70592498779297,
+          459.3452835083008
+        ],
+        "pf": [
+          555.8822250366211,
+          633.6153411865234,
+          557.3734283447266,
+          567.0502471923828,
+          603.713264465332,
+          553.5443115234375,
+          604.5939254760742,
+          578.0607986450195,
+          577.7324676513672,
+          632.4895858764648,
+          553.88671875,
+          556.5792083740234,
+          576.0575866699219,
+          554.4761657714844,
+          605.5456161499023,
+          555.0783920288086,
+          581.9807815551758,
+          553.0303955078125,
+          556.1254501342773,
+          604.1971206665039
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r1",
+      "world": 4,
+      "tokens": 64,
+      "weft_backend": "pf",
+      "routing_sha256": "8058a8825c98fd2fb2cc814cc5f15e2d4bd2a7eccb78849b218979019da55ff6",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004932634066790342
+      },
+      "rank_max_p50_us": {
+        "baseline": 1221.3545608520508,
+        "pf": 1049.395523071289
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1222.2124481201172,
+          1216.5523529052734,
+          1226.0313415527344,
+          1209.5590209960938,
+          1226.5657806396484,
+          1163.9718627929688,
+          1214.7801971435547,
+          1232.8441619873047,
+          1218.730239868164,
+          1227.6716613769531,
+          1227.5238037109375,
+          1227.1250915527344,
+          1219.749755859375,
+          1223.5065460205078,
+          1223.4381103515625,
+          1203.1737518310547,
+          1211.2608337402344,
+          1216.6815948486328,
+          1227.1897888183594,
+          1220.4966735839844
+        ],
+        "pf": [
+          1071.6812896728516,
+          1046.280288696289,
+          1066.2297821044922,
+          1040.097885131836,
+          1088.6528015136719,
+          984.0217590332031,
+          1045.683822631836,
+          1093.921890258789,
+          1046.9120025634766,
+          1068.5350036621094,
+          1095.3791809082031,
+          1049.84130859375,
+          1070.6694030761719,
+          1048.9497375488281,
+          1068.5337829589844,
+          1042.441635131836,
+          1041.6966247558594,
+          1045.4643249511719,
+          1069.7785949707031,
+          1042.5836944580078
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r1",
+      "world": 4,
+      "tokens": 128,
+      "weft_backend": "pf",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004916733596473932
+      },
+      "rank_max_p50_us": {
+        "baseline": 1293.1375885009766,
+        "pf": 1109.6166229248047
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1318.3244323730469,
+          1275.7657623291016,
+          1322.7104187011719,
+          1268.6105346679688,
+          1318.4416198730469,
+          1287.3951721191406,
+          1289.7906494140625,
+          1298.8172912597656,
+          1318.0940246582031,
+          1282.530517578125,
+          1294.8760986328125,
+          1288.0351257324219,
+          1291.3990783691406,
+          1305.9890747070312,
+          1282.3052978515625,
+          1296.6624450683594,
+          1323.4669494628906,
+          1286.6246032714844,
+          1298.8479614257812,
+          1285.0425720214844
+        ],
+        "pf": [
+          1138.2374572753906,
+          1060.3520202636719,
+          1134.7264099121094,
+          1058.3634948730469,
+          1136.3967895507812,
+          1105.5757141113281,
+          1106.1408233642578,
+          1136.1727905273438,
+          1133.7958526611328,
+          1084.4435119628906,
+          1110.013427734375,
+          1087.7318572998047,
+          1106.4864349365234,
+          1133.9929962158203,
+          1109.2198181152344,
+          1111.3676452636719,
+          1137.2268676757812,
+          1105.8956909179688,
+          1131.638412475586,
+          1102.7398681640625
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r1",
+      "world": 4,
+      "tokens": 512,
+      "weft_backend": "pf",
+      "routing_sha256": "b89da3def467f892675f10c22ba6410cdd2b8be64ac85c4f1fd1d103721b7d34",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004902095068246126
+      },
+      "rank_max_p50_us": {
+        "baseline": 1719.578857421875,
+        "pf": 1359.9059295654297
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1717.3190307617188,
+          1723.5737609863281,
+          1728.7551879882812,
+          1702.6643371582031,
+          1707.8477478027344,
+          1724.3449401855469,
+          1734.5484924316406,
+          1727.0732116699219,
+          1690.8773803710938,
+          1722.0985412597656,
+          1750.6092834472656,
+          1693.0009460449219,
+          1696.5689086914062,
+          1718.2220458984375,
+          1737.6985168457031,
+          1709.0675354003906,
+          1727.6678466796875,
+          1716.7205810546875,
+          1713.6192321777344,
+          1720.9356689453125
+        ],
+        "pf": [
+          1380.3814697265625,
+          1379.7593688964844,
+          1348.5305786132812,
+          1330.9869384765625,
+          1362.2892761230469,
+          1365.7267761230469,
+          1320.7942199707031,
+          1357.5225830078125,
+          1355.3913879394531,
+          1377.918701171875,
+          1350.1338195800781,
+          1314.4972229003906,
+          1409.8886108398438,
+          1340.3475952148438,
+          1354.7148132324219,
+          1372.4946594238281,
+          1366.5216064453125,
+          1394.6073913574219,
+          1353.0393981933594,
+          1376.3597106933594
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r2",
+      "world": 4,
+      "tokens": 512,
+      "weft_backend": "pf",
+      "routing_sha256": "b89da3def467f892675f10c22ba6410cdd2b8be64ac85c4f1fd1d103721b7d34",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004902095068246126
+      },
+      "rank_max_p50_us": {
+        "baseline": 1718.93310546875,
+        "pf": 1358.9292907714844
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1718.9785766601562,
+          1722.6188659667969,
+          1727.1693420410156,
+          1701.9520568847656,
+          1707.6377868652344,
+          1725.3677368164062,
+          1736.7097473144531,
+          1725.8201599121094,
+          1690.8741760253906,
+          1721.6838073730469,
+          1750.7148742675781,
+          1690.5868530273438,
+          1698.2138061523438,
+          1718.8876342773438,
+          1735.7708740234375,
+          1710.8390808105469,
+          1729.7984313964844,
+          1717.0565795898438,
+          1712.0697021484375,
+          1717.9104614257812
+        ],
+        "pf": [
+          1378.3021545410156,
+          1379.5404052734375,
+          1349.2691040039062,
+          1339.3190002441406,
+          1362.4345397949219,
+          1365.084228515625,
+          1321.5980529785156,
+          1351.2608337402344,
+          1355.3887939453125,
+          1379.1693115234375,
+          1348.8070678710938,
+          1315.2499389648438,
+          1408.0294799804688,
+          1339.632568359375,
+          1355.4240417480469,
+          1372.0166015625,
+          1366.1383056640625,
+          1394.7859191894531,
+          1350.7008361816406,
+          1376.8159484863281
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r2",
+      "world": 4,
+      "tokens": 128,
+      "weft_backend": "pf",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004916733596473932
+      },
+      "rank_max_p50_us": {
+        "baseline": 1289.4307708740234,
+        "pf": 1112.1913528442383
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1315.1507568359375,
+          1275.8118438720703,
+          1312.7116394042969,
+          1268.6457824707031,
+          1315.572509765625,
+          1286.5414428710938,
+          1289.1194152832031,
+          1295.494384765625,
+          1318.8249206542969,
+          1281.5744018554688,
+          1289.7421264648438,
+          1283.0528259277344,
+          1288.7008666992188,
+          1301.2947082519531,
+          1280.947265625,
+          1296.6085815429688,
+          1321.7036437988281,
+          1282.9498291015625,
+          1299.3894958496094,
+          1285.5430603027344
+        ],
+        "pf": [
+          1136.8851470947266,
+          1063.6370849609375,
+          1136.4415740966797,
+          1057.5718688964844,
+          1135.5769348144531,
+          1110.136947631836,
+          1103.8015747070312,
+          1134.2848205566406,
+          1135.646743774414,
+          1086.0774230957031,
+          1114.2457580566406,
+          1088.0537414550781,
+          1104.8230743408203,
+          1133.7542724609375,
+          1108.84033203125,
+          1115.3241729736328,
+          1138.8729858398438,
+          1103.7433624267578,
+          1134.6886444091797,
+          1103.5968017578125
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r2",
+      "world": 4,
+      "tokens": 64,
+      "weft_backend": "pf",
+      "routing_sha256": "8058a8825c98fd2fb2cc814cc5f15e2d4bd2a7eccb78849b218979019da55ff6",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.004932634066790342
+      },
+      "rank_max_p50_us": {
+        "baseline": 1223.2307434082031,
+        "pf": 1049.3545532226562
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1223.5846710205078,
+          1215.9442901611328,
+          1228.0633544921875,
+          1208.6099243164062,
+          1228.5810852050781,
+          1164.3814086914062,
+          1217.1155548095703,
+          1233.6006164550781,
+          1219.2588806152344,
+          1230.2156829833984,
+          1230.9375762939453,
+          1229.4834899902344,
+          1222.8768157958984,
+          1223.8162994384766,
+          1229.6243286132812,
+          1203.2281494140625,
+          1212.7916717529297,
+          1216.4300537109375,
+          1230.640640258789,
+          1219.876480102539
+        ],
+        "pf": [
+          1072.828140258789,
+          1047.729263305664,
+          1069.6749114990234,
+          1044.8140716552734,
+          1091.9967651367188,
+          986.8492889404297,
+          1047.0829010009766,
+          1098.5657501220703,
+          1048.1088256835938,
+          1072.3987579345703,
+          1095.2294158935547,
+          1050.3321838378906,
+          1071.585922241211,
+          1048.1100463867188,
+          1071.8905639648438,
+          1044.4422149658203,
+          1046.9996643066406,
+          1048.3769226074219,
+          1071.905288696289,
+          1043.5513305664062
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r2",
+      "world": 4,
+      "tokens": 8,
+      "weft_backend": "pf",
+      "routing_sha256": "57e13d8ac845ca2ab3e407935a341c20984bca37a6c881eca58f820aac7df57e",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005028837826102972
+      },
+      "rank_max_p50_us": {
+        "baseline": 450.8294486999512,
+        "pf": 570.148811340332
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          448.80062103271484,
+          469.4348907470703,
+          450.0697708129883,
+          450.42240142822266,
+          460.1939010620117,
+          411.7599868774414,
+          458.4729766845703,
+          452.9171371459961,
+          451.2364959716797,
+          467.5187301635742,
+          406.7987060546875,
+          442.41790771484375,
+          453.8854217529297,
+          437.48416900634766,
+          460.11390686035156,
+          408.1292724609375,
+          454.6214294433594,
+          409.0796661376953,
+          444.49790954589844,
+          458.4281539916992
+        ],
+        "pf": [
+          557.8982543945312,
+          636.0230255126953,
+          560.3814315795898,
+          557.1974563598633,
+          606.4307022094727,
+          554.9459075927734,
+          609.6128082275391,
+          580.4064178466797,
+          580.4902267456055,
+          634.2707061767578,
+          555.1091384887695,
+          556.5119934082031,
+          578.1849670410156,
+          562.1126556396484,
+          609.6723175048828,
+          554.0934371948242,
+          583.639030456543,
+          557.8553771972656,
+          559.4879913330078,
+          606.4128112792969
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp4_r2",
+      "world": 4,
+      "tokens": 1,
+      "weft_backend": "pf",
+      "routing_sha256": "e2c5285183ef22c3a49913e3a6da7513899255f001d601c2292914cdce097d8c",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.0000457763671875
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.0052924673072993755
+      },
+      "rank_max_p50_us": {
+        "baseline": 147.88352012634277,
+        "pf": 233.82399559020996
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          172.8179168701172,
+          173.36896896362305,
+          147.31648445129395,
+          146.38272285461426,
+          156.4793586730957,
+          134.51775550842285,
+          138.0185604095459,
+          144.90495681762695,
+          147.30624198913574,
+          148.4505558013916,
+          135.71200370788574,
+          157.41056442260742,
+          174.21632766723633,
+          134.9075222015381,
+          145.75551986694336,
+          146.4345645904541,
+          156.67136192321777,
+          156.2547206878662,
+          156.2342357635498,
+          156.30911827087402
+        ],
+        "pf": [
+          286.3897514343262,
+          285.1897621154785,
+          232.50431060791016,
+          232.70208358764648,
+          237.21599578857422,
+          230.60543060302734,
+          231.68703079223633,
+          229.69024658203125,
+          230.2739143371582,
+          235.77983856201172,
+          232.18687057495117,
+          235.0374412536621,
+          286.56192779541016,
+          230.16000747680664,
+          234.005126953125,
+          231.04511260986328,
+          233.83487701416016,
+          235.00799179077148,
+          236.31359100341797,
+          233.81311416625977
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r1",
+      "world": 8,
+      "tokens": 1,
+      "weft_backend": "pf",
+      "routing_sha256": "caf7d45240a73c62283fc1d3d307591fb3115784667265473fc926a6bf8c1b20",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005515082739293575
+      },
+      "rank_max_p50_us": {
+        "baseline": 155.66752433776855,
+        "pf": 223.0729579925537
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          148.30400466918945,
+          149.43872451782227,
+          192.4928092956543,
+          145.17056465148926,
+          147.63327598571777,
+          157.8547191619873,
+          158.97472381591797,
+          149.66527938842773,
+          147.78688430786133,
+          149.11359786987305,
+          169.24224853515625,
+          157.08736419677734,
+          194.49792861938477,
+          168.82495880126953,
+          155.84704399108887,
+          155.48800468444824,
+          157.6979160308838,
+          149.40287590026855,
+          149.41632270812988,
+          157.01120376586914
+        ],
+        "pf": [
+          219.21215057373047,
+          220.46207427978516,
+          274.42880630493164,
+          218.95231246948242,
+          219.2915153503418,
+          226.96704864501953,
+          222.90176391601562,
+          220.67903518676758,
+          218.96127700805664,
+          222.66559600830078,
+          248.11328887939453,
+          223.95263671875,
+          277.24735260009766,
+          250.5120086669922,
+          223.7926483154297,
+          224.06272888183594,
+          225.06559371948242,
+          221.78495407104492,
+          221.66719436645508,
+          223.2441520690918
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r1",
+      "world": 8,
+      "tokens": 8,
+      "weft_backend": "pf",
+      "routing_sha256": "add86d594aad35698862c4bb73b766e56bbc6e7802f0084d6f170fda9b884142",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005202468018978834
+      },
+      "rank_max_p50_us": {
+        "baseline": 539.951057434082,
+        "pf": 469.7043228149414
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          539.918098449707,
+          527.1948623657227,
+          559.6537780761719,
+          559.5507049560547,
+          527.0361709594727,
+          542.4697494506836,
+          525.0969696044922,
+          557.9276657104492,
+          559.8144149780273,
+          524.3596649169922,
+          550.1894378662109,
+          523.3939361572266,
+          539.984016418457,
+          542.4588775634766,
+          551.7209625244141,
+          526.2873458862305,
+          538.2796859741211,
+          537.9251098632812,
+          523.0956649780273,
+          542.4934387207031
+        ],
+        "pf": [
+          467.37598419189453,
+          467.20577239990234,
+          515.7804870605469,
+          516.04736328125,
+          468.0972671508789,
+          472.2880172729492,
+          465.02655029296875,
+          517.9001617431641,
+          517.5769424438477,
+          471.63135528564453,
+          492.2022247314453,
+          466.65599822998047,
+          468.3232116699219,
+          470.9574508666992,
+          492.56446838378906,
+          464.9708938598633,
+          481.25633239746094,
+          468.4511947631836,
+          466.2150573730469,
+          467.93792724609375
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r1",
+      "world": 8,
+      "tokens": 64,
+      "weft_backend": "pf",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005064515862613916
+      },
+      "rank_max_p50_us": {
+        "baseline": 744.3299102783203,
+        "pf": 632.8704071044922
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          763.8899230957031,
+          750.9299468994141,
+          745.1564788818359,
+          709.9858856201172,
+          743.5033416748047,
+          748.1938934326172,
+          731.014404296875,
+          787.1295928955078,
+          742.7519989013672,
+          752.9420471191406,
+          736.2847900390625,
+          721.6019439697266,
+          729.1117095947266,
+          738.3296203613281,
+          762.0313262939453,
+          745.5264282226562,
+          757.1199798583984,
+          728.7353515625,
+          780.3244781494141,
+          727.3958587646484
+        ],
+        "pf": [
+          635.5206298828125,
+          590.6092834472656,
+          649.2876434326172,
+          607.5167846679688,
+          634.9472045898438,
+          639.6575927734375,
+          612.5068664550781,
+          645.4854583740234,
+          632.3884963989258,
+          637.064323425293,
+          635.8265686035156,
+          613.8079833984375,
+          632.8467178344727,
+          632.8940963745117,
+          615.4048156738281,
+          618.8659286499023,
+          637.7241516113281,
+          629.7798538208008,
+          637.3152160644531,
+          630.0179290771484
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r1",
+      "world": 8,
+      "tokens": 128,
+      "weft_backend": "pf",
+      "routing_sha256": "9d55e80dadeeb1c60ef234cdd611f036f0d169d8699212b48ffa4be6637b1850",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005042227450758219
+      },
+      "rank_max_p50_us": {
+        "baseline": 912.756462097168,
+        "pf": 699.2902374267578
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          920.1548767089844,
+          896.1766052246094,
+          918.695068359375,
+          900.7698822021484,
+          906.9491577148438,
+          914.4076538085938,
+          919.8854064941406,
+          890.2649688720703,
+          876.9241333007812,
+          918.7462615966797,
+          875.494384765625,
+          918.6707305908203,
+          933.0290985107422,
+          928.6112213134766,
+          917.7292633056641,
+          911.1052703857422,
+          905.0809478759766,
+          903.1622314453125,
+          907.2198486328125,
+          917.9488372802734
+        ],
+        "pf": [
+          679.3004608154297,
+          705.2127838134766,
+          698.1311798095703,
+          678.5427093505859,
+          672.9132843017578,
+          668.9324951171875,
+          679.7535705566406,
+          703.2889556884766,
+          680.5088043212891,
+          724.1977691650391,
+          699.7261047363281,
+          704.7245025634766,
+          700.8326721191406,
+          654.5932769775391,
+          703.7478637695312,
+          703.2288360595703,
+          705.5181121826172,
+          723.3830261230469,
+          672.2713470458984,
+          698.8543701171875
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r1",
+      "world": 8,
+      "tokens": 512,
+      "weft_backend": "pf",
+      "routing_sha256": "239c6190d9f8e1d9d1a07035fbef10c6d97a94ba07a654cbb245dcf135aea566",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005038743373006582
+      },
+      "rank_max_p50_us": {
+        "baseline": 1528.4473419189453,
+        "pf": 936.6883087158203
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1536.9683837890625,
+          1519.3356323242188,
+          1555.6031799316406,
+          1547.5654602050781,
+          1519.4303894042969,
+          1517.3414611816406,
+          1558.0889892578125,
+          1527.6287841796875,
+          1551.8733215332031,
+          1545.9199523925781,
+          1498.1663513183594,
+          1529.2658996582031,
+          1525.8688354492188,
+          1535.4899597167969,
+          1512.6470947265625,
+          1506.5586853027344,
+          1517.2428894042969,
+          1542.291259765625,
+          1499.9833679199219,
+          1539.8918151855469
+        ],
+        "pf": [
+          962.4665832519531,
+          934.0850830078125,
+          948.0678558349609,
+          962.6393890380859,
+          938.3763122558594,
+          935.0003051757812,
+          963.5801696777344,
+          932.4953460693359,
+          961.7343902587891,
+          963.3580780029297,
+          928.8352203369141,
+          931.871337890625,
+          945.4041290283203,
+          929.8278045654297,
+          929.9667358398438,
+          942.5023651123047,
+          914.6701049804688,
+          933.1097412109375,
+          912.4793243408203,
+          959.6147155761719
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r2",
+      "world": 8,
+      "tokens": 512,
+      "weft_backend": "pf",
+      "routing_sha256": "239c6190d9f8e1d9d1a07035fbef10c6d97a94ba07a654cbb245dcf135aea566",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.000091552734375
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005038743373006582
+      },
+      "rank_max_p50_us": {
+        "baseline": 1532.933120727539,
+        "pf": 937.5360107421875
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          1540.9638977050781,
+          1522.42431640625,
+          1555.6179809570312,
+          1547.7191162109375,
+          1519.4131469726562,
+          1514.9382019042969,
+          1559.776611328125,
+          1534.4210815429688,
+          1552.9664611816406,
+          1545.770263671875,
+          1499.6864318847656,
+          1531.4451599121094,
+          1529.9635314941406,
+          1535.8930969238281,
+          1515.6416320800781,
+          1512.0051574707031,
+          1522.3091125488281,
+          1543.4912109375,
+          1500.2143859863281,
+          1543.7362670898438
+        ],
+        "pf": [
+          962.6668548583984,
+          935.5328369140625,
+          950.711669921875,
+          961.4822387695312,
+          939.5391845703125,
+          934.2508697509766,
+          964.0345764160156,
+          932.8428649902344,
+          960.0204467773438,
+          962.1376037597656,
+          928.2924652099609,
+          934.4774627685547,
+          946.5280151367188,
+          930.8863830566406,
+          929.6979522705078,
+          943.2339477539062,
+          915.6806182861328,
+          931.4112091064453,
+          913.8047790527344,
+          956.4198303222656
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r2",
+      "world": 8,
+      "tokens": 128,
+      "weft_backend": "pf",
+      "routing_sha256": "9d55e80dadeeb1c60ef234cdd611f036f0d169d8699212b48ffa4be6637b1850",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005042227450758219
+      },
+      "rank_max_p50_us": {
+        "baseline": 914.1945648193359,
+        "pf": 700.8700561523438
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          919.9155426025391,
+          894.3148803710938,
+          918.8422393798828,
+          900.9561920166016,
+          911.4176177978516,
+          919.1449737548828,
+          915.8195495605469,
+          890.0614166259766,
+          877.4752044677734,
+          918.8582611083984,
+          877.1417236328125,
+          919.2755126953125,
+          914.5184326171875,
+          931.817626953125,
+          918.7398529052734,
+          913.8706970214844,
+          903.6307525634766,
+          903.609619140625,
+          908.8832092285156,
+          921.8534088134766
+        ],
+        "pf": [
+          680.2054595947266,
+          705.2652740478516,
+          701.3823699951172,
+          679.3017578125,
+          676.3442993164062,
+          669.3555450439453,
+          683.4092712402344,
+          702.9625701904297,
+          681.0867309570312,
+          726.1119842529297,
+          700.1593780517578,
+          706.6099548339844,
+          700.3577423095703,
+          657.667236328125,
+          706.5427398681641,
+          704.268798828125,
+          704.4076538085938,
+          724.4601440429688,
+          670.4780578613281,
+          702.2873687744141
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r2",
+      "world": 8,
+      "tokens": 64,
+      "weft_backend": "pf",
+      "routing_sha256": "e11eca5c53fb8d44ff038a7e89685780801a76937dc225200914d7f97c01e2cf",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005064515862613916
+      },
+      "rank_max_p50_us": {
+        "baseline": 744.7830200195312,
+        "pf": 635.6787109375
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          764.8294067382812,
+          752.8147125244141,
+          745.7202911376953,
+          709.5897674560547,
+          743.0560302734375,
+          746.5478515625,
+          730.1100921630859,
+          778.4716796875,
+          751.488037109375,
+          751.0463714599609,
+          730.63232421875,
+          722.4262237548828,
+          728.6873626708984,
+          736.9983673095703,
+          749.0982055664062,
+          743.8457489013672,
+          759.7452545166016,
+          729.3817901611328,
+          779.0022277832031,
+          727.2736358642578
+        ],
+        "pf": [
+          637.1443176269531,
+          593.2243347167969,
+          643.0194854736328,
+          608.4262466430664,
+          637.3222351074219,
+          640.3347015380859,
+          616.9158554077148,
+          652.0499420166016,
+          637.6710510253906,
+          638.6886215209961,
+          638.84033203125,
+          610.4569625854492,
+          633.8380813598633,
+          634.2131042480469,
+          614.7641754150391,
+          621.5724945068359,
+          640.6060791015625,
+          631.5379333496094,
+          640.4736328125,
+          631.9865417480469
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r2",
+      "world": 8,
+      "tokens": 8,
+      "weft_backend": "pf",
+      "routing_sha256": "add86d594aad35698862c4bb73b766e56bbc6e7802f0084d6f170fda9b884142",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005202468018978834
+      },
+      "rank_max_p50_us": {
+        "baseline": 536.7856025695801,
+        "pf": 470.8355140686035
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          538.0697631835938,
+          525.5315017700195,
+          560.2297592163086,
+          556.9804763793945,
+          527.0431900024414,
+          537.2089767456055,
+          524.0300750732422,
+          556.4441680908203,
+          558.1945419311523,
+          532.0064163208008,
+          553.2627105712891,
+          525.0182342529297,
+          541.1526489257812,
+          536.3622283935547,
+          552.3123168945312,
+          526.7315292358398,
+          534.5939254760742,
+          533.1423950195312,
+          523.7228775024414,
+          537.9449462890625
+        ],
+        "pf": [
+          470.69568634033203,
+          467.72350311279297,
+          518.5599899291992,
+          516.6182327270508,
+          470.975341796875,
+          471.0105514526367,
+          469.07520294189453,
+          518.4281539916992,
+          518.2668685913086,
+          471.6134262084961,
+          497.5923156738281,
+          468.06270599365234,
+          468.9811325073242,
+          469.34337615966797,
+          494.6598434448242,
+          467.8246307373047,
+          468.80321502685547,
+          469.8387145996094,
+          467.8508758544922,
+          472.4076843261719
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    },
+    {
+      "run": "formal/pf_dp8_r2",
+      "world": 8,
+      "tokens": 1,
+      "weft_backend": "pf",
+      "routing_sha256": "caf7d45240a73c62283fc1d3d307591fb3115784667265473fc926a6bf8c1b20",
+      "observed_sm_clocks_mhz": [
+        1620
+      ],
+      "rank_max_abs_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.00006103515625
+      },
+      "rank_max_relative_l2_vs_baseline": {
+        "baseline": 0,
+        "pf": 0.005515082739293575
+      },
+      "rank_max_p50_us": {
+        "baseline": 155.93088150024414,
+        "pf": 224.99648094177246
+      },
+      "rank_max_samples_us": {
+        "baseline": [
+          146.5939235687256,
+          148.50879669189453,
+          193.05152893066406,
+          145.32608032226562,
+          148.06591987609863,
+          158.05184364318848,
+          157.96544075012207,
+          149.41887855529785,
+          149.17951583862305,
+          149.3446445465088,
+          171.2678337097168,
+          157.58272171020508,
+          194.11712646484375,
+          168.9036750793457,
+          155.9763240814209,
+          155.88543891906738,
+          157.0956802368164,
+          149.70687866210938,
+          149.8310375213623,
+          157.1987247467041
+        ],
+        "pf": [
+          220.96256256103516,
+          220.0716781616211,
+          273.88864517211914,
+          219.52447891235352,
+          221.3408088684082,
+          226.37760162353516,
+          225.90143203735352,
+          220.9574317932129,
+          218.79680633544922,
+          224.75648880004883,
+          250.62976837158203,
+          226.70400619506836,
+          277.6748847961426,
+          250.5183982849121,
+          225.2364730834961,
+          226.19264602661133,
+          226.49152755737305,
+          222.92608261108398,
+          222.08511352539062,
+          224.66815948486328
+        ]
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ],
+      "parity_atol": 0.0001,
+      "parity_rtol": 0.025
+    }
+  ],
+  "summary": [
+    {
+      "world": 4,
+      "tokens": 1,
+      "us": {
+        "pf": 233.2369565963745,
+        "dt": 129.23663854599,
+        "baseline": 147.55360007286072
+      },
+      "best_weft_latency_reduction_percent": 12.413767958101985
+    },
+    {
+      "world": 4,
+      "tokens": 8,
+      "us": {
+        "pf": 570.8513641357422,
+        "dt": 379.5096015930176,
+        "baseline": 450.8965587615967
+      },
+      "best_weft_latency_reduction_percent": 15.83222488205408
+    },
+    {
+      "world": 4,
+      "tokens": 64,
+      "us": {
+        "pf": 1049.3750381469727,
+        "dt": 860.810718536377,
+        "baseline": 1221.7495250701904
+      },
+      "best_weft_latency_reduction_percent": 29.542782634851218
+    },
+    {
+      "world": 4,
+      "tokens": 128,
+      "us": {
+        "pf": 1110.9039878845215,
+        "dt": 1289.4374084472656,
+        "baseline": 1291.8575286865234
+      },
+      "best_weft_latency_reduction_percent": 14.007236617336872
+    },
+    {
+      "world": 4,
+      "tokens": 512,
+      "us": {
+        "pf": 1359.417610168457,
+        "dt": 1344.7275161743164,
+        "baseline": 1719.755973815918
+      },
+      "best_weft_latency_reduction_percent": 21.807073989076574
+    },
+    {
+      "world": 8,
+      "tokens": 1,
+      "us": {
+        "pf": 224.0347194671631,
+        "dt": 128.88976097106934,
+        "baseline": 155.7421612739563
+      },
+      "best_weft_latency_reduction_percent": 17.241574203951483
+    },
+    {
+      "world": 8,
+      "tokens": 8,
+      "us": {
+        "pf": 470.26991844177246,
+        "dt": 328.1955146789551,
+        "baseline": 538.7561655044556
+      },
+      "best_weft_latency_reduction_percent": 39.08273618146819
+    },
+    {
+      "world": 8,
+      "tokens": 64,
+      "us": {
+        "pf": 634.2745590209961,
+        "dt": 850.7724952697754,
+        "baseline": 744.3994998931885
+      },
+      "best_weft_latency_reduction_percent": 14.793795655154774
+    },
+    {
+      "world": 8,
+      "tokens": 128,
+      "us": {
+        "pf": 700.0801467895508,
+        "dt": 598.8460826873779,
+        "baseline": 914.3298435211182
+      },
+      "best_weft_latency_reduction_percent": 34.504370941103765
+    },
+    {
+      "world": 8,
+      "tokens": 512,
+      "us": {
+        "pf": 937.1121597290039,
+        "dt": 1102.0419120788574,
+        "baseline": 1532.114543914795
+      },
+      "best_weft_latency_reduction_percent": 38.83537210380275
+    }
+  ],
+  "verification": [
+    {
+      "run": "diagnostic/dt_ep4_verify",
+      "world": 4,
+      "tokens": 128,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "95950f30a851ddc0422867dbf68a34b4a3efded6a553c6fd2fec257eb562b571"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "462849eabc309645f61dd2b861fb806b068a7150c1e5f71f9d99d890a05f3b87"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "cb1857de11a3639406378ec9489e213b6e2d241caa270f52ab59acafed96c808"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "e5f748928399607827f39cbe04bc76801ad00d1c195cadf0dcf7f29aab116d3b"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00002911195406340994,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.00001928322308231145,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00014054639905225486,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.0001240340934600681,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00010130484588444233,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00012548940139822662,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00014296433073468506,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000059536734624998644,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep4_verify",
+      "world": 4,
+      "tokens": 512,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "fc8616abcdf2863a69a5ffdd1d4798a64a0fab013d269214dfdcba1a492cb851"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "cbeb4e9d4bcf163e2bd59a41995ce5e85ace0905b02a7853116871316dae2173"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "34efba7d72f4a97bd42e75ad31ca193201e543e3a0d15b0a582320987bcb0f60"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "a3ee74ddeed588db10340b50428dca7678e7f58c77479b43b260161d1aaca5e2"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004446304228622466,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00008336640894412994,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004347861613496207,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000059355152188800275,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00005555438110604882,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000043863306927960366,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.000029094557248754427,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00007622836710652336,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep8_verify",
+      "world": 8,
+      "tokens": 1,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "41ebc51d437457fb208abc41461b71138c04cdcb19b1b72eb53139d875f2484e"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "dd6451e0413b3ac1a30f6222b992c81e19abed3b6969205867e8d9be2ba2edb0"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "44af9444714c2d81a0fc4dad3c7e01e6c506cf6cd717f3a69d66bdbbb136a305"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "0cf3788a0cba5181b7b8dd01f18621f56101601187cb76bdd82baa70670930c2"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "fdb429b5edf781579009d2e525a173fcafcfa8cf39eb31f31e61259f615fcc53"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "9b0ef8a7e20ca3068046e6c127b34ece863359b6256869cec0fac5f756e17386"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "8112d8048d1f28f7953b0d6e5a387caecddcdb13b096febb18dbab14894809d4"
+        },
+        {
+          "tokens": [
+            1,
+            1
+          ],
+          "sha256": "ea2bdc64f7d949df8124ead28461af31f9a920a3ac31547f48e55ed65f7d8862"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0005889657186344266,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0009896059054881334,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0005794057506136596,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0008625315967947245,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0007963074604049325,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.0005828940193168819,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0006234814645722508,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0007982066599652171,
+              "max_abs": 0.00002288818359375
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0018952932441607118,
+              "max_abs": 0.0000457763671875
+            },
+            {
+              "relative_l2": 0.0005154012469574809,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0006202474469318986,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0007266181637533009,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00046475217095576227,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0013135303743183613,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00060481415130198,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0006174709997139871,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep8_verify",
+      "world": 8,
+      "tokens": 8,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "c264d7dd43178bbe65e87ef6eb39f1d4f708a3aaa8c730db6a3c8592be95c292"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "f6efbdb397636c5a60d14ecee23e037733a93ad61f2c536fff392f7ccc704264"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "8cafb253bebecb57e7da81acec9b511ccc9fc4b5b7a982af4b0249dddf020e88"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "6f0f26bfacc40c5f40389201eb17d9cd84794d1fe5fbd25355a32546b6ab374a"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "be83fee2692f1954dde5d403a8a68d4b780238aa38b462d16d289905ba1b55f0"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "1fca6e9cbedef3c8a0d0e3bec049b5dcd6f413a670a0dc0b1f9c8da02951a176"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "68860a109ece2306c7dc1659908a2ca6130dda2b40037bac1dfbadfc91ae72e0"
+        },
+        {
+          "tokens": [
+            8,
+            8
+          ],
+          "sha256": "fceecbf06f05b84fa302d633862b4b7f69d9d41f377f4efbe29e514b26c9d4ef"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.00004006205563200638,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.00004027147588203661,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.00007602290861541405,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.00005943637734162621,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.00003284818012616597,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.000001526611413282808,
+              "max_abs": 4.76837158203125e-7
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 4.408757448004508e-8,
+              "max_abs": 1.4901161193847656e-8
+            },
+            {
+              "relative_l2": 0.00010577449575066566,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 0.0001214300500578247,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep8_verify",
+      "world": 8,
+      "tokens": 64,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "e83542ea48d6b247e6832b282a544d9e9cbe6436f688ed66b62145bf8f82db4d"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "8fe4b2f02e71284cd9b2d48c6b7d57debcf82c226d70d53cfcc58356a9672e9e"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "6e48bfa7b07af364c69430abc24ed3828e29377eb29eedf235a22558d9bed9fc"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "09fba144bdf7f780e835443368783102a811d77da0e37fafc2e08503039d9d8f"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "d555c2825d213ea28d0020f973a46cd74f3c79b9f70f10cdb8fa4adb536e84af"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "46df539564c9cea29e79c4544bb2d3451f01e5451cb94de4261163992046f46b"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "00d5b2410e453fb2c0747ff82e87a2c9cdc559c02e25cf52755ab1e6f18d554f"
+        },
+        {
+          "tokens": [
+            64,
+            64
+          ],
+          "sha256": "6e4ff06a46f234722baba5859f04f30e581c7d33f68c76516accb0484dcb0d4a"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 5.324593530531274e-7,
+              "max_abs": 4.76837158203125e-7
+            },
+            {
+              "relative_l2": 0.000006444909558922518,
+              "max_abs": 0.000003814697265625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004670655107474886,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00004779097071150318,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00012857915135100484,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000020576253518811427,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00008269751560874283,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.00003147883035126142,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00008776115282671526,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.0000015274255247277324,
+              "max_abs": 9.5367431640625e-7
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.000008815972250886261,
+              "max_abs": 0.00000762939453125
+            },
+            {
+              "relative_l2": 0.00009659123315941542,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00006544146162923425,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000032043983082985505,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0,
+              "max_abs": 0
+            },
+            {
+              "relative_l2": 2.973354753521562e-7,
+              "max_abs": 2.384185791015625e-7
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            1,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep8_verify",
+      "world": 8,
+      "tokens": 128,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "95950f30a851ddc0422867dbf68a34b4a3efded6a553c6fd2fec257eb562b571"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "462849eabc309645f61dd2b861fb806b068a7150c1e5f71f9d99d890a05f3b87"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "cb1857de11a3639406378ec9489e213b6e2d241caa270f52ab59acafed96c808"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "e5f748928399607827f39cbe04bc76801ad00d1c195cadf0dcf7f29aab116d3b"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "8c33c84bebb90964c790b1ebc425486cdec7c1dffc376d63e73dd0a382890f5e"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "2fea8a7f0f2b477151a2587297b8f04b2fe18ea1749f2d8c5e7d66c062f3c4d4"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "31c0bdf68b962030d2cc4e3aaadf9288232d48e7c7bd2d005cb2efca041290a1"
+        },
+        {
+          "tokens": [
+            128,
+            128
+          ],
+          "sha256": "2148b5f64d70b7e67c469620ef31799019a02ee22e10c10dc9f3169861a0b5c9"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00008178023563232273,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000009325934115622658,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.000045808585127815604,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.00005377888010116294,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.0000362848695658613,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.0000063846637203823775,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004199326576781459,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.0000598024416831322,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004003288995590992,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.000011035663192160428,
+              "max_abs": 0.00000762939453125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00003814771116594784,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.000039537579141324386,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00009260042861569673,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00014612301310990006,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.000028143194867880084,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.000043360247218515724,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        }
+      ]
+    },
+    {
+      "run": "diagnostic/dt_ep8_verify",
+      "world": 8,
+      "tokens": 512,
+      "route_bias_std": 10,
+      "workload": [
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "fc8616abcdf2863a69a5ffdd1d4798a64a0fab013d269214dfdcba1a492cb851"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "cbeb4e9d4bcf163e2bd59a41995ce5e85ace0905b02a7853116871316dae2173"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "34efba7d72f4a97bd42e75ad31ca193201e543e3a0d15b0a582320987bcb0f60"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "a3ee74ddeed588db10340b50428dca7678e7f58c77479b43b260161d1aaca5e2"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "a4b228d7cc2f7be491d1116a331377552e91550afeba9603ff3b0ca8b266616a"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "a6a21654787250f5c559e09941cf1db6480a012d0c641218384a841d25880861"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "6b21f35961119a0a7317699e6f9a0add82e6b403e3f11e27c7ba0c75882f5eca"
+        },
+        {
+          "tokens": [
+            512,
+            512
+          ],
+          "sha256": "ac08010cb98f2345bcdbc0fca36204de5ce7157b4a9a2ab29b111d6964afa767"
+        }
+      ],
+      "per_rank": [
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00001645307565922849,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.00003544925129972398,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00006510336243081838,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00006141614721855149,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004871939745498821,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000060847840359201655,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00004789500962942839,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.00003767942689592019,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00005052499909652397,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.0000512375590915326,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00005576439434662461,
+              "max_abs": 0.000030517578125
+            },
+            {
+              "relative_l2": 0.000020141063941991888,
+              "max_abs": 0.0000152587890625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.00006793537613702938,
+              "max_abs": 0.0000457763671875
+            },
+            {
+              "relative_l2": 0.00006994216528255492,
+              "max_abs": 0.00006103515625
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        },
+        {
+          "errors": [
+            {
+              "relative_l2": 0.000020832199879805557,
+              "max_abs": 0.0000152587890625
+            },
+            {
+              "relative_l2": 0.000060720336477970704,
+              "max_abs": 0.000030517578125
+            }
+          ],
+          "kernel_ids": [
+            5,
+            6,
+            7,
+            8,
+            2,
+            9
+          ]
+        }
+      ]
+    }
+  ],
+  "fp32_diagnostics": [
+    {
+      "run": "diagnostic/pf_dp8_fp32_diagnostic",
+      "tokens": 8,
+      "routing_sha256": "add86d594aad35698862c4bb73b766e56bbc6e7802f0084d6f170fda9b884142",
+      "per_rank_max_errors": [
+        {
+          "baseline": {
+            "max_abs": 0.0000408124178647995,
+            "relative_l2": 0.00498265540227294
+          },
+          "pf": {
+            "max_abs": 0.00003154808655381203,
+            "relative_l2": 0.003763609565794468
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00003815907984972,
+            "relative_l2": 0.004868247080594301
+          },
+          "pf": {
+            "max_abs": 0.0000331108458340168,
+            "relative_l2": 0.003768192371353507
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00004928046837449074,
+            "relative_l2": 0.004893038887530565
+          },
+          "pf": {
+            "max_abs": 0.00003148149698972702,
+            "relative_l2": 0.003756081685423851
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00004708999767899513,
+            "relative_l2": 0.004930528812110424
+          },
+          "pf": {
+            "max_abs": 0.000028310809284448624,
+            "relative_l2": 0.003757169470191002
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.000038340454921126366,
+            "relative_l2": 0.004894961137324572
+          },
+          "pf": {
+            "max_abs": 0.00003866152837872505,
+            "relative_l2": 0.003765988629311323
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00004330463707447052,
+            "relative_l2": 0.004952047485858202
+          },
+          "pf": {
+            "max_abs": 0.000026788096874952316,
+            "relative_l2": 0.0037790967617183924
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.000049898168072104454,
+            "relative_l2": 0.004959568846970797
+          },
+          "pf": {
+            "max_abs": 0.000037964899092912674,
+            "relative_l2": 0.003771203337237239
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00005008140578866005,
+            "relative_l2": 0.0049761272966861725
+          },
+          "pf": {
+            "max_abs": 0.000029158778488636017,
+            "relative_l2": 0.0037542334757745266
+          }
+        }
+      ],
+      "rank_max_errors": {
+        "baseline": {
+          "max_abs": 0.00005008140578866005,
+          "relative_l2": 0.00498265540227294
+        },
+        "pf": {
+          "max_abs": 0.00003866152837872505,
+          "relative_l2": 0.0037790967617183924
+        }
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ]
+    },
+    {
+      "run": "diagnostic/pf_dp8_fp32_diagnostic",
+      "tokens": 512,
+      "routing_sha256": "239c6190d9f8e1d9d1a07035fbef10c6d97a94ba07a654cbb245dcf135aea566",
+      "per_rank_max_errors": [
+        {
+          "baseline": {
+            "max_abs": 0.00006970949470996857,
+            "relative_l2": 0.004801835864782333
+          },
+          "pf": {
+            "max_abs": 0.000043112318962812424,
+            "relative_l2": 0.0037225638516247272
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00006671063601970673,
+            "relative_l2": 0.0048172748647630215
+          },
+          "pf": {
+            "max_abs": 0.00003784801810979843,
+            "relative_l2": 0.003723973175510764
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00006445497274398804,
+            "relative_l2": 0.004829506855458021
+          },
+          "pf": {
+            "max_abs": 0.00003965059295296669,
+            "relative_l2": 0.0037218413781374693
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00007131369784474373,
+            "relative_l2": 0.004841320216655731
+          },
+          "pf": {
+            "max_abs": 0.000038182828575372696,
+            "relative_l2": 0.003723629517480731
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00007034977898001671,
+            "relative_l2": 0.004809513688087463
+          },
+          "pf": {
+            "max_abs": 0.00003902660682797432,
+            "relative_l2": 0.0037292365450412035
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00006719306111335754,
+            "relative_l2": 0.004805123433470726
+          },
+          "pf": {
+            "max_abs": 0.00004054047167301178,
+            "relative_l2": 0.0037254984490573406
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.0000630510039627552,
+            "relative_l2": 0.0048005105927586555
+          },
+          "pf": {
+            "max_abs": 0.000041114166378974915,
+            "relative_l2": 0.00372515176422894
+          }
+        },
+        {
+          "baseline": {
+            "max_abs": 0.00006086425855755806,
+            "relative_l2": 0.004813807085156441
+          },
+          "pf": {
+            "max_abs": 0.00003781914710998535,
+            "relative_l2": 0.0037246565334498882
+          }
+        }
+      ],
+      "rank_max_errors": {
+        "baseline": {
+          "max_abs": 0.00007131369784474373,
+          "relative_l2": 0.004841320216655731
+        },
+        "pf": {
+          "max_abs": 0.000043112318962812424,
+          "relative_l2": 0.0037292365450412035
+        }
+      },
+      "kernel_ids": [
+        0,
+        3,
+        4
+      ]
+    }
+  ],
+  "incomplete_attempts": [
+    {
+      "run": "diagnostic/pf_dp8_r1",
+      "completed_case": {
+        "world": 8,
+        "tokens": 1,
+        "tokens_scope": "dp_local",
+        "global_tokens": 8,
+        "dp_size": 8,
+        "baseline_communication": "all_gather+reduce_scatter",
+        "experts": 256,
+        "top_k": 6,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "weft_backend": "pf",
+        "native_capacity": 512,
+        "fresh_routes": true,
+        "route_bias_std": 0.5,
+        "seed": 100,
+        "routing_sha256": "caf7d45240a73c62283fc1d3d307591fb3115784667265473fc926a6bf8c1b20",
+        "scope": "CUDA graph; includes staging, dispatch, FC1/FC2, return/reduce; excludes router, initialization and weight packing",
+        "deepgemm_package": null,
+        "mega_capacity": null,
+        "warmup": 5,
+        "measured": 20,
+        "replays": 50,
+        "rank_max_abs_vs_baseline": {
+          "baseline": 0,
+          "pf": 0.00006103515625
+        },
+        "rank_max_p50_us": {
+          "baseline": 155.42943954467773,
+          "pf": 222.50911712646484
+        },
+        "rank_max_samples_us": {
+          "baseline": [
+            146.38272285461426,
+            148.69824409484863,
+            192.79359817504883,
+            145.36895751953125,
+            147.29920387268066,
+            157.6467227935791,
+            156.60736083984375,
+            149.64863777160645,
+            147.2544002532959,
+            148.76480102539062,
+            169.06047821044922,
+            156.61120414733887,
+            195.62688827514648,
+            168.64896774291992,
+            155.30431747436523,
+            155.55456161499023,
+            158.0742359161377,
+            149.93663787841797,
+            148.13440322875977,
+            156.85312271118164
+          ],
+          "pf": [
+            219.45856094360352,
+            219.4816017150879,
+            271.5110397338867,
+            218.87039184570312,
+            218.7596893310547,
+            224.43199157714844,
+            222.47039794921875,
+            220.40063858032227,
+            215.70560455322266,
+            221.45471572875977,
+            247.70944595336914,
+            224.2207908630371,
+            278.16383361816406,
+            248.6617660522461,
+            226.1689567565918,
+            224.9203109741211,
+            223.3785629272461,
+            221.39583587646484,
+            220.6572723388672,
+            222.54783630371094
+          ]
+        },
+        "observed_sm_clocks_mhz": [
+          1620
+        ],
+        "kernel_ids": [
+          0,
+          3,
+          4
+        ]
+      },
+      "excluded_from_summary": true,
+      "reason": "At T8, rank1: 1/32768 elements failed old atol=2e-5, max absolute difference 2.5510787963867188e-5 at (2,4058), baseline zero. Stopped stranded test workers; diagnosed with FP32 reference before rerunning all timings."
+    }
+  ],
+  "profiles": {
+    "configs/pf_flash_strategy_20261015/weftmoe_forward_tuning_generated.hpp": "ec85fa57ffe5bbea82c2f21e466fbe3d353d9a5aaadaf03b8a9ddf973dbbf33d",
+    "configs/dt_flash_probe_20261009/weftmoe_forward_tuning_generated.hpp": "98c2e9b2f2dcb1ce7a3907814ccc303423a8561ae351fb52b0aa9a74948a2fe3"
+  },
+  "kernel_names": [
+    "stage_inputs",
+    "void weftmoe::cuda::(anonymous namespace)::weftmoe_dt::kernel<16u>(weftmoe::cuda::(anonymous namespace)::ForwardKernelArgs, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+    "void weftmoe::cuda::(anonymous namespace)::weftmoe_dt::kernel<64u>(weftmoe::cuda::(anonymous namespace)::ForwardKernelArgs, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+    "void weftmoe::cuda::(anonymous namespace)::weftmoe_pf::notify_kernel<false, false>(weftmoe::cuda::(anonymous namespace)::ForwardKernelArgs)",
+    "weftmoe::cuda::(anonymous namespace)::weftmoe_pf::local::kernel(weftmoe::cuda::(anonymous namespace)::ForwardKernelArgs, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st, CUtensorMap_st)",
+    "Memcpy DtoH (Device -> Pinned)",
+    "Memcpy HtoD (Pinned -> Device)",
+    "Memset (Device)",
+    "ncclDevKernel_AllGather_RING(ncclDevKernelArgsStorage<4096ul>)",
+    "weftmoe::cuda::(anonymous namespace)::interleave_forward_w1_kernel(weftmoe::transport::BFloat16 const*, weftmoe::transport::BFloat16*, unsigned long, unsigned long, unsigned long)"
+  ],
+  "measurement_settings": {
+    "warmups": 5,
+    "samples": 20,
+    "graph_replays_per_sample": 50,
+    "repeats": 2,
+    "seed": 100,
+    "route_bias_std": 0.5,
+    "fresh_routes": true,
+    "reverse_backend_and_token_order": true,
+    "weight_seed": "37 + rank",
+    "parity_atol": 0.0001,
+    "parity_rtol": 0.025,
+    "relative_l2_limit": 0.01,
+    "fp32_reference_in_formal_timing": false
+  },
+  "validation": {
+    "dt_hotspot_rank_samples": 96,
+    "dt_hotspot_max_relative_l2": 0.0018952932441607118,
+    "max_abs_vs_sglang": 0.000091552734375,
+    "max_relative_l2_vs_sglang": 0.005515082739293575,
+    "pf_main_registers": 168,
+    "dt_registers": {
+      "M16": 80,
+      "M64": 128
+    },
+    "main_spill_bytes": 0
+  }
+}

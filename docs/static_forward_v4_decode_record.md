@@ -1,5 +1,122 @@
 # 单机 decode 专属实现与验收记录
 
+## 2026-10-16：Flash 小 batch，现版 PF / DT / SGLang 对比
+
+**Flash 不复现 Qwen 的“DT 五档全胜”。EP8 的 1/8/128 tokens 是 DT
+更快，64/512 是 PF 更快；EP4 的 1/8/64 是 DT 更快，128 是 PF 更快，
+512 两者接近（DT 约快 1.1%）。这些排序在反序复测中重现。**
+
+这轮只将同一个 SGLang benchmark 的 H/I/E/top-k 参数化，并补充数值
+诊断；没有修改 PF/DT 算法、GEMM 参数或生产选择策略。CLI 默认仍是
+Qwen，Flash 显式传 H4096/I2048/E256/top-k6；没有加载实际模型权重。
+
+### 口径与结果
+
+与下节 Qwen 对齐：BF16、单机 DP4+EP4 / DP8+EP8、expert TP1，
+tokens 为**每卡**数量；固定 1620 MHz，pool capacity512、B512/D2。
+只测 routed MoE inference，不缓存训练中间结果；包含 fused staging、
+dispatch、FC1/FC2、return/reduce，以及 PF 的独立 notify。排除初始化、
+一次性权重重排、router/shared expert 和外部输入更新，不是端到端模型吞吐。
+
+每个 sample 更换 X 和随机非均衡路由，bias std=0.5、seed100。
+5 warmups / 20 samples，每 sample 50 次 graph replay；两轮反转后端
+与 tokens 顺序，所有配对路由 hash 一致。表为**两轮 rank-max p50 的
+均值，µs/调用**；SGLang 列汇总与 PF/DT 配对的四轮基线 p50。
+正式计时的 NVML 前后采样与运行期间轮询均只观察到 1620 MHz，仍非逐周期保证。
+
+SGLang 仍是 `0.5.10.post1`、Triton `3.5.1`，`moe_a2a_backend=none`，
+包含 all-gather/reduce-scatter。安装目录没有 L20X 的 E32/E64、N2048
+专用 tuning 文件，使用默认 Triton 配置；不是 DeepEP，也不是已调优上限。
+
+| DP8 + EP8，tokens/rank | PF µs | DT µs | SGLang µs |
+|---:|---:|---:|---:|
+| 1 | 224.03 | 128.89 | 155.74 |
+| 8 | 470.27 | 328.20 | 538.76 |
+| 64 | 634.27 | 850.77 | 744.40 |
+| 128 | 700.08 | 598.85 | 914.33 |
+| 512 | 937.11 | 1102.04 | 1532.11 |
+
+| DP4 + EP4，tokens/rank | PF µs | DT µs | SGLang µs |
+|---:|---:|---:|---:|
+| 1 | 233.24 | 129.24 | 147.55 |
+| 8 | 570.85 | 379.51 | 450.90 |
+| 64 | 1049.38 | 860.81 | 1221.75 |
+| 128 | 1110.90 | 1289.44 | 1291.86 |
+| 512 | 1359.42 | 1344.73 | 1719.76 |
+
+不能从这张表推出“64 tokens 起统一切 PF”：DT 在 EP8 的 128 又快于
+PF，而 EP4 的 64 仍然是 DT 更快。DT 在 EP8 的 64 甚至慢于 SGLang；
+EP4 的 128 与 SGLang 基本持平。逐点择优也不代表当前自动策略的收益。
+
+### DT 为什么在 EP8 的 128 比 64 快
+
+实际 trace 确认现有启发式 `T × EP × top-k >= E × 16` 的分支：
+
+- EP8：1/8/64 用 M16，128/512 用 M64。
+- EP4：1/8/64/128 用 M16，512 用 M64。
+
+M16 是 warp MMA，M64 是 WGMMA；这不是只多算一倍 tokens 的同一个
+计算配置。Flash 的 EP8/T64 平均专家输入只有 12 行，没有触发 M64；
+Qwen 的同一 EP/T 有 16 行，已触发 M64。该切换与观察到的非单调耗时
+一致，但本轮没有固定 M 做单变量消融，不将全部差距归因于它。
+PF 保持 M128/N256/K64。这里应按 shape/EP/batch 分别测量，不能照搬
+Qwen 或历史 Flash 的一个阈值。
+
+DT 的生产容量上限仍为 64。本次与 Qwen 一样，构建时仅设置
+`WEFTMOE_DT_MAX_TOKENS=512`，保留单窗口保护，强制测 DT 的 128/512；
+所有点均检查实际 kernel 名称，不允许 PF fallback。没有重新启用
+已经撤回的 DT FC1 16B epilogue。PF main 168 registers、DT M16/M64
+80/128 registers，均无 spill。
+
+### BF16 数值检查与保留的失败记录
+
+最初沿用 Qwen 的 `atol=2e-5, rtol=0.025`，在 EP8/T8 的 rank1
+有 1/32768 个元素失败：位置 `(2,4058)` 的 SGLang 输出为 0，绝对差
+2.55108e-5。原始失败日志和该次已完成的 T1 数据留档，整个中断运行
+不纳入最终表；没有删除异常后只统计剩余点。
+
+随后对**相同路由、权重和输入生成方式**的 EP8/T8、T512 做独立
+FP32 PyTorch 参考检查（关闭 TF32，所有 matmul/activation/reduce 为
+FP32），每档 25 个变化输入，对照结果如下：
+
+| tokens/rank | PF 最大 relative L2 | SGLang 最大 relative L2 | PF 最大绝对差 | SGLang 最大绝对差 |
+|---:|---:|---:|---:|---:|
+| 8 | 0.3779% | 0.4983% | 3.86615e-5 | 5.00814e-5 |
+| 512 | 0.3729% | 0.4841% | 4.31123e-5 | 7.13137e-5 |
+
+两边均为 BF16 级误差。源码中 Weft 将 router weight 乘入 FC2 的 BF16
+输入，SGLang 的本配置在 FC2 epilogue 乘 weight；归约次序也不同，
+数学等价不代表逐元素 BF16 舍入相同。没有因此改动任何算术路径。
+
+正式 Flash 对比显式使用原有 Flash native 验证的绝对容差 `1e-4`，
+保留 `rtol=0.025`，并新增 **relative L2 <1%** 的整体检查；Qwen 默认
+绝对容差仍为 `2e-5`。校验在计时之外集体报告失败，避免某一 rank
+退出后其余 rank 卡在 native 同步中。正式两轮全部通过，最大跨实现
+relative L2=0.55151%、绝对差 9.15527e-5。FP32 诊断运行不计入性能表。
+
+另外，DT 的 bias std=10 热点路由验证覆盖 EP8 五档及 EP4 的128/512，
+共 96 个 rank/sample，全部通过；相对现有 BF16 PyTorch 参考的最大
+relative L2=0.18953%。未新增细碎单测。
+
+原始性能样本、逐轮数据、hash、manifest、频率、热点验证以及数值诊断
+见 [Flash 结果 JSON](../benchmarks/results/flash_small_inference_20261016.json)。
+正式运行目录为 `build/flash_small_compare_20261016`；原始失败和独立
+参考诊断在 `build/flash_small_20261016`，未覆盖。
+
+复现构建：
+
+```bash
+/opt/.venv/bin/python benchmarks/build_pf_main_timeline.py flash_small_pf_20261016 \
+  --profile configs/pf_flash_strategy_20261015
+/opt/.venv/bin/python benchmarks/build_pf_main_timeline.py flash_small_dt_20261016 \
+  --profile configs/dt_flash_probe_20261009 --define WEFTMOE_DT_MAX_TOKENS=512
+```
+
+运行沿用下节 launcher 命令，改为对应 Flash artifact、新 label/port，
+并向 `torchrun_sglang_decode.py` 增加
+`--hidden 4096 --intermediate 2048 --experts 256 --top-k 6 --atol 0.0001`。
+独立参考诊断另加 `--reference-check --tokens 8 512`，不要将其性能混入正式结果。
+
 ## 2026-10-16：Qwen 小 batch，现版 PF / DT / SGLang 对比
 
 **结论：这次 Qwen 的 1/8/64/128/512 tokens，DT 均快于 PF。DT 相对
