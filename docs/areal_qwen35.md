@@ -1,5 +1,37 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-18：修复版重新启动 1500-update 长跑
+
+12-update 诊断已通过：07:33:29 UTC 完成第 12 次 update，07:36:28
+supervisor 确认 exit code 0；12 次 native 梯度和更新后权重检查均通过，
+无非有限 logprob/梯度异常，W&B 已同步，未产生 checkpoint。
+
+按用户要求，仅在本机 10.10.16.219 重新启动 WeftMoE 这一组长跑。
+另一节点的 baseline 不停止、不重启，也不启动 EP16。诊断未保存
+checkpoint，因此本次重新加载初始模型和新 optimizer，不接续第 12 步。
+
+- trainer 于 **10:18:10 UTC** 启动；supervisor 428883、trainer 429020。
+  此处记录的是启动时状态，不表示已完成第一个 update。
+- 目标 1500 updates，沿用现有入口的 `AREAL_STOP_AFTER_STEPS=1500`；
+  epoch=1、total_train_steps=null，原 LR horizon、seed、batch、长度、
+  重算及 CPU-staged optimizer 配方不变。
+- 仍为单机 8 GPU：actor attention TP4/DP2、EP8/ETP1；rollout 两组
+  DP4/EP4、attention TP1。实际拓扑由各自 `backend` 字段决定；旧的
+  顶层 `allocation_mode` 字符串不参与该入口的拓扑解析。
+- native 固定为 `qwen_areal_barrier_fix_20261018`，库 SHA256
+  `9889c7606071872a169cf67569c3130629928047ceef47cc6b4cefb63cae8d99`，
+  trainer、actor、rollout 三处路径一致，仍锁频 1620 MHz。
+- actor 恢复普通 `areal.infra.rpc.rpc_server` 入口，移除 `debug_actor`
+  的逐层抓取/同步检查；保留专家 optimizer 的 ETP norm 修正与 DDP
+  `check_for_nan_in_grad=true`。旧 baseline 未热修改这两项，对比时需注明。
+- 原生 online W&B，使用权限 0600 的 NETRC，不启动独立上传进程；
+  saver/recover 三种频率均 null，recover disabled，不保存 checkpoint。
+
+新 [W&B run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-weftmoe-pfdt-dp4ep4-mb32-1500-fixed-20261018_train)。
+配置、启动脚本、source/native 指纹、状态及日志位于
+`build/rl_pf_dt_1500_fix_20261018/`，训练输出位于
+`results/areal_pf_dt_1500_fix_20261018/`；旧长跑和诊断记录均保留。
+
 ## 2026-10-18：长跑 NaN 排查与 BWD barrier 生命周期修复
 
 截至 04:40 UTC，baseline 已完成 194 次 update，仍在运行；WeftMoE
@@ -91,7 +123,8 @@ dW 的 TMA-store 输出暂存复用。Qwen 配置下的布局如下（字节偏�
 
   这是单轮性能回归检查，不把 20K 的差异直接解释为稳定回退或测量噪声。
   原始结果保留在 `build/rl_nan_20261018/bwd_{before,after}.log`。
-  完整 RL 尚未跨过原先第 7 次 update 的故障位置，不能宣称长跑问题已闭环。
+  后续完整 RL 已通过 12 次 update（见本页开头）；这不替代 1500-step
+  长跑验证。
 
 本机损坏 run 已停止，保留日志和小型异常摘要，没有生成 checkpoint。
 诊断重跑配置保留原 DP4/EP4 rollout、TP4/EP8 actor、1620 MHz、原生
@@ -110,7 +143,7 @@ online W&B，关闭 checkpoint/recover；启用 DDP NaN 检查，在 native BWD
 首次 update 就停止，日志保留为 `old_native_*`；修复版使用新 trial
 `qwen35-weftmoe-barrier-fix-20261018`，仍从初始模型开始。
 修复版 trainer 于 04:58:01 UTC 启动（supervisor 330634、trainer 330744），
-当前为初始化/诊断验证，不表示已经通过 12 次 update。AReaL 公共 norm
+该诊断已完成 12 次 update 并退出。AReaL 公共 norm
 修正位于其现有 working tree；未将其他已有集成改动混入本次 WeftMoE commit。
 
 ## 2026-10-16：两机分别长跑 1500 updates，原生 online W&B
