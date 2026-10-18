@@ -143,6 +143,7 @@ def main():
             if name in expected
         ]
         for name, a, b in pairs:
+            assert torch.isfinite(a).all() and torch.isfinite(b).all(), (step, name)
             error = (a.float() - b.float()).square().mean().sqrt()
             scale = b.float().square().mean().sqrt().clamp_min(1e-10)
             if error / scale > 0.025:

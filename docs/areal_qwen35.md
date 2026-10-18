@@ -1,5 +1,118 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-18：长跑 NaN 排查与 BWD barrier 生命周期修复
+
+截至 04:40 UTC，baseline 已完成 194 次 update，仍在运行；WeftMoE
+只完成 7 次，最后一次为 10 月 16 日 11:19:57。不能把旧 supervisor 的
+`running` 状态当作训练仍有进展。未启动双机 EP16。
+
+已确认的故障链：
+
+- v7 权重发布之后，两组独立 rollout 服务均出现非有限 logprob，首次为
+  11:20:47；后续 workflow 失败/丢弃，固定大小 batch 不断补样，训练等待
+  下一批数据。后来的 RPC 连接错误不是首次故障。
+- 使用现有 weights checker 的 snapshot/compare 做只读定位，两组推理
+  副本都只有 `model.layers.13.mlp.experts.w13_weight` 的同一 EP 分片
+  自比较不等。不是简单 KV cache/CUDA graph 问题。
+- 检查训练 actor 保留的 CPU 权重和 Adam 状态：rank3、layer13（零基）、
+  local expert3/global expert99 的 FC1，BF16 权重、FP32 master 和 m1
+  各 72 个非有限值，m2 有 96 个。异常集中于行 608/736/864/992、列
+  1280–1315；另 24 个位置 m1 约 `-5.19e32`、m2 为 Inf。
+  **损坏已存在于训练权重和优化器状态，不能归因于 AWEX 发布或推理端。**
+
+已修正一个独立的检测漏洞：当前 TE 普通 grouped expert 权重的
+`tensor_model_parallel=False`，但 MCore 给专家 optimizer leaf 使用了
+attention TP4 组，导致 TP 非零 rank 的独立 EP 专家梯度漏计 norm。
+AReaL `MegatronEngine.initialize()` 在 optimizer 创建后，改为给专家
+leaf 设置 expert TP 组（当前 ETP1）；保留参数元数据，不改变 AWEX
+权重布局。此修改属于公共 Megatron 接入，不是 WeftMoE 特例。
+旧 baseline 未热修改；修正后的 norm 不能直接与历史 norm 对比。
+这项修正只补上检测漏洞，不负责修复 native 梯度损坏。
+
+Native BWD 中发现了与现场损坏位置精确对应的协议错误：激活阶段结束后，
+`Shared.full/empty/pull_full` 共 9 个 mbarrier 未失效，其存储就被作为
+dW 的 TMA-store 输出暂存复用。Qwen 配置下的布局如下（字节偏移）：
+
+|对象|shared-memory 偏移|与坏值的对应关系|
+|---|---:|---|
+|dW 输出 tile 起点|147456|每个 N64 atom 每行 128 B|
+|旧 9 个 mbarrier|159744–159815|tile 第 96 行、连续 36 个 BF16|
+|损坏的 FC1 行|608/736/864/992|均为 `M-tile * 128 + 96`|
+|损坏的 FC1 列|1280–1315|同一个 N256 tile 的前 36 列|
+
+每个 8 B barrier 的第 1/4 个 BF16 对应 NaN；额外 24 个超大梯度位置，
+又恰好对应 `full/pull_full` transaction barrier 的第 3 个 BF16，而
+`empty` 中没有这类额外值。这是很强的定位证据，不是普通的 GEMM 误差。
+[PTX 明确要求](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-inval)
+复用 mbarrier 的存储前先 invalidate；普通 STSM 覆盖不能代替这个要求。
+未定义行为的具体硬件内部机制尚不能确定。
+
+修复只发生在 BWD 激活阶段到 dW 的交接：
+
+- producer 尾部 drain 全部 operand empty stages，包含远端 multicast
+  consumer 的最后 arrivals。
+- 现有 compute join 后，由 producer 线程 invalidate 旧 9 个 barrier，
+  再初始化 dW 状态，经现有同步后复用 arena。
+- 多机仍在工作的 `NetworkShared` 通信 barrier 不动；没有增大缓冲，
+  没有改 GEMM tile、路由、FWD/DT 或稳态流水线。
+- 新 artifact 为 `build/pf_main_timeline/qwen_areal_barrier_fix_20261018/`；
+  与原长跑使用相同 Qwen tuning，单/多机 BWD 均为 168 个静态寄存器、
+  0 spill。多机本轮仅编译验证，另一节点继续运行 baseline。
+
+修复前的排查测试（不能作为修复后验证或长跑稳定的证据）：
+
+- EP8/E256/top8/H2048/I512：原生 FWD/BWD parity、workspace 清理和多层
+  graph 回归通过；新分配浮点张量先填 NaN，也通过。
+- 实际 Megatron TP4/EP8、两层 MoE、DDP、两 microbatch、两次 optimizer/
+  offload 周期通过。补上显式 finite 断言，避免 NaN 使误差比值比较静默通过。
+- 1000 次变化 token 数（8191/20003/32767/17）随机路由 FWD/BWD 通过；
+  另 500 次强偏斜路由、NaN 初始化分配测试也通过。
+- AReaL 专家 TP 组修正及重复参数回归：2 passed；相关 Ruff/diff 检查通过。
+  尚未复现完整 RL 中首次坏梯度，不据此宣称长跑稳定。
+
+修复后二进制验证：
+
+- EP8/E256/top8/H2048/I512、T257 的数值对照、workspace 释放、多层
+  graph/offload 测试通过；实际 Megatron TP4/EP8、DDP、两层/两
+  microbatch、两次 optimizer/offload 测试通过。
+- 500 次强偏斜随机路由，token 数循环 8191/20003/32767/17；浮点新
+  分配先填 NaN，byte scratch 先填 0xff，所有输出/梯度保持有限。
+- 另测 EP8/T17、全部路由集中 rank0：数值与 graph/offload 回归通过，
+  覆盖其余 rank 没有激活任务时的 producer-tail/barrier 退出。
+- 1620 MHz、EP8，使用原 `benchmark_training.py --backward-only`，
+  随机 tokens 的标准差 10%、共享路由偏置 0.5、6 warmup/24 samples，
+  先 prime trace。两版逐 rank workload hash 一致；缓存就绪后测 BWD，
+  含调用开销、权重重排、临时分配，不含 FWD 和输入准备：
+
+  |每 rank nominal tokens|修复前 BWD p50|修复后 BWD p50|变化|
+  |---|---:|---:|---:|
+  |8192|4.163 ms|4.161 ms|-0.04%|
+  |20480|9.541 ms|9.699 ms|+1.66%|
+
+  这是单轮性能回归检查，不把 20K 的差异直接解释为稳定回退或测量噪声。
+  原始结果保留在 `build/rl_nan_20261018/bwd_{before,after}.log`。
+  完整 RL 尚未跨过原先第 7 次 update 的故障位置，不能宣称长跑问题已闭环。
+
+本机损坏 run 已停止，保留日志和小型异常摘要，没有生成 checkpoint。
+诊断重跑配置保留原 DP4/EP4 rollout、TP4/EP8 actor、1620 MHz、原生
+online W&B，关闭 checkpoint/recover；启用 DDP NaN 检查，在 native BWD
+返回（DDP 累加前）和 optimizer 更新后检查异常。首次 native 异常时只
+保存对应单层的跨 rank 输入/梯度以便独立复现，不保存整个模型。
+诊断最多 12 次 update，额外检查的耗时不能作为性能结果。
+
+重跑前曾阻塞于旧 actor 的驱动清理：残留进程为 D 状态，内核栈在
+`nvidia: portSyncRwLockAcquireWrite / os_acquire_rwlock_write`，SIGKILL
+不能使其退出，`nvidia-smi` 查询超时。未重置 GPU、卸载驱动或重启节点，
+也未影响另一台健康 baseline。04:42 UTC 八卡 CUDA 冒烟检查恢复通过，
+另外发现旧 rollout 的 14 个孤儿子进程仍继承着 CUDA 句柄；按精确 trial
+和 PID 清理。诊断资料与启动配置位于 `build/rl_nan_20261018/`，后续
+保留诊断记录，不能直接恢复损坏的 v7 权重。旧 native 的诊断重启尚未进入
+首次 update 就停止，日志保留为 `old_native_*`；修复版使用新 trial
+`qwen35-weftmoe-barrier-fix-20261018`，仍从初始模型开始。
+修复版 trainer 于 04:58:01 UTC 启动（supervisor 330634、trainer 330744），
+当前为初始化/诊断验证，不表示已经通过 12 次 update。AReaL 公共 norm
+修正位于其现有 working tree；未将其他已有集成改动混入本次 WeftMoE commit。
+
 ## 2026-10-16：两机分别长跑 1500 updates，原生 online W&B
 
 每台机器仍运行一组独立的单机 8 GPU 实验，不改成双机 EP16：

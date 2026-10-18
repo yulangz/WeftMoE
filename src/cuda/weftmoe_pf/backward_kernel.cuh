@@ -277,6 +277,13 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
       phase ^= stage == 0U;
     }
   }
+  // Drain every operand slot, including remote multicast readers, before
+  // the activation barriers themselves become part of the dW output arena.
+  for (unsigned i = 0U; i < kStages; ++i) {
+    s.empty[stage].wait(phase ^ 1U);
+    stage = (stage + 1U) % kStages;
+    phase ^= stage == 0U;
+  }
 }
 
 template <unsigned N, bool Dx, bool Network>
@@ -475,6 +482,19 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
 }
 
 // Phase helpers keep math/producer scopes separate from the return roles.
+__device__ __forceinline__ void retire_activation_barriers(Shared &s) {
+  if (threadIdx.x != 256U)
+    return;
+  // These barriers may alias the dW store tile. PTX requires inval before
+  // their storage can be used for ordinary data, even after the phase join.
+  for (auto &barrier : s.full)
+    local::Barrier::invalidate(reinterpret_cast<std::uint64_t *>(&barrier));
+  for (auto &barrier : s.empty)
+    local::Barrier::invalidate(reinterpret_cast<std::uint64_t *>(&barrier));
+  for (auto &barrier : s.pull_full)
+    local::Barrier::invalidate(reinterpret_cast<std::uint64_t *>(&barrier));
+}
+
 template <bool Network>
 __device__ __forceinline__ void
 begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
@@ -486,6 +506,7 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     using Sync =
         backward_weights::UnifiedComputeSynchronization<true>;
     Sync::cta_sync();
+    retire_activation_barriers(*reinterpret_cast<Shared *>(storage));
     backward_weights::initialize_compute<
         backward_weights::kStorageTileN>(storage, state);
     Sync::cta_sync();
@@ -507,6 +528,7 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     // Every writer drains once before the grid/rank handoff to Reduce.
     __threadfence_system();
     grid_sync<0U, 384U>(f);
+    retire_activation_barriers(*reinterpret_cast<Shared *>(storage));
     backward_weights::initialize_compute<
         backward_weights::kStorageTileN>(storage, state);
     __syncthreads();
