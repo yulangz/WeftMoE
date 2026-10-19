@@ -1,5 +1,36 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：8K baseline 长度消融
+
+按用户要求，在 `10.10.19.233` 启动原版 Megatron + SGLang baseline，
+从已核验的官方 `Qwen/Qwen3.5-35B-A3B-Base` 权重和新 optimizer 开始。
+目标先跑 **100 updates**，用于观察 8K 预算下的起始 reward 和早期趋势，
+不把外部实验的 0.6 → 0.8 曲线当作本配置必然收敛的证据。
+
+- trainer 于 **04:29:54 UTC** 启动：supervisor `147934`，trainer `148011`。
+  **04:35:01 UTC** 两组推理服务均 ready，04:35:04 proxy 初始化完成；
+  W&B 服务端已查到新 run 为 running。此时尚无完整 update/reward。
+- 基于旧 20K baseline 配置，除 trial/输出目录/W&B 名称外，只将
+  `gconfig/eval_gconfig/actor.max_new_tokens` 从 20480 改为 **8192**。
+  总 context 32767、32 prompts × 16 samples、temperature/top-p=1、seed=1、
+  数据、学习率、batching 和重算配置不变。没有添加独立 step-0/验证集评估。
+- 仍为单机 8 GPU，actor attention TP4/DP2、EP8/ETP1；rollout 为两组
+  DP4/EP4、attention TP1。两端 `AREAL_USE_WEFTMOE=0`，时钟固定 1620 MHz。
+- 使用现有共享 AReaL 代码，因此包含 10 月 18 日的专家 optimizer TP-group
+  norm 修正；旧 20K baseline 没有这项修正。不是旧二进制的严格单变量复跑。
+- 保留原有 `math_reward_fn` 评分逻辑，避免本轮同时更换长度和评分口径。
+  `verify(ans, gold)` 与库的 `verify(gold, target)` 参数约定相反，
+  对实际 reward 的影响尚未量化；不能据此断言旧 0.8 得分虚高。
+- 原生 online W&B，私有 NETRC 认证，不开独立上传进程。
+  saver/recover 的所有频率仍为 null，recover disabled，不保存 checkpoint。
+- 旧 baseline 已自然退出、状态为 failed/284 updates，启动前八卡均空闲；
+  本轮没有杀进程，也没有清理历史 NCCL shared-memory 文件。
+  `10.10.16.219` 上的 WeftMoE 任务不变。
+
+配置、监督脚本和 source 指纹：`build/rl_baseline_8k_20261019/`；
+输出：`results/areal_baseline_8k_20261019/`。
+[8K baseline W&B](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-baseline-dp4ep4-mb32-8k-100-20261019_train)。
+
 ## 2026-10-19：barrier 问题留档与 baseline 进度
 
 ### 待做的最小复现
