@@ -1,5 +1,23 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：停止 WeftMoE 长跑，提取 barrier 独立诊断
+
+按用户要求停止 `10.10.16.219` 上的修复版 WeftMoE 长跑。最后完整完成
+**101 updates**；06:20:14 UTC 已更新状态为 `stopped_by_user`，训练/推理
+子进程退出、八卡释放。保留日志和 W&B，不生成 checkpoint。
+`10.10.19.233` 上的 8K baseline 没有停止或修改。
+
+独立 CUDA 程序、运行脚本、现场说明和本轮原始结果放在
+`../Amazing-Hopper/mbarrier_arena_reuse/`。保留旧 barrier 与 dW 输出的
+重叠布局、TMA/WGMMA、cluster multicast、阶段交接、STSM/TMA 写回，
+drain/invalidate 可分别开关；剥离模型、AReaL、optimizer 和 RDMA。
+
+**尚未成功复现原 NaN。** 单 CTA、全 SM cluster1/2、copy/GEMM、
+不同 stage 尾部的 28 组测试各 10000 次，均未捕获坏值；双 CTA 的
+racecheck/synccheck 也未报错。关闭修复仍通过，不能据此证明旧协议正确，
+也不能把“旧 barrier 晚到写回”当作已验证机制。后续需要进一步保留原生
+PF 的真实任务/时序条件，不能以人为添加的另一种竞态替代现场问题。
+
 ## 2026-10-19：8K baseline 长度消融
 
 按用户要求，在 `10.10.19.233` 启动原版 Megatron + SGLang baseline，
