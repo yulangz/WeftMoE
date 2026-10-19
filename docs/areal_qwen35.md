@@ -1,5 +1,26 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：停止旧 8K baseline，准备双侧 DeepEP 对照
+
+按用户要求停止 `10.10.19.233` 上未启用 DeepEP 的 8K baseline，保留日志
+和 W&B。共完成 **79 updates**，最后一轮 reward=0.76172；第 80 轮期间
+收到停止信号。监督状态已标记 `stopped_by_user`，原 session 的活跃子进程
+已退出，八卡无 compute process。未删除模型、日志或历史实验数据。
+本机 WeftMoE 8K 组不改动。
+
+新 DeepEP 组尚未启动。接入检查发现：
+
+- Megatron-Bridge 无条件覆盖 dispatcher 为 alltoall，需透传已有配置中的
+  flex + moe_enable_deepep，且不可顺手改变 provider 的 permutation fusion。
+- AReaL SGLangConfig 缺少 moe_a2a_backend/deepep_mode 配置入口。
+- 原生 SGLang DeepEP 将 Qwen shared expert 改为 TP1，AWEX reader 的
+  shared-expert 元数据也需对应 NO_SHARDING；不能通过开启 WeftMoE 间接适配。
+- 同 BF16 比较需明确设置 SGLANG_DEEPEP_BF16_DISPATCH=1，避免默认 low-latency
+  FP8 通信改变数值口径。
+
+远端已确认 DeepEP 1.2.1+567632d、MCore 0.17.0、Bridge 0.4.0 可导入，无需
+安装新依赖。依仓库规则，已请求用户确认配置结构的小适配，再启动新组。
+
 ## 2026-10-19：启动 8K WeftMoE 对照组
 
 在本机 `10.10.16.219` 启动与另一台 8K baseline 对齐的 WeftMoE 组，
