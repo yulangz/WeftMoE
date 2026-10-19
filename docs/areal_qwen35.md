@@ -1,5 +1,23 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：barrier 故障已独立复现
+
+后续测试找到有效触发条件：同卡两个独立 CUDA context。最小程序仅做
+barrier init/arrive/wait、覆盖为普通 shared 数据并读取，不含 GEMM/TMA。
+旧协议三轮均捕获损坏，invalidate 对照三轮均未捕获；两个进程不共享内存。
+普通数据被改成 `0xfffff800001ffffe`，按 BF16 解读含 NaN 和约 `-1.04e34`。
+
+保留 PF 流水线的四组消融也确认：仅 drain 仍损坏，仅 invalidate 未损坏。
+原生未修复 PF EP4 在第 218 轮、layer 11 的 dW1 捕获 36 个 NaN 和 12 个
+超大有限值，均位于 M128 tile 第 96 行的旧 barrier 区域，发生在 optimizer
+之前。修复版完成 500 轮、每 rank 8000 次 BWD，同轮共卡压力测试未见坏值。
+
+代码、运行方法和原始结果见
+[独立复现说明](../../Amazing-Hopper/mbarrier_arena_reuse/README.md)。
+未 invalidate 的协议错误及其数据损坏已确认；context 切换时硬件内部的
+保存/恢复细节仍属推断，不混同为已观测机制。本轮不修改生产 kernel，
+保留修复 `9b38230`。测试已结束，另一台机器的 8K baseline 未受影响。
+
 ## 2026-10-19：停止 WeftMoE 长跑，提取 barrier 独立诊断
 
 按用户要求停止 `10.10.16.219` 上的修复版 WeftMoE 长跑。最后完整完成
@@ -12,7 +30,7 @@
 重叠布局、TMA/WGMMA、cluster multicast、阶段交接、STSM/TMA 写回，
 drain/invalidate 可分别开关；剥离模型、AReaL、optimizer 和 RDMA。
 
-**尚未成功复现原 NaN。** 单 CTA、全 SM cluster1/2、copy/GEMM、
+**以下为早期负结果，已被上方的成功复现补充。** 单 CTA、全 SM cluster1/2、copy/GEMM、
 不同 stage 尾部的 28 组测试各 10000 次，均未捕获坏值；双 CTA 的
 racecheck/synccheck 也未报错。关闭修复仍通过，不能据此证明旧协议正确，
 也不能把“旧 barrier 晚到写回”当作已验证机制。后续需要进一步保留原生
