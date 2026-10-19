@@ -1,5 +1,29 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：启动 8K WeftMoE 对照组
+
+在本机 `10.10.16.219` 启动与另一台 8K baseline 对齐的 WeftMoE 组，
+目标同为 **100 updates**，从原始 Base 模型与新 optimizer 开始。
+trainer 启动于 **07:24:16 UTC**：supervisor `519421`、trainer `519538`。
+**07:29:22 UTC** 两组 SGLang ready，**07:29:44 UTC** rollout proxy 初始化
+完成，进入首轮 rollout；W&B 已开始 online 同步。尚未完成第一个 update，
+另一台 baseline 不改动。
+
+- 模型 `Qwen/Qwen3.5-35B-A3B-Base`，DAPO-Math-17k；生成上限 8192，
+  总 context 32767，32 prompts × 16 samples，seed=1，采样、训练和评分配方
+  与 8K baseline 相同；三个关键 AReaL 源文件指纹也与 baseline 启动时一致。
+- 单机八卡固定 1620 MHz；actor attention TP4/DP2、EP8/ETP1；rollout
+  两组 DP4/EP4、attention TP1。Megatron 使用 PF FWD/BWD，SGLang 使用
+  PF prefill / DT decode，均固定为已验证的 `qwen_areal_barrier_fix_20261018`。
+- 原生 online W&B，同 baseline 的 group，不启动独立上传进程；认证已核验。
+  saver/recover 频率全部 null，recover disabled，无 checkpoint。
+- 保留修复版 `check_for_nan_in_grad=true`，baseline 为 false；此外只变更
+  WeftMoE 开关及必要 runtime 配置、run 标识和输出目录。不加逐层诊断同步。
+
+配置、manifest、监督脚本和状态：`build/rl_weftmoe_8k_20261019/`；
+训练输出：`results/areal_weftmoe_8k_20261019/`。
+[WeftMoE 8K W&B](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-weftmoe-pfdt-dp4ep4-mb32-8k-100-20261019_train)。
+
 ## 2026-10-19：barrier 故障已独立复现
 
 后续测试找到有效触发条件：同卡两个独立 CUDA context。最小程序仅做
