@@ -1,5 +1,70 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：barrier 问题留档与 baseline 进度
+
+### 待做的最小复现
+
+继续保留 10 月 18 日的 BWD barrier 生命周期问题，后续独立复现，不把
+12-update 诊断通过等同于已经捕获了首次损坏。修复 `9b38230` 同时加入
+producer-tail drain 和旧 mbarrier invalidate，需要分开消融两者的作用。
+
+补充的二进制证据：旧单机 BWD 没有 `SYNCS.CCTL.IV`；修复版在
+`0x27000` 至 `0x27040`、间隔 8 B 的 9 个旧 barrier 地址上实际发出
+该指令。dW 新 barrier 初始化在 `0x34000`，不会使旧对象自动失效。
+这证明修复不是空的 C++ 标记，但仍不能证明具体的硬件内部写回机制。
+
+后续最小复现按以下顺序进行：
+
+- 去掉 AReaL、SGLang、Adam 和 RDMA，保留 SM90a 上 barrier arena
+  到 dW 输出 tile 的复用，以及 swizzled STSM → TMA-store 数据流。
+  首先测试单 CTA；如需保留跨 CTA arrivals，再用双 CTA cluster。
+- 做 drain 开/关 × invalidate 开/关的四组对照。区分“异步事务未结束”
+  与“事务结束后未 invalidate”两种错误，不用人为制造的另一种竞态
+  冒充现场问题的复现。
+- 检查整个输出 tile 的位模式及损坏位置，重点核对第 96 行的 36 个
+  BF16；不能只检查 NaN，因为现场还有超大有限值进入 Adam 后溢出。
+- 当前没有可重复触发原故障的独立脚本。等待用户确认释放 baseline
+  节点后再实现和测试，本轮没有停止训练或启动 GPU 复现实验。
+
+### baseline：284 / 1500，已经失败，不是正常长跑
+
+03:30 UTC 检查 `10.10.19.233`：最后完成第 **284** 次 update（18.9%），
+完成时间为 **00:14:05 UTC**。随后第 285 次更新在 **00:21:29 UTC**
+报告 `ppo_update` 失败：`validate_transport_padding` 的 CPU/Gloo
+all-reduce 出现 `Connection closed by peer`。02:21 起又出现 NCCL
+collective timeout，属于更晚的故障，不能据此定位最初原因。
+
+supervisor 的状态文件仍是启动时留下的 `running`，supervisor/trainer
+进程也未退出；实际已经超过 3 小时没有完成更新。只读 GPU 查询仍有
+5 个 actor 进程各占约 49–52 GiB，不能把这台机器当作已经释放。
+同节点内核日志另有 memory-cgroup OOM-kill（`dmesg -T` 显示
+00:22:48，host PID 71649）；尚未核对 host/container PID 和时钟对应，
+因此仅记录为排查线索，不把它或 WeftMoE barrier bug 当作已确认原因。
+baseline 未使用 WeftMoE native。
+
+Reward 使用已完成 update 的 `ppo_actor/task_reward/avg`，即原始任务
+得分，不使用归一化后接近零的 `final_reward/avg`。本配方得分为 0/1，
+每步 512 个样本；下表为各区间的平均值，以百分比表示：
+
+|完成的 update|平均原始 reward|
+|---|---:|
+|1–50|81.63%|
+|51–100|81.85%|
+|101–150|81.93%|
+|151–200|84.19%|
+|201–250|82.06%|
+|251–284（34 步）|80.10%|
+
+等长窗口对比：最初 50 步 **81.63%**，最近 50 步（235–284）
+**80.47%**，下降 **1.16 个百分点**；最后单步为 81.25%。当前没有
+持续上涨的证据。训练 batch 在变化，且本次没有固定验证集评估，不能
+据此认定泛化能力下降。以上由 `benchmarks/publish_areal_logs.py`
+的 `read_updates()` 只读解析完整日志表格获得，没有启动上传进程。
+
+原始日志保留在远端 `build/rl_pf_dt_1500_20261016/baseline.log`；
+[原生 W&B run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-baseline-pfdt-dp4ep4-mb32-1500-20261016_train)。
+本轮未发送停止信号、未清理残留进程、未重启或修改 baseline。
+
 ## 2026-10-18：修复版重新启动 1500-update 长跑
 
 12-update 诊断已通过：07:33:29 UTC 完成第 12 次 update，07:36:28
