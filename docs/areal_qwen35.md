@@ -1,5 +1,64 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：双侧 DeepEP 接入与 8K baseline 重启
+
+**当前状态：未成功跑起。** 两次均在推理初始化时失败，完成 0 updates，
+没有可用的 reward/性能结果，也尚未创建原生 W&B run。三处 AReaL 适配
+已完成，但当前 SGLang 的 BF16 + DeepEP GEMM 路径尚不完整。
+
+经用户确认，完成三处 AReaL 适配（commit `d5395ffa`），不修改 WeftMoE
+kernel 或训练配方：
+
+- Megatron-Bridge 透传 `moe_token_dispatcher_type=flex` 和
+  `moe_enable_deepep=true`，不再强制 alltoall；保持原 permutation fusion。
+  首次启动八个 actor rank 均实际构建 40 层
+  `MoEFlexTokenDispatcher / _DeepepManager`，非仅配置开关。
+- SGLangConfig 新增可选 `moe_a2a_backend` / `deepep_mode`，默认不添加 CLI
+  参数；本组使用 `deepep / auto`，prefill normal、decode low-latency。
+- AWEX 接收端对原生 SGLang DeepEP 的 Qwen3.5 shared expert 使用
+  `NO_SHARDING` 元数据：训练端仍是 TP4 源分片，推理每 rank 接收完整
+  shared MLP。routed experts、attention、shared-expert gate 不改变。
+
+新增 CPU 测试覆盖配置透传与两种 shared-expert 布局，3 cases 通过；
+连同已有 Qwen TP4 权重布局测试共 4 cases 通过。全量 pre-commit 在隔离
+工作树通过，自动生成两种语言的 CLI 文档；依赖锁文件的环境差异不带入
+生产工作树，没有安装或升级依赖。
+
+首次启动在 CUDA Graph 捕获 batch=263 时超过 DeepEP 默认 LL 容量 128，
+于 rollout 前退出，未产生 update。改为
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512`、
+`NVSHMEM_QP_DEPTH=2048`，满足 `QP_DEPTH >= 2*(capacity+1)`；
+保留 CUDA Graph、batch、并发配置不变。此容量限制针对 LL decode，
+不限制 normal prefill 的完整 token 数。旧 attempt 日志和状态完整保留。
+
+远端 `10.10.19.233` 第二次 trainer 启动于 **16:39:42 UTC**，
+supervisor `312387`、trainer `312457`。目标 **100 updates**，
+从官方 Base 权重和新 optimizer 开始。8K 生成上限、32 prompts × 16 samples、
+seed=1、actor attention TP4/DP2 + EP8/ETP1、两组 rollout DP4/EP4
+不变；八卡固定 1620 MHz，双方 `AREAL_USE_WEFTMOE=0`。
+显式启用 `SGLANG_DEEPEP_BF16_DISPATCH=1`，避免 LL 默认 FP8 通信
+改变比较口径。W&B 配置为原生 online，recover disabled，不保存 checkpoint。
+本机 WeftMoE 8K 组未停止或重启。
+
+配置、source 指纹、监督脚本及 attempt1 记录：
+`build/rl_baseline_deepep_8k_20261019/`；
+输出：`results/areal_baseline_deepep_8k_20261019/`。
+
+第二次已越过通信容量检查，于 **16:43:50 UTC** 在
+`DeepEPMoE.run_moe_core` 报 `forward_deepgemm_masked is deprecated`，
+supervisor 于 **16:44:16 UTC** 记录 failed/0 updates。当前安装的
+SGLang **0.5.10.post1** 中，未量化 BF16 未切入新的 DeepGemm runner；
+旧 LL 分支是上述硬断言，normal 分支同样是
+`forward_deepgemm_contiguous is deprecated`。简单切成 normal 不足以修复，
+且该模式自动关闭 CUDA Graph。普通 BF16 Triton runner 仅有 standard
+dispatch 布局接线，DeepGemm runner 当前实际调用 FP8 GEMM，不能靠改开关
+得到同口径的 BF16 baseline。
+
+未切换 FP8、未关闭 CUDA Graph、未修改第三方 GEMM 或升级依赖；下一步
+需要另行确定 BF16 + DeepEP 的计算接线方案。这超出原定三项配置/元数据
+适配。失败进程的残留 RPC worker 已定向停止，日志保留；本机 WeftMoE
+任务不变。AWEX shared-expert 元数据仅完成 CPU 验证，尚未完成端到端验证。
+
 ## 2026-10-19：停止旧 8K baseline，准备双侧 DeepEP 对照
 
 按用户要求停止 `10.10.19.233` 上未启用 DeepEP 的 8K baseline，保留日志
