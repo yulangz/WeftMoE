@@ -1,5 +1,39 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-19：仅 Megatron 开启 DeepEP 的 8K baseline
+
+按用户要求，暂不修补 SGLang BF16 + DeepEP 计算路径，改为仅训练端
+启用 `moe_token_dispatcher_type=flex / moe_enable_deepep=true`。
+推理端显式 `moe_a2a_backend=none`，恢复原生通信/GEMM/CUDA Graph；
+删除前次 rollout 的 DeepEP BF16、LL capacity、NVSHMEM QP-depth 环境设置。
+AWEX 的 DeepEP shared-expert 元数据分支因此不启用。
+
+CPU 配置比对确认：SGLang 参数及 rollout 环境与原 8K baseline 一致
+（仅新增显式 backend=none 和未设置的 mode）；Megatron 配置只改变上述
+两个开关。模型、数据、采样、seed、optimizer、重算及实际并行拓扑不变。
+没有生产源码改动，复用 AReaL commit `d5395ffa` 的 dispatcher 透传。
+
+在 `10.10.19.233` 的八卡空闲后启动；trainer 时间 **16:56:03 UTC**，
+supervisor `316696`、trainer `316766`。使用新的 run 名称和输出目录，
+保留前两次双侧 DeepEP 失败记录；从官方 Base 权重及新 optimizer 开始，
+目标 **100 updates**，不续跑旧 baseline 的第 79 步。
+仍为 8K 生成预算、32 prompts × 16 samples、BF16、1620 MHz，
+actor attention TP4/DP2 + EP8/ETP1、两组 rollout DP4/EP4。
+W&B 配置原生 online，checkpoint 关闭、recover disabled；本机 WeftMoE
+实验未停止或重启。
+
+启动核验：八个 actor rank 各 40 层均实际构建
+`MoEFlexTokenDispatcher / _DeepepManager`。两组 SGLang 于 17:00 UTC
+就绪，17:00:36 proxy 初始化完成；服务接口核验 `moe_a2a_backend=none`、
+`moe_runner_backend=auto`、BF16、CUDA Graph 开启、DP4/EP4。
+17:01 UTC 两组均有实际生成请求，已进入首轮 rollout；W&B 服务端确认
+run 为 running。尚未完成首个 training update，也尚未验证更新后的 AWEX
+权重同步；没有据此报告 reward 或性能改善。
+
+配置、监督脚本和 manifest：`build/rl_baseline_mcore_deepep_8k_20261019/`；
+训练输出：`results/areal_baseline_mcore_deepep_8k_20261019/`。
+[仅训练端 DeepEP 的 W&B](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-baseline-mcore-deepep-dp4ep4-mb32-8k-100-20261019_train)。
+
 ## 2026-10-19：双侧 DeepEP 接入与 8K baseline 重启
 
 **当前状态：未成功跑起。** 两次均在推理初始化时失败，完成 0 updates，
