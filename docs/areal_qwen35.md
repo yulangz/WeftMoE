@@ -1,5 +1,97 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-20：相同规模的双机 EP16 路由偏斜对照
+
+结论：本轮 EP16 的全部 case，当前 PF 的 p50 均低于 Megatron+DeepEP；
+FWD 加速 **1.10–1.54×**，BWD 为 **1.06–1.18×**。多机 BWD 的收益明显
+小于单机，极强偏斜 6K 只有约 6%，不能称为大幅领先。多机 FWD 的相对
+优势则随本轮偏斜档位提高而扩大，不能直接套用上一节单机的趋势。
+
+### 口径及验证
+
+- 两台各 8 GPU，EP16/ETP1，Qwen3.5 H2048/I512/E256/top8 BF16。
+  两节点无其他 compute process 后开测，显式锁定全部 GPU 为 1620 MHz。
+  没有停止、修改或重启 RL；两组 100-update 实验已结束。
+- 仍是每 rank nominal M=6144/8192，正态标准差 10%、截断 ±3σ、seed=123。
+  实际均值 6162.85/8200.90，范围 4303–7826/5922–10277；这是近似规模的
+  合成压力测试，不是真实 RL 路由或 packing 长度回放。现有 RL 没有专家
+  负载指标。前 8 rank 的路由/gates hash 与 EP8 对应 case 一致，新加
+  8 rank；专家归属由每 rank 32 个改为 16 个。
+- 每 rank M 不变意味着全局 source tokens 相对 EP8 翻倍。这是固定每卡
+  输入规模的 weak-scaling 对照，不能解释为固定全局 batch 的双机扩展效率。
+- 复用相同 `qwen_areal_barrier_fix_20261018` 二进制，SHA256
+  `9889c7606071872a169cf67569c3130629928047ceef47cc6b4cefb63cae8d99`；
+  两节点哈希一致。使用现有多机 Qwen B1024/D2 配置，不重新 autotune，
+  不修改算子。PF 跨机使用原生 GDAKI 路径。
+- baseline 同单机：MCore 0.17.0、TE 2.14.1+27de67e1、DeepEP
+  1.2.1+567632d、flex/20 SM、permutation/activation fusion、`moe_act`。
+  两节点版本核验一致。
+- 缓存 FWD 与新 tape 上的独立 BWD 分别计时；固定 buffer、IPC/RDMA
+  初始化和 allocator 预热不计入，调用内重排/临时分配/device synchronize
+  计入。排除 router projection/top-k、接入层 parameter stack、shared
+  expert、attention 和 optimizer；不是纯通信或完整 RL step。
+- 每次 prime 全 trace、6 warmups/24 samples，逐 sample 取 16 rank
+  最大耗时再求 p50。极强档反转后端运行顺序复测，48 samples 全部合并，
+  不挑最快一轮。其余为 24 samples；正式区间 baseline 新编译图计数均为 0。
+- 20 个正式运行的两节点时钟记录全部成功，观测值均为 1620 MHz；仍是
+  稀疏采样，不是连续硬件遥测。两种后端在 bias=2、6K/8K 各一组新样本
+  上通过 16 rank 的 output/dX/dGate/dW1/dW2 Torch reference 检查。
+
+### 负载与通信量
+
+构造方式同 EP8：每 token 的标准正态 logits 加跨 source rank 共享的
+expert bias，top8；bias 每调用重新采样。指标为逐调用峰均比的 p50，
+范围对应 6K/8K，不是置信区间。GPU/node 负载指接收的专家行数，
+不是实测 GPU utilization 或 NIC 占用。
+
+| 路由 | 最热专家/平均专家 | 最忙 GPU/平均 GPU | 最忙节点/平均节点 |
+|---|---:|---:|---:|
+| 均衡 | 1.00× | 1.00× | 1.00× |
+| 历史档，bias=0.5 | 7.26–7.63× | 1.58–1.59× | 1.04–1.05× |
+| 强偏斜，bias=1 | 16.86–17.72× | 2.19–2.37× | 1.10–1.11× |
+| 极强偏斜，bias=2 | 28.67–29.63× | 2.87–3.36× | 1.14–1.18× |
+
+相同 bias 的专家峰均比与 EP8 接近，但卡级偏斜更重；例如极强档由
+EP8 的约 2.1–2.2× 增至 EP16 的 2.9–3.4×。节点级偏斜仍较轻。
+
+按路由计算，8K 四档的跨机 dispatch BF16 payload 平均约
+0.533–0.536 GB，return BF16 payload 约 2.150–2.156 GB，均为全
+16 rank 合计、十进制字节，不含协议开销和 BWD dGate 的 4 B/row。
+不是 NIC 带宽测量，也不模拟 FWD rail 分流后的每卡发送量。
+偏斜没有显著降低总跨机字节数，改变了计算/通信的分布和 GEMM 形状。
+
+### 缓存 FWD 与独立 BWD 结果
+
+单位 ms；加速比=Megatron+DeepEP/PF。FWD/BWD p50 不能相加当成实测
+cycle。极强档为两轮全部样本合并后的 p50，不是两轮 p50 的平均值。
+
+| nominal M/rank | 路由 | PF FWD | Megatron FWD | 加速比 | PF BWD | Megatron BWD | 加速比 |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 6144 | 均衡 | 5.367 | 6.477 | 1.21× | 4.672 | 5.530 | 1.18× |
+| 6144 | bias=0.5 | 5.217 | 6.696 | 1.28× | 5.490 | 6.265 | 1.14× |
+| 6144 | bias=1 | 5.494 | 7.958 | 1.45× | 7.286 | 8.183 | 1.12× |
+| 6144 | bias=2 | 6.349 | 9.323 | 1.47× | 9.380 | 9.948 | 1.06× |
+| 8192 | 均衡 | 6.549 | 7.230 | 1.10× | 5.804 | 6.692 | 1.15× |
+| 8192 | bias=0.5 | 6.494 | 8.053 | 1.24× | 6.914 | 8.071 | 1.17× |
+| 8192 | bias=1 | 6.739 | 9.665 | 1.43× | 8.758 | 10.370 | 1.18× |
+| 8192 | bias=2 | 7.387 | 11.381 | 1.54× | 10.691 | 12.404 | 1.16× |
+
+极强档的逐轮 BWD p50：6K PF 9.496/9.380、baseline 9.979/9.911；
+8K PF 10.763/10.691、baseline 12.265/12.494。该 trace 上的小优势可复现，
+但不据此保证任意路由均领先。8K 历史偏斜档的单机 FWD/BWD 加速比为
+2.01×/1.47×，双机降为 1.24×/1.17×，进一步说明不能把单机算子收益
+外推到 EP16 或端到端 RL。
+
+这轮只测性能与正确性，没有用 timeline 区分通信、GEMM 和同步的因果贡献。
+更重的卡级偏斜和新增的跨机路径同时存在，不能单凭此表归因于静态任务分配。
+
+[EP16 结果 JSON](../benchmarks/results/qwen_rl_skew_ep16_20261020.json)
+保存逐 sample 时延、逐轮/p95 统计、负载/流量指标、16 rank workload hash、
+数值误差及 clock 摘要。原始日志、manifest、clock 位于
+`build/qwen_rl_skew_ep16_20261020/`。复现使用下节命令，将 `--nodes` 改为
+`2`、`--ring-tokens` 改为 `1024`，使用新的 output/label/master-port；
+其余模型、采样和测量参数不变。
+
 ## 2026-10-20：实际 packing 规模下的 EP8 路由偏斜压力测试
 
 结论：当前 RL 使用的 PF 二进制，在本轮所有合成负载下均领先
