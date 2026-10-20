@@ -1542,9 +1542,9 @@ struct GinResources {
   std::size_t bytes_per_slot = 0;
   std::vector<void *> allocations;
   std::shared_ptr<internal::NcclSessionState> nccl;
+  std::shared_ptr<internal::DeviceCommunicator> connection;
   ncclDevComm_t dev_comm{};
   std::vector<ncclWindow_t> windows;
-  bool dev_comm_created = false;
   std::mutex mutex;
   cudaEvent_t last_use = nullptr;
   unsigned long long last_capture_id = 0;
@@ -1556,20 +1556,15 @@ struct GinResources {
       (void)cudaEventDestroy(last_use);
     }
     using Deregister = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
-    using Destroy = ncclResult_t (*)(ncclComm_t, const ncclDevComm_t *);
     using Free = ncclResult_t (*)(void *);
     const auto deregister = reinterpret_cast<Deregister>(
         dlsym(RTLD_DEFAULT, "ncclCommWindowDeregister"));
-    const auto destroy =
-        reinterpret_cast<Destroy>(dlsym(RTLD_DEFAULT, "ncclDevCommDestroy"));
     const auto free_memory =
         reinterpret_cast<Free>(dlsym(RTLD_DEFAULT, "ncclMemFree"));
     if (nccl && deregister)
       for (const auto window : windows)
         if (window)
           (void)deregister(nccl->comm, window);
-    if (nccl && dev_comm_created && destroy)
-      (void)destroy(nccl->comm, &dev_comm);
     if (free_memory)
       for (auto *allocation : allocations)
         if (allocation)

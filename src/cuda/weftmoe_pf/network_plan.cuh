@@ -212,9 +212,9 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
     }
     collective_scope_sync<Threads, kCollectiveScopeBarrier>();
   }
-  // Exact source-side receive counts, accumulated across invocations. Signals
-  // are per sending worker; neither payload readiness nor credit is inferred
-  // from unrelated packets on the same context.
+  // Plan against the committed receive prefix. A tape allocation may fail
+  // after Notify; retrying must overwrite this target, not count an unsent
+  // invocation twice. Only the receive worker advances forward_rows.
   for (auto node = worker; node < p.nodes; node += workers) {
     if (node == a.node)
       continue;
@@ -225,10 +225,10 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
               prefix[node * a.local_world_size * owned];
     }
     const auto channel = a.static_network.rings.channel(a.node, node, 0U);
-    peer_at<static_forward::NetworkChannel>(
+    auto &state = *peer_at<static_forward::NetworkChannel>(
         a.gin_window_base, a.static_network.ring_region +
-                               a.static_network.rings.state(true, channel))
-        ->forward_rows += rows;
+                               a.static_network.rings.state(true, channel));
+    state.forward_target = state.forward_rows + rows;
   }
   grid_sync<0U, Threads>(a);
   prepare_return<Threads>(a);

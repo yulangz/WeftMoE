@@ -46,6 +46,7 @@ class TensorRuntime:
         input_layout: str = "dp",
         interconnect: str | None = None,
         decode_only: bool = False,
+        session=None,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -93,16 +94,19 @@ class TensorRuntime:
             except (OSError, ValueError, KeyError, AttributeError) as error:
                 decision = dict(profile=None, key=None, error=str(error))
         decision["decode_only"] = decode_only
+        decision["reuse_session"] = session is not None
         decisions = [None] * self.world
         dist.all_gather_object(decisions, decision, group=group)
         if any(d["error"] for d in decisions):
             raise ValueError(f"collective autotune preparation failed: {decisions}")
         if any(d != decision for d in decisions):
             raise ValueError("EP ranks selected incompatible autotune profiles")
-        bootstrap = [native.bootstrap_id() if self.rank == 0 else None]
-        dist.broadcast_object_list(
-            bootstrap, src=dist.get_global_rank(group, 0), group=group
-        )
+        bootstrap = [b""]
+        if session is None:
+            bootstrap = [native.bootstrap_id() if self.rank == 0 else None]
+            dist.broadcast_object_list(
+                bootstrap, src=dist.get_global_rank(group, 0), group=group
+            )
         arguments = (
             bootstrap[0],
             self.rank,
@@ -122,7 +126,13 @@ class TensorRuntime:
         )
         if decode_only:
             tuning = dict(tuning or {}, decode_only=True, window_tokens=max_tokens)
-        self.native = native.Runtime(*arguments, tuning) if tuning else native.Runtime(*arguments)
+        if session is not None:
+            self.native = native.Runtime(*arguments, tuning or {}, session)
+        else:
+            self.native = (
+                native.Runtime(*arguments, tuning) if tuning
+                else native.Runtime(*arguments)
+            )
 
     def _check(self, x, routes, gates, w1, w2):
         if self.training and torch.cuda.current_stream() != self.stream:
@@ -164,6 +174,22 @@ class TensorRuntime:
         if torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Backward must use the preparation stream")
         return self.native.backward(tape, dy.contiguous())
+
+    def forward_async(self, x, routes, gates, w1, w2):
+        """Enqueue training FWD on the preparation stream; retain its workspace."""
+        self._check(x, routes, gates, w1, w2)
+        return self.native.forward_async(x, routes, gates, w1, w2)
+
+    def backward_async(self, tape, dy):
+        """Return stream-ordered gradients; retire completion at the next call."""
+        if torch.cuda.current_stream() != self.stream:
+            raise RuntimeError("Backward must use the preparation stream")
+        return self.native.backward_async(tape, dy.contiguous())
+
+    def drain(self):
+        """Finish the pending training call before inspecting or releasing leases."""
+        if self.training:
+            self.native.drain_training()
 
     def inference(self, layer, x, routes, gates, w1, w2):
         self._check(x, routes, gates, w1, w2)
@@ -209,6 +235,7 @@ class TensorRuntime:
         if self.native is None:
             return
         torch.cuda.synchronize()
+        self.drain()
         self.native.drain_eager_inference()
         if self.training and self.native.usage()["notify_slots_in_use"]:
             raise RuntimeError("Live backward tapes prevent closing the runtime")

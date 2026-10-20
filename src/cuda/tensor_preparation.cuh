@@ -5,7 +5,7 @@
 struct CollectiveTensorPreparation::Impl {
   std::shared_ptr<internal::NcclSessionState> nccl;
   CudaExecution execution;
-  cudaStream_t stream;
+  cudaStream_t stream = nullptr;
   std::shared_ptr<tensor_storage_detail::Allocation> status;
   std::uint32_t *host = nullptr;
 
@@ -16,8 +16,7 @@ struct CollectiveTensorPreparation::Impl {
   }
 
   Impl(const NcclSession &session, const CudaExecution &exec)
-      : nccl(internal::NcclSessionAccess::checked(session)), execution(exec),
-        stream(internal::checked_execution_state(exec)->stream) {
+      : nccl(internal::NcclSessionAccess::checked(session)), execution(exec) {
     if (nccl->device != exec.device_ordinal())
       throw std::invalid_argument("tensor preparation requires the NCCL device");
     check(cudaSetDevice(static_cast<int>(exec.device_ordinal())));
@@ -25,11 +24,15 @@ struct CollectiveTensorPreparation::Impl {
                                                exec.device_ordinal());
     check(cudaHostAlloc(reinterpret_cast<void **>(&host),
                          4U * sizeof(std::uint32_t), cudaHostAllocPortable));
+    // This agreement reads host allocation status, not tensor contents.
+    // Keep it independent of the application's attention/router/DDP stream.
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   }
 
   ~Impl() noexcept {
     (void)cudaSetDevice(static_cast<int>(execution.device_ordinal()));
     (void)cudaStreamSynchronize(stream);
+    (void)cudaStreamDestroy(stream);
     (void)cudaFreeHost(host);
   }
 
@@ -72,7 +75,8 @@ bool CollectiveTensorPreparation::run_with_change(
   auto &state = *impl_;
   Impl::check(cudaSetDevice(static_cast<int>(state.execution.device_ordinal())));
   cudaStreamCaptureStatus capture;
-  Impl::check(cudaStreamIsCapturing(state.stream, &capture));
+  Impl::check(cudaStreamIsCapturing(
+      internal::checked_execution_state(state.execution)->stream, &capture));
   if (capture != cudaStreamCaptureStatusNone)
     throw std::runtime_error("collective tensor preparation requires eager execution");
   std::exception_ptr failure;
@@ -85,6 +89,10 @@ bool CollectiveTensorPreparation::run_with_change(
   const auto origin = state.agree(static_cast<bool>(failure), changed);
   if (origin == state.nccl->world)
     return state.host[3] == 0U;
+  // A failed allocation may follow an already-enqueued Notify. Drain it on
+  // every rank before releasing the lease or retrying the idle plan.
+  Impl::check(cudaStreamSynchronize(
+      internal::checked_execution_state(state.execution)->stream));
   const auto error = TensorPreparationFailure(
       "tensor preparation failed on rank " + std::to_string(origin) +
       " before execution");

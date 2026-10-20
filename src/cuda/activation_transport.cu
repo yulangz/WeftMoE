@@ -37,6 +37,7 @@
 #include "cuda/backward/scheduler.cuh"
 #include "cuda/backward/tuning_config.hpp"
 #include "cuda/cuda_internal.hpp"
+#include "cuda/device_communicator.cuh"
 #include "cuda/pipeline/atomics.cuh"
 #include "cuda/pipeline/contracts.hpp"
 #include "cuda/profiling/device_timeline.cuh"
@@ -1544,8 +1545,6 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
 
   using QueryPropertiesFn =
       ncclResult_t (*)(ncclComm_t, ncclCommProperties_t *);
-  using DevCommCreateFn = ncclResult_t (*)(
-      ncclComm_t, const ncclDevCommRequirements_t *, ncclDevComm_t *);
   using WindowRegisterFn =
       ncclResult_t (*)(ncclComm_t, void *, std::size_t, ncclWindow_t *, int);
   using TeamFn = ncclTeam_t (*)(ncclComm_t);
@@ -1561,8 +1560,6 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
   };
   const auto query_properties =
       reinterpret_cast<QueryPropertiesFn>(load("ncclCommQueryProperties"));
-  const auto dev_comm_create =
-      reinterpret_cast<DevCommCreateFn>(load("ncclDevCommCreate"));
   const auto window_register =
       reinterpret_cast<WindowRegisterFn>(load("ncclCommWindowRegister"));
   const auto team_rail = reinterpret_cast<TeamFn>(load("ncclTeamRail"));
@@ -1787,7 +1784,7 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
     allocated_context_count = pool->gin_layout.static_forward.contexts;
   backend->gin_context_count = kGinContextCount;
   backend->gin_allocated_context_count = allocated_context_count;
-  if (!resources.dev_comm_created) {
+  if (!resources.connection) {
     ncclDevCommRequirements_t requirements =
         NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     // Allocate a private pool for this devComm. Static CTA/channel ownership
@@ -1808,13 +1805,9 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
     requirements.ginCounterCount = 2U + wire_counters * pool->slots.size();
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     requirements.ginType = NCCL_GIN_TYPE_GDAKI;
-    internal::throw_nccl(
-        "gin-create",
-        dev_comm_create(nccl->comm, &requirements, &resources.dev_comm),
-        nccl->rank, nccl->world, session.session().identity(),
-        session.session().generation(), ExchangeKind::ExpertCounts,
-        "ncclDevCommCreate(activation GIN)");
-    resources.dev_comm_created = true;
+    resources.connection =
+        internal::lease_device_communicator(session, requirements);
+    resources.dev_comm = resources.connection->value;
     if ((static_inference_pool &&
          resources.dev_comm.ginContextCount < allocated_context_count) ||
         resources.dev_comm.ginContextCount < 1U ||

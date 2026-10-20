@@ -139,12 +139,16 @@ struct ExternalCudaProducerState final : BackendExecutionState {
   std::uint32_t device = 0;
 };
 
+struct DeviceCommunicator;
+
 struct NcclSessionState final : BackendSessionState {
   std::uint32_t device = 0;
   std::uint32_t rank = 0;
   std::uint32_t world = 0;
   std::vector<std::uint8_t> bootstrap_identity;
   ncclComm_t comm = nullptr;
+  std::mutex device_communicator_mutex;
+  std::vector<std::shared_ptr<DeviceCommunicator>> device_communicators;
   ~NcclSessionState() noexcept override;
 };
 

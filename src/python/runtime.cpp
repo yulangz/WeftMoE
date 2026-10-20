@@ -1,5 +1,6 @@
 // Application tensor bindings. Python owns tensors; native handles retain their
 // owners.
+#include <chrono>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <map>
@@ -85,7 +86,8 @@ public:
           unsigned experts, unsigned top_k, unsigned hidden,
           unsigned intermediate, std::uint64_t max_tokens,
           std::uint64_t max_rows, bool training, unsigned max_saved,
-          py::dict tuning = py::dict())
+          py::dict tuning = py::dict(),
+          std::optional<NcclSession> session = std::nullopt)
       : rank_(rank), hidden_(hidden), intermediate_(intermediate),
         max_tokens_(max_tokens), training_(training),
         stream_(reinterpret_cast<cudaStream_t>(stream)) {
@@ -109,11 +111,23 @@ public:
             "training ring metadata exceeds uint32 row indices");
       max_rows = std::max(max_rows, max_tokens * top_k * world);
     }
-    std::string bytes = bootstrap;
-    auto id = NcclBootstrapId::from_bytes({bytes.begin(), bytes.end()});
+    auto checkpoint = std::chrono::steady_clock::now();
+    const auto elapsed = [&](const char *stage) {
+      const auto now = std::chrono::steady_clock::now();
+      setup_seconds_[stage] =
+          std::chrono::duration<double>(now - checkpoint).count();
+      checkpoint = now;
+    };
     execution_ = make_external_cuda_execution("torch", device, stream_,
                                               owner(stream_owner));
-    base_ = make_nccl_session("weftmoe-torch", world, rank, 1, device, id);
+    if (session) {
+      base_ = *session;
+    } else {
+      std::string bytes = bootstrap;
+      auto id = NcclBootstrapId::from_bytes({bytes.begin(), bytes.end()});
+      base_ = make_nccl_session("weftmoe-torch", world, rank, 1, device, id);
+    }
+    elapsed("communicator");
     config_.num_experts = experts;
     config_.top_k = top_k;
     config_.m_tile_rows = 64;
@@ -161,12 +175,14 @@ public:
     capacity.enable_gin_rdma = WEFTMOE_ENABLE_GIN_RDMA && nodes > 1;
     pool_ = prepare_activation_transport_pool(base_.session(), execution_,
                                               capacity);
+    elapsed("activation_pool");
     deferred_training_notify_ =
         training_ring && pool_.separates_forward_notify();
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
         {config_, max_tokens, 8192, max_saved, 4, fused_inference_,
          training_ring, deferred_training_notify_});
+    elapsed("notify_pool");
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (WEFTMOE_ENABLE_GIN_RDMA && nodes > 1)
       gin_ =
@@ -178,13 +194,18 @@ public:
     local_ = std::make_unique<LocalCudaP2pForwardMegaKernel>(base_, execution_,
                                                              pool_);
 #endif
+    elapsed("transport_backend");
     torch_ = py::module_::import("torch");
     device_ = "cuda:" + std::to_string(device);
     if (training_)
       tensor_preparation_ =
           std::make_unique<CollectiveTensorPreparation>(base_, execution_);
     check_cuda(cudaEventCreateWithFlags(&input_ready_, cudaEventDisableTiming));
+    elapsed("tensor_preparation");
   }
+
+  NcclSession session() const { return base_; }
+  std::map<std::string, double> setup_seconds() const { return setup_seconds_; }
 
   ~Runtime() {
     // eager_inference_async() deliberately keeps the most recent handle alive
@@ -192,6 +213,7 @@ public:
     // tensor owners are still valid.  Destructors cannot report an error, so
     // explicit users should call drain_eager_inference() at a phase boundary.
     try {
+      drain_training();
       drain_eager_inference();
     } catch (...) {
     }
@@ -280,7 +302,28 @@ public:
   std::shared_ptr<Tape> forward(py::object x, py::object routes,
                                 py::object gates, py::object w1, py::object w2,
                                 std::optional<unsigned> layer = std::nullopt) {
+    drain_training();
     return execute_forward(x, routes, gates, w1, w2, true, layer);
+  }
+
+  std::shared_ptr<Tape> forward_async(py::object x, py::object routes,
+                                     py::object gates, py::object w1,
+                                     py::object w2) {
+    drain_training();
+    auto tape = execute_forward(x, routes, gates, w1, w2, false);
+    pending_training_forward_ = tape->forward;
+    return tape;
+  }
+
+  void drain_training() {
+    if (pending_training_forward_) {
+      pending_training_forward_.wait();
+      pending_training_forward_ = {};
+    }
+    if (pending_training_backward_) {
+      pending_training_backward_.wait();
+      pending_training_backward_ = {};
+    }
   }
 
   std::shared_ptr<Tape>
@@ -365,6 +408,16 @@ public:
   }
 
   py::tuple backward(std::shared_ptr<Tape> tape, py::object dy) {
+    return execute_backward(std::move(tape), std::move(dy), true);
+  }
+
+  py::tuple backward_async(std::shared_ptr<Tape> tape, py::object dy) {
+    return execute_backward(std::move(tape), std::move(dy), false);
+  }
+
+  py::tuple execute_backward(std::shared_ptr<Tape> tape, py::object dy,
+                             bool synchronize) {
+    drain_training();
     if (!training_ || !tape->forward)
       throw std::invalid_argument("backward requires a live training tape");
     auto context = make_rank_collective_context(tape->generation.session(),
@@ -387,7 +440,11 @@ public:
           tape->forward, bc,
           {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
     });
-    BackwardMegaKernel().run(tape->forward, input, bc);
+    auto backward = BackwardMegaKernel().enqueue(tape->forward, input, bc);
+    if (synchronize)
+      backward.wait();
+    else
+      pending_training_backward_ = std::move(backward);
     tape->forward = {};
     tape->dispatch = {};
     return py::make_tuple(dx, dg, dw1, dw2);
@@ -645,6 +702,7 @@ private:
   cudaStream_t stream_;
   cudaEvent_t input_ready_ = nullptr;
   RuntimeConfig config_;
+  std::map<std::string, double> setup_seconds_;
   CudaExecution execution_;
   NcclSession base_;
   DeviceNotifyResourcePool notify_pool_;
@@ -665,10 +723,16 @@ private:
   // One-generation pipeline for eager inference.  The pool intentionally has
   // one large workspace; completion is delayed to the next MoE boundary.
   std::shared_ptr<Tape> pending_inference_;
+  // One compute workspace is shared across all saved tapes. Retain the
+  // pending completion until the next MoE boundary, allowing the framework
+  // to enqueue attention, gradient accumulation and other intervening work.
+  DeviceForwardHandle pending_training_forward_;
+  DeviceBackwardHandle pending_training_backward_;
 };
 } // namespace
 
 PYBIND11_MODULE(_runtime, m) {
+  py::class_<NcclSession>(m, "Session");
   m.def("forward_tuning_id", &forward_tuning_id);
   m.def("bootstrap_id", [] {
     auto id = make_nccl_bootstrap_id();
@@ -705,10 +769,19 @@ PYBIND11_MODULE(_runtime, m) {
                     std::uintptr_t, py::object, unsigned, unsigned, unsigned,
                     unsigned, std::uint64_t, std::uint64_t, bool, unsigned,
                     py::dict>())
+      .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned,
+                    std::uintptr_t, py::object, unsigned, unsigned, unsigned,
+                    unsigned, std::uint64_t, std::uint64_t, bool, unsigned,
+                    py::dict, std::optional<NcclSession>>())
+      .def("session", &Runtime::session)
+      .def("setup_seconds", &Runtime::setup_seconds)
       .def("forward", &Runtime::forward, py::arg("x"), py::arg("routes"),
            py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("layer") = std::nullopt)
       .def("backward", &Runtime::backward)
+      .def("forward_async", &Runtime::forward_async)
+      .def("backward_async", &Runtime::backward_async)
+      .def("drain_training", &Runtime::drain_training)
       .def("graph_forward", &Runtime::graph_forward)
       .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)
       .def("eager_inference", &Runtime::eager_inference, py::arg("x"),

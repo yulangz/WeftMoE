@@ -19,7 +19,7 @@ class _Routed(torch.autograd.Function):
         # optimizer update before backward repacks their values.
         ctx.save_for_backward(*parameters)
         ctx.runtime = runtime
-        ctx.tape = runtime.forward(x, routes, gates, *packed)
+        ctx.tape = runtime.forward_async(x, routes, gates, *packed)
         return ctx.tape.output
 
     @staticmethod
@@ -28,7 +28,7 @@ class _Routed(torch.autograd.Function):
         # complete before reuse; restore this layer's weights before backward
         # consumes the retained lease. Optimizer steps happen after all tapes.
         ctx.manager.pack(ctx.saved_tensors)
-        dx, dg, dw1, dw2 = ctx.runtime.backward(ctx.tape, dy)
+        dx, dg, dw1, dw2 = ctx.runtime.backward_async(ctx.tape, dy)
         ctx.tape = None
         ctx.runtime = None
         ctx.manager = None
@@ -42,6 +42,10 @@ class MegatronAdapter:
 
         self.max_tokens = max_tokens
         self.runtime = None
+        # Keep the transport connection, not its activation/IPC/GIN payloads,
+        # across train/rollout residency switches. Destroying the adapter also
+        # closes this final session reference.
+        self.session = None
         self.packed = {}
         self.layers = []
         for model in models:
@@ -110,7 +114,9 @@ class MegatronAdapter:
                 + layer.num_local_experts * 128,
                 training=True,
                 max_saved=len(self.layers) + 8,
+                session=self.session,
             )
+            self.session = self.runtime.native.session()
         return self.runtime
 
     def _make_forward(self):
@@ -153,6 +159,7 @@ class MegatronAdapter:
         if self.runtime is None:
             return
         torch.cuda.synchronize()
+        self.runtime.drain()
         if self.runtime.native.usage()["notify_slots_in_use"]:
             raise RuntimeError(
                 "Cannot offload WeftMoE while autograd still owns saved X/AB"
@@ -161,3 +168,8 @@ class MegatronAdapter:
         self.packed.clear()
         self.runtime = None
         torch.cuda.empty_cache()
+
+    def close(self):
+        """Release the session too when the training engine is destroyed."""
+        self.suspend()
+        self.session = None

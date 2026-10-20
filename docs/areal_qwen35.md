@@ -1,5 +1,136 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-20：EP16 端到端回退定位与修复
+
+用户指出的回退真实存在。对齐两组 step 1–5、去掉首轮后：
+
+| 指标（均值） | Megatron + DeepEP | 原 WeftMoE | 变化 |
+| --- | ---: | ---: | ---: |
+| train_step | 53.01 s | 77.91 s | +47.0% |
+| 每 microbatch 训练时间 | 1.699 s | 2.420 s | +42.4% |
+| valid tokens/update | 2,949,760 | 2,950,620 | 基本相同 |
+| microbatches/update | 31.2 | 32.2 | +3.2% |
+| rollout | 246.60 s | 231.04 s | -6.3% |
+| weight update | 17.39 s | 25.93 s | +49.1% |
+| 完整 update 墙钟间隔 | 321.69 s | 358.34 s | +11.4% |
+
+不能用多了一个 microbatch 解释训练回退，也不能把算子 warm-cache
+benchmark 的收益直接等同于共卡 RL 的收益。原 WeftMoE 在完成 8 次
+update 后主动停止，另外启动短 profiling run，完成首轮后主动停止；
+这两次退出均不是训练自身报错。保留原生 online W&B，没有 checkpoint。
+
+原路径的真实模型 GPU trace（第 3 个 packed microbatch，40 个 MoE 层）：
+
+| 项目 | rank 0 汇总 |
+| --- | ---: |
+| PF FWD main GPU 时间 | 151.30 ms |
+| PF BWD main GPU 时间 | 176.28 ms |
+| 两类 PF notify GPU 时间 | 57.40 ms |
+| native FWD 接口 CPU 区间 | 274.87 ms |
+| native BWD 接口 CPU 区间 | 468.77 ms |
+| 120 次 u32 allocation-status AllReduce | 148.14 ms |
+| 其中 40 次 BWD allocation-status AllReduce | 140.15 ms |
+
+这些是 profiler 下的诊断区间，不是独立可相加的端到端分解。
+u64 AllReduce 还包括 Megatron router 的统计，不能都归为 WeftMoE。
+另一次不插桩的 CPU 采样估计每次训练切换重建 runtime 约 8.65 s、
+close 约 2.65 s；采样值只用于定位，不作为精确消融收益。
+
+真实第 3 个 microbatch 的各 rank 输入数为
+`[6342×4, 6339×4, 7488×4, 6306×4]`。40 层专家 max/mean 的中位数
+5.185、最大 7.068；汇总到目标 GPU 后 max/mean 中位数 1.271、
+最大 1.601。这不是均衡合成负载，但也不是全部流量挤到一张卡。
+
+实现：
+
+- 训练接口逐层立即等待 GPU 完成，阻止后续模型计算提前入队。
+  改为保留一个 pending handle，在下一次使用共享 workspace 前
+  drain；不改变 GEMM、缓存、梯度或 ring 协议。
+- allocation-status agreement 只读取 CPU 申请结果，却排在模型计算流上。
+  移到长期存在的独立控制流；仍保留全 rank OOM 一致性检查，
+  失败时额外排空执行流后才清理/重试。
+- 训练/推理切换仍释放大块 payload 和 IPC 映射，保留 NCCL Session
+  及其中空闲的 GIN device communicator。
+
+进一步的精确计时确认，单独保留 host Session 不够：GIN device
+communicator 的 QP/队列仍被反复销毁重建。旧路径同一真实输入回放中，
+每轮 runtime 准备约 21 s，其中 transport backend 为 16.9–19.5 s；
+仅保留 host Session 后，下一轮 backend 仍需 15.3 s。
+目前候选把空闲 device communicator 随 Session 保留，按 NCCL
+requirements 精确匹配租用；窗口 deregister、payload free、IPC close
+仍在切换时进行。连续三轮重建的同步/异步 FWD、dX、dGate、dW1、dW2
+逐位一致，第二、三轮 runtime 准备约 0.6–1.5 s，显存没有逐轮增加。
+Session 最终释放约回收 1.60 GiB/rank 的 NCCL 原生显存；这部分是
+保留连接的成本，不能宣称“切换后所有通信显存都归零”。
+
+OOM 重试检查还暴露了旧版的独立问题：Notify 提前执行
+`NetworkChannel.forward_rows += rows`，saved-X 随后分配失败时未发送
+任何 return，重试又累计一次，RX 永远等不到双倍行数。修复为 Notify
+写入本轮 `forward_target = forward_rows + rows`，RX 确认完成后才提交
+`forward_rows = forward_target`。新字段占用原结构体 padding，
+`NetworkChannel` 仍为 128 B，不新增 kernel 或缓冲容量。失败后的
+barrier/execution epoch 则必须保留，因为该次 Notify 已真实完成。
+`torchrun_tensor_runtime.py` 的 EP16 FWD ordinal-3/BWD ordinal-5
+申请失败、全组抛错、重试、数值参考、workspace 释放以及推理/Graph
+释放回归均通过（`parity-oom-fixed-64.node{0,1}.log`）。
+
+### 相同真实输入的完整训练回放
+
+原始 HF 权重、实际 rollout 产生的四份 DP train_batch 输入、34 个 packed
+microbatch、TP4/EP16、选择性重算、DDP/optimizer、CPU-staged 上下卡均保留。
+三组串行运行，16 卡均为 1620 MHz；丢弃含 profiling/编译的 step 0，
+下面取 step 1–2 的均值，每个阶段取各 rank 最大值：
+
+| 阶段 | Megatron + DeepEP | 原 WeftMoE | 连接复用 + 异步/控制流候选 |
+| --- | ---: | ---: | ---: |
+| train_batch | 48.288 s | 70.631 s | 46.533 s |
+| onload | 0.912 s | 0.942 s | 0.917 s |
+| offload | 1.824 s | 9.324 s | 2.457 s |
+| onload + train + offload 墙钟 | 51.011 s | 80.886 s | 49.888 s |
+
+阶段最大值不一定来自同一 rank，因此分项相加不必严格等于总墙钟。
+候选训练耗时比旧版下降 34.1%，比相同输入的 DeepEP 基线下降 3.6%；
+含上下卡分别下降 38.3%、2.2%。这不是整轮 RL 加速比：这里没有
+rollout 和 AWEX 权重发布。也不能把原长跑的 53.01 s 与本表候选直接相除，
+两者不是同一批输入。
+
+候选与原版 warm trace 的 FWD main 分别为 150.74/150.99 ms，
+BWD main 为 175.89/176.07 ms（40 层），说明主要收益来自主机调度和
+通信资源生命周期，而不是改动 GEMM。control-stream AllReduce 的 GPU
+区间会包含更早启动后的等候，不能仅凭该区间变长判定端到端变慢。
+当前候选在首轮以及每轮切换仍正常释放训练 payload；最终 engine
+destroy 使用 `MegatronAdapter.close()` 释放连接，常规 offload 则使用
+`suspend()` 保留连接。
+
+回放脚本为 `benchmarks/replay_areal_training.py`；配置、精确环境、
+全部 rank 日志/manifest/trace 位于
+`build/rl_ep16_session_reuse_20261020/`，标签为 `original`、
+`baseline` 和 `cache_async_control`。首轮原版/候选保存的
+16 ranks × 40 层 routes 逐位相同；这不代替梯度验证，也不代表不同
+后端在 BF16 optimizer 更新后的训练轨迹逐位相同。
+
+额外进行了完整模型梯度检查：冻结 LR=0、复用相同真实 batch 和 CUDA
+RNG 状态，依次运行同步、异步、同步，保存第一次完整 DDP grad buffers
+作为参考；检查本身保留大块参考梯度，不纳入正式性能表。
+
+| 相对第一次同步的梯度 relative L2（16 ranks 均值） | 异步 | 再次同步 |
+| --- | ---: | ---: |
+| dense 参数 | 0.5514% | 0.5525% |
+| expert 参数 | 0.6046% | 0.6111% |
+
+异步误差未高于同步自身重复的数值波动水平；算子级同步/异步则已逐位
+一致。完整模型有重复运行数值波动，不能要求独立 BF16 optimizer 轨迹
+逐位一致，也不能仅凭后续某一步 grad_norm 差异判断异步越界。
+对应日志为 `full_gradient_order.node{0,1}.log`。原有单 rank 注入 OOM
+回归已覆盖新增失败重试修复，没有增加一组细碎单测。
+
+证据：`build/rl_weftmoe_ep16_8k_20261020/actor0_cpu_profile.json`，
+`build/rl_weftmoe_ep16_profile_20261020/traces/`。
+后者保存四个 TP head 的 CPU train_batch 输入（不是模型 checkpoint），
+以及全部 rank 的真实 routes，用于相同模型/输入/packing/重算设置下的
+串行回放。回放还须对齐 AReaL 的单可见 GPU、CUDA connection 数、
+线程设置和编译缓存目录；不一致环境下的尝试不计入结果。
+
 ## 2026-10-20：相同规模的双机 EP16 路由偏斜对照
 
 结论：本轮 EP16 的全部 case，当前 PF 的 p50 均低于 Megatron+DeepEP；

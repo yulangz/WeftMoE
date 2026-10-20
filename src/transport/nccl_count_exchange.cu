@@ -234,6 +234,7 @@ NcclSessionState::~NcclSessionState() noexcept {
   if (!comm)
     return;
   (void)cudaSetDevice(static_cast<int>(device));
+  device_communicators.clear();
   ncclResult_t async = ncclSuccess;
   const auto query = ncclCommGetAsyncError(comm, &async);
   if (query == ncclSuccess && async == ncclSuccess)

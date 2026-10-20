@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "cuda/cuda_internal.hpp"
+#include "cuda/device_communicator.cuh"
 #include "cuda/device_notify_bridge.hpp"
 #include "weftmoe/api/errors.hpp"
 
@@ -2729,9 +2730,8 @@ void DeviceNotifyPoolBridge::configure_communication(
                          session.session().generation(),
                          ExchangeKind::ExpertCounts, what);
   };
-  check(ncclDevCommCreate(nccl->comm, &req, &resource->view.dev),
-        "create notify device communicator");
-  resource->created = true;
+  resource->connection = internal::lease_device_communicator(session, req);
+  resource->view.dev = resource->connection->value;
   check(ncclMemAlloc(reinterpret_cast<void **>(&resource->view.base),
                      resource->bytes),
         "allocate notify exchange");

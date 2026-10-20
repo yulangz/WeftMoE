@@ -168,7 +168,8 @@ __device__ __noinline__ void receive_blocks(const ForwardKernelArgs &a,
     if (peer == a.node)
       continue;
     const auto channel = endpoint.layout().channel(a.node, peer, 0U);
-    const auto target = endpoint.state(true, channel).forward_rows;
+    auto &state = endpoint.state(true, channel);
+    const auto target = state.forward_target;
     while (true) {
       unsigned long long rows = 0U;
       for (unsigned sender = lane;
@@ -182,6 +183,8 @@ __device__ __noinline__ void receive_blocks(const ForwardKernelArgs &a,
       for (unsigned offset = 16U; offset; offset /= 2U)
         rows += __shfl_down_sync(0xffffffffU, rows, offset);
       if (__shfl_sync(0xffffffffU, rows >= target, 0U)) {
+        if (!lane)
+          state.forward_rows = target;
         WEFTMOE_TIMELINE_RECORD_IF(a.timeline, !lane, SourceSignalObserved,
                                    SourceRelay, channel, target, 0U);
         break;

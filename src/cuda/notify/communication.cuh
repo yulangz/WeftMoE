@@ -14,20 +14,21 @@ struct NotifyCommunication {
   NcclSession session;
   unsigned device = 0;
   NotifyCommunicationView view;
+  std::shared_ptr<internal::DeviceCommunicator> connection;
   std::size_t bytes = 0;
-  bool created = false;
   bool abandon = false;
   ~NotifyCommunication() {
-    if (abandon)
+    if (abandon) {
+      if (connection)
+        connection->abandoned = true;
       return;
+    }
     (void)cudaSetDevice(device);
     const auto state = internal::NcclSessionAccess::checked(session);
     if (view.window)
       (void)ncclCommWindowDeregister(state->comm, view.window);
     if (view.base)
       (void)ncclMemFree(view.base);
-    if (created)
-      (void)ncclDevCommDestroy(state->comm, &view.dev);
   }
 };
 
