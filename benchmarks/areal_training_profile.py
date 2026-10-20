@@ -1,8 +1,7 @@
 """Bounded PP1 training diagnostics; profiling runs are not performance samples.
 
-The temporary AReaL hook constructs TrainingProfile at forward_backward_batch,
-calls microbatch() at each forward_step entrance, and finish() after the schedule.
-No extra GPU synchronization is inserted into the timed method wrappers.
+The replay runner installs this instrumentation explicitly. No production engine
+hook or extra GPU synchronization is required in the timed method wrappers.
 """
 
 from collections import defaultdict
@@ -15,6 +14,43 @@ import time
 
 import torch
 import torch.distributed as dist
+
+
+def instrument_engine():
+    """Instrument PP1 replay without modifying AReaL's production schedule."""
+    import areal.engine.megatron_engine as module
+
+    original = module.MegatronEngine.forward_backward_batch
+
+    def measured(engine, *args, forward_only=False, **kwargs):
+        if forward_only:
+            return original(engine, *args, forward_only=True, **kwargs)
+        diagnostic = TrainingProfile(engine)
+        factory = module.get_forward_backward_func
+
+        def profiled_factory():
+            schedule = factory()
+
+            def profiled_schedule(*args, **kwargs):
+                forward = kwargs["forward_step_func"]
+
+                def step(*args, **kwargs):
+                    diagnostic.microbatch()
+                    return forward(*args, **kwargs)
+
+                kwargs["forward_step_func"] = step
+                return schedule(*args, **kwargs)
+
+            return profiled_schedule
+
+        module.get_forward_backward_func = profiled_factory
+        try:
+            return original(engine, *args, forward_only=False, **kwargs)
+        finally:
+            module.get_forward_backward_func = factory
+            diagnostic.finish()
+
+    module.MegatronEngine.forward_backward_batch = measured
 
 
 class TrainingProfile:

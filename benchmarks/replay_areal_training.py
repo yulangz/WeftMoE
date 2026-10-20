@@ -37,6 +37,10 @@ def main():
                         help="Ablation: original blocking MoE application boundary")
     args = parser.parse_args()
     config, _ = load_expr_config(["--config", str(args.config)], MultiTurnGRPOConfig)
+    if os.environ.get("AREAL_MEGATRON_PROFILE_DIR"):
+        from benchmarks.areal_training_profile import instrument_engine
+
+        instrument_engine()
     if args.synchronous:
         from weftmoe.runtime import TensorRuntime
 
