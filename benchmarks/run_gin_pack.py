@@ -17,11 +17,18 @@ from run_multinode_nccl import launch_rank_processes, parse_args, sample_stats
 def monitor_clocks(args, stop, samples):
     query = ["nvidia-smi", "--query-gpu=index,clocks.current.sm,clocks.current.memory,utilization.gpu",
              "--format=csv,noheader,nounits"]
-    commands = [query, ["ssh", "-o", "BatchMode=yes", "-p", str(args.port),
-                        args.remote, shlex.join(query)]]
+    commands = [query]
+    if getattr(args, "nodes", 2) > 1:
+        commands.append(["ssh", "-o", "BatchMode=yes", "-p", str(args.port),
+                         args.remote, shlex.join(query)])
     while not stop.is_set():
         for node, command in enumerate(commands):
-            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            except subprocess.TimeoutExpired:
+                samples.append({"node": node, "time": time.time(), "returncode": 124,
+                                "csv": "", "error": "clock query timed out"})
+                continue
             samples.append({"node": node, "time": time.time(), "returncode": result.returncode,
                             "csv": result.stdout.strip(), "error": result.stderr.strip()})
         stop.wait(1)

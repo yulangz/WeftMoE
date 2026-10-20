@@ -1,5 +1,108 @@
 # Qwen3.5 接入 AReaL
 
+## 2026-10-20：实际 packing 规模下的 EP8 路由偏斜压力测试
+
+结论：当前 RL 使用的 PF 二进制，在本轮所有合成负载下均领先
+Megatron + DeepEP；但偏斜越重，优势总体越小，尤其是 BWD。
+最强档 8K 的 FWD 为 **4.579 vs 6.596 ms（1.44×）**，BWD 为
+**6.525 vs 7.427 ms（1.14×）**。这不是实际 RL 路由回放，不能据此
+断言 RL 已处于最强档，也不能把算子加速比直接当成端到端加速比。
+
+### 负载来源与测量口径
+
+- 两组 100-update RL 日志均未记录 router/expert 负载指标，无法从已有
+  指标恢复专家分布。日志已有逐 microbatch 的 `padded to`；取 rank 0/4
+  两个 DP 组并除以 SP4，WeftMoE 的本地 M：P10=6161、P50=6276、
+  P90=7513；baseline 为 6142/6276/7503。这里按日志中的调用计数，包含
+  重复的前向/训练准备记录，不是逐 MoE kernel 的采样。
+- 选每 rank nominal M=6144/8192，沿用正态 token 波动：标准差 10%、
+  截断 ±3σ，seed=123。实测均值 6155.77/8159.94，范围分别为
+  4420–7826/5922–10055。8K 档包含高于 RL 当前约 8K 本地上限的压力样本，
+  不是原始 packing 长度的精确回放；两种后端逐 rank workload hash 一致。
+- 单机 EP8，NVIDIA L20X，BF16，H2048/I512/E256/top8，固定目标
+  1620 MHz。没有启动 EP16，也没有改变或重启 RL 实验。
+- PF 复用 RL artifact `build/pf_main_timeline/qwen_areal_barrier_fix_20261018`，
+  library SHA256 为 `9889c7606071872a169cf67569c3130629928047ceef47cc6b4cefb63cae8d99`。
+  B2048/D2，不修改 kernel、不重新调参。
+- baseline：Megatron-Core 0.17.0、TE 2.14.1+27de67e1、DeepEP
+  1.2.1+567632d、flex dispatcher/20 SM；启用 permutation/activation fusion，
+  selective `moe_act` 重算，与 PF 保存 X/GU 的边界对齐。
+- FWD 测到训练缓存就绪；BWD 用计时外准备并同步的新 FWD tape，测到
+  梯度就绪。固定通信池/allocator 已预热，调用内重排、临时分配和最终
+  device synchronize 计入；不含 router projection/top-k、Megatron 接入层
+  parameter stack、shared expert、optimizer 和输入生成。不是纯 GPU GEMM 时间。
+- 每次先 prime 完整 trace，再 6 warmup/24 samples。对每个 sample 先取
+  8 rank 最大值，再求 p50。最强档 FWD/BWD、bias=1 的 BWD 均反转后端
+  运行顺序复测，两轮共 48 samples 合并；其余为 24 samples，不取最快一轮。
+  baseline 所有正式区间的新增编译图数量均为 0。
+
+### 偏斜的量化
+
+随机路由为每 token 的独立标准正态 logits，加上跨 source rank 共享的
+expert bias，再取 top8；bias 每次调用重新采样，标准差分别 0.5/1/2。
+均衡对照替换为随机排列的均衡周期。这里的“历史档”指旧 benchmark 默认
+偏斜，不是从真实 RL 拟合。下表是每个 sample 的指标再取 p50，范围对应
+6K/8K 两档；CV=专家接收行数的标准差/均值。
+
+| 路由 | 最热专家/平均专家 | 专家 CV | 最忙 GPU/平均 GPU |
+|---|---:|---:|---:|
+| 均衡 | 1.00× | <0.001 | 1.00× |
+| 历史档，bias=0.5 | 7.28–7.66× | 1.14 | 1.32–1.33× |
+| 强偏斜，bias=1 | 16.89–17.72× | 2.23–2.26 | 1.68–1.71× |
+| 极强偏斜，bias=2 | 28.66–29.63× | 3.62–3.64 | 2.07–2.20× |
+
+单 token 不重复选择同一专家，因此 E256/top8 下专家峰均比理论上限为
+32。最强档已接近这一上限，但整卡负载峰均比仅约 2.1：专家偏斜与 GPU
+偏斜不是同一个指标，热专家仍分布在多张卡上。
+
+### 缓存 FWD 与独立 BWD
+
+单位 ms；加速比为 Megatron+DeepEP / PF，不能将两列 p50 相加作为实测
+FWD+BWD cycle。这里全部来自本轮当前二进制，没有混用历史性能表。
+
+| nominal M/rank | 路由 | PF FWD | Megatron FWD | 加速比 | PF BWD | Megatron BWD | 加速比 |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 6144 | 均衡 | 2.106 | 5.971 | 2.84× | 2.617 | 4.909 | 1.88× |
+| 6144 | bias=0.5 | 2.453 | 5.286 | 2.15× | 3.348 | 5.145 | 1.54× |
+| 6144 | bias=1 | 3.080 | 6.162 | 2.00× | 4.133 | 6.514 | 1.58× |
+| 6144 | bias=2 | 3.625 | 5.567 | 1.54× | 5.048 | 6.037 | 1.20× |
+| 8192 | 均衡 | 2.586 | 5.896 | 2.28× | 3.271 | 5.672 | 1.73× |
+| 8192 | bias=0.5 | 3.038 | 6.105 | 2.01× | 4.112 | 6.044 | 1.47× |
+| 8192 | bias=1 | 3.835 | 6.532 | 1.70× | 5.224 | 6.764 | 1.29× |
+| 8192 | bias=2 | 4.579 | 6.596 | 1.44× | 6.525 | 7.427 | 1.14× |
+
+8K 从均衡到极强偏斜，PF 的 FWD/BWD 分别增加约 77%/100%，baseline
+增加约 12%/31%。负载偏斜确实会压缩当前 PF 的优势，BWD 更敏感；但这组
+实验同时改变了专家 GEMM 形状、活跃专家数、GPU 负载和通信目的分布，
+不能单凭这些时延认定瓶颈就是静态 CTA 分工或某个同步点。
+
+独立数值检查：bias=2、6K/8K、两种后端，各一组变化长度样本，全部
+8 rank 的 output/dX/dGate/dW1/dW2 均通过现有 Torch reference 检查
+（relative L2 <1%，逐元素 rtol=2%、atol=1e-4）。这不是完整 RL 稳定性测试。
+
+时钟备注：所有成功的正式时钟采样均为 1620 MHz，但只是稀疏观测。
+`bias10_megatron_bwd_r2` 的 monitor 因本地 nvidia-smi 超时中断，该轮时延
+仍保留并与补测合并；r3 已补两种后端。首个 `r1` 是单机监控错误访问远端
+的试跑，不进入正式矩阵。本轮仅修正 benchmark monitor：单机不查远端，
+查询超时记录失败后继续采样；没有算子实现改动。
+
+完整结果、逐 sample 慢 rank 时延、各轮统计、负载指标、哈希和数值误差见
+[结果 JSON](../benchmarks/results/qwen_rl_skew_20261020.json)。原始日志、
+manifest 和时钟记录在 `build/qwen_rl_skew_20261020/`。
+
+复现示例（换 backend、bias、FWD/BWD；每次使用新 label/port）：
+
+```bash
+/opt/.venv/bin/python benchmarks/run_pf_network.py \
+  --artifact build/pf_main_timeline/qwen_areal_barrier_fix_20261018 \
+  --nodes 1 --label skew_pf_fwd --output build/qwen_rl_skew_replay \
+  --master-port 29710 --benchmark tools/benchmark_training.py -- \
+  --backend pf --hidden 2048 --intermediate 512 --experts 256 --top-k 8 \
+  --ring-tokens 2048 --ring-depth 2 --tokens 6144 8192 \
+  --route-bias-std 2 --forward-only --prime-trace --warmups 6 --samples 24 \
+  --report-communication --report-window-padding
+```
+
 ## 2026-10-19：仅 Megatron 开启 DeepEP 的 8K baseline
 
 按用户要求，暂不修补 SGLang BF16 + DeepEP 计算路径，改为仅训练端
