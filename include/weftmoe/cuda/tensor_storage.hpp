@@ -45,10 +45,9 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-// Collective host-allocation boundary, outside CUDA Graph capture. Construct
-// before allocating per-call tensors; every rank then calls run in the same
-// order. The callback performs rank-local preparation, not collectives. No
-// rank may enter execution when any rank's preparation throws.
+// Setup/remapping agreement, outside CUDA Graph capture. Every rank calls run
+// in the same order; callbacks perform rank-local preparation, not collectives.
+// Per-call training tensor allocation does not use this recovery boundary.
 // The small status buffer and NCCL collective are prepared once, before an
 // allocation failure could prevent creating the agreement's own resources.
 // Calls on one instance must be serialized. This does not recover a failed
@@ -57,8 +56,8 @@ class CollectiveTensorPreparation {
 public:
   CollectiveTensorPreparation(const NcclSession &, const CudaExecution &);
   void run(const std::function<void()> &prepare) const;
-  // Carry a binding-change flag in the allocation agreement. Returns true on
-  // every rank if any callback reports a change; failures still throw first.
+  // Agree only whether peer pointers changed. Preparation exceptions propagate
+  // locally; unlike run(), this hot path does not coordinate allocation errors.
   bool run_with_change(const std::function<bool()> &prepare) const;
 
 private:

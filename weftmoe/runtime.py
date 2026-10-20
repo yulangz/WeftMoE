@@ -176,12 +176,12 @@ class TensorRuntime:
         return self.native.backward(tape, dy.contiguous())
 
     def forward_async(self, x, routes, gates, w1, w2):
-        """Enqueue training FWD on the preparation stream; retain its workspace."""
+        """Enqueue FWD; stream-order workspace reuse and retain pending tensors."""
         self._check(x, routes, gates, w1, w2)
         return self.native.forward_async(x, routes, gates, w1, w2)
 
     def backward_async(self, tape, dy):
-        """Return stream-ordered gradients; retire completion at the next call."""
+        """Return stream-ordered gradients; reclaim completed calls without waiting."""
         if torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Backward must use the preparation stream")
         return self.native.backward_async(tape, dy.contiguous())

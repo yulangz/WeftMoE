@@ -1622,6 +1622,8 @@ void reset_timeline(const char *phase, void *allocation,
 }
 #endif
 
+#include "cuda/stream_completion.cuh"
+
 struct ActivationPoolState {
   ActivationTransportPoolConfig config;
   Layout layout;
@@ -1638,7 +1640,8 @@ struct ActivationPoolState {
   std::weak_ptr<ActivationMegaKernelBackendState> gin_backend;
   std::shared_ptr<GinResources> gin_resources;
   std::shared_ptr<PeerMappings> peer_mappings;
-  std::unique_ptr<CollectiveTensorPreparation> forward_tensor_preparation;
+  std::shared_ptr<TrainingCompletionPool> training_completions =
+      std::make_shared<TrainingCompletionPool>();
   std::vector<PoolSlot> slots;
   std::uint64_t epoch_high = 0;
   cudaStream_t cancel_stream = nullptr;
@@ -1756,9 +1759,23 @@ struct SlotLease {
   bool quarantined = false;
   bool forward_pending = false;
   bool backward_pending = false;
+  bool stream_released = false;
+
+  void release_on(cudaStream_t stream) {
+    auto &slot = pool->slots[index];
+    // The event is recorded after all execution-stream work, including the
+    // join from Backward's transport stream. Future reset/Notify/main work
+    // follows this dependency; host ownership need not wait for completion.
+    const auto error = cudaStreamWaitEvent(stream, slot.complete, 0);
+    if (error != cudaSuccess)
+      throw std::runtime_error(cudaGetErrorString(error));
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    slot.state = SlotState::Available;
+    stream_released = true;
+  }
 
   ~SlotLease() noexcept {
-    if (!pool || index >= pool->slots.size())
+    if (stream_released || !pool || index >= pool->slots.size())
       return;
     auto &slot = pool->slots[index];
     bool complete = true;

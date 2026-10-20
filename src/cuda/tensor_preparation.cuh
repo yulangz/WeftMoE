@@ -64,14 +64,6 @@ CollectiveTensorPreparation::CollectiveTensorPreparation(
 
 void CollectiveTensorPreparation::run(
     const std::function<void()> &prepare) const {
-  run_with_change([&] {
-    prepare();
-    return false;
-  });
-}
-
-bool CollectiveTensorPreparation::run_with_change(
-    const std::function<bool()> &prepare) const {
   auto &state = *impl_;
   Impl::check(cudaSetDevice(static_cast<int>(state.execution.device_ordinal())));
   cudaStreamCaptureStatus capture;
@@ -80,15 +72,14 @@ bool CollectiveTensorPreparation::run_with_change(
   if (capture != cudaStreamCaptureStatusNone)
     throw std::runtime_error("collective tensor preparation requires eager execution");
   std::exception_ptr failure;
-  bool changed = false;
   try {
-    changed = prepare();
+    prepare();
   } catch (...) {
     failure = std::current_exception();
   }
-  const auto origin = state.agree(static_cast<bool>(failure), changed);
+  const auto origin = state.agree(static_cast<bool>(failure), false);
   if (origin == state.nccl->world)
-    return state.host[3] == 0U;
+    return;
   // A failed allocation may follow an already-enqueued Notify. Drain it on
   // every rank before releasing the lease or retrying the idle plan.
   Impl::check(cudaStreamSynchronize(
@@ -104,4 +95,24 @@ bool CollectiveTensorPreparation::run_with_change(
     }
   }
   throw error;
+}
+
+bool CollectiveTensorPreparation::run_with_change(
+    const std::function<bool()> &prepare) const {
+  auto &state = *impl_;
+  // Only changing an exported pointer requires every peer to remap. Do not
+  // turn a per-call allocation exception into a recoverable collective error.
+  state.host[0] = prepare() ? 1U : 0U;
+  auto *device = static_cast<std::uint32_t *>(state.status->data);
+  Impl::check(cudaMemcpyAsync(device, state.host, sizeof(*device),
+                             cudaMemcpyHostToDevice, state.stream));
+  const auto error = ncclAllReduce(device, device + 1U, 1U, ncclUint32,
+                                   ncclMax, state.nccl->comm, state.stream);
+  if (error != ncclSuccess)
+    throw std::runtime_error(std::string("peer binding agreement: ") +
+                             ncclGetErrorString(error));
+  Impl::check(cudaMemcpyAsync(state.host + 1U, device + 1U, sizeof(*device),
+                             cudaMemcpyDeviceToHost, state.stream));
+  Impl::check(cudaStreamSynchronize(state.stream));
+  return state.host[1] != 0U;
 }

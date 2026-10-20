@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
+#include <deque>
 #include <map>
 #include <optional>
 #include <pybind11/pybind11.h>
@@ -160,6 +161,7 @@ public:
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
     capacity.enable_backward_state = training;
+    capacity.stream_ordered_training = training;
     capacity.decode_only = tuning.contains("decode_only") &&
                            tuning["decode_only"].cast<bool>();
     if (capacity.decode_only &&
@@ -198,9 +200,6 @@ public:
     elapsed("transport_backend");
     torch_ = py::module_::import("torch");
     device_ = "cuda:" + std::to_string(device);
-    if (training_)
-      tensor_preparation_ =
-          std::make_unique<CollectiveTensorPreparation>(base_, execution_);
     check_cuda(cudaEventCreateWithFlags(&input_ready_, cudaEventDisableTiming));
     elapsed("tensor_preparation");
   }
@@ -303,27 +302,30 @@ public:
   std::shared_ptr<Tape> forward(py::object x, py::object routes,
                                 py::object gates, py::object w1, py::object w2,
                                 std::optional<unsigned> layer = std::nullopt) {
-    drain_training();
+    reap_training();
     return execute_forward(x, routes, gates, w1, w2, true, layer);
   }
 
   std::shared_ptr<Tape> forward_async(py::object x, py::object routes,
                                      py::object gates, py::object w1,
                                      py::object w2) {
-    drain_training();
+    reap_training();
     auto tape = execute_forward(x, routes, gates, w1, w2, false);
-    pending_training_forward_ = tape->forward;
+    pending_training_.push_back({tape->forward, {}});
     return tape;
   }
 
   void drain_training() {
-    if (pending_training_forward_) {
-      pending_training_forward_.wait();
-      pending_training_forward_ = {};
+    while (!pending_training_.empty()) {
+      pending_training_.front().wait();
+      pending_training_.pop_front();
     }
-    if (pending_training_backward_) {
-      pending_training_backward_.wait();
-      pending_training_backward_ = {};
+  }
+
+  void reap_training() {
+    while (!pending_training_.empty() && pending_training_.front().ready()) {
+      pending_training_.front().wait();
+      pending_training_.pop_front();
     }
   }
 
@@ -360,38 +362,35 @@ public:
     BFloat16ActivationLease input;
     ForwardWeightLease weights;
     ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
-    prepare_tensors([&] {
-      input = producer.publish_activations(
-          static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
-          tokens, hidden_, owner(x));
-      if (layer) {
-        weights = prepared_inference_weights(*layer, producer, w1, w2);
-      } else {
-        auto packed_w1 = empty({elements(w1)}, "bfloat16");
-        weights = producer.publish_weights(
-            static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
-            owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
-            elements(w2), owner(w2),
-            config_.num_experts / config_.topology.world_size,
-            rank_ * (config_.num_experts / config_.topology.world_size),
-            hidden_, intermediate_, binding(packed_w1));
-      }
-      // Output/weights do not depend on the plan. Only a deferred training
-      // tape needs the exact row count produced by standalone PF notify.
-      tape->output = empty({tokens, hidden_}, "bfloat16");
-      ForwardTensorBuffers buffers;
-      buffers.output = binding(tape->output);
-      if (!deferred_training_notify_)
-        fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc,
-                                             buffers, allocator());
-    });
-    if (deferred_training_notify_)
+    input = producer.publish_activations(
+        static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
+        tokens, hidden_, owner(x));
+    if (layer) {
+      weights = prepared_inference_weights(*layer, producer, w1, w2);
+    } else {
+      auto packed_w1 = empty({elements(w1)}, "bfloat16");
+      weights = producer.publish_weights(
+          static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
+          owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
+          elements(w2), owner(w2),
+          config_.num_experts / config_.topology.world_size,
+          rank_ * (config_.num_experts / config_.topology.world_size),
+          hidden_, intermediate_, binding(packed_w1));
+    }
+    // Output/weights do not depend on the plan. Only a deferred training
+    // tape needs the exact row count produced by standalone PF notify.
+    tape->output = empty({tokens, hidden_}, "bfloat16");
+    ForwardTensorBuffers buffers;
+    buffers.output = binding(tape->output);
+    if (deferred_training_notify_) {
       fc.tensor_factory = [&] {
-        ForwardTensorBuffers buffers;
-        buffers.output = binding(tape->output);
         return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers,
                                        allocator());
       };
+    } else {
+      fc.tensors = prepare_forward_tensors(tape->dispatch, execution_, fc,
+                                           buffers, allocator());
+    }
 #if WEFTMOE_ENABLE_GIN_RDMA
     if (synchronize)
       tape->forward = gin_ ? gin_->run(tape->dispatch, input, weights, fc)
@@ -418,7 +417,7 @@ public:
 
   py::tuple execute_backward(std::shared_ptr<Tape> tape, py::object dy,
                              bool synchronize) {
-    drain_training();
+    reap_training();
     if (!training_ || !tape->forward)
       throw std::invalid_argument("backward requires a live training tape");
     auto context = make_rank_collective_context(tape->generation.session(),
@@ -430,22 +429,19 @@ public:
         static_cast<const transport::BFloat16 *>(pointer(dy)), elements(dy),
         tokens, hidden_, owner(dy));
     auto local_experts = config_.num_experts / config_.topology.world_size;
-    py::object dx, dg, dw1, dw2;
+    auto dx = empty({tokens, hidden_}, "bfloat16");
+    auto dg = empty({tokens, config_.top_k}, "float32");
+    auto dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
+    auto dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
     BackwardMegaKernelConfig bc{hidden_, intermediate_};
-    prepare_tensors([&] {
-      dx = empty({tokens, hidden_}, "bfloat16");
-      dg = empty({tokens, config_.top_k}, "float32");
-      dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
-      dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
-      bc.tensors = BackwardMegaKernel().prepare_tensors(
-          tape->forward, bc,
-          {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
-    });
+    bc.tensors = BackwardMegaKernel().prepare_tensors(
+        tape->forward, bc,
+        {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
     auto backward = BackwardMegaKernel().enqueue(tape->forward, input, bc);
     if (synchronize)
       backward.wait();
     else
-      pending_training_backward_ = std::move(backward);
+      pending_training_.push_back({{}, std::move(backward)});
     tape->forward = {};
     tape->dispatch = {};
     return py::make_tuple(dx, dg, dw1, dw2);
@@ -717,12 +713,6 @@ private:
       return binding(empty({bytes}, "uint8"));
     };
   }
-  void prepare_tensors(const std::function<void()> &prepare) {
-    if (tensor_preparation_)
-      tensor_preparation_->run(prepare);
-    else
-      prepare();
-  }
   unsigned rank_, hidden_, intermediate_;
   std::uint64_t max_tokens_, generation_ = 1;
   bool training_, fused_inference_ = false, deferred_training_notify_ = false;
@@ -734,7 +724,6 @@ private:
   NcclSession base_;
   DeviceNotifyResourcePool notify_pool_;
   ActivationTransportResourcePool pool_;
-  std::unique_ptr<CollectiveTensorPreparation> tensor_preparation_;
   std::unique_ptr<LocalCudaP2pForwardMegaKernel> local_;
 #if WEFTMOE_ENABLE_GIN_RDMA
   std::unique_ptr<GinRdmaForwardMegaKernel> gin_;
@@ -753,8 +742,20 @@ private:
   // One compute workspace is shared across all saved tapes. Retain the
   // pending completion until the next MoE boundary, allowing the framework
   // to enqueue attention, gradient accumulation and other intervening work.
-  DeviceForwardHandle pending_training_forward_;
-  DeviceBackwardHandle pending_training_backward_;
+  struct PendingTraining {
+    DeviceForwardHandle forward;
+    DeviceBackwardHandle backward;
+    bool ready() const {
+      return forward ? forward.ready() : backward.ready();
+    }
+    void wait() const {
+      if (forward)
+        forward.wait();
+      else
+        backward.wait();
+    }
+  };
+  std::deque<PendingTraining> pending_training_;
 };
 } // namespace
 

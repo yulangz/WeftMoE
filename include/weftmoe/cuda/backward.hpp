@@ -77,6 +77,7 @@ public:
   const BackwardMegaKernelTimings &timings() const;
   const BackwardTensorStorage &tensors() const;
   void wait() const;
+  bool ready() const;
   void wait_on(CUstream_st *stream) const;
   explicit operator bool() const noexcept { return static_cast<bool>(impl_); }
 

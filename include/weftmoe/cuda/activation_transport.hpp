@@ -95,6 +95,9 @@ struct ActivationTransportPoolConfig {
   // Explicit single-node decode pool; independent of the compiled PF tiles.
   // Its complete invocation must fit one source window.
   bool decode_only = false;
+  // Eager training submits successive uses of a workspace on its execution
+  // stream. Handles retain tensors independently until GPU completion.
+  bool stream_ordered_training = false;
 };
 
 struct ActivationTransportPoolUsage {
@@ -183,9 +186,9 @@ struct ForwardMegaKernelConfig {
   // consumed by Forward's SwiGLU. The pool must have been constructed with
   // enable_backward_state=true.
   bool retain_backward_state = false;
-  // Caller-owned storage is prepared before entering Forward. Distributed
-  // callers must agree allocation failures before any rank starts execution.
-  // With no binding, the training-ring backend allocates/agrees the tape.
+  // Caller-owned storage is prepared before entering Forward. Allocation
+  // exceptions propagate locally; recovery belongs to the application.
+  // With no binding, the training-ring backend allocates the tape.
   ForwardTensorStorage tensors{};
   // The replay stream itself orders output consumers and serialized workspace
   // reuse, so observable events can be recorded once during graph release.
@@ -273,10 +276,13 @@ public:
   const ForwardMegaKernelAudit &audit() const;
   const ForwardMegaKernelTimings &timings() const;
   const ForwardTensorStorage &tensors() const;
-  // enqueue() returns before GPU completion. wait() collects diagnostics and
-  // releases the execution slot; saved tensors remain valid. Captured handles
-  // reserve their slot until destruction. wait_on() inserts only a dependency.
+  // enqueue() returns before GPU completion. wait() collects diagnostics;
+  // saved tensors remain valid. Stream-ordered training hands the workspace
+  // back at submission, otherwise wait() releases it. Captured handles reserve
+  // their slot until destruction. wait_on() inserts only a dependency.
   void wait() const;
+  // Nonblocking host completion check for stream-ordered training handles.
+  bool ready() const;
   void wait_on(CUstream_st *stream) const;
   // Serialize reuse of the persistent execution workspace on another stream.
   // Unlike wait_on(), this also waits for status copies and the terminal

@@ -131,8 +131,8 @@ struct BackwardPeerWorkspace {
       return next != buffer;
     });
     // Logical rows and call generations do not change peer addresses. The
-    // existing allocation agreement also tells unchanged ranks when a peer
-    // grew, so all ranks enter the remapping path together only when needed.
+    // binding-change agreement tells unchanged ranks when a peer grew, so all
+    // ranks enter the remapping path together only when needed.
     if (!bindings_changed) {
       generation = next_generation;
       return;
