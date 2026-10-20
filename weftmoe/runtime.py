@@ -200,8 +200,8 @@ class TensorRuntime:
     def inference_eager(self, x, routes, gates, w1, w2, *, layer=None):
         """Run changing inputs/routes; an optional layer caches immutable weights.
 
-        Call invalidate_inference_layer(layer) before replacing weights,
-        including in-place updates. Omit layer to repack on every call.
+        Invalidate before replacing weight addresses, or refresh after in-place
+        updates. Omit layer to repack on every call.
         """
         self._check(x, routes, gates, w1, w2)
         return self.native.eager_inference(
@@ -221,6 +221,14 @@ class TensorRuntime:
         self.native.invalidate_inference_layer(
             layer, torch.cuda.current_stream().cuda_stream
         )
+
+    def refresh_inference_weights(self):
+        """Repack updated weights at the same addresses without recapturing graphs.
+
+        Call collectively outside capture, after restoring/updating the original
+        weight tensors and before resuming any inference. This drains GPU work.
+        """
+        self.native.refresh_inference_weights()
 
     def inference_eager_async(self, x, routes, gates, w1, w2, *, layer=None):
         """Defer completion; optional layer uses the same immutable weight cache."""

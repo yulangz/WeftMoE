@@ -101,6 +101,10 @@ def _sync_result():
 
 
 def install():
+    # Keep graph allocations outside TMS: their native child-graph addresses
+    # stay resident, or are explicitly destroyed by the low-memory policy.
+    # Model weights and KV memory still use TMS normally.
+    os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "0"
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -108,10 +112,6 @@ def install():
         CustomAllreduce,
     )
 
-    # This adapter destroys and recaptures graphs to release native IPC/GIN
-    # addresses. TMS graph remapping assumes graphs stay alive and cannot own
-    # the same graph allocations. KV and model memory still use TMS normally.
-    os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "0"
     global _dp_layout_patched
     if not _dp_layout_patched:
         patch_dp_attention_layout()
@@ -120,8 +120,8 @@ def install():
         return
 
     # Graph-buffer IPC mappings live for the all-reduce communicator's entire
-    # lifetime. Its existing TMS staging path avoids retaining destroyed graph
-    # allocations, even though WeftMoE itself does not use TMS graph remapping.
+    # lifetime. Use the existing TMS staging path so graph allocations are never
+    # exported through long-lived IPC mappings, including on final teardown.
     # Retained so a diagnostic build can bypass the transport.
     original_forward = FusedMoE.forward
 
@@ -538,34 +538,56 @@ def patch_dp_attention_layout():
 
 
 
-def suspend(model_runner):
-    """Discard outer graphs before releasing any of their native addresses."""
-    global _runtime, _decode_runtime, _recapture, _eager_pending
-    if _runtime is None:
+def _release_prefill():
+    global _runtime, _eager_pending
+    if _runtime is None and _eager_pending is None:
         return
     torch.cuda.synchronize()
-    runner = getattr(model_runner, "graph_runner", None)
-    if runner is not None:
-        runner.graphs.clear()
-        runner.output_buffers.clear()
-        _recapture = True
-    if _decode_runtime is not None:
-        _decode_runtime.close()
-        _decode_runtime = None
-    _runtime.close()
-    _runtime = None
-    _eager_pending = None
-    _graph_inputs.clear()
+    if _eager_pending is not None:
+        _eager_pending.native.drain_eager_inference()
+        _eager_pending = None
+    if _runtime is not None:
+        _runtime.close()
+        _runtime = None
     torch.cuda.empty_cache()
+
+
+def suspend(model_runner):
+    """Keep decode graphs/packed weights, unless the low-memory policy is set."""
+    global _recapture
+    if os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
+        _recapture = getattr(model_runner, "graph_runner", None) is not None
+        close(model_runner)
+    else:
+        _release_prefill()
 
 
 def resume(model_runner):
     global _recapture
     if _recapture:
-        # Rebuild against restored addresses once per residency phase. Native
-        # communication contexts remain persistent across every layer/token call.
         from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
         with torch.no_grad(), model_capture_mode():
             model_runner.graph_runner.capture()
         _recapture = False
+        return
+    # AWEX has restored the same weight addresses and copied the new version.
+    # Refresh the packed FC1 copy in place; child/outer graphs need no recapture.
+    if _decode_runtime is not None:
+        _decode_runtime.refresh_inference_weights()
+
+
+def close(model_runner):
+    """Final teardown: discard outer graphs before freeing native addresses."""
+    global _decode_runtime
+    torch.cuda.synchronize()
+    runner = getattr(model_runner, "graph_runner", None)
+    if runner is not None:
+        runner.graphs.clear()
+        runner.output_buffers.clear()
+    _release_prefill()
+    if _decode_runtime is not None:
+        _decode_runtime.close()
+        _decode_runtime = None
+    _graph_inputs.clear()
+    torch.cuda.empty_cache()

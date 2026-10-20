@@ -1,6 +1,7 @@
 """Real SGLang EP parity, outer CUDA graph replay, and residency restart."""
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -43,10 +44,20 @@ def main():
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
-    layer = FusedMoE(
-        experts, 2048, 512, layer_id=0, top_k=top_k,
-        params_dtype=torch.bfloat16, inplace=False,
-    ).cuda()
+    memory_saver = None
+    if os.environ.get("TEST_TMS") == "1":
+        from torch_memory_saver.entrypoint import TorchMemorySaver
+
+        memory_saver = TorchMemorySaver()
+        memory_saver.hook_mode = "torch"
+    with (
+        memory_saver.region(tag="weights", enable_cpu_backup=True)
+        if memory_saver else nullcontext()
+    ):
+        layer = FusedMoE(
+            experts, 2048, 512, layer_id=0, top_k=top_k,
+            params_dtype=torch.bfloat16, inplace=False,
+        ).cuda()
     torch.manual_seed(37 + rank)
     layer.w13_weight.normal_(0, 0.03)
     layer.w2_weight.normal_(0, 0.03)
@@ -90,8 +101,29 @@ def main():
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, eager, rtol=0.02, atol=0.00002)
+    # Keep the existing graph while AWEX updates weights in place. In particular
+    # FC1 must refresh its packed copy rather than replaying stale parameters.
+    model_runner = SimpleNamespace(graph_runner=None)
+    adapter.suspend(model_runner)
+    if memory_saver:
+        memory_saver.pause("weights")
+        scratch = torch.empty_like(layer.w13_weight)
+        scratch.fill_(7)
+        torch.cuda.synchronize()
+        del scratch
+        memory_saver.resume("weights")
+    ids.add_(1).remainder_(experts)
+    layer.w13_weight.mul_(0.75)
+    layer.w2_weight.mul_(0.875)
+    adapter.resume(model_runner)
+    expected = baseline(x, topk)
+    dist.all_reduce(expected)
+    graph.replay()
+    actual = captured.clone()
+    dist.all_reduce(actual)
+    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
     del graph, captured
-    adapter.suspend(SimpleNamespace(graph_runner=None))
+    adapter.close(model_runner)
     assert adapter._runtime is None
     assert adapter._decode_runtime is None
     assert not adapter._graph_inputs
@@ -116,7 +148,7 @@ def main():
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, previous, rtol=0, atol=0)
     del graph, captured
-    adapter.suspend(SimpleNamespace(graph_runner=None))
+    adapter.close(model_runner)
     print(rank, "SGLANG_PARITY_GRAPH_RESTART_PASS", flush=True)
     dist.destroy_process_group()
 
