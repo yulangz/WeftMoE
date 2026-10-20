@@ -124,6 +124,95 @@ RNG 状态，依次运行同步、异步、同步，保存第一次完整 DDP gr
 对应日志为 `full_gradient_order.node{0,1}.log`。原有单 rank 注入 OOM
 回归已覆盖新增失败重试修复，没有增加一组细碎单测。
 
+### 完整 RL 回归
+
+修复提交为 `0ee57ac`；`5b87ef1` 将诊断 hook 收回 replay benchmark，
+生产 AReaL schedule 不保留 profiling 分支。AReaL engine 最终销毁调用
+adapter `close()`，常规上下卡仍调用 `suspend()`；这项接入改动保留在
+AReaL 工作树中，没有把该仓库原有的其它修改一起提交。
+
+`11:12:14 UTC` 启动 trial `qwen35-weftmoe-ep16-residency-fix-20261020`，
+计划 100 updates，从 Base 权重重新开始；训练加载
+`build/rl_ep16_residency_fix_20261020/`，rollout 继续加载原 PF/DT 二进制。
+配置逐字段对比确认只有训练二进制、trial/记录路径及 W&B 描述变化，
+模型、数据、batch、packing、重算、优化器和 rollout 设置均未变化。
+两节点 16 卡仍锁 1620 MHz，原生 online W&B，checkpoint/recover 关闭，
+没有独立上传进程。配置、二进制哈希及监督进程日志位于
+`build/rl_weftmoe_ep16_residency_fix_20261020/`。
+
+首轮 update 已于 `11:23:44 UTC` 完成，AWEX version 1 发布成功并恢复
+rollout；W&B 服务端确认 step 0、update_successful=1、reward=0.62109375、
+grad_norm=0.1308716、train_step=67.1206 s、update_weights=24.3397 s。
+该轮 33 个 microbatch，包含冷启动，不计入稳态性能。
+[原生 W&B run](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-weftmoe-ep16-residency-fix-20261020_train)。
+
+该组完成 3 次 update 后，为验证下一项修复主动 SIGINT 停止：
+
+| step | train | microbatches | weight update | rollout | 完整 update 墙钟 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0（冷启动） | 67.121 s | 33 | 24.340 s | 250.54 s | — |
+| 1 | 52.576 s | 31 | 19.810 s | 223.86 s | 327.689 s |
+| 2 | 57.195 s | 33 | 24.474 s | 245.28 s | 357.752 s |
+
+三步均 update_successful=1；step 1/2 reward 为 0.6582/0.71875。
+训练的每 microbatch 时间已恢复到 DeepEP 附近，但整轮尚未领先。
+日志进一步定位到每次恢复 SGLang 都重新捕获 37 档 CUDA Graph，
+约 20 多秒且在 rollout 计时之外；不能把分项相加冒充整轮墙钟。
+
+### 消除 rollout 的重复捕获
+
+`eb4b532` 保留 DT 原生工作区、逐层 packed FC1 权重、child/outer graphs，
+offload 只释放 eager PF；模型与 KV 继续由 TMS 卸载。图分配不交给 TMS
+重映射。AWEX 更新原权重后，显式 `refresh_inference_weights()` 将 FC1
+重新打包到同一地址，排空后才恢复推理，因此不必重新捕获图。只保留图、
+不刷新 packed 权重会使用旧参数，这是该实现必须避免的错误。
+
+保留的 packed W1 在本模型 EP4 下为 10 GiB/rank，另有 DT 工作区与图输出。
+这比训练侧保留连接的 1.60 GiB 更大；它是明确的驻留成本，不是泄漏。
+`WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS=0` 仍可选择原来的全部释放/重新捕获，
+最终 teardown 使用 `close()`，两种策略复用释放逻辑。
+
+现有 EP4/E256/K8 的 SGLang 回归增加了必要的生命周期检查：T257 下保持
+同一 outer graph，TMS pause/resume 原权重、修改 W1/W2、原地 refresh 后，
+图输出与参考对齐；最终关闭和重建也通过。低显存策略另以原回归 T17
+验证通过。没有为内部函数名/实现细节增加细碎单测。
+日志为 `build/rl_ep16_graph_residency_fix_20261020/sglang_{tms,low_memory}_parity.log`。
+
+完整 RL 验证使用 trial `qwen35-weftmoe-ep16-graph-residency-fix-20261020`，
+配置及日志位于 `build/rl_weftmoe_ep16_graph_residency_fix_20261020/`。
+训练二进制继续使用上一阶段已验证版本，只更新 rollout 扩展及驻留策略；
+其余配方、原生 online W&B、无 checkpoint/recover 保持不变。
+
+首轮完整 update 成功，服务端 W&B 确认 update_successful=1、
+reward=0.6484375。对比控制器 `Train step done` 到 SGLang 收到
+`ContinueGenerationReqInput` 的日志时间，旧策略三轮分别为
+23.632/24.386/21.337 s，新策略首轮为 0.186 s，且没有新增 capture。
+该区间包括 KV/graph 恢复和 packed 权重刷新，不是单独的重排 kernel 时间。
+同一 onload 位置的设备显存从 15.41 增为 28.36 GiB/rank，差 12.95 GiB；
+新组首轮训练的两节点最高采样为 92,289 MiB（每 10 s 采样，不是精确峰值）。
+
+完整热态 step 1 已成功，三组同一步的观测如下：
+
+| 指标 | DeepEP baseline | 原 WeftMoE | 两项驻留修复 |
+| --- | ---: | ---: | ---: |
+| train_step | 52.700 s | 76.177 s | 55.270 s |
+| microbatches | 31 | 31 | 32 |
+| train / microbatch | 1.700 s | 2.457 s | 1.727 s |
+| valid tokens | 2,909,200 | 2,795,500 | 2,885,800 |
+| rollout | 234.77 s | 220.46 s | 229.00 s |
+| update_weights | 17.077 s | 25.306 s | 22.714 s |
+| 完整 update 墙钟间隔 | 309.962 s | 345.197 s | 312.583 s |
+
+真实 RL 的生成数据、packing 不逐位相同，且这里只有一个完整热态样本，
+不能将此表当作严格的算子消融。该步完整墙钟比原版下降 9.4%，与 baseline
+相差 +0.8%，主要回退已消除，但尚不能宣称端到端领先。权重发布仍比 baseline
+多约 5.6 s，尚未完成这部分差异的独立归因；它不在前面的相同输入训练回放中。
+修复组前两步 update_successful 都为 1，step 1 reward=0.68359375、
+grad_norm=0.1015778；没有数值/通信错误。新 trial 保持运行，监督进程目标
+100 updates，原生数据继续上传
+[W&B](http://8.150.1.98:8080/sct-test/areal-qwen35/runs/dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged_qwen35-weftmoe-ep16-graph-residency-fix-20261020_train)；
+后续应比较更多热态样本，不能用前两步 reward 判断收敛。
+
 证据：`build/rl_weftmoe_ep16_8k_20261020/actor0_cpu_profile.json`，
 `build/rl_weftmoe_ep16_profile_20261020/traces/`。
 后者保存四个 TP head 的 CPU train_batch 输入（不是模型 checkpoint），
