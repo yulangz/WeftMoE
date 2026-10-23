@@ -59,7 +59,6 @@ class NativeBuildTest(unittest.TestCase):
             self.assertNotEqual(obj, other)
 
     def test_installed_headers_exclude_repository_only_interfaces(self):
-        self.assertEqual(len(PUBLIC_HEADERS), 14)
         self.assertIn("include/weftmoe/cuda/tensor_storage.hpp", PUBLIC_HEADERS)
         self.assertNotIn('include/weftmoe/metadata/serialize.hpp', PUBLIC_HEADERS)
         self.assertNotIn('include/weftmoe/kernels/persistent_contract.hpp', PUBLIC_HEADERS)

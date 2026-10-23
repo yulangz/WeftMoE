@@ -3,6 +3,7 @@
 #include "cuda/communication/local_notification.cuh"
 #include "cuda/communication/nccl_device.cuh"
 #include "cuda/communication/return_layout.hpp"
+#include "cuda/primitives/address_range.cuh"
 #include "cuda/primitives/hopper.cuh"
 #include "cuda/primitives/programmatic_launch.cuh"
 
@@ -81,6 +82,10 @@ __global__ void fill_transport_benchmark_output(transport::BFloat16 *output,
 
 #include "cuda/tensor_storage.cuh"
 #include "cuda/tensor_preparation.cuh"
+
+std::pair<std::uint32_t, std::uint32_t> forward_shape() {
+  return {forward_tuning::kMainHidden, forward_tuning::kMainIntermediate};
+}
 
 namespace {
 #include "cuda/backward/peer_workspace.cuh"
@@ -2938,9 +2943,17 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
               : impl_->backend->nccl->world;
   if (capacity.enable_backward_state)
     for (auto &slot : pool.impl_->state->slots)
-      if (!slot.backward_peer_workspace)
+      if (!slot.backward_peer_workspace) {
         slot.backward_peer_workspace = std::make_shared<BackwardPeerWorkspace>(
             session, execution, local_world, capacity);
+        // Reserve IPC storage before application activations fill the Torch
+        // caching allocator. cudaMalloc cannot reclaim its unused segments.
+        if (!use_gin || !weftmoe_pf::kNetworkPrivateDr) {
+          auto &workspace = *slot.backward_peer_workspace;
+          workspace.prepare(0, workspace.initial_rows, workspace.max_routes,
+                            capacity.max_hidden_size);
+        }
+      }
 }
 
 GinRdmaForwardMegaKernel::GinRdmaForwardMegaKernel(
@@ -4455,8 +4468,11 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                             : DispatchWaveKernelView{};
   const bool fused_inference_routes =
       ActivationTransportBridge::fused_inference_routes(dispatch);
+  // A checkpoint's no-grad pass reuses the training ring's Notify and
+  // stream-ordered workspace, but leaves the saved X/AB pointers null.
   const bool training_ring =
-      state->layout.static_ring.depth && config.retain_backward_state;
+      state->layout.static_ring.depth && !fused_inference_routes &&
+      state->config.enable_backward_state;
   const auto training_counts =
       ActivationTransportBridge::training_counts(dispatch);
   const bool split_notify =
@@ -5012,8 +5028,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     args.forward_compute_cta_count = forward_main_compute_ctas;
     args.forward_reduce_cta_count = forward_main_compute_ctas;
   }
-  auto smem = decode ? (wide_decode ? sizeof(weftmoe_dt::Shared<64U>)
-                                    : sizeof(weftmoe_dt::Shared<16U>))
+  auto smem = decode ? (wide_decode ? weftmoe_dt::shared_bytes<64U>(
+                                        id.num_experts, view.sizes.owned_expert_count)
+                                  : weftmoe_dt::shared_bytes<16U>(
+                                        id.num_experts, view.sizes.owned_expert_count))
                      : sizeof(weftmoe_pf::local::Shared);
   const bool pdl = programmatic_launch::enabled();
   if (network_prefill)
@@ -5432,7 +5450,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
 #if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("event_verified");
 #endif
-    consumer.finish();
+    ActivationTransportBridge::finish_completed(consumer);
 #if WEFTMOE_DEBUG_VALIDATE
     debug_forward_host_phase("consumer_finished");
     debug_forward_host_phase("terminal_agreement_enter");
@@ -6601,7 +6619,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const auto &status = record ? record->host->status : *slot.host_status;
     if (diagnostic_progress)
       diagnostic_status(*slot.host_status, false);
-    consumer.finish();
+    ActivationTransportBridge::finish_completed(consumer);
 
     result->audit.specialization =
         BackwardKernelSpecialization::Sm90CachedXAb7168x3072;

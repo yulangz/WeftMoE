@@ -184,6 +184,8 @@ public:
   static void wait_for_gates(const DeviceDispatchHandle &dispatch,
                              const CudaExecution &execution);
   static void submit(DeviceDispatchConsumerLease &consumer);
+  // The operator has already observed its own GPU completion.
+  static void finish_completed(DeviceDispatchConsumerLease &consumer);
   static const RankCollectiveContext &
   context(const DeviceDispatchConsumerLease &consumer);
   static const RankCollectiveContext &

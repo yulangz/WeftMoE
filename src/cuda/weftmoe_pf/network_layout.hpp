@@ -6,6 +6,12 @@
 #ifndef WEFTMOE_PF_NETWORK_GET_WORKERS
 #define WEFTMOE_PF_NETWORK_GET_WORKERS 64
 #endif
+#ifndef WEFTMOE_PF_NETWORK_WORKERS
+#define WEFTMOE_PF_NETWORK_WORKERS 112
+#endif
+#ifndef WEFTMOE_PF_NETWORK_PROGRESS_WORKERS
+#define WEFTMOE_PF_NETWORK_PROGRESS_WORKERS 19
+#endif
 #ifndef WEFTMOE_PF_NETWORK_PRIVATE_DR
 #define WEFTMOE_PF_NETWORK_PRIVATE_DR 0
 #endif
@@ -22,9 +28,10 @@ static_assert(kNetworkCreditWindows >= 1U && kNetworkCreditWindows <= 8U);
 // Borrow one control warp per CTA: dispatch, return, progress, admission.
 inline constexpr unsigned kNetworkPending = WEFTMOE_PF_NETWORK_PENDING;
 inline constexpr unsigned kGetWorkers = WEFTMOE_PF_NETWORK_GET_WORKERS;
-inline constexpr unsigned kPutWorkers = 112U - kGetWorkers;
-static_assert(kGetWorkers > 0U && kGetWorkers < 112U);
-inline constexpr unsigned kProgressWorkers = 19U;
+inline constexpr unsigned kPutWorkers = WEFTMOE_PF_NETWORK_WORKERS - kGetWorkers;
+static_assert(kGetWorkers > 0U && kGetWorkers < WEFTMOE_PF_NETWORK_WORKERS);
+inline constexpr unsigned kProgressWorkers = WEFTMOE_PF_NETWORK_PROGRESS_WORKERS;
+static_assert(kProgressWorkers > 0U);
 inline constexpr unsigned kNetworkOwners =
     kGetWorkers + kPutWorkers + kProgressWorkers + 1U;
 

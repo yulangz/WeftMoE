@@ -1,9 +1,6 @@
 """Framework-independent preparation settings (no process-group initialization)."""
 
 from dataclasses import dataclass
-import os
-from pathlib import Path
-from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -40,37 +37,12 @@ def token_bucket(tokens: int) -> TokenBucket:
     """Select a tuning representative, without padding the actual input.
 
     Empty local batches participate in EP and share the smallest bucket.
-    Inputs beyond the prepared range require an explicit larger workload.
+    Larger inputs extend the buckets geometrically; there is no token ceiling.
     """
     if type(tokens) is not int or tokens < 0:
         raise ValueError("tokens must be a nonnegative integer")
     for bucket in TOKEN_BUCKETS:
         if tokens <= bucket.upper:
             return bucket
-    raise ValueError("tokens exceed the largest prepared bucket (65536)")
-
-
-@dataclass(frozen=True)
-class RuntimeSettings:
-    root: Path
-    autotune_config: Path | None = None
-
-    @classmethod
-    def from_environment(cls, environment: Mapping[str, str] | None = None):
-        env = os.environ if environment is None else environment
-        root = Path(env.get("WEFTMOE_ROOT") or "~/.cache/weftmoe").expanduser().resolve()
-        config = env.get("WEFTMOE_AUTOTUNE_CONFIG")
-        return cls(root, Path(config).expanduser().resolve() if config else None)
-
-    def compile_directory(self, phase: str) -> Path:
-        self._check_phase(phase)
-        return self.root / "compile" / phase
-
-    def tune_directory(self, phase: str) -> Path:
-        self._check_phase(phase)
-        return self.root / "tune" / phase
-
-    @staticmethod
-    def _check_phase(phase: str):
-        if phase not in ("forward", "backward"):
-            raise ValueError(f"unknown phase: {phase}")
+    upper = 1 << (tokens - 1).bit_length()
+    return TokenBucket(upper // 2 + 1, upper)

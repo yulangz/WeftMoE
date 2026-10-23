@@ -22,6 +22,7 @@ namespace weftmoe::cuda {
 // Identity of the immutable generated Forward profile, checked before pool
 // preparation when applying an offline autotune table.
 const char *forward_tuning_id();
+std::pair<std::uint32_t, std::uint32_t> forward_shape();
 
 template <class T> class SelectedActivationLease;
 using BFloat16ActivationLease = SelectedActivationLease<transport::BFloat16>;

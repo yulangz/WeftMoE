@@ -2,6 +2,7 @@
 #include "cuda/communication/nccl_device.cuh"
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/pipeline/contracts.hpp"
+#include "cuda/primitives/address_range.cuh"
 #include "cuda/primitives/programmatic_launch.cuh"
 
 #include <cooperative_groups.h>
@@ -167,20 +168,9 @@ void validate_external_cuda_range(const void *pointer,
     invalid(std::string("phase=external-cuda-producer, field=") + field +
             ", rank=n/a, expected=device allocation on ordinal=" +
             std::to_string(expected_device) + ", actual=wrong memory/device");
-  CUdeviceptr base = 0;
-  std::size_t allocation_bytes = 0;
-  if (cuMemGetAddressRange(&base, &allocation_bytes,
-                           reinterpret_cast<CUdeviceptr>(pointer)) !=
-      CUDA_SUCCESS)
+  if (!internal::mapped_device_range(pointer, capacity_bytes))
     invalid(std::string("phase=external-cuda-producer, field=") + field +
-            ", rank=n/a, expected=queryable CUDA allocation, "
-            "actual=cuMemGetAddressRange failure");
-  const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
-  const auto allocation_begin = static_cast<std::uintptr_t>(base);
-  if (begin < allocation_begin || begin - allocation_begin > allocation_bytes ||
-      capacity_bytes > allocation_bytes - (begin - allocation_begin))
-    invalid(std::string("phase=external-cuda-producer, field=") + field +
-            ", rank=n/a, expected=declared capacity within allocation, "
+            ", rank=n/a, expected=declared capacity within mapped CUDA range, "
             "actual=short range");
 }
 
@@ -2838,6 +2828,8 @@ CudaNotifyWorkspace DeviceNotifyPoolBridge::workspace(
   state->epoch = context.session().generation();
   state->execution = execution;
   state->allocation = allocation->workspace;
+  state->allocation->consumer_work_completed.store(false,
+                                                  std::memory_order_release);
   state->receive = allocation->receive;
   state->communication = allocation->communication;
   state->unstable_inference_rows = allocation->unstable_inference_rows;
@@ -2854,6 +2846,12 @@ bool DeviceNotifyPoolBridge::drain(
     const CudaExecution &execution) noexcept {
   if (!allocation || !execution)
     return false;
+  // Completed operators retain the metadata lease until all their GPU work
+  // ends. Do not record a new event here: the stream may already contain
+  // unrelated later layers. Unconsumed/failed generations retain the drain.
+  if (allocation->workspace->consumer_work_completed.load(
+          std::memory_order_acquire))
+    return true;
   try {
     const auto exec = internal::checked_execution_state(execution);
     (void)cudaSetDevice(static_cast<int>(exec->device));
@@ -4408,6 +4406,8 @@ DeviceDispatchConsumerLease DeviceDispatchHandle::acquire_consumer(
           internal::ConsumerEventSlotState::Available) {
         workspace->allocation->consumer_event_states[i] =
             internal::ConsumerEventSlotState::InUse;
+        workspace->allocation->consumer_work_completed.store(
+            false, std::memory_order_release);
         event_index = i;
         break;
       }
@@ -4495,6 +4495,20 @@ ActivationTransportBridge::view(DeviceDispatchConsumerLease &consumer) {
     invalid("phase=activation-transport-view, field=consumer, rank=n/a, "
             "expected=Acquired, actual=invalid");
   return consumer.impl_->kernel_view();
+}
+
+void ActivationTransportBridge::finish_completed(
+    DeviceDispatchConsumerLease &consumer) {
+  // Keep the workspace (and its pool lease) alive until completion is marked.
+  auto workspace = consumer.impl_->workspace;
+  consumer.finish();
+  auto &allocation = *workspace->allocation;
+  std::lock_guard<std::mutex> lock(allocation.consumer_mutex);
+  if (std::none_of(allocation.consumer_event_states.begin(),
+                   allocation.consumer_event_states.end(), [](auto state) {
+                     return state == internal::ConsumerEventSlotState::InUse;
+                   }))
+    allocation.consumer_work_completed.store(true, std::memory_order_release);
 }
 
 DispatchWaveKernelView

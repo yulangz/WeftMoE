@@ -13,9 +13,18 @@ import shutil
 import subprocess
 import tempfile
 
-from tools.forward_jit import HOST_SOURCES, CUDA_SOURCES, TEST_SOURCE
-
 ROOT = Path(__file__).resolve().parent
+HOST_SOURCES = (
+    'src/cuda/backward_stub.cpp', 'src/cuda/control_protocol.cpp',
+    'src/metadata/notify_dispatch.cpp', 'src/metadata/serialize.cpp',
+    'src/transport/bootstrap_channel.cpp', 'src/transport/activation_protocol.cpp',
+    'src/transport/host_fake_count_exchange.cpp', 'src/scoreboard/workspace_plan.cpp',
+)
+CUDA_SOURCES = (
+    'src/cuda/device_notify.cu', 'src/cuda/activation_transport.cu',
+    'src/transport/nccl_count_exchange.cu',
+)
+TEST_SOURCE = 'tests/test_cuda_notify.cpp'
 PUBLIC_HEADERS = tuple(str(p.relative_to(ROOT)) for p in sorted((ROOT / 'include').rglob('*.hpp'))
                        if p.relative_to(ROOT).as_posix() not in {
                            'include/weftmoe/kernels/persistent_contract.hpp',
@@ -125,8 +134,6 @@ def build(target='lib', output=None, jobs=None):
         sources.append(mains[target])
     def compile_one(source):
         command = list(device if source.endswith('.cu') or source == TEST_SOURCE else host)
-        if source == 'src/cuda/forward_transport.cu':
-            command += ['-diag-suppress=177']
         if source == TEST_SOURCE:
             command += ['-x', 'cu']
         return compile_source(source, command, cache)

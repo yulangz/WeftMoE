@@ -21,7 +21,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from benchmarks.megatron_dispatch_baseline import loaded_nccl_libraries, nccl_runtime_version
+from benchmarks.nccl_library import loaded_nccl_libraries, nccl_runtime_version
 
 
 class MegatronTrainingBackend:
@@ -40,7 +40,10 @@ class MegatronTrainingBackend:
             moe_deepep_num_sms=args.deepep_num_sms, variable_seq_lengths=True,
             bf16=True, params_dtype=torch.bfloat16, moe_router_dtype="fp32",
             add_bias_linear=False, gated_linear_unit=True, activation_func=F.silu,
-            moe_grouped_gemm=True, moe_permute_fusion=True, bias_activation_fusion=True,
+            moe_grouped_gemm=True,
+            moe_permute_fusion=getattr(args, "moe_permute_fusion", True),
+            bias_activation_fusion=getattr(args, "bias_activation_fusion", True),
+            gradient_accumulation_fusion=getattr(args, "accumulate_main_grad", False),
             recompute_granularity="selective", recompute_modules=["moe_act"])
         owned = args.experts // world
         groups = get_default_pg_collection()
@@ -53,6 +56,10 @@ class MegatronTrainingBackend:
         self.experts = spec.submodules.mlp.submodules.experts(owned, config, pg_collection=groups)
         self.w1 = [getattr(self.experts.linear_fc1, f"weight{i}") for i in range(owned)]
         self.w2 = [getattr(self.experts.linear_fc2, f"weight{i}") for i in range(owned)]
+        self.accumulate_main_grad = config.gradient_accumulation_fusion
+        if self.accumulate_main_grad:
+            for weight in self.w1 + self.w2:
+                weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
         with torch.no_grad():
             for index in range(owned):
                 self.w1[index].copy_(w1[index])
@@ -60,7 +67,9 @@ class MegatronTrainingBackend:
         self.num_experts = args.experts
         self.metadata = dict(
             dispatcher=args.dispatcher, deepep_num_sms=args.deepep_num_sms,
-            moe_permute_fusion=True, bias_activation_fusion=True,
+            moe_permute_fusion=config.moe_permute_fusion,
+            bias_activation_fusion=config.bias_activation_fusion,
+            gradient_accumulation_fusion=config.gradient_accumulation_fusion,
             recompute_granularity="selective", recompute_modules=["moe_act"],
             megatron_core=version("megatron-core"), transformer_engine=version("transformer-engine"),
             torch=torch.__version__, torch_nccl_compile_version=torch.cuda.nccl.version(),
@@ -85,8 +94,10 @@ class MegatronTrainingBackend:
     def backward(self, tape, dy):
         torch.autograd.backward(tape.output, dy)
         gradients = (tape.x.grad, tape.gates.grad,
-                     tuple(weight.grad for weight in self.w1),
-                     tuple(weight.grad for weight in self.w2))
+                     tuple(weight.main_grad if self.accumulate_main_grad else weight.grad
+                           for weight in self.w1),
+                     tuple(weight.main_grad if self.accumulate_main_grad else weight.grad
+                           for weight in self.w2))
         tape.x.grad = tape.gates.grad = None
         self.experts.zero_grad(set_to_none=True)
         return gradients

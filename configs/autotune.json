@@ -1,0 +1,192 @@
+{
+  "environment": {
+    "WEFTMOE_PF_MIN_RING_DEPTH": "2",
+    "WEFTMOE_PF_CREDIT_WINDOWS": "2"
+  },
+  "stream_ordered": true,
+  "sample_pause_ms": 50,
+  "stages": [
+    "forward",
+    "activation",
+    "weight",
+    "ring"
+  ],
+  "forward": {
+    "variants": [
+      {
+        "forward.static_v4_fc1_stages": 2,
+        "forward.static_v4_fc2_stages": 2
+      },
+      {
+        "forward.fc1_tile_n": 128,
+        "forward.fc2_tile_n": 128
+      },
+      {
+        "forward.fc1_tile_n": 128,
+        "forward.fc2_tile_n": 128,
+        "forward.static_v4_fc1_stages": 2,
+        "forward.static_v4_fc2_stages": 2
+      },
+      {
+        "forward.fc1_tile_n": 128,
+        "forward.fc2_tile_n": 128,
+        "forward.static_v4_fc1_stages": 4,
+        "forward.static_v4_fc2_stages": 4
+      }
+    ]
+  },
+  "activation": {
+    "variants": [
+      {
+        "backward.dab_tile_n": 128
+      },
+      {
+        "backward.dx_tile_n": 128
+      },
+      {
+        "backward.dab_tile_n": 128,
+        "backward.dx_tile_n": 128
+      },
+      {
+        "backward.dab_stages": 2,
+        "backward.dx_stages": 2
+      },
+      {
+        "backward.dab_stages": 4,
+        "backward.dx_stages": 4
+      },
+      {
+        "backward.activation_tile_k": 128,
+        "backward.dab_stages": 2,
+        "backward.dx_stages": 2
+      }
+    ]
+  },
+  "weight": {
+    "variants": [
+      {
+        "backward.dw_tile_m": 256,
+        "backward.dw_tile_n": 128
+      },
+      {
+        "backward.dw_tile_n": 128
+      },
+      {
+        "backward.dw1_stages": 2,
+        "backward.dw2_stages": 2
+      },
+      {
+        "backward.dw1_claim_tiles": 1,
+        "backward.dw2_claim_tiles": 1
+      },
+      {
+        "backward.dw1_claim_tiles": 2,
+        "backward.dw2_claim_tiles": 2
+      },
+      {
+        "backward.dw1_claim_tiles": 4,
+        "backward.dw2_claim_tiles": 2
+      }
+    ]
+  },
+  "ring": {
+    "local": [
+      {
+        "window_tokens": 2048,
+        "contribution_windows": 2
+      },
+      {
+        "window_tokens": 512,
+        "contribution_windows": 8
+      },
+      {
+        "window_tokens": 1024,
+        "contribution_windows": 4
+      },
+      {
+        "window_tokens": 4096,
+        "contribution_windows": 2
+      },
+      {
+        "window_tokens": 2048,
+        "contribution_windows": 4
+      }
+    ],
+    "network": [
+      {
+        "window_tokens": 2048,
+        "contribution_windows": 2
+      },
+      {
+        "window_tokens": 512,
+        "contribution_windows": 8
+      },
+      {
+        "window_tokens": 1024,
+        "contribution_windows": 4
+      },
+      {
+        "window_tokens": 4096,
+        "contribution_windows": 2
+      }
+    ]
+  },
+  "seed": 123,
+  "token_std_fraction": 0.1,
+  "route_bias_std": 0.5,
+  "screen": {
+    "warmups": 4,
+    "samples": 12
+  },
+  "final": {
+    "warmups": 4,
+    "samples": 20
+  },
+  "confirmation_candidates": 2,
+  "confirm_screen_improvements_only": true,
+  "confirmation_repeats": 2,
+  "minimum_improvement_percent": 1.0,
+  "verify_tokens": [
+    129
+  ],
+  "verify_samples": 2,
+  "workspace_limit_bytes": 21474836480,
+  "timeout_seconds": 900,
+  "modes": {
+    "inference": {
+      "stages": ["forward", "ring"]
+    },
+    "decode": {
+      "stages": ["decode"],
+      "workload": {"tokens": [1, 8, 64]},
+      "token_std_fraction": 0,
+      "graph_replays": 50
+    }
+  },
+  "decode": {
+    "axes": {
+      "v4.decode_math_m": [0, 16, 64],
+      "v4.decode_stages": [2, 3],
+      "v4.decode_cta_multiplier": [0, 1, 2, 3]
+    }
+  },
+  "workload": {
+    "model": "qwen35b",
+    "tokens": [
+      8192,
+      20480
+    ]
+  },
+  "system": {
+    "gpus_per_node": 8,
+    "remotes": [],
+    "master_addr": "127.0.0.1",
+    "master_port": 29531,
+    "ssh_port": 22
+  },
+  "run": {
+    "jobs": 4,
+    "output": "../build/autotune/{model}/h{hidden}_i{intermediate}_e{experts}_k{top_k}/{mode}/ep{world}",
+    "cache": "../build/autotune/cache"
+  }
+}

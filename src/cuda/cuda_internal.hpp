@@ -198,6 +198,7 @@ struct CudaAllocation {
   std::vector<cudaEvent_t> consumer_events;
   mutable std::mutex consumer_mutex;
   std::vector<ConsumerEventSlotState> consumer_event_states;
+  std::atomic<bool> consumer_work_completed{false};
   std::atomic<bool> dispatch_slot_quarantined{false};
   bool abandon_on_teardown = false;
   bool owns_device_memory = true;

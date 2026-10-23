@@ -21,7 +21,6 @@ _dp_layout_patched = False
 # sees DP-sharded rows. With the stock layout the layer communicator gathers
 # every rank's rows, so the transport must shard them itself.
 _rows_are_dp_sharded = False
-_layout_active = False
 _eager_pending = None
 _decode_batch = False
 _graph_inputs = {}
@@ -71,35 +70,6 @@ def participate_idle_layers(model):
         # Call the installed adapter forward (bound to this layer).
         experts.forward(x, topk)
 
-# Temporary diagnostics: synchronize (and report) after every transport call so
-# a corrupted CUDA context is attributed to the layer that caused it.
-_DEBUG_SYNC = os.environ.get("WEFTMOE_DEBUG_SYNC") == "1"
-_DEBUG_CALLS = os.environ.get("WEFTMOE_DEBUG_CALLS") == "1"
-_SYNC_EAGER = os.environ.get("WEFTMOE_SGLANG_SYNC_EAGER") == "1"
-_call_counts = {}
-_cudart = None
-
-
-def _cuda_last_error():
-    """Return cudaGetLastError() without going through torch's error checks."""
-    global _cudart
-    if _cudart is None:
-        import ctypes
-
-        _cudart = ctypes.CDLL("libcudart.so")
-        _cudart.cudaGetLastError.restype = ctypes.c_int
-    return _cudart.cudaGetLastError()
-
-
-def _sync_result():
-    """Synchronize and report the outcome without raising."""
-    try:
-        torch.cuda.synchronize()
-        return "ok"
-    except Exception as error:  # noqa: BLE001 - diagnostic path
-        return "FAILED:%s" % error
-
-
 def install():
     # Keep graph allocations outside TMS: their native child-graph addresses
     # stay resident, or are explicitly destroyed by the low-memory policy.
@@ -122,9 +92,6 @@ def install():
     # Graph-buffer IPC mappings live for the all-reduce communicator's entire
     # lifetime. Use the existing TMS staging path so graph allocations are never
     # exported through long-lived IPC mappings, including on final teardown.
-    # Retained so a diagnostic build can bypass the transport.
-    original_forward = FusedMoE.forward
-
     original_ar_init = CustomAllreduce.__init__
 
     @functools.wraps(original_ar_init)
@@ -170,28 +137,6 @@ def install():
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         global _runtime, _decode_runtime, _eager_pending
-        if os.environ.get("WEFTMOE_NULL_MOE") == "1":
-            # Diagnostic: keep the layout conversion but remove the transport
-            # entirely, so a crash can be attributed to one of the two.
-            return torch.zeros_like(hidden_states)
-        if os.environ.get("WEFTMOE_BYPASS_TRANSPORT") == "1":
-            return original_forward(layer, hidden_states, topk_output)
-        if _DEBUG_CALLS:
-            rank_now = dist.get_rank() if dist.is_initialized() else -1
-            count = _call_counts.get(rank_now, 0)
-            if count < 6:
-                _call_counts[rank_now] = count + 1
-                print(
-                    "[WEFTMOE-CALL] rank=%s n=%d layer=%s tokens=%d dp=%s"
-                    % (
-                        rank_now,
-                        count + 1,
-                        getattr(layer, "layer_id", "?"),
-                        hidden_states.shape[0],
-                        get_global_server_args().enable_dp_attention,
-                    ),
-                    flush=True,
-                )
         group = get_tp_group().device_group
         world = dist.get_world_size(group)
         if layer.moe_ep_size != world or layer.moe_tp_size != 1:
@@ -271,7 +216,6 @@ def install():
         # where this rank may own fewer than ``local_tokens`` real rows.
         elif (
             not sharded_rows
-            and os.environ.get("WEFTMOE_SGLANG_FORCE_ROUTE_COPY") != "1"
             and valid_tokens == local_tokens
             and ids.dtype == torch.int32
             and weights.dtype == torch.float32
@@ -321,26 +265,11 @@ def install():
                 _eager_pending.native.drain_eager_inference()
                 _eager_pending = None
             output = runtime.inference(layer.layer_id, *inputs)
-        elif _SYNC_EAGER:
-            output = runtime.inference_eager(*inputs, layer=layer.layer_id)
         else:
             if _eager_pending is not None and _eager_pending is not runtime:
                 _eager_pending.native.drain_eager_inference()
             output = runtime.inference_eager_async(*inputs, layer=layer.layer_id)
             _eager_pending = runtime
-        if _DEBUG_SYNC and not get_is_capture_mode():
-            print(
-                "[WEFTMOE] rank=%d layer=%s tokens=%d local=%d sync=%s cuda_err=%d"
-                % (
-                    rank,
-                    getattr(layer, "layer_id", "?"),
-                    tokens,
-                    local_tokens,
-                    _sync_result(),
-                    _cuda_last_error(),
-                ),
-                flush=True,
-            )
         if not sharded_rows:
             # Every row in this rank's batch is complete already.
             return output
@@ -382,25 +311,15 @@ def patch_dp_attention_layout():
     from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
     from sglang.srt.server_args import get_global_server_args
 
-    # Debug switch: "all" applies the full conversion, "layout" only moves
-    # dispatch/combine out of the communicator, "dispatch" only removes the two
-    # reduce sites, "off" disables the conversion (used to bisect failures).
-    layout_mode = os.environ.get("WEFTMOE_DP_LAYOUT", "all")
-    if layout_mode == "off":
-        return
-    apply_layout = layout_mode in ("all", "layout")
-    global _rows_are_dp_sharded, _layout_active
-    _rows_are_dp_sharded = apply_layout
-    _layout_active = apply_layout
-    apply_dispatch = layout_mode in ("all", "dispatch")
+    global _rows_are_dp_sharded
+    _rows_are_dp_sharded = True
 
     original_mlp_mode = LayerScatterModes._compute_mlp_mode.__func__
 
     def mlp_mode(cls, context):
         original = original_mlp_mode(cls, context)
         if (
-            apply_layout
-            and context.is_layer_sparse
+            context.is_layer_sparse
             and original == ScatterMode.FULL
             and get_global_server_args().enable_dp_attention
         ):
@@ -423,8 +342,6 @@ def patch_dp_attention_layout():
             is_nextn=is_nextn,
         )
         if not get_global_server_args().enable_dp_attention:
-            return
-        if not apply_dispatch:
             return
         # The routed path already returns complete DP-local rows, so the
         # block's own tensor-parallel reduce would sum unrelated tokens.
@@ -449,9 +366,6 @@ def patch_dp_attention_layout():
                 replicate_qwen35_shared_experts()
 
     Qwen2MoeSparseMoeBlock.__init__ = block_init
-
-    if not apply_layout:
-        return
 
     # A DP rank without local tokens still has to join one transport handshake
     # per MoE layer: the dispatch/return protocol involves every EP rank, and
@@ -497,8 +411,7 @@ def patch_dp_attention_layout():
         pp_proxy_tensors, input_deepstack_embeds,
     ):
         if (
-            _layout_active
-            and get_global_server_args().enable_dp_attention
+            get_global_server_args().enable_dp_attention
             and forward_batch is not None
             and forward_batch.forward_mode.is_idle()
             and (input_ids is None or input_ids.numel() == 0)

@@ -1,4 +1,4 @@
-"""Offline V4 results: exact workload lookup, without compiling or benchmarking.
+"""Offline PF/DT results: exact workload lookup, without runtime autotuning.
 
 A table selects a whole prepared pool. Loading another communication profile
 requires rebuilding/loading its native library and preparing fresh graphs.

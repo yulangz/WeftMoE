@@ -28,14 +28,14 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a,
     const auto blocks = (rows + kBlockM - 1U) / kBlockM;
     const auto prefix = static_forward::warp_inclusive_sum(blocks);
     if (expert < owned) {
-      s.rows[expert] = rows;
-      s.blocks[expert] = total_blocks + prefix - blocks;
+      s.rows()[expert] = rows;
+      s.blocks(owned)[expert] = total_blocks + prefix - blocks;
     }
     total_rows += __reduce_add_sync(0xffffffffU, rows);
     total_blocks += __shfl_sync(0xffffffffU, prefix, 31U);
   }
   if (lane == 31U)
-    s.blocks[owned] = total_blocks;
+    s.blocks(owned)[owned] = total_blocks;
   if (blockIdx.x == 0U && lane == 0U) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -57,8 +57,8 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared<M> &s) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned expert = 0U, begin = 0U, phase = 0U, peer_rows = 0U, pulled = 0U;
   for (unsigned linear = blockIdx.x * 3U + warp;; linear += gridDim.x * 3U) {
-    while (expert < owned && linear >= begin + s.rows[expert])
-      begin += s.rows[expert++];
+    while (expert < owned && linear >= begin + s.rows()[expert])
+      begin += s.rows()[expert++];
     if (expert == owned)
       break;
     unsigned source, ordinal;
@@ -67,7 +67,7 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Shared<M> &s) {
       const auto identity =
           weftmoe_pf::source_routes<static_forward::SourceRoute>(
               a, a.rank, source, expert)[ordinal];
-      const auto row = s.blocks[expert] * kBlockM + linear - begin;
+      const auto row = s.blocks(owned)[expert] * kBlockM + linear - begin;
       const auto token = identity.route / a.dispatch.identity.top_k;
       const auto *input =
           peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
@@ -191,7 +191,7 @@ __global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
     for (auto block = tid; block < a.ring.depth / 2U; block += stride)
       states(a)[block] = {};
   } else if (blockIdx.x == 0U) {
-    weftmoe_pf::ring::build_single_window<128U, kMathThreads>(a, s.counts);
+    weftmoe_pf::ring::build_single_window<128U, kMathThreads>(a, s.rows());
   }
   // CTA0's source builder uses the control-only collective barrier. Math
   // must not enter the all-thread grid collective until that phase retires.
@@ -219,7 +219,8 @@ __global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
     // The next invocation's BeforePull waits for all peers to finish this
     // kernel before any FC2 writer can reuse their contribution storage.
     if (blockIdx.x == 0U && threadIdx.x == kMathThreads) {
-      const auto blocks = s.blocks[a.dispatch.sizes.owned_expert_count];
+      const auto owned = a.dispatch.sizes.owned_expert_count;
+      const auto blocks = s.blocks(owned)[owned];
       status->fc1_tasks_done = blocks * kFc1Tiles;
       status->fc2_tasks_done = blocks * kFc2Tiles;
       status->actual_return_peer_bytes = status->actual_dispatch_peer_bytes;

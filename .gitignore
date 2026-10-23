@@ -5,16 +5,6 @@ __pycache__/
 
 /benchmarks/results/
 /codex-exports/
-/docs/*
-!/docs/areal_qwen35.md
-!/docs/static_forward_v4_design.md
-!/docs/static_forward_v4_optimize_record.md
-!/docs/static_forward_v4_prefill_record.md
-!/docs/static_forward_v4_ring_record.md
-!/docs/static_forward_v4_decode_record.md
-!/docs/static_forward_v4_prefill_optimization_history.md
-!/docs/static_forward_v4_decode_optimization_history.md
-!/docs/autotune.md
 /dist/
 /*.egg-info/
 /server_parity*.json

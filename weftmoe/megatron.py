@@ -42,9 +42,8 @@ class MegatronAdapter:
 
         self.max_tokens = max_tokens
         self.runtime = None
-        # Keep the transport connection, not its activation/IPC/GIN payloads,
-        # across train/rollout residency switches. Destroying the adapter also
-        # closes this final session reference.
+        # Communication workspaces survive train/rollout residency switches,
+        # like Megatron's DeepEP buffer. close() releases them at engine teardown.
         self.session = None
         self.packed = {}
         self.layers = []
@@ -63,7 +62,6 @@ class MegatronAdapter:
                     or config.add_bias_linear
                     or config.expert_tensor_parallel_size != 1
                     or layer.moe_layer_recompute
-                    or config.recompute_granularity == "full"
                     or not config.gated_linear_unit
                     or config.activation_func is not torch.nn.functional.silu
                     or config.moe_apply_probs_on_input
@@ -71,11 +69,8 @@ class MegatronAdapter:
                     or config.glu_linear_offset != 0
                 ):
                     raise ValueError(
-                        "WeftMoE requires ETP1, bias-free SwiGLU, separate shared experts, and cached X/AB"
-                    )
-                if config.hidden_size != 2048 or config.moe_ffn_hidden_size != 512:
-                    raise ValueError(
-                        "This compiled WeftMoE profile supports Qwen3.5 H2048/I512"
+                        "WeftMoE requires ETP1, bias-free SwiGLU, separate shared experts, "
+                        "and no partial MoE checkpoint (full-layer checkpoint is supported)"
                     )
                 self.layers.append(layer)
                 layer.forward = MethodType(self._make_forward(), layer)
@@ -140,14 +135,21 @@ class MegatronAdapter:
                 getattr(layer.experts.linear_fc2, f"weight{i}")
                 for i in range(layer.num_local_experts)
             ]
-            output = _Routed.apply(
-                manager,
-                layer,
+            inputs = (
                 hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous(),
                 routes.int().contiguous(),
                 gates.float().contiguous(),
-                *parameters,
             )
+            # Megatron's full checkpoint runs the first pass under no_grad;
+            # only its grad-enabled replay needs a tape. Check outside
+            # autograd.Function.forward, which always runs with grad disabled.
+            if torch.is_grad_enabled():
+                output = _Routed.apply(manager, layer, *inputs, *parameters)
+            else:
+                packed = manager.pack(parameters)
+                output = manager.get_runtime(layer).forward_async(
+                    *inputs, *packed, retain_backward_state=False
+                ).output
             output = output.view_as(hidden_states)
             if shared is not None:
                 output = output + shared
@@ -156,6 +158,7 @@ class MegatronAdapter:
         return forward
 
     def suspend(self):
+        """Finish training uses before offload, retaining communication buffers."""
         if self.runtime is None:
             return
         torch.cuda.synchronize()
@@ -164,12 +167,13 @@ class MegatronAdapter:
             raise RuntimeError(
                 "Cannot offload WeftMoE while autograd still owns saved X/AB"
             )
-        self.runtime.close()
-        self.packed.clear()
-        self.runtime = None
-        torch.cuda.empty_cache()
 
     def close(self):
-        """Release the session too when the training engine is destroyed."""
+        """Release buffers and the session when the training engine is destroyed."""
         self.suspend()
+        if self.runtime is not None:
+            self.runtime.close()
+            self.runtime = None
+        self.packed.clear()
         self.session = None
+        torch.cuda.empty_cache()

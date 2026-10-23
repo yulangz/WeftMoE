@@ -3,8 +3,8 @@ recursive-include include *.hpp
 recursive-include src *.hpp *.h *.cuh *.cu *.cpp
 recursive-include tools *.py *.json
 recursive-include tests *.py *.cpp *.cu
-recursive-include configs *.json *.md
-recursive-include benchmarks *.py *.cpp *.json
+recursive-include configs *.json *.hpp
+recursive-include benchmarks *.py *.cpp *.cuh *.json
 prune benchmarks/results
 prune docs
 prune artifacts

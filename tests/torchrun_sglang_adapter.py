@@ -23,9 +23,11 @@ def main():
     experts = int(os.environ.get("TEST_EXPERTS", 16))
     top_k = int(os.environ.get("TEST_TOP_K", 4))
     tokens = int(os.environ.get("TEST_TOKENS", 17))
+    hidden = int(os.environ.get("TEST_HIDDEN", 2048))
+    intermediate = int(os.environ.get("TEST_INTERMEDIATE", 512))
     torch.cuda.set_device(local_rank)
     args = ServerArgs(
-        model_path="/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B-Base",
+        model_path="dummy",
         tp_size=world,
         ep_size=world,
         moe_runner_backend="triton",
@@ -55,14 +57,14 @@ def main():
         if memory_saver else nullcontext()
     ):
         layer = FusedMoE(
-            experts, 2048, 512, layer_id=0, top_k=top_k,
+            experts, hidden, intermediate, layer_id=0, top_k=top_k,
             params_dtype=torch.bfloat16, inplace=False,
         ).cuda()
     torch.manual_seed(37 + rank)
     layer.w13_weight.normal_(0, 0.03)
     layer.w2_weight.normal_(0, 0.03)
     torch.manual_seed(100)
-    x = torch.randn(tokens, 2048, device="cuda", dtype=torch.bfloat16) * 0.03
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.03
     ids = (
         torch.arange(tokens * top_k, device="cuda").reshape(tokens, top_k) % experts
     ).int()

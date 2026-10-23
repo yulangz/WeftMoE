@@ -11,7 +11,7 @@ produce(const ForwardKernelArgs &a, Shared<M> &s, const CUtensorMap &x_map,
         const CUtensorMap &s_map, const CUtensorMap &w1_map,
         const CUtensorMap &w2_map) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto tasks = s.blocks[owned] * (kFc1Tiles + kFc2Tiles);
+  const auto tasks = s.blocks(owned)[owned] * (kFc1Tiles + kFc2Tiles);
   unsigned stage = 0U, phase = 0U;
   for (unsigned index = blockIdx.x; index < tasks; index += gridDim.x) {
     const auto block = task(s, owned, index);
@@ -116,8 +116,8 @@ template <unsigned M>
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a,
                                         Shared<M> &s) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto fc1_tasks = s.blocks[owned] * kFc1Tiles;
-  const auto tasks = s.blocks[owned] * (kFc1Tiles + kFc2Tiles);
+  const auto fc1_tasks = s.blocks(owned)[owned] * kFc1Tiles;
+  const auto tasks = s.blocks(owned)[owned] * (kFc1Tiles + kFc2Tiles);
   const auto lane = threadIdx.x % 32U;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   unsigned stage = 0U, phase = 0U;

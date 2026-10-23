@@ -145,7 +145,9 @@ __global__ __launch_bounds__(384U, 1) void notify_kernel(
     status->dispatch_blocks_done = status->reduced_tokens =
         status->fc1_start_clock = status->relay_blocks_done = ~0ULL;
   }
-  if (a.retain_backward_state && !a.training_counts_ready) {
+  // A training runtime also materializes notify for checkpoint's no-cache
+  // pass. Planning readiness is independent of whether X/AB will be saved.
+  if (!a.training_counts_ready) {
     count_training_routes<Network>(a);
     if (a.checkpoint.counts.runtime->error)
       return;

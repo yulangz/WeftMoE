@@ -144,7 +144,15 @@ def main():
                     target.copy_(source)
                 values.extend(value.clone() for value in backward(
                     tape, dy.chunk(world)[rank].contiguous()))
+            if asynchronous:
+                torch.cuda.synchronize()
+                tail = torch.cuda.Event()
+                torch.cuda._sleep(405_000_000)
+                tail.record()
             runtime.drain()
+            if asynchronous:
+                assert not tail.query(), "retiring completed tapes drained later stream work"
+                torch.cuda.synchronize()
             results.append(values)
         for actual, expected in zip(*results):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -205,18 +213,11 @@ def main():
                                        rtol=0.02, atol=0.00002)
         del tape
         print(rank, "TRAINING_WEIGHT_REFRESH_PASS", flush=True)
-    usage = runtime.native.usage()
-    resident_bytes = sum(usage[key] for key in ("compute_bytes", "gin_bytes", "notify_bytes"))
-    torch.cuda.empty_cache()
-    free_before = torch.cuda.mem_get_info()[0]
-    runtime.close()
-    torch.cuda.empty_cache()
-    freed = torch.cuda.mem_get_info()[0] - free_before
-    assert freed >= resident_bytes, (freed, resident_bytes)
-    print(rank, "TRAINING_WORKSPACE_RELEASE_PASS", freed, resident_bytes, flush=True)
-    del output, runtime
+    runtime.drain()
+    assert runtime.native.usage()["notify_slots_in_use"] == 0
+    del output
     # AReaL trains across EP16 but serves with independent node-local EP4
-    # engines. Allow the test to exercise those distinct process groups.
+    # engines, retaining the idle training communication buffers during rollout.
     inference_world = int(os.environ.get("TEST_INFERENCE_EP_SIZE", world))
     assert world % inference_world == 0
     inference_group = dist.group.WORLD
@@ -323,6 +324,14 @@ def main():
     freed = torch.cuda.mem_get_info()[0] - free_before
     assert freed >= resident_bytes, (freed, resident_bytes)
     print(rank, "GRAPH_DESTROY_AND_OFFLOAD_PASS", flush=True)
+    usage = runtime.native.usage()
+    resident_bytes = sum(usage[key] for key in ("compute_bytes", "gin_bytes", "notify_bytes"))
+    free_before = torch.cuda.mem_get_info()[0]
+    runtime.close()
+    torch.cuda.empty_cache()
+    freed = torch.cuda.mem_get_info()[0] - free_before
+    assert freed >= resident_bytes, (freed, resident_bytes)
+    print(rank, "TRAINING_WORKSPACE_RELEASE_PASS", freed, resident_bytes, flush=True)
     dist.destroy_process_group()
 
 

@@ -52,7 +52,7 @@ def parameter_macros(phase):
 def validate_shared_parameters(forward, backward):
     for key in sorted(SHARED_PARAMETERS):
         if forward[key] != backward[key]:
-            raise ValueError(
+            raise PlanError(
                 f"shared parameter {key} differs between Forward ({forward[key]}) "
                 f"and Backward ({backward[key]}); select one common value")
 
@@ -72,11 +72,6 @@ DEFAULTS = dict(gin_dispatch_channels=64, gin_return_ports=2, gin_chunk_rows=64,
                 wgmma_n256_atom_n=256)
 
 
-def upgrade_legacy_groups(groups, *, search=False, extra_defaults=None):
-    """Make old frozen plans explicit without changing their worker layout."""
-    group = groups.setdefault("1_gemm", {})
-    for key, value in dict(DEFAULTS, **(extra_defaults or {})).items():
-        group.setdefault(key, [value] if search else value)
 
 
 
@@ -89,41 +84,6 @@ def require_resources(condition, message):
         raise ResourceCombinationError(message)
 
 
-def filter_generated_candidates(document, flatten_groups, validate_tuning):
-    """Prune resource conflicts only in an automatically expanded unified grid.
-
-    Explicit frozen candidates never call this helper. Malformed values remain
-    errors, and legacy grids keep their prior strict validation behavior.
-    """
-    fixed = flatten_groups(document["fixed"], require_all=True)
-    configs = [dict(fixed, **flatten_groups(candidate.get("override", {}),
-                                          require_all=False))
-               for candidate in document["candidates"]]
-    if not any(config["unified_workers"] == 1 for config in configs):
-        return
-    accepted, rejected = [], []
-    for candidate, config in zip(document["candidates"], configs):
-        try:
-            validate_tuning(config)
-        except ResourceCombinationError as error:
-            if config["unified_workers"] != 1:
-                raise
-            rejected.append(dict(name=candidate["name"],
-                                 override=candidate.get("override", {}),
-                                 reason=str(error)))
-        else:
-            accepted.append(candidate)
-    require(accepted, "generated unified grid has no legal resource combination: "
-            + (rejected[0]["reason"] if rejected else "empty grid"))
-    document["candidate_filter"] = dict(generated=len(configs),
-                                        accepted=len(accepted), rejected=rejected)
-    document["candidates"] = accepted
-    # Generated grid indices remain stable, including when the first legal
-    # candidate becomes the incumbent. The tuning driver uses candidates[0].
-    selection = document.get("selection", {})
-    count = selection.get("confirmation_candidates")
-    if type(count) is int and 1 <= count <= len(configs):
-        selection["confirmation_candidates"] = min(count, len(accepted))
 
 
 def validate(config):

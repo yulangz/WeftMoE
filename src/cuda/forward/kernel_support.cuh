@@ -78,21 +78,10 @@ void validate_external_cuda_range(const void *pointer,
         NotifyErrorCode::WorkspaceMismatch, "external-cuda-producer", field, 0,
         "device allocation on ordinal=" + std::to_string(expected_device),
         "wrong memory/device");
-  CUdeviceptr base = 0;
-  std::size_t allocation_bytes = 0;
-  if (cuMemGetAddressRange(&base, &allocation_bytes,
-                           reinterpret_cast<CUdeviceptr>(pointer)) !=
-      CUDA_SUCCESS)
-    transport_error(NotifyErrorCode::CudaFailure, "external-cuda-producer",
-                    field, 0, "queryable CUDA allocation",
-                    "cuMemGetAddressRange failure");
-  const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
-  const auto allocation_begin = static_cast<std::uintptr_t>(base);
-  if (begin < allocation_begin || begin - allocation_begin > allocation_bytes ||
-      capacity_bytes > allocation_bytes - (begin - allocation_begin))
+  if (!internal::mapped_device_range(pointer, capacity_bytes))
     transport_error(NotifyErrorCode::WorkspaceCapacityExceeded,
                     "external-cuda-producer", field, 0,
-                    "declared capacity within allocation", "short range");
+                    "declared capacity within mapped CUDA range", "short range");
 }
 
 std::size_t append(std::size_t &cursor, std::uint64_t count, std::size_t width,

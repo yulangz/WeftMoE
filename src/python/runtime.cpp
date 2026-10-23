@@ -97,6 +97,12 @@ public:
         !max_saved)
       throw std::invalid_argument(
           "invalid EP topology or saved-tensor capacity");
+    const auto shape = forward_shape();
+    if (hidden != shape.first || intermediate != shape.second)
+      throw std::invalid_argument(
+          "WeftMoE compiled shape is H" + std::to_string(shape.first) + "/I" +
+          std::to_string(shape.second) + "; requested H" + std::to_string(hidden) +
+          "/I" + std::to_string(intermediate) + ". Load a matching specialization.");
     const auto *ring_setting = std::getenv("WEFTMOE_STATIC_RING_TOKENS");
     const auto ring_tokens = tuning.contains("window_tokens")
                                  ? tuning["window_tokens"].cast<unsigned>()
@@ -183,7 +189,7 @@ public:
         training_ring && pool_.separates_forward_notify();
     notify_pool_ = make_device_notify_resource_pool(
         base_, execution_,
-        {config_, max_tokens, 8192, max_saved, 4, fused_inference_,
+        {config_, max_tokens, 0, max_saved, 4, fused_inference_,
          training_ring, deferred_training_notify_});
     elapsed("notify_pool");
 #if WEFTMOE_ENABLE_GIN_RDMA
@@ -308,9 +314,11 @@ public:
 
   std::shared_ptr<Tape> forward_async(py::object x, py::object routes,
                                      py::object gates, py::object w1,
-                                     py::object w2) {
+                                     py::object w2,
+                                     bool retain_backward_state = true) {
     reap_training();
-    auto tape = execute_forward(x, routes, gates, w1, w2, false);
+    auto tape = execute_forward(x, routes, gates, w1, w2, false, std::nullopt,
+                                retain_backward_state);
     pending_training_.push_back({tape->forward, {}});
     return tape;
   }
@@ -332,7 +340,8 @@ public:
   std::shared_ptr<Tape>
   execute_forward(py::object x, py::object routes, py::object gates,
                   py::object w1, py::object w2, bool synchronize,
-                  std::optional<unsigned> layer = std::nullopt) {
+                  std::optional<unsigned> layer = std::nullopt,
+                  bool retain_backward_state = true) {
     cudaStreamCaptureStatus status;
     if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
         status != cudaStreamCaptureStatusNone)
@@ -361,7 +370,8 @@ public:
         coordinator.run_device({config_, r, g, max_tokens_}).dispatch();
     BFloat16ActivationLease input;
     ForwardWeightLease weights;
-    ForwardMegaKernelConfig fc{hidden_, intermediate_, training_};
+    ForwardMegaKernelConfig fc{hidden_, intermediate_,
+                               training_ && retain_backward_state};
     input = producer.publish_activations(
         static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
         tokens, hidden_, owner(x));
@@ -382,7 +392,7 @@ public:
     tape->output = empty({tokens, hidden_}, "bfloat16");
     ForwardTensorBuffers buffers;
     buffers.output = binding(tape->output);
-    if (deferred_training_notify_) {
+    if (deferred_training_notify_ && fc.retain_backward_state) {
       fc.tensor_factory = [&] {
         return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers,
                                        allocator());
@@ -636,7 +646,7 @@ private:
     routes = import_selected_expert_routes(routes, context, execution_);
     gates = import_selected_expert_gates(gates, routes, context, execution_);
     bucket->notify_pool = make_device_notify_resource_pool(
-        base_, execution_, {config_, tokens, 8192, 1, 4, fused_inference_});
+        base_, execution_, {config_, tokens, 0, 1, 4, fused_inference_});
     CudaNotifyGenerationCoordinator coordinator(bucket->generation, execution_,
                                                 bucket->notify_pool);
     bucket->dispatch =
@@ -762,6 +772,7 @@ private:
 PYBIND11_MODULE(_runtime, m) {
   py::class_<NcclSession>(m, "Session");
   m.def("forward_tuning_id", &forward_tuning_id);
+  m.def("forward_shape", &forward_shape);
   m.def("bootstrap_id", [] {
     auto id = make_nccl_bootstrap_id();
     return py::bytes(reinterpret_cast<const char *>(id.bytes().data()),
@@ -807,7 +818,9 @@ PYBIND11_MODULE(_runtime, m) {
            py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("layer") = std::nullopt)
       .def("backward", &Runtime::backward)
-      .def("forward_async", &Runtime::forward_async)
+      .def("forward_async", &Runtime::forward_async, py::arg("x"),
+           py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
+           py::arg("retain_backward_state") = true)
       .def("backward_async", &Runtime::backward_async)
       .def("drain_training", &Runtime::drain_training)
       .def("graph_forward", &Runtime::graph_forward)

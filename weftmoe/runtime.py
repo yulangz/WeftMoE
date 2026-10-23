@@ -175,10 +175,12 @@ class TensorRuntime:
             raise RuntimeError("Backward must use the preparation stream")
         return self.native.backward(tape, dy.contiguous())
 
-    def forward_async(self, x, routes, gates, w1, w2):
-        """Enqueue FWD; stream-order workspace reuse and retain pending tensors."""
+    def forward_async(self, x, routes, gates, w1, w2, *, retain_backward_state=True):
+        """Enqueue FWD, optionally omitting X/AB for checkpoint's no-grad pass."""
         self._check(x, routes, gates, w1, w2)
-        return self.native.forward_async(x, routes, gates, w1, w2)
+        return self.native.forward_async(
+            x, routes, gates, w1, w2, retain_backward_state
+        )
 
     def backward_async(self, tape, dy):
         """Return stream-ordered gradients; reclaim completed calls without waiting."""

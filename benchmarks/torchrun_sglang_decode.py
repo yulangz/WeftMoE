@@ -30,9 +30,12 @@ import pynvml
 import torch
 import torch.distributed as dist
 import triton
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import weftmoe.sglang as adapter
 from weftmoe._sglang_kernels import scatter_output, stage_inputs
 from weftmoe.runtime import TensorRuntime
+from benchmarks.models import add_model_arguments, resolve_model
 
 
 def make_staged_forward(storage, kernel, tokens, rank, world, dp_attention):
@@ -131,10 +134,9 @@ def main():
         help="Bracket one warmed Weft graph for NCU application replay",
     )
     parser.add_argument("--samples", type=int, default=20)
-    parser.add_argument("--hidden", type=int, default=2048)
-    parser.add_argument("--intermediate", type=int, default=512)
-    parser.add_argument("--experts", type=int, default=256)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--replays", type=int, default=50,
+                        help="Graph replays per sample; reduce for long prefill buckets")
+    add_model_arguments(parser)
     parser.add_argument("--weft-backend", choices=("auto", "pf", "dt"), default="auto",
                         help="Use an explicit native profile and verify its captured kernel")
     parser.add_argument("--fresh-routes", action="store_true",
@@ -151,6 +153,7 @@ def main():
         help="Use DP=EP with distinct tokens per rank; --tokens is per DP rank",
     )
     args = parser.parse_args()
+    resolve_model(args)
     h, i, e, k = args.hidden, args.intermediate, args.experts, args.top_k
     if args.reference_check and not args.dp_attention:
         parser.error("--reference-check requires --dp-attention")
@@ -181,7 +184,7 @@ def main():
     # ServerArgs supplies distributed/MoE policy only. CLI dimensions and
     # synthetic weights below define the layer; no model is loaded here.
     server = ServerArgs(
-        model_path="/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B-Base",
+        model_path="dummy",
         tp_size=world,
         ep_size=world,
         dp_size=world if args.dp_attention else 1,
@@ -314,7 +317,8 @@ def main():
                 torch.cuda.synchronize()
             kernel_names = sorted({event.name for event in probe.events()
                                    if event.device_type == torch.autograd.DeviceType.CUDA})
-            expected = ("weftmoe_pf::local::kernel" if args.weft_backend == "pf"
+            locality = "local" if runtime.nodes == 1 else "network"
+            expected = (f"weftmoe_pf::{locality}::kernel" if args.weft_backend == "pf"
                         else "weftmoe_dt::kernel")
             assert any(expected in name for name in kernel_names), kernel_names
         samples = {name: [] for name in calls}
@@ -342,12 +346,12 @@ def main():
                 torch.cuda.synchronize()
                 before = pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
                 begin.record()
-                for _ in range(50):
+                for _ in range(args.replays):
                     graphs[name].replay()
                 end.record()
                 end.synchronize()
                 if iteration >= 5:
-                    samples[name].append(begin.elapsed_time(end) * 1000 / 50)
+                    samples[name].append(begin.elapsed_time(end) * 1000 / args.replays)
                     after = pynvml.nvmlDeviceGetClockInfo(card, pynvml.NVML_CLOCK_SM)
                     clocks.extend((before, after))
             current_errors = check_outputs(outputs, outputs["baseline"], args.atol)
@@ -355,7 +359,7 @@ def main():
                 for metric, value in metrics.items():
                     errors[name][metric] = max(errors[name][metric], value)
             if args.reference_check:
-                from benchmarks.torchrun_megamoe_prefill import reference
+                from benchmarks.torchrun_inference import reference
 
                 torch.backends.cuda.matmul.allow_tf32 = False
                 expected = reference(x.float(), topk.topk_ids, topk.topk_weights,
@@ -409,7 +413,7 @@ def main():
                             mega_buffer.num_max_tokens_per_rank
                             if mega_buffer is not None else None
                         ),
-                        "warmup": 5, "measured": args.samples, "replays": 50,
+                        "warmup": 5, "measured": args.samples, "replays": args.replays,
                         "rank_max_abs_vs_baseline": {
                             name: max(row[name]["max_abs"] for row in all_errors) for name in calls
                         },

@@ -96,7 +96,8 @@ std::shared_ptr<Allocation> allocate(std::uint64_t bytes, std::uint32_t device,
     const auto error =
         cudaMalloc(&result->data, std::max<std::uint64_t>(bytes, 128));
     if (error != cudaSuccess)
-      throw std::runtime_error(std::string("allocate tensor storage: ") +
+      throw std::runtime_error("allocate tensor storage (" +
+                               std::to_string(bytes) + " bytes): " +
                                cudaGetErrorString(error));
     internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
   }

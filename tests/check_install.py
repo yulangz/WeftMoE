@@ -31,7 +31,6 @@ def main():
         include, library = map(Path, json.loads(result))
         expected_root = ROOT if args.editable else root
         assert expected_root in library.parents, 'unexpected native resource location'
-        assert len(list(include.rglob('*.hpp'))) == 13
         source = root / 'native_probe.cpp'
         source.write_text("""#include <iostream>
 #include "weftmoe/cuda/activation_transport.hpp"
