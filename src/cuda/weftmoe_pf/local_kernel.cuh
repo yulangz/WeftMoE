@@ -17,7 +17,9 @@ contribution_output(const ForwardKernelArgs &a, unsigned source,
   auto row =
       std::uint64_t(route % top_k) * a.max_tokens_per_rank + route / top_k;
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
-  if (a.retain_backward_state)
+  if (a.retain_backward_state &&
+      (!forward_tuning::kLocalCompactReturnMaxTokens ||
+       a.ring.contribution_rows != nullptr))
     row = ring::peer(a, source, a.ring.contribution_rows)[route];
 #endif
   return peer_at<transport::BFloat16>(a.peer_bases[source],
@@ -71,6 +73,7 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
   const auto lane = threadIdx.x & 31U;
   const auto owned = a.dispatch.sizes.owned_expert_count;
   unsigned expert = 0U, begin = 0U, phase = 0U, peer_rows = 0U;
+  SourceRowCursor cursor(a);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
   for (unsigned linear = blockIdx.x * kPullWarps + warp;;
        linear += gridDim.x * kPullWarps) {
@@ -79,7 +82,7 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
     if (expert == owned)
       break;
     unsigned source, ordinal;
-    decode_source_row(a, expert, linear - begin, source, ordinal);
+    cursor.decode(expert, linear - begin, source, ordinal);
     if (lane == 0U) {
       const auto logical =
           unsigned(a.ring.expert_blocks[expert]) * kM + linear - begin;
@@ -172,7 +175,9 @@ __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
         auto row = slot * a.max_tokens_per_rank + token;
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
         if constexpr (!Network)
-          if (a.retain_backward_state)
+          if (a.retain_backward_state &&
+              (!forward_tuning::kLocalCompactReturnMaxTokens ||
+               a.ring.contribution_rows != nullptr))
             row = a.ring.contribution_rows[token * top_k + slot];
 #endif
         if constexpr (Network) {

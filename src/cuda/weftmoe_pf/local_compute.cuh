@@ -56,16 +56,21 @@ produce(const ForwardKernelArgs &a, Shared &s, const CUtensorMap &x_map,
     __syncwarp();
     const auto reduction =
         t.fc2 ? forward_tuning::kMainIntermediate : forward_tuning::kMainHidden;
-    const auto columns = t.fc2 ? forward_tuning::kMainHidden
-                               : 2U * forward_tuning::kMainIntermediate;
     for (unsigned k = 0; k < reduction; k += kK) {
       s.empty[stage].wait(phase ^ 1U);
       if (cute::elect_one_sync()) {
         hopper::tma_load<kK, kM, 128U>(t.fc2 ? &s_map : &x_map, &s.full[stage],
                                        s.a[stage], k, t.row, 2U);
-        hopper::tma_load<kK, kN, 128U>(t.fc2 ? &w2_map : &w1_map,
+        if (!t.fc2)
+          cute::SM90_TMA_LOAD_5D::copy(
+              &w1_map, reinterpret_cast<std::uint64_t *>(&s.full[stage]),
+              static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+              s.b[stage], k, 0, 0, t.column * (kN / 16U), t.expert);
+        else
+          hopper::tma_load<kK, kN, 128U>(&w2_map,
                                        &s.full[stage], s.b[stage], k,
-                                       t.expert * columns + t.column * kN);
+                                       t.expert * forward_tuning::kMainHidden +
+                                           t.column * kN);
         s.full[stage].arrive_and_expect_tx((kM + kN) * kK * 2U);
       }
       stage = stage + 1U == kStages ? 0U : stage + 1U;

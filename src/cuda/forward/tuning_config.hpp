@@ -288,6 +288,17 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH
 #define WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH 0
 #endif
+#ifndef WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS
+// Zero preserves the existing unbounded compact-return policy.
+#define WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS 0
+#endif
+inline constexpr std::uint64_t kLocalCompactReturnMaxTokens =
+    WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS;
+inline constexpr bool local_compact_return_capacity_supported(
+    std::uint64_t max_tokens_per_rank) {
+  return !kLocalCompactReturnMaxTokens ||
+         max_tokens_per_rank <= kLocalCompactReturnMaxTokens;
+}
 inline constexpr bool kLocalPrefillStreaming =
     WEFTMOE_FWD_LOCAL_PREFILL_STREAMING;
 inline constexpr bool kLocalPrefillFastMath =

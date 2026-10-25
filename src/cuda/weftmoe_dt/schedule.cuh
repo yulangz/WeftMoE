@@ -13,6 +13,23 @@ namespace weftmoe_dt {
 #ifndef WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER
 #define WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER 0
 #endif
+#ifndef WEFTMOE_DT_SLICE_SCHEDULE
+#define WEFTMOE_DT_SLICE_SCHEDULE 0
+#endif
+#ifndef WEFTMOE_FWD_LOCAL_DECODE_M64_MIN_ROWS
+#define WEFTMOE_FWD_LOCAL_DECODE_M64_MIN_ROWS 16
+#endif
+#ifndef WEFTMOE_FWD_LOCAL_DECODE_NARROW_CTA_MULTIPLIER
+#define WEFTMOE_FWD_LOCAL_DECODE_NARROW_CTA_MULTIPLIER 0
+#endif
+// Bit 0 enables M16 slices, bit 1 enables M64 slices. The row storage and
+// readiness directory stay M128; only the deterministic compute raster changes.
+constexpr unsigned kSliceScheduleMask = WEFTMOE_DT_SLICE_SCHEDULE;
+static_assert(kSliceScheduleMask <= 3U);
+template <unsigned M>
+inline constexpr bool kSliceSchedule =
+    (kSliceScheduleMask & (M == 16U ? 1U : 2U)) != 0U;
+
 // Keep production selection unchanged; diagnostic builds can compare larger
 // batches provided the complete invocation still fits a single source window.
 #ifndef WEFTMOE_DT_MAX_TOKENS
@@ -22,6 +39,11 @@ constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U;
 constexpr unsigned kStages = WEFTMOE_FWD_LOCAL_DECODE_STAGES;
 constexpr unsigned kSelectedM = WEFTMOE_FWD_LOCAL_DECODE_M;
 constexpr unsigned kCtaMultiplier = WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER;
+constexpr unsigned kM64MinRows = WEFTMOE_FWD_LOCAL_DECODE_M64_MIN_ROWS;
+constexpr unsigned kNarrowCtaMultiplier =
+    WEFTMOE_FWD_LOCAL_DECODE_NARROW_CTA_MULTIPLIER;
+static_assert(kM64MinRows > 0U);
+static_assert(kNarrowCtaMultiplier <= 3U);
 static_assert(kSelectedM == 0U || kSelectedM == 16U || kSelectedM == 64U);
 static_assert(kStages == 2U || kStages == 3U);
 static_assert(kCtaMultiplier <= 3U);
@@ -66,12 +88,17 @@ template <unsigned M> struct Shared {
   Barrier full[kStages], empty[kStages], pull_full[3];
 
   // The variable-size tail first holds one source count per global expert.
-  // After the source-ready barrier it holds local row counts and block offsets.
+  // After the source-ready barrier it holds local row counts, physical block
+  // offsets, and (when enabled) compute-slice offsets. Slices share the same
+  // physical input directory and completion counters as the M128 schedule.
   __device__ __forceinline__ unsigned *rows() {
     return reinterpret_cast<unsigned *>(this + 1);
   }
   __device__ __forceinline__ unsigned *blocks(unsigned owned) {
     return rows() + owned;
+  }
+  __device__ __forceinline__ unsigned *slices(unsigned owned) {
+    return rows() + 2U * owned + 1U;
   }
 };
 static_assert(sizeof(Shared<16U>) <= 76U * 1024U);
@@ -80,7 +107,9 @@ static_assert(sizeof(Shared<64U>) <= 112U * 1024U);
 template <unsigned M>
 std::size_t shared_bytes(unsigned experts, unsigned owned) {
   return sizeof(Shared<M>) +
-         sizeof(unsigned) * std::max<std::size_t>(experts, 2ULL * owned + 1U);
+         sizeof(unsigned) * std::max<std::size_t>(
+             experts, kSliceSchedule<M> ? 3ULL * owned + 2U
+                                       : 2ULL * owned + 1U);
 }
 
 __device__ __forceinline__ BlockState *states(const ForwardKernelArgs &a) {
@@ -92,6 +121,23 @@ struct Task {
   bool fc2;
 };
 
+template <unsigned M>
+__device__ __forceinline__ unsigned compute_units(Shared<M> &s,
+                                                 unsigned owned) {
+  if constexpr (kSliceSchedule<M>)
+    return s.slices(owned)[owned];
+  return s.blocks(owned)[owned];
+}
+
+template <unsigned M>
+__device__ __forceinline__ unsigned ready_rows(Shared<M> &s, unsigned owned,
+                                              const Task &t) {
+  if constexpr (kSliceSchedule<M>)
+    return min(kBlockM, s.rows()[t.expert] -
+                           (t.block - s.blocks(owned)[t.expert]) * kBlockM);
+  return t.rows;
+}
+
 // Producer and math independently replay this immutable grid-stride sequence.
 // FC1 residues continue into FC2. TMA stages and credits are CTA-local: each
 // full barrier publishes A/B; one math-group arrival releases both operands.
@@ -99,11 +145,21 @@ template <unsigned M>
 __device__ __forceinline__ Task task(Shared<M> &s, unsigned owned,
                                      unsigned index) {
   const auto *blocks = s.blocks(owned);
-  const auto fc1 = blocks[owned] * kFc1Tiles;
+  const auto fc1 = compute_units(s, owned) * kFc1Tiles;
   const bool fc2 = index >= fc1;
   const auto linear = fc2 ? index - fc1 : index;
   const auto columns = fc2 ? kFc2Tiles : kFc1Tiles;
   const auto block = linear / columns;
+  if constexpr (kSliceSchedule<M>) {
+    const auto *slices = s.slices(owned);
+    unsigned expert = 0U;
+    while (slices[expert + 1U] <= block)
+      ++expert;
+    const auto offset = (block - slices[expert]) * M;
+    return {expert, blocks[expert] + offset / kBlockM, linear % columns,
+            min(M, s.rows()[expert] - offset),
+            blocks[expert] * kBlockM + offset, fc2};
+  }
   unsigned expert = 0U;
   while (blocks[expert + 1U] <= block)
     ++expert;

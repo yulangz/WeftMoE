@@ -25,7 +25,8 @@ __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
   const auto chunks =
       (routes + kTrainingCountChunkRoutes - 1U) / kTrainingCountChunkRoutes;
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
-  if (!a.use_gin) {
+  if (!a.use_gin && (!forward_tuning::kLocalCompactReturnMaxTokens ||
+                     a.ring.contribution_rows != nullptr)) {
     const auto *counts =
         a.dispatch.source_expert_count + std::uint64_t(a.rank) * experts;
     for (unsigned expert = threadIdx.x; expert < experts; expert += Threads) {
@@ -95,7 +96,8 @@ __device__ __noinline__ void build_training_rows(const ForwardKernelArgs &a,
       const auto expert = unsigned(a.selected_experts[route]);
       const auto ordinal = shared.keys[within];
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
-      if (!a.use_gin)
+      if (!a.use_gin && (!forward_tuning::kLocalCompactReturnMaxTokens ||
+                         a.ring.contribution_rows != nullptr))
         a.ring.contribution_rows[route] = order_base[expert] + ordinal;
 #endif
       const auto row = a.checkpoint.counts.expert_source_base[expert] + ordinal;

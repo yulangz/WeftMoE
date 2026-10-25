@@ -179,6 +179,10 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
       words[layout.completed_dw1_tiles] = words[layout.completed_dw2_tiles] =
           0ULL;
       words[layout.completed_dx_tiles] = 0ULL;
+#if WEFTMOE_PF_BWD_DYNAMIC_DW
+      // This preparation launch precedes every backward execution on stream.
+      words[layout.dw2_head] = 0ULL;
+#endif
       backward_pipeline_detail::initialize_status(a);
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
       auto *status =

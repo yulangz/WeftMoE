@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cuda/weftmoe_pf/source_row_decoder.cuh"
+
 namespace weftmoe_pf {
 
 // The source owns one disjoint directory plane on each destination. These
@@ -106,49 +108,5 @@ __device__ __forceinline__ void build_geometry(const ForwardKernelArgs &a) {
   grid_sync<BaseThread, Threads>(a);
 }
 
-// Return the source and source-local ordinal of an expert's interleaved row.
-// Lanes stripe the rank domain, so this remains valid beyond one warp of ranks.
-__device__ __forceinline__ void
-decode_source_row(const ForwardKernelArgs &a, unsigned expert,
-                  std::uint64_t row, unsigned &source, unsigned &source_slot) {
-  const auto lane = threadIdx.x & 31U;
-  const auto owned = a.dispatch.sizes.owned_expert_count;
-  unsigned peeled = 0U;
-  auto slot = static_cast<unsigned>(row);
-  while (true) {
-    unsigned active = 0U, layer = ~0U;
-    for (unsigned rank = lane; rank < a.world; rank += 32U) {
-      const auto count =
-          a.fused_local_expert_count[std::uint64_t(rank) * owned + expert];
-      if (count > peeled) {
-        ++active;
-        layer = min(layer, static_cast<unsigned>(count) - peeled);
-      }
-    }
-    active = __reduce_add_sync(0xffffffffU, active);
-    layer = __reduce_min_sync(0xffffffffU, layer);
-    const auto rectangle = std::uint64_t(active) * layer;
-    if (slot < rectangle) {
-      auto ordinal = slot % active;
-      source_slot = peeled + slot / active;
-      for (unsigned base = 0; base < a.world; base += 32U) {
-        const auto rank = base + lane;
-        const bool present =
-            rank < a.world &&
-            a.fused_local_expert_count[std::uint64_t(rank) * owned + expert] >
-                peeled;
-        const auto mask = __ballot_sync(0xffffffffU, present);
-        const auto count = __popc(mask);
-        if (ordinal < count) {
-          source = base + __fns(mask, 0U, ordinal + 1U);
-          return;
-        }
-        ordinal -= count;
-      }
-    }
-    slot -= static_cast<unsigned>(rectangle);
-    peeled += layer;
-  }
-}
 
 } // namespace weftmoe_pf

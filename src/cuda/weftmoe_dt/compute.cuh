@@ -11,27 +11,36 @@ produce(const ForwardKernelArgs &a, Shared<M> &s, const CUtensorMap &x_map,
         const CUtensorMap &s_map, const CUtensorMap &w1_map,
         const CUtensorMap &w2_map) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto tasks = s.blocks(owned)[owned] * (kFc1Tiles + kFc2Tiles);
+  const auto tasks = compute_units(s, owned) * (kFc1Tiles + kFc2Tiles);
   unsigned stage = 0U, phase = 0U;
   for (unsigned index = blockIdx.x; index < tasks; index += gridDim.x) {
     const auto block = task(s, owned, index);
     const auto *ready = block.fc2 ? &states(a)[block.block].s_ready
                                   : &states(a)[block.block].x_ready;
-    const auto target =
-        block.fc2 ? ((block.rows + M - 1U) / M) * kFc1Tiles : block.rows;
+    // Each x_ready counts unordered arrivals for a whole physical M128 block.
+    // Every FC2 slice must observe completion of all FC1 slices in that block.
+    const auto physical_rows = ready_rows(s, owned, block);
+    const auto target = block.fc2
+                            ? ((physical_rows + M - 1U) / M) * kFc1Tiles
+                            : physical_rows;
     const auto reduction = block.fc2 ? forward_tuning::kMainIntermediate
                                      : forward_tuning::kMainHidden;
-    const auto columns = block.fc2 ? forward_tuning::kMainHidden
-                                   : 2U * forward_tuning::kMainIntermediate;
     for (unsigned offset = 0U; offset < block.rows; offset += M) {
       const auto t = slice<M>(block, offset);
       for (unsigned k = 0U; k < reduction; k += kK) {
         s.empty[stage].wait(phase ^ 1U);
         if (cute::elect_one_sync()) {
           s.full[stage].expect_transaction((M + kN) * kK * 2U);
-          hopper::tma_load<kK, kN, 128U>(t.fc2 ? &w2_map : &w1_map,
+          if (!t.fc2)
+            cute::SM90_TMA_LOAD_5D::copy(
+                &w1_map, reinterpret_cast<std::uint64_t *>(&s.full[stage]),
+                static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                s.b[stage], k, 0, 0, t.column * (kN / 16U), t.expert);
+          else
+            hopper::tma_load<kK, kN, 128U>(&w2_map,
                                          &s.full[stage], s.b[stage], k,
-                                         t.expert * columns + t.column * kN);
+                                         t.expert * forward_tuning::kMainHidden +
+                                             t.column * kN);
           if (offset == 0U && k == 0U)
             while (weftmoe_pf::load_acquire_device(ready) != target) {
             }
@@ -116,8 +125,8 @@ template <unsigned M>
 __device__ __forceinline__ void compute(const ForwardKernelArgs &a,
                                         Shared<M> &s) {
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto fc1_tasks = s.blocks(owned)[owned] * kFc1Tiles;
-  const auto tasks = s.blocks(owned)[owned] * (kFc1Tiles + kFc2Tiles);
+  const auto fc1_tasks = compute_units(s, owned) * kFc1Tiles;
+  const auto tasks = compute_units(s, owned) * (kFc1Tiles + kFc2Tiles);
   const auto lane = threadIdx.x % 32U;
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
   unsigned stage = 0U, phase = 0U;
@@ -125,8 +134,12 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a,
     const auto block = task(s, owned, index);
     const auto *ready = block.fc2 ? &states(a)[block.block].s_ready
                                   : &states(a)[block.block].x_ready;
-    const auto target =
-        block.fc2 ? ((block.rows + M - 1U) / M) * kFc1Tiles : block.rows;
+    // Each x_ready counts unordered arrivals for a whole physical M128 block.
+    // Every FC2 slice must observe completion of all FC1 slices in that block.
+    const auto physical_rows = ready_rows(s, owned, block);
+    const auto target = block.fc2
+                            ? ((physical_rows + M - 1U) / M) * kFc1Tiles
+                            : physical_rows;
     while (weftmoe_pf::load_acquire_device(ready) != target) {
     }
     // Phase extrema need only this CTA's first/last task, not a contended
@@ -211,7 +224,10 @@ __device__ __forceinline__ void compute(const ForwardKernelArgs &a,
       if (t.fc2) {
         if (threadIdx.x == 0U && first && offset == 0U)
           atomicMin(&status->relay_blocks_done, device_globaltimer_ns());
-        store_fc2(a, s, t, accum, offset);
+        store_fc2(a, s, t, accum,
+                  offset + (kSliceSchedule<M>
+                                ? block.row - block.block * kBlockM
+                                : 0U));
       } else {
         store_fc1<M>(a, t, accum);
       }

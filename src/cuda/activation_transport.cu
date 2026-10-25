@@ -597,10 +597,9 @@ struct ForwardWeightLease::Impl {
   CUtensorMap backward_w2_map{};
 
   void initialize_decode_maps() {
-    decode_w1_map = make_bf16_tma_map(
-        const_cast<transport::BFloat16 *>(w1_interleaved), hidden,
-        owned_experts * 2ULL * intermediate, weftmoe_dt::kN,
-        "decode interleaved W1", weftmoe_dt::kK);
+    decode_w1_map = make_packed_w1_tma_map(
+        const_cast<transport::BFloat16 *>(w1), hidden, intermediate,
+        owned_experts, weftmoe_dt::kN, weftmoe_dt::kK, "decode packed TMA W1");
     decode_w2_map = make_bf16_tma_map(
         const_cast<transport::BFloat16 *>(w2), intermediate,
         owned_experts * hidden, weftmoe_dt::kN, "decode W2", weftmoe_dt::kK);
@@ -965,10 +964,9 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
         forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
-    impl->w1_interleaved_map = make_bf16_tma_map(
-        impl->allocation->w1_interleaved, hidden_size,
-        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        forward_tuning::kFc1TileN, "interleaved W1", forward_tuning::kTileK);
+    impl->w1_interleaved_map = make_packed_w1_tma_map(
+        impl->allocation->w1, hidden_size, intermediate_size, owned_experts,
+        forward_tuning::kFc1TileN, forward_tuning::kTileK, "packed TMA W1");
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
@@ -1067,15 +1065,6 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
       state_->backend->context.session().generation(),
       ExchangeKind::ExpertCounts, "cudaEventCreate(weight ready)");
   internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
-  interleave_forward_w1_kernel<<<4096, 256, 0, state_->backend->stream>>>(
-      w1, static_cast<transport::BFloat16 *>(allocation->w1_interleaved),
-      w1_elements, hidden_size, intermediate_size);
-  internal::throw_cuda("external-weight-publish", cudaGetLastError(),
-                       state_->backend->context.calling_rank(),
-                       state_->backend->context.session().world_size(),
-                       state_->backend->context.session().identity(),
-                       state_->backend->context.session().generation(),
-                       ExchangeKind::ExpertCounts, "interleave W1");
   internal::throw_cuda(
       "external-weight-publish",
       internal::record_input_ready(allocation->ready, state_->backend->stream,
@@ -1105,10 +1094,9 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
         impl->allocation->w1, hidden_size,
         static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
         forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
-    impl->w1_interleaved_map = make_bf16_tma_map(
-        impl->allocation->w1_interleaved, hidden_size,
-        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        forward_tuning::kFc1TileN, "interleaved W1", forward_tuning::kTileK);
+    impl->w1_interleaved_map = make_packed_w1_tma_map(
+        impl->allocation->w1, hidden_size, intermediate_size, owned_experts,
+        forward_tuning::kFc1TileN, forward_tuning::kTileK, "packed TMA W1");
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
@@ -4826,7 +4814,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       args.checkpoint.rows = at<std::uint64_t>(slot.device, l.tape_rows);
     if (use_gin
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
-        || training_ring
+        || (training_ring &&
+            forward_tuning::local_compact_return_capacity_supported(
+                state->config.max_tokens_per_rank))
 #endif
     )
       r.contribution_rows = at<std::uint32_t>(slot.device, l.contribution_rows);
@@ -5008,7 +4998,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
       decode &&
       (weftmoe_dt::kSelectedM == 64U ||
        (weftmoe_dt::kSelectedM == 0U &&
-        id.num_tokens * id.world_size * id.top_k >= id.num_experts * 16ULL));
+        id.num_tokens * id.world_size * id.top_k >=
+            id.num_experts * std::uint64_t(weftmoe_dt::kM64MinRows)));
   const auto decode_kernel =
       wide_decode ? weftmoe_dt::kernel<64U> : weftmoe_dt::kernel<16U>;
   auto threads =
@@ -5020,9 +5011,15 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     // set should not pay the grid collective cost of mostly idle CTAs.
     const auto expert_tiles = view.sizes.owned_expert_count *
                               (weftmoe_dt::kFc1Tiles + weftmoe_dt::kFc2Tiles);
-    forward_main_compute_ctas *=
+    // A global override wins; otherwise the narrow-only override leaves the
+    // M64 grid and the default sub-four-token launch unchanged.
+    const auto decode_multiplier =
         weftmoe_dt::kCtaMultiplier
             ? weftmoe_dt::kCtaMultiplier
+            : (!wide_decode ? weftmoe_dt::kNarrowCtaMultiplier : 0U);
+    forward_main_compute_ctas *=
+        decode_multiplier
+            ? decode_multiplier
             : std::clamp(expert_tiles / forward_main_compute_ctas, 1U,
                          wide_decode ? 2U : 3U);
     args.forward_compute_cta_count = forward_main_compute_ctas;

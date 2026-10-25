@@ -128,6 +128,41 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   return map;
 }
 
+// Describe original [expert, gate/up, channel, hidden] storage in the order
+// consumed by GMMA: [expert, channel/8, gate/up, channel%8, hidden].
+CUtensorMap make_packed_w1_tma_map(void *base, std::uint64_t hidden,
+                                  std::uint64_t intermediate,
+                                  std::uint32_t experts, std::uint32_t tile_n,
+                                  std::uint32_t tile_k, const char *field) {
+  if (!base || !hidden || !intermediate || !experts || !tile_n || !tile_k ||
+      hidden > UINT32_MAX || intermediate > UINT32_MAX ||
+      intermediate % 8U || tile_n % 16U)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
+                    field, 0, "valid packed gate/up dimensions", "invalid");
+  CUtensorMap map{};
+  const auto row_bytes = checked_mul(hidden, 2ULL, field);
+  const auto projection_bytes = checked_mul(intermediate, row_bytes, field);
+  const cuuint64_t dims[5] = {hidden, 8U, 2U, intermediate / 8U, experts};
+  const cuuint64_t strides[4] = {
+      row_bytes, projection_bytes, checked_mul(8U, row_bytes, field),
+      checked_mul(2U, projection_bytes, field)};
+  const cuuint32_t box[5] = {tile_k, 8U, 2U, tile_n / 16U, 1U};
+  const cuuint32_t element_strides[5] = {1U, 1U, 1U, 1U, 1U};
+  const auto result = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, base, dims, strides, box,
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    const char *text = nullptr;
+    (void)cuGetErrorString(result, &text);
+    transport_error(NotifyErrorCode::CudaFailure, "forward-tma-map", field, 0,
+                    "cuTensorMapEncodeTiled success",
+                    text ? text : "unknown CUDA driver error");
+  }
+  return map;
+}
+
 CUtensorMap make_bf16_tma_store_map(void *base, std::uint64_t inner,
                                     std::uint64_t outer, const char *field,
                                     std::uint64_t row_stride_bytes = 0ULL,
@@ -1052,7 +1087,9 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                sizeof(std::uint64_t), "contribution route generations");
     if (config.max_nodes > 1U
 #if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
-        || config.enable_backward_state
+        || (config.enable_backward_state &&
+            forward_tuning::local_compact_return_capacity_supported(
+                config.max_tokens_per_rank))
 #endif
     )
       ring.contribution_rows =

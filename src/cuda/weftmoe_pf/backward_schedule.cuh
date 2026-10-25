@@ -1,7 +1,13 @@
 #pragma once
 
+#ifndef WEFTMOE_PF_BWD_DYNAMIC_DW
+#define WEFTMOE_PF_BWD_DYNAMIC_DW 0
+#endif
+
 namespace weftmoe_pf::backward {
-// Fixed dW chunks rotate across clusters after all activation work drains.
+// After activation drains, clusters process disjoint dW chunks. Dynamic
+// claiming balances experts with different reduction lengths; the default
+// retains the static round-robin schedule.
 struct Schedule {
   unsigned weight_partition;
 
@@ -19,9 +25,26 @@ struct Schedule {
     constexpr auto chunks2 = (kDw2Pairs + claim2 - 1U) / claim2;
     constexpr auto chunks1 = (kDw1Pairs + claim1 - 1U) / claim1;
     const auto experts = a.dispatch.sizes.owned_expert_count;
+#if WEFTMOE_PF_BWD_DYNAMIC_DW
+    while (true) {
+      // Reuse the scheduler's cache-line-padded dW2 head for both dW domains.
+      // Only the cluster leader claims; existing cluster joins publish the
+      // selected task to its peer. prepare_kernel resets the head each call.
+      const auto layout = pipeline::backward::make_backward_scheduler_layout(
+          a.scheduler_mblock_capacity,
+          backward_tuning::kMainHidden / backward_tuning::kDxTileN / 2U,
+          a.scheduler_expert_capacity);
+      auto *words = scheduler_words(a);
+      const auto index = static_cast<unsigned>(atomicAdd(
+          reinterpret_cast<unsigned long long *>(words + layout.dw2_head),
+          1ULL));
+      if (index >= experts * (chunks2 + chunks1))
+        return false;
+#else
     while (weight_partition < experts * (chunks2 + chunks1)) {
       const auto index = weight_partition;
       weight_partition += clusters;
+#endif
       const bool first = index < experts * chunks2;
       const auto claim = first ? claim2 : claim1;
       const auto chunks = first ? chunks2 : chunks1;

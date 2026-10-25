@@ -17,7 +17,7 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a,
   if (lane < a.world)
     error = weftmoe_pf::ring::peer(a, lane, a.ring.source_header)->error != 0U;
   error = __any_sync(0xffffffffU, error);
-  unsigned total_rows = 0U, total_blocks = 0U;
+  unsigned total_rows = 0U, total_blocks = 0U, total_slices = 0U;
   for (unsigned base = 0U; base < owned; base += 32U) {
     const auto expert = base + lane;
     unsigned rows = 0U;
@@ -31,11 +31,21 @@ __device__ __forceinline__ void geometry(const ForwardKernelArgs &a,
       s.rows()[expert] = rows;
       s.blocks(owned)[expert] = total_blocks + prefix - blocks;
     }
+    if constexpr (kSliceSchedule<M>) {
+      const auto slices = (rows + M - 1U) / M;
+      const auto slice_prefix = static_forward::warp_inclusive_sum(slices);
+      if (expert < owned)
+        s.slices(owned)[expert] = total_slices + slice_prefix - slices;
+      total_slices += __shfl_sync(0xffffffffU, slice_prefix, 31U);
+    }
     total_rows += __reduce_add_sync(0xffffffffU, rows);
     total_blocks += __shfl_sync(0xffffffffU, prefix, 31U);
   }
-  if (lane == 31U)
+  if (lane == 31U) {
     s.blocks(owned)[owned] = total_blocks;
+    if constexpr (kSliceSchedule<M>)
+      s.slices(owned)[owned] = total_slices;
+  }
   if (blockIdx.x == 0U && lane == 0U) {
     auto *status =
         peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -221,8 +231,8 @@ __global__ __launch_bounds__(kThreads, M == 16U ? 3 : 2) void kernel(
     if (blockIdx.x == 0U && threadIdx.x == kMathThreads) {
       const auto owned = a.dispatch.sizes.owned_expert_count;
       const auto blocks = s.blocks(owned)[owned];
-      status->fc1_tasks_done = blocks * kFc1Tiles;
-      status->fc2_tasks_done = blocks * kFc2Tiles;
+      status->fc1_tasks_done = compute_units(s, owned) * kFc1Tiles;
+      status->fc2_tasks_done = compute_units(s, owned) * kFc2Tiles;
       status->actual_return_peer_bytes = status->actual_dispatch_peer_bytes;
       if (!blocks) {
         status->fc1_start_clock = status->route_exchange_complete_clock;
