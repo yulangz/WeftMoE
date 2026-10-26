@@ -58,7 +58,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--edge-cases", action="store_true")
     parser.add_argument("--decode", action="store_true",
-                        help="Use short capacity and check bitwise batch invariance")
+                        help="Select DT explicitly and check batch invariance")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=300))
@@ -76,8 +76,6 @@ def main():
     w1 = all_w1.chunk(world)[rank].contiguous()
     w2 = all_w2.chunk(world)[rank].contiguous()
     generator.manual_seed(900 + rank)
-    if args.decode and max(args.tokens) > 64:
-        parser.error("--decode requires --tokens <=64")
     max_tokens = max(*args.tokens, 257 if args.edge_cases and not args.decode else 1)
     edge_tokens = min(257, max_tokens)
     max_rows = max(2 * max_tokens * args.top_k + (args.experts // world) * 128,
@@ -87,6 +85,7 @@ def main():
         hidden=hidden, intermediate=intermediate, max_tokens=max_tokens,
         max_rows=max_rows,
         training=False,
+        decode_only=args.decode,
     )
 
     def inputs(tokens, skew=False):
@@ -196,8 +195,21 @@ def main():
             assert torch.equal(actual, expected), f"not batch invariant: {label}"
             check(actual, expected, label)
 
+        def selected_inference(selected_runtime, entry):
+            with torch.profiler.profile(activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]) as probe:
+                output = selected_runtime.inference_eager(
+                    x, routes, gates, w1, w2).clone()
+                torch.cuda.synchronize()
+            kernels = [event.name for event in probe.events()
+                       if event.device_type == torch.autograd.DeviceType.CUDA]
+            assert any(entry in name for name in kernels), kernels
+            return output
+
         x, routes, gates = inputs(max_tokens)
-        baseline = runtime.inference_eager(x, routes, gates, w1, w2).clone()
+        baseline = selected_inference(runtime, "weftmoe_dt::kernel")
         for tokens in sorted({1, min(7, max_tokens), min(32, max_tokens), max_tokens}):
             exact(runtime.inference_eager(x[:tokens], routes[:tokens], gates[:tokens],
                                           w1, w2), baseline[:tokens],
@@ -222,16 +234,18 @@ def main():
         exact(runtime.inference_eager(x, hot_routes, gates, w1, w2)[:1],
               hot_baseline, "batch-invariant-hot-expert")
 
-        # A large-capacity pool selects the unchanged general V4 kernel even
-        # for these short actual inputs. The numerical contract is shared.
+        # An ordinary pool selects PF even for short actual inputs.
+        # PF and DT have distinct arithmetic paths: require numerical parity
+        # across backends, while retaining bitwise DT batch checks above.
         general = TensorRuntime(
             group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
-            hidden=hidden, intermediate=intermediate, max_tokens=512,
-            max_rows=world * 512 * args.top_k + (args.experts // world) * 128,
+            hidden=hidden, intermediate=intermediate, max_tokens=max_tokens,
+            max_rows=world * max_tokens * args.top_k + (args.experts // world) * 128,
             training=False,
         )
-        exact(general.inference_eager(x, routes, gates, w1, w2), baseline,
-              "decode-general-bitwise-parity")
+        actual = selected_inference(general, "weftmoe_pf::local::kernel")
+        check(actual, reference(x, routes, gates, all_w1, all_w2), "pf-reference")
+        check(actual, baseline, "decode-pf-numerical-parity")
         general.close()
     runtime.close()
     dist.destroy_process_group()

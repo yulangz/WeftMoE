@@ -30,11 +30,6 @@ template <unsigned M>
 inline constexpr bool kSliceSchedule =
     (kSliceScheduleMask & (M == 16U ? 1U : 2U)) != 0U;
 
-// Keep production selection unchanged; diagnostic builds can compare larger
-// batches provided the complete invocation still fits a single source window.
-#ifndef WEFTMOE_DT_MAX_TOKENS
-#define WEFTMOE_DT_MAX_TOKENS 64
-#endif
 constexpr unsigned kBlockM = 128U, kM = 16U, kN = 128U, kK = 64U;
 constexpr unsigned kStages = WEFTMOE_FWD_LOCAL_DECODE_STAGES;
 constexpr unsigned kSelectedM = WEFTMOE_FWD_LOCAL_DECODE_M;
@@ -55,19 +50,17 @@ constexpr unsigned kWarpN = kN / (kMathThreads / 32U);
 using WarpMma = cute::SM80_16x8x16_F32BF16BF16F32_TN;
 using GroupMma = hopper::BF16Mma<kN>;
 
-// Selection uses collective capacity, never one source's actual batch size.
-// One window covers even the all-to-one-expert case. Explicit decode pools
-// cover the server's decode capacity; legacy DT profiles retain their limit.
+// DT is selected only by an explicit, collectively agreed decode pool.
+// Its complete capacity must fit one window, including all-to-one routing;
+// neither a small actual batch nor a PF profile implicitly selects DT.
 inline bool eligible(const ActivationTransportPoolConfig &config,
                      const static_forward::ComputeRingLayout &ring) {
-  return (config.decode_only || forward_tuning::kStaticV4PrefillEnabled) &&
+  return config.decode_only &&
          forward_tuning::kClusterSize == 2U &&
          forward_tuning::kTileM == kBlockM && forward_tuning::kTileK == kK &&
          config.max_hidden_size == forward_tuning::kMainHidden &&
          config.max_intermediate_size == forward_tuning::kMainIntermediate &&
          config.max_nodes == 1U && !config.enable_backward_state &&
-         (config.decode_only ||
-          config.max_tokens_per_rank <= WEFTMOE_DT_MAX_TOKENS) &&
          ring.depth && ring.max_windows == 1U && config.max_world_size <= 32U;
 }
 
