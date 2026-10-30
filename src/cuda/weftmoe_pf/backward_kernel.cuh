@@ -20,6 +20,9 @@ constexpr unsigned kDxTiles = backward_tuning::kMainHidden / kDxN;
 #ifndef WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
 #define WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS 128
 #endif
+#ifndef WEFTMOE_FP8_BWD_WAVE_BLOCKS
+#define WEFTMOE_FP8_BWD_WAVE_BLOCKS 0
+#endif
 constexpr unsigned kNetworkMathRegisters =
     WEFTMOE_PF_BWD_NETWORK_MATH_REGISTERS;
 // The CTA initially owns 384 * 168 registers, not the entire 64K SM file.
@@ -48,43 +51,67 @@ constexpr auto kDwBytes = backward_compute_detail::dynamic_shared_bytes<
 constexpr auto kSharedBytes = sizeof(Shared) > kDwBytes ? sizeof(Shared)
                                                         : kDwBytes;
 
+constexpr auto kFP8ScaleBytes = kStages * (kM + kN) * sizeof(float);
+// FP8 Wgrad has its own smaller pipeline; reserving the BF16 arena here
+// wastes enough SMEM to prevent the concurrent GIN workers from launching.
+constexpr auto kFP8BaseSharedBytes = backward_weights::kFP8PipelineBytes > sizeof(Shared) + kFP8ScaleBytes
+    ? backward_weights::kFP8PipelineBytes : sizeof(Shared) + kFP8ScaleBytes;
+constexpr auto kFP8SharedBytes = kFP8BaseSharedBytes +
+    (WEFTMOE_FP8_STREAMED_WGRAD ? 128U * 132U : 0U);
+__device__ __forceinline__ float *fp8_scales(Shared &s, unsigned stage) {
+  return reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(&s) + sizeof(Shared)) + stage * (kM + kN);
+}
+
 enum class Phase : unsigned { Du, Swiglu, Dx };
 struct Task {
   unsigned expert, block, column, rows, row, generation;
   Phase phase;
 };
 
+
+template <bool FP8 = false>
 struct Schedule {
   const ForwardKernelArgs &a;
-  unsigned expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
+  unsigned expert = 0U, wave_expert = 0U, begin = 0U, end = 0U, index = blockIdx.x;
+  const unsigned swiglu_tiles, wave_blocks;
 
-  __device__ Schedule(const ForwardKernelArgs &args, const BackwardKernelArgs &)
-      : a(args) {}
+  __device__ Schedule(const ForwardKernelArgs &args, const BackwardKernelArgs &b)
+      : a(args), swiglu_tiles(b.fp8_x_data ? unsigned(b.intermediate / 128U) : 2U),
+        // Streamed SwiGLU adds feature tasks. Shorter waves reduce the Du/Dx
+        // critical path for larger workloads; keep small workloads together.
+        wave_blocks(b.fp8_x_data && args.ring.state->blocks > WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS
+            ? (WEFTMOE_FP8_BWD_WAVE_BLOCKS ? unsigned(WEFTMOE_FP8_BWD_WAVE_BLOCKS)
+                : max(1U, 128U / kDuTiles))
+            : unsigned(WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS)) {}
 
   __device__ __forceinline__ bool next(Task &t) {
     const auto all_blocks = unsigned(a.ring.state->blocks);
     while (begin < all_blocks) {
-      if (end == begin)
+      if (end == begin) {
         end = min(all_blocks,
-                  begin + min(a.ring.depth,
-                              unsigned(WEFTMOE_PF_BWD_LOCAL_WAVE_BLOCKS)));
+                  begin + min(a.ring.depth, wave_blocks));
+        // Du, SwiGLU and Dx revisit this wave. Keep its first expert so a
+        // phase change never scans the entire expert directory from zero.
+        if constexpr (FP8)
+          while (begin >= a.ring.expert_blocks[wave_expert + 1U])
+            ++wave_expert;
+      }
       const auto blocks = end - begin;
       const auto du = blocks * kDuTiles;
-      const auto epilogue = blocks * 2U;
+      const auto epilogue = blocks * swiglu_tiles;
       const auto total = du + epilogue + blocks * kDxTiles;
       if (index < total) {
-        const auto phase = index < du              ? Phase::Du
-                           : index < du + epilogue ? Phase::Swiglu
-                                                   : Phase::Dx;
-        const auto linear = index - (phase == Phase::Du       ? 0U
+        const auto phase = index < du ? Phase::Du
+                           : index < du + epilogue ? Phase::Swiglu : Phase::Dx;
+        const auto linear = index - (phase == Phase::Du ? 0U
                                      : phase == Phase::Swiglu ? du
-                                                              : du + epilogue);
+                                     : du + epilogue);
         const auto columns = phase == Phase::Du   ? kDuTiles
                              : phase == Phase::Dx ? kDxTiles
-                                                  : 2U;
+                             : swiglu_tiles;
         const auto block = begin + linear / columns;
         if (block < a.ring.expert_blocks[expert])
-          expert = 0U;
+          expert = FP8 ? wave_expert : 0U;
         while (block >= a.ring.expert_blocks[expert + 1U])
           ++expert;
         const auto expert_begin = unsigned(a.ring.expert_blocks[expert]);
@@ -143,14 +170,9 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
     mapping[a.dispatch.expert_row_prefix[expert] + row] =
         unsigned(padded + row);
   if constexpr (Network) {
-#if !defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) || !WEFTMOE_PF_WINDOW_ORDERED_TAPE
-    for (auto block = std::uint64_t(tid); block < (rows + kM - 1U) / kM;
-         block += stride)
-      words[layout.phase + padded / kM + block] = padded / kM + block;
-#endif
     // Initialize canonical cache padding before the dW phase.
     const auto tail = (kM - rows % kM) % kM;
-    for (auto v = std::uint64_t(tid); v < tail * a.intermediate; v += stride) {
+    for (auto v = std::uint64_t(tid); !a.fp8 && v < tail * a.intermediate; v += stride) {
       reinterpret_cast<unsigned short *>(
           a.recomputed_u)[(padded + rows) * a.intermediate + v] = 0U;
       auto *dab = reinterpret_cast<unsigned short *>(a.dab) +
@@ -160,6 +182,15 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
   }
   if (!rows) {
     const auto elements = a.hidden * a.intermediate;
+    if (a.fp32_weight_gradients) {
+      auto *dw1 = reinterpret_cast<float *>(a.dw1) + expert * 2U * elements;
+      auto *dw2 = reinterpret_cast<float *>(a.dw2) + expert * elements;
+      for (auto i = std::uint64_t(tid); i < 2U * elements; i += stride) {
+        dw1[i] = 0.0F;
+        if (i < elements)
+          dw2[i] = 0.0F;
+      }
+    } else {
     auto *dw1 =
         reinterpret_cast<unsigned short *>(a.dw1 + expert * 2U * elements);
     auto *dw2 = reinterpret_cast<unsigned short *>(a.dw2 + expert * elements);
@@ -168,8 +199,11 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
       if (i < elements)
         dw2[i] = 0U;
     }
+    }
   }
   if (!expert) {
+    if (!tid && a.fp8_wgrad_ready)
+      *a.fp8_wgrad_ready = 0;
     if constexpr (!Network)
       for (auto i = tid; i < f.ring.depth; i += stride)
         f.ring.slots[i] = {};
@@ -179,10 +213,8 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
       words[layout.completed_dw1_tiles] = words[layout.completed_dw2_tiles] =
           0ULL;
       words[layout.completed_dx_tiles] = 0ULL;
-#if WEFTMOE_PF_BWD_DYNAMIC_DW
-      // This preparation launch precedes every backward execution on stream.
+      // FP8 always claims independent CTA tasks, even in BF16 static builds.
       words[layout.dw2_head] = 0ULL;
-#endif
       backward_pipeline_detail::initialize_status(a);
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
       auto *status =
@@ -206,12 +238,13 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 namespace weftmoe_pf::backward_stream {
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
-template <bool Network>
+#include "cuda/weftmoe_pf/fp8_swiglu.cuh"
+template <bool Network, bool FP8>
 __device__ __forceinline__ void
 produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
         const CUtensorMap &dy, const CUtensorMap &dab, const CUtensorMap &w2,
         const CUtensorMap &w1) {
-  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
+  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule<FP8>>;
   Scheduler schedule(f, a);
   Task t;
   unsigned stage = 0U, phase = 0U;
@@ -260,22 +293,74 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
 #endif
     const auto reduction = dx ? 2U * f.intermediate : f.hidden;
     const auto input_row =
-        Network ? (dx ? t.block * kM : directory(a)[t.block].compact_row)
-                : t.row;
-    for (unsigned k = 0U; k < reduction; k += kK) {
+        Network ? (FP8 ? (dx ? t.row : t.block * kM)
+                       : (dx ? t.block * kM : directory(a)[t.block].compact_row)) : t.row;
+    for (unsigned k = 0U; k < reduction; k += (FP8 ? 128U : kK)) {
       s.empty[stage].wait(phase ^ 1U);
-      if (cute::elect_one_sync()) {
-        hopper::tma_load<kK, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
-                                       s.a[stage], k, input_row, 2U);
-        if (dx)
-          hopper::tma_load<kDxN, kK, 128U>(
-              &w1, &s.full[stage], s.b[stage], t.column * kDxN,
-              t.expert * unsigned(2U * f.intermediate) + k);
-        else
-          hopper::tma_load<kDuN, kK, 128U>(&w2, &s.full[stage], s.b[stage],
-                                           t.column * kDuN,
-                                           t.expert * unsigned(f.hidden) + k);
-        s.full[stage].arrive_and_expect_tx((kM + (dx ? kDxN : kDuN)) * kK * 2U);
+      if constexpr (FP8) {
+        auto *sa = fp8_scales(s, stage), *sb = sa + kM;
+        [[maybe_unused]] const auto stride = dx ? a.activation_stride : f.hidden;
+        const auto *input = reinterpret_cast<const std::uint8_t *>(dx
+            ? a.dx_rows : Network ? a.dr : peer_at<const transport::BFloat16>(f.local_base, f.canonical_rows_offset)) +
+            std::uint64_t(input_row) * (dx ? a.fp8_activation_pitch : Network ? fp8::source_pitch(unsigned(f.hidden)) : f.fp8_x_pitch);
+        constexpr bool Packed = WEFTMOE_FP8_PACKED_RING && local::kN == 256U;
+        if constexpr (Network && Packed && local::kFP8NetworkRowScales)
+          if (!dx)
+            for (unsigned row = threadIdx.x % 32U; row < kM; row += 32U)
+              sa[row] = row < t.rows ? reinterpret_cast<const float *>(input + kM * reduction)[row * (reduction / 128U) + k / 128U] : 1.0F;
+        if constexpr (!Packed)
+          for (unsigned row = threadIdx.x % 32U; row < kM; row += 32U)
+            sa[row] = row < t.rows ? reinterpret_cast<const float *>(
+                input + std::uint64_t(row) * stride * 2U + reduction)[k / 128U] : 1.0F;
+        const auto columns = dx ? kDxN : kDuN;
+        const auto elements = f.hidden * f.intermediate * (dx ? 2U : 1U);
+        fp8::WeightReader weight{nullptr,
+            (dx ? f.fp8.s1_t : f.fp8.s2_t) + t.expert * elements / (128U * 128U),
+            unsigned(reduction), t.column * columns, unsigned(f.intermediate), false};
+        const auto lane = threadIdx.x % 32U;
+        if (lane < 2U * (columns / 128U)) {
+          const auto column = lane / 2U * 128U + lane % 2U * 8U;
+          sb[lane] = weight.scale(column, k / 128U);
+        }
+        __syncwarp();
+        if (cute::elect_one_sync()) {
+          if constexpr (Packed) {
+            auto *barrier = reinterpret_cast<std::uint64_t *>(&s.full[stage]);
+            if (cute::block_rank_in_cluster() == 0U)
+              cute::SM90_TMA_LOAD_MULTICAST_3D::copy(dx ? &dab : &dy, barrier, 3U,
+                static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                s.a[stage], k, 0, input_row / kM);
+            if (!Network || dx || !local::kFP8NetworkRowScales)
+              cute::SM90_BULK_COPY_G2S::copy(input + kM * reduction + k * sizeof(float),
+                  barrier, sa, kM * sizeof(float));
+          } else
+            hopper::tma_load<128U, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
+                reinterpret_cast<std::uint8_t *>(s.a[stage]), k, input_row, 2U);
+          if (dx)
+            hopper::tma_load<128U, kDxN, 128U>(&w1, &s.full[stage],
+                reinterpret_cast<std::uint8_t *>(s.b[stage]), k,
+                t.expert * unsigned(f.hidden) + t.column * kDxN);
+          else
+            hopper::tma_load<128U, kDuN, 128U>(&w2, &s.full[stage],
+                reinterpret_cast<std::uint8_t *>(s.b[stage]), k,
+                t.expert * unsigned(f.intermediate) + t.column * kDuN);
+          s.full[stage].arrive_and_expect_tx((kM + columns) * 128U +
+              (Packed && (!Network || dx || !local::kFP8NetworkRowScales) ? kM * sizeof(float) : 0U));
+        }
+      } else {
+        if (cute::elect_one_sync()) {
+          hopper::tma_load<kK, kM, 128U>(dx ? &dab : &dy, &s.full[stage],
+                                         s.a[stage], k, input_row, 2U);
+          if (dx)
+            hopper::tma_load<kDxN, kK, 128U>(
+                &w1, &s.full[stage], s.b[stage], t.column * kDxN,
+                t.expert * unsigned(2U * f.intermediate) + k);
+          else
+            hopper::tma_load<kDuN, kK, 128U>(&w2, &s.full[stage], s.b[stage],
+                                             t.column * kDuN,
+                                             t.expert * unsigned(f.hidden) + k);
+          s.full[stage].arrive_and_expect_tx((kM + (dx ? kDxN : kDuN)) * kK * 2U);
+        }
       }
       stage = (stage + 1U) % kStages;
       phase ^= stage == 0U;
@@ -291,6 +376,57 @@ produce(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
 }
 
 template <unsigned N, bool Dx, bool Network>
+__device__ __forceinline__ void fp8_activation(
+    const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
+    const Task &t, float *accum, unsigned &stage, unsigned &phase) {
+  {
+    constexpr unsigned reduction = Dx ? 2U * backward_tuning::kMainIntermediate : backward_tuning::kMainHidden;
+    for (unsigned k = 0; k < reduction; k += 128U) {
+      s.full[stage].wait(phase);
+      auto *scales = fp8_scales(s, stage);
+      const bool cache_owner = !Dx && a.fp8_x_data &&
+          t.column == (t.block + k / 128U) % kDuTiles;
+      // Stripe ownership over dU N tiles. Each X block is converted once,
+      // alongside dR; every dW1 tile then reuses the same global result.
+      auto *xraw = reinterpret_cast<std::uint8_t *>(&s) + kFP8BaseSharedBytes;
+      auto *xscales = reinterpret_cast<float *>(xraw + kM * 128U);
+      const auto xoffset = std::uint64_t(t.block) * kM * reduction + k * kM;
+      if (cache_owner && a.fp8_x_row_data) {
+        for (unsigned v = threadIdx.x * 16U; v < kM * 128U; v += 256U * 16U) {
+          const auto dest = unsigned(__cvta_generic_to_shared(xraw + v));
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
+              "r"(dest), "l"(a.fp8_x_row_data + xoffset + v) : "memory");
+        }
+        if (threadIdx.x < kM)
+          xscales[threadIdx.x] = a.fp8_x_row_scales[xoffset / 128U + threadIdx.x];
+        asm volatile("cp.async.commit_group;" ::: "memory");
+      }
+      if (threadIdx.x / 128U * 64U < t.rows)
+        fp8::multiply_tile<N, fp8::NoSync, true, true>(reinterpret_cast<std::uint8_t *>(s.a[stage]),
+            reinterpret_cast<std::uint8_t *>(s.b[stage]), scales, scales + kM, accum);
+      if (cache_owner) {
+        const auto offset = std::uint64_t(t.block) * kM * reduction + k * kM;
+        fp8::row_to_column(reinterpret_cast<const std::uint8_t *>(s.a[stage]),
+            scales, t.rows, a.fp8_wgrad_data + offset, a.fp8_wgrad_scales + offset / 128U);
+        if (a.fp8_x_row_data) {
+          asm volatile("cp.async.wait_group 0;" ::: "memory");
+          fp8::MathSync::sync();
+          fp8::row_to_column(xraw, xscales, t.rows,
+              a.fp8_x_data + xoffset,
+              a.fp8_x_scales + xoffset / 128U);
+          fp8::MathSync::sync();
+        }
+      }
+      backward_compute_detail::release_stage(s.empty[stage]);
+      stage = (stage + 1U) % kStages;
+      phase ^= stage == 0U;
+    }
+    return;
+  }
+
+}
+
+template <unsigned N, bool Dx, bool Network, bool FP8>
 __device__ __forceinline__ void
 gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
      const Task &t, unsigned &stage, unsigned &phase) {
@@ -312,6 +448,9 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   const auto half = (t.column % 2U) * 64U;
   const auto checkpoint_rows = t.rows > half ? min(64U, t.rows - half) : 0U;
   forward_compute_detail::StaticV4XCheckpoint<64U, 64U> checkpoint;
+  if constexpr (FP8) {
+    fp8_activation<N, Dx, Network>(f, a, s, t, accum, stage, phase);
+  } else {
   for (unsigned k = 0U; k < reduction; k += kK) {
     s.full[stage].wait(phase);
     if (k == 0U && checkpoint_owner)
@@ -351,6 +490,7 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     stage = (stage + 1U) % kStages;
     phase ^= stage == 0U;
   }
+  }
   const auto lane = threadIdx.x % 32U;
   const auto row0 = threadIdx.x / 32U * 16U + lane / 4U;
   const auto *mapping =
@@ -368,7 +508,8 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
     else
       output = a.recomputed_u +
                std::uint64_t(
-                   Network ? t.block * kM + row
+                   a.fp8_du_ring ? t.row + row
+                           : Network ? t.block * kM + row
                            : mapping[f.checkpoint.rows[t.block * kM + row]]) *
                    a.intermediate;
     output += t.column * N;
@@ -410,10 +551,10 @@ gemm(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
   }
 }
 
-template <bool Network>
+template <bool Network, bool FP8>
 __device__ __forceinline__ void
 compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
-  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule>;
+  using Scheduler = std::conditional_t<Network, NetworkSchedule, Schedule<FP8>>;
   Scheduler schedule(f, a);
   Task t;
   unsigned stage = 0U, phase = 0U;
@@ -421,9 +562,9 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
       peer_at<const unsigned>(a.local_base, a.compact_to_padded_offset);
   while (schedule.next(t)) {
     if (t.phase == Phase::Du) {
-      gemm<kDuN, false, Network>(f, a, s, t, stage, phase);
+      gemm<kDuN, false, Network, FP8>(f, a, s, t, stage, phase);
     } else if (t.phase == Phase::Dx) {
-      gemm<kDxN, true, Network>(f, a, s, t, stage, phase);
+      gemm<kDxN, true, Network, FP8>(f, a, s, t, stage, phase);
     } else {
       auto &slot = f.ring.slots[t.row / kM];
       if (!threadIdx.x)
@@ -434,6 +575,19 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
       using Sync =
           backward_weights::UnifiedComputeSynchronization<true>;
       Sync::math_sync(256U, 0U);
+      if constexpr (FP8) {
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+          const auto task_begin = device_globaltimer_ns();
+#endif
+          fp8_swiglu_columns<Network>(f, a, t, reinterpret_cast<float *>(
+              reinterpret_cast<unsigned char *>(&s) + kFP8BaseSharedBytes));
+#if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+          if (!threadIdx.x)
+            atomicAdd(&peer_at<TransportDeviceStatus>(a.local_base, a.status_offset)
+                           ->synthetic_ticks,
+                      device_globaltimer_ns() - task_begin);
+#endif
+      } else {
 #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
       const auto task_begin = device_globaltimer_ns();
 #endif
@@ -448,11 +602,10 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
             Network || !valid ? t.block * kM + row : mapping[saved];
         // All dU N tiles have retired above. The local dY ring can now
         // receive dAB directly from registers, alongside the dW1 cache.
-        backward_swiglu_epilogue_warp_row<!Network>(
-            a, padded, saved, valid, threadIdx.x % 32U,
-            Network
-                ? nullptr
-                : a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride);
+        auto *staging = Network ? nullptr
+            : a.dx_rows + std::uint64_t(t.row + row) * a.activation_stride;
+        backward_swiglu_epilogue_warp_row<!Network, false>(
+            a, padded, saved, valid, threadIdx.x % 32U, staging, nullptr);
         __syncwarp();
         const auto lane = threadIdx.x % 32U;
         if (valid && !lane) {
@@ -481,6 +634,7 @@ compute(const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s) {
                        ->fc1_complete_clock,
                   device_globaltimer_ns());
       }
+      }
     }
   }
 }
@@ -499,7 +653,7 @@ __device__ __forceinline__ void retire_activation_barriers(Shared &s) {
     local::Barrier::invalidate(reinterpret_cast<std::uint64_t *>(&barrier));
 }
 
-template <bool Network>
+template <bool Network, bool FP8 = false>
 __device__ __forceinline__ void
 begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
               unsigned char *storage,
@@ -512,7 +666,7 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     Sync::cta_sync();
     retire_activation_barriers(*reinterpret_cast<Shared *>(storage));
     backward_weights::initialize_compute<
-        backward_weights::kStorageTileN>(storage, state);
+        backward_weights::kStorageTileN, FP8>(storage, state);
     Sync::cta_sync();
     if (!threadIdx.x) {
       const auto layout = pipeline::backward::make_backward_scheduler_layout(
@@ -534,7 +688,7 @@ begin_weights(const ForwardKernelArgs &f, const BackwardKernelArgs &a,
     grid_sync<0U, 384U>(f);
     retire_activation_barriers(*reinterpret_cast<Shared *>(storage));
     backward_weights::initialize_compute<
-        backward_weights::kStorageTileN>(storage, state);
+        backward_weights::kStorageTileN, FP8>(storage, state);
     __syncthreads();
     cute::cluster_sync();
   }
@@ -550,7 +704,7 @@ __device__ __forceinline__ void finish() {
 }
 #endif
 
-template <bool Network = false>
+template <bool Network = false, bool FP8 = false>
 __global__ __launch_bounds__(384U, 1) void kernel(
     const __grid_constant__ ForwardKernelArgs f,
     const __grid_constant__ BackwardKernelArgs a,
@@ -582,7 +736,7 @@ __global__ __launch_bounds__(384U, 1) void kernel(
       barrier.init(1U);
     if constexpr (Network) {
       auto &comm =
-          *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
+          *reinterpret_cast<NetworkShared *>(storage + (FP8 ? kFP8NetworkCommOffset : kNetworkCommOffset));
       for (auto &barrier : comm.pull_full)
         barrier.init(1U);
     }
@@ -592,48 +746,63 @@ __global__ __launch_bounds__(384U, 1) void kernel(
   cute::cluster_sync();
   if (threadIdx.x < 256U) {
     cutlass::arch::warpgroup_reg_alloc<
-        Network ? kNetworkMathRegisters
+        FP8 ? fp8::kMathRegisters : Network ? kNetworkMathRegisters
                 : backward_tuning::kUnifiedMathRegisters>();
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
     identity<Network>(f, a);
-    begin_weights<Network>(f, a, storage, state);
+    begin_weights<Network, FP8>(f, a, storage, state);
 #else
-    compute<Network>(f, a, s);
-    begin_weights<Network>(f, a, storage, state);
+    compute<Network, FP8>(f, a, s);
+    begin_weights<Network, FP8>(f, a, storage, state);
+    if constexpr (FP8) {
+      backward_weights::run_fp8_weights_pipeline<false>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
+    } else {
     backward_weights::UnifiedComputeSynchronization<true> sync{
         state};
-    backward_weights::run_compute<backward_tuning::kDwTileN>(
+    backward_weights::run_compute<backward_tuning::kDwTileN, FP8>(
         a, dr_mn_map, u_mn_map, dab_mn_map, x_mn_map, dw2_store_map, dw1_store_map,
         geometry, storage, state, sync);
+    }
 #endif
     finish();
   } else {
     cutlass::arch::warpgroup_reg_dealloc<
-        Network ? kNetworkControlRegisters
+        FP8 ? fp8::kControlRegisters : Network ? kNetworkControlRegisters
                 : backward_tuning::kUnifiedControlRegisters>();
     if (threadIdx.x < 288U) {
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
-      begin_weights<Network>(f, a, storage, state);
+      begin_weights<Network, FP8>(f, a, storage, state);
 #else
-      produce<Network>(f, a, s, dy_map, dab_map, w2_map, w1_map);
-      begin_weights<Network>(f, a, storage, state);
+      produce<Network, FP8>(f, a, s, dy_map, dab_map, w2_map, w1_map);
+      begin_weights<Network, FP8>(f, a, storage, state);
+      if constexpr (FP8)
+        backward_weights::run_fp8_weights_pipeline<true>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
+      if constexpr (!FP8) {
       backward_weights::UnifiedComputeSynchronization<false>
           sync{state};
-      backward_weights::run_compute<backward_tuning::kDwTileN>(
+      backward_weights::run_compute<backward_tuning::kDwTileN, FP8>(
         a, dr_mn_map, u_mn_map, dab_mn_map, x_mn_map, dw2_store_map, dw1_store_map,
           geometry, storage, state, sync);
+      }
 #endif
       finish();
     } else {
       if constexpr (Network) {
         auto &comm =
-            *reinterpret_cast<NetworkShared *>(storage + kNetworkCommOffset);
+            *reinterpret_cast<NetworkShared *>(storage + (FP8 ? kFP8NetworkCommOffset : kNetworkCommOffset));
         network_workers(f, a, comm);
         finish_network<>(f, a);
       } else {
-        if ((threadIdx.x - 288U) / 32U < local::kPullWarps)
-          local::pull<kDxTiles, true>(f, s);
-        begin_weights<false>(f, a, storage, state);
+        if ((threadIdx.x - 288U) / 32U < local::kPullWarps) {
+          if constexpr (FP8) {
+            if (f.fp8_source_x)
+              local::pull_fp8<kDxTiles, true, true>(f, s, nullptr);
+            else
+              local::pull_fp8<kDxTiles, true>(f, s, a.fp8_x_data ? nullptr : a.dr);
+          } else
+            local::pull<kDxTiles, true>(f, s);
+        }
+        begin_weights<false, FP8>(f, a, storage, state);
         auto *status =
             peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
         rank_barrier<288U, 96U>(f);

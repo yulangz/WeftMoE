@@ -1,0 +1,5844 @@
+{
+  "date": "2026-10-28",
+  "scope": "FWD with training checkpoints, Qwen35B H2048 I512 E256 top8, 8192 nominal tokens/rank, EP2 L20X; final sample of each 5-warmup/20-sample run; seeds 123/124/125",
+  "units": "microseconds",
+  "notes": [
+    "MainEnter is sampled by math thread 0 after programmatic_launch::wait, before local kernel initialization. No cross-GPU timestamps are subtracted.",
+    "MmaBegin means first operand stage is ready, immediately before entering MMA setup; not a hardware instruction issue timestamp.",
+    "First GEMM is relative to its own CTA MainEnter. Mean GEMM start averages all task MmaBegin offsets within a CTA. Mean start gap averages consecutive GEMM starts.",
+    "Ready wait is TileStart to MmaBegin. Math is MmaBegin to MathEnd, including subsequent staging waits, FP32 promotion and any X column-cache work. Epilogue is MathEnd to TileEnd including publication and synchronization.",
+    "The statistics aggregate per-CTA means, weighting every active CTA equally. FP8 and BF16 have different task schedules; matching CTA IDs do not mean matching task identities.",
+    "Both variants execute the same diagnostic binary. Timeline overhead can alter scheduling and elapsed times; do not treat these as production latency.",
+    "All traces have zero overflow, matching complete task boundaries; workload hashes match between FP8/BF16 at each seed.",
+    "For each seed, only the final measured sample is traced to disk. There are 3 seeds x 2 ranks x 132 CTAs = 792 CTA observations per dtype, not 792 distinct physical CTAs.",
+    "Matched-first-task cohort matches seed, rank, CTA and the actual first task identity (FC kind, M block, N column); 208 observations. It reduces first-task scheduling confounding but does not isolate quantization alone."
+  ],
+  "metrics": {
+    "bf16": {
+      "ctas": 792,
+      "first_kind_counts": {
+        "fc1": 380,
+        "fc2": 412
+      },
+      "first_gemm_us": {
+        "mean": 44.717333333333336,
+        "p50": 48.304,
+        "p95": 70.496
+      },
+      "mean_gemm_start_us": {
+        "mean": 996.930590854984,
+        "p50": 992.3344427807488,
+        "p95": 1114.7633898305085
+      },
+      "mean_start_gap_us": {
+        "mean": 36.405872083378064,
+        "p50": 36.29473103448276,
+        "p95": 37.701565217391305
+      },
+      "mean_ready_wait_us": {
+        "mean": 15.72297075479353,
+        "p50": 15.889,
+        "p95": 19.382
+      },
+      "mean_producer_input_wait_us": {
+        "mean": 19.691986477514483,
+        "p50": 19.82873246753247,
+        "p95": 24.318
+      },
+      "total_tma_wait_us": {
+        "mean": 925.446303030303,
+        "p50": 921.5999999999999,
+        "p95": 1072.896
+      },
+      "fc1_first_gemm_us": {
+        "mean": 88.91361616161616,
+        "p50": 70.784,
+        "p95": 275.904
+      },
+      "fc1_mean_ready_wait_us": {
+        "mean": 1.8271397117988268,
+        "p50": 1.1075555555555554,
+        "p95": 4.435478260869566
+      },
+      "fc1_mean_math_us": {
+        "mean": 24.852559140837972,
+        "p50": 24.812495238095238,
+        "p95": 25.72952380952381
+      },
+      "fc1_mean_epilogue_us": {
+        "mean": 5.6742969316876835,
+        "p50": 5.664,
+        "p95": 6.018285714285715
+      },
+      "fc1_mean_tile_us": {
+        "mean": 32.35399578432448,
+        "p50": 32.12972631578947,
+        "p95": 34.624
+      },
+      "fc2_first_gemm_us": {
+        "mean": 76.73248484848484,
+        "p50": 64.112,
+        "p95": 130.784
+      },
+      "fc2_mean_ready_wait_us": {
+        "mean": 22.72522091384271,
+        "p50": 22.493282593375618,
+        "p95": 25.176774193548386
+      },
+      "fc2_mean_math_us": {
+        "mean": 6.108181471083458,
+        "p50": 6.109686411149825,
+        "p95": 6.235428571428572
+      },
+      "fc2_mean_epilogue_us": {
+        "mean": 7.76903029967054,
+        "p50": 7.677551020408163,
+        "p95": 8.746666666666666
+      },
+      "fc2_mean_tile_us": {
+        "mean": 36.60243268459671,
+        "p50": 36.468768627450984,
+        "p95": 39.28606896551724
+      }
+    },
+    "fp8": {
+      "ctas": 792,
+      "first_kind_counts": {
+        "fc1": 792
+      },
+      "first_gemm_us": {
+        "mean": 69.17644444444444,
+        "p50": 69.392,
+        "p95": 118.944
+      },
+      "mean_gemm_start_us": {
+        "mean": 1406.8488937977402,
+        "p50": 1424.5159832167833,
+        "p95": 1560.3964745762712
+      },
+      "mean_start_gap_us": {
+        "mean": 38.87145609969892,
+        "p50": 39.11447272727273,
+        "p95": 39.959172413793105
+      },
+      "mean_ready_wait_us": {
+        "mean": 15.527345325537548,
+        "p50": 15.459078787878788,
+        "p95": 17.060338983050848
+      },
+      "mean_producer_input_wait_us": {
+        "mean": 18.22001667749845,
+        "p50": 18.167205128205126,
+        "p95": 19.88284745762712
+      },
+      "total_tma_wait_us": {
+        "mean": 797.6816161616161,
+        "p50": 808.816,
+        "p95": 964.384
+      },
+      "fc1_first_gemm_us": {
+        "mean": 69.17644444444444,
+        "p50": 69.392,
+        "p95": 118.944
+      },
+      "fc1_mean_ready_wait_us": {
+        "mean": 44.82308938195161,
+        "p50": 44.2902,
+        "p95": 51.08
+      },
+      "fc1_mean_math_us": {
+        "mean": 32.980403153481845,
+        "p50": 32.980105263157895,
+        "p95": 33.884235294117644
+      },
+      "fc1_mean_epilogue_us": {
+        "mean": 8.427734654942963,
+        "p50": 8.431670588235296,
+        "p95": 8.892631578947368
+      },
+      "fc1_mean_tile_us": {
+        "mean": 86.23122719037642,
+        "p50": 85.73552631578947,
+        "p95": 92.61473684210526
+      },
+      "fc2_first_gemm_us": {
+        "mean": 1227.382505050505,
+        "p50": 1226.672,
+        "p95": 1290.72
+      },
+      "fc2_mean_ready_wait_us": {
+        "mean": 0.925173550708584,
+        "p50": 0.9248681408681408,
+        "p95": 1.017
+      },
+      "fc2_mean_math_us": {
+        "mean": 5.145458671352647,
+        "p50": 5.147773321708806,
+        "p95": 5.333
+      },
+      "fc2_mean_epilogue_us": {
+        "mean": 7.207648327252647,
+        "p50": 7.18,
+        "p95": 8.061
+      },
+      "fc2_mean_tile_us": {
+        "mean": 13.278280549313877,
+        "p50": 13.252500000000001,
+        "p95": 14.169
+      }
+    }
+  },
+  "traces": [
+    {
+      "seed": 123,
+      "dtype": "bf16",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/123-bf16/t8192.rank0.json",
+      "sha256": "c57db927c99a4e7a2e72e2f1d1d93ac379df3b85d848a9157e6573f5b79ec1ea",
+      "tasks": 6804,
+      "ctas": 132
+    },
+    {
+      "seed": 123,
+      "dtype": "bf16",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/123-bf16/t8192.rank1.json",
+      "sha256": "c8dcf66776a2534b24a1d3a12c6b6dd1fc96cd8ef8c62832d85df32020941bcc",
+      "tasks": 6348,
+      "ctas": 132
+    },
+    {
+      "seed": 123,
+      "dtype": "fp8",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/123-fp8/t8192.rank0.json",
+      "sha256": "abdd3e64bd836ad5e565208ee832614eb7e6ac25ffb7dab716a06a2bb4dfbefb",
+      "tasks": 6804,
+      "ctas": 132
+    },
+    {
+      "seed": 123,
+      "dtype": "fp8",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/123-fp8/t8192.rank1.json",
+      "sha256": "85c866197405dadefee8cf72449907fbb2085737f881d48eafdb9e33cfba82db",
+      "tasks": 6348,
+      "ctas": 132
+    },
+    {
+      "seed": 124,
+      "dtype": "fp8",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/124-fp8/t8192.rank0.json",
+      "sha256": "147db7d625b501f4a656a288cfb33d51e58a43eb27691711652a843ec4598df0",
+      "tasks": 7788,
+      "ctas": 132
+    },
+    {
+      "seed": 124,
+      "dtype": "fp8",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/124-fp8/t8192.rank1.json",
+      "sha256": "8e25e7787100dea4d9b75ac59f9db4b28401718b90d89c610e4e64345c6b22d7",
+      "tasks": 6312,
+      "ctas": 132
+    },
+    {
+      "seed": 124,
+      "dtype": "bf16",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/124-bf16/t8192.rank0.json",
+      "sha256": "ccf16e9c925947870bb6266cfd18d2ade4325dadd9184a6664f03d858147b33b",
+      "tasks": 7788,
+      "ctas": 132
+    },
+    {
+      "seed": 124,
+      "dtype": "bf16",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/124-bf16/t8192.rank1.json",
+      "sha256": "39d40cf2b0139d03e3c2e71398957225b30ed91ccdf71eaf7a3c5906f4ad7beb",
+      "tasks": 6312,
+      "ctas": 132
+    },
+    {
+      "seed": 125,
+      "dtype": "bf16",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/125-bf16/t8192.rank0.json",
+      "sha256": "cda51ce86acb4040b07a0b84610746848f96247509b4486b3a7c569387571a30",
+      "tasks": 7308,
+      "ctas": 132
+    },
+    {
+      "seed": 125,
+      "dtype": "bf16",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/125-bf16/t8192.rank1.json",
+      "sha256": "da7e5131bfac546d9e4a43272c4843a96011b01465bc31ddda82a96fad263474",
+      "tasks": 7344,
+      "ctas": 132
+    },
+    {
+      "seed": 125,
+      "dtype": "fp8",
+      "rank": 0,
+      "path": "build/fp8-fwd-timeline/traces/125-fp8/t8192.rank0.json",
+      "sha256": "9e71ea278977933c6159da8ef9cc3d5a1ea980abeb4e1b4646707ebeab90a312",
+      "tasks": 7308,
+      "ctas": 132
+    },
+    {
+      "seed": 125,
+      "dtype": "fp8",
+      "rank": 1,
+      "path": "build/fp8-fwd-timeline/traces/125-fp8/t8192.rank1.json",
+      "sha256": "0cc8523b916fb7ea546a4d61fb832132a3846777797f17e7e8db5652add60534",
+      "tasks": 7344,
+      "ctas": 132
+    }
+  ],
+  "runs": [
+    {
+      "name": "123-bf16",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "123",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-bf16.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-bf16",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "8a46152b52f99cc5abbb451d4e613e07e546409ee4ca350e52fd0d64a7c0e94f",
+          "4f5e60fb2db968b1a7db8dea0b843818695c9bbfd3b5580e48fa0879298df0c4"
+        ],
+        "per_rank_tokens": [
+          [
+            7972,
+            8040,
+            6622,
+            8671,
+            8054,
+            7771,
+            7571,
+            8351,
+            9297,
+            7552,
+            7762,
+            6979,
+            8916,
+            6998,
+            7498,
+            7927,
+            8474,
+            8032,
+            8124,
+            7428
+          ],
+          [
+            9690,
+            8345,
+            7338,
+            8534,
+            6683,
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8751,
+            8645,
+            7301,
+            9159,
+            6958
+          ],
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            83532,
+            67685,
+            60442,
+            55098,
+            57710,
+            61048,
+            65413,
+            61403,
+            77008,
+            63274,
+            60385,
+            63072,
+            75472,
+            64962,
+            61720,
+            61405,
+            68809,
+            59290,
+            62972,
+            64414
+          ],
+          [
+            57764,
+            63395,
+            51238,
+            82542,
+            60186,
+            74224,
+            64507,
+            67309,
+            58456,
+            69870,
+            59887,
+            68048,
+            62800,
+            66326,
+            61328,
+            54683,
+            72567,
+            75414,
+            64644,
+            59506
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          9,
+          4,
+          1,
+          4,
+          3,
+          5,
+          3,
+          1,
+          10,
+          1,
+          3,
+          9,
+          0,
+          9,
+          2,
+          3,
+          6,
+          4,
+          4,
+          6
+        ],
+        "expert_rows_max_per_step": [
+          6949,
+          3759,
+          2732,
+          5064,
+          3998,
+          3640,
+          5472,
+          4609,
+          4281,
+          3094,
+          3075,
+          3496,
+          3755,
+          3867,
+          3282,
+          3019,
+          4623,
+          4540,
+          2539,
+          3491
+        ],
+        "actual_tokens_min": 6584,
+        "actual_tokens_max": 9690,
+        "actual_tokens_mean": 8093.15,
+        "actual_tokens_std": 796.4708579100682,
+        "max_tokens_capacity": 9690,
+        "max_rows_capacity": 99916,
+        "input_tokens_per_second": 6151178.971535934,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "bf16",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": false,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2592.809,
+        "forward_ready_slowest_rank_p50_us": 2582.861,
+        "per_rank_forward_ready_us": [
+          [
+            3083.852,
+            2712.317,
+            2416.337,
+            3002.512,
+            2344.124,
+            2685.924,
+            2534.066,
+            2484.649,
+            2715.925,
+            2678.246,
+            2423.598,
+            2559.405,
+            2625.187,
+            2558.261,
+            2431.449,
+            2433.547,
+            2666.996,
+            2979.284,
+            2522.531,
+            2457.417
+          ],
+          [
+            3104.611,
+            2697.247,
+            2413.852,
+            2996.324,
+            2327.043,
+            2698.237,
+            2552.48,
+            2473.711,
+            2705.18,
+            2686.597,
+            2408.706,
+            2582.47,
+            2616.378,
+            2583.252,
+            2429.496,
+            2418.677,
+            2663.666,
+            2986.689,
+            2520.657,
+            2455.49
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 467.9575,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          3121.775,
+          2721.584,
+          2425.169,
+          3012.605,
+          2353.816,
+          2707.287,
+          2562.089,
+          2493.73,
+          2725.196,
+          2696.284,
+          2434.283,
+          2591.558,
+          2635.04,
+          2594.06,
+          2440.569,
+          2442.122,
+          2675.669,
+          2997.013,
+          2531.299,
+          2467.137
+        ],
+        "per_rank_wall_us": [
+          [
+            3093.847,
+            2721.584,
+            2425.169,
+            3012.605,
+            2353.816,
+            2695.379,
+            2544.076,
+            2493.73,
+            2725.196,
+            2687.262,
+            2434.283,
+            2568.934,
+            2635.04,
+            2572.573,
+            2440.569,
+            2442.122,
+            2675.669,
+            2988.251,
+            2531.299,
+            2467.137
+          ],
+          [
+            3121.775,
+            2709.538,
+            2424.087,
+            3006.944,
+            2336.847,
+            2707.287,
+            2562.089,
+            2482.983,
+            2714.617,
+            2696.284,
+            2419.758,
+            2591.558,
+            2625.854,
+            2594.06,
+            2438.508,
+            2428.035,
+            2672.433,
+            2997.013,
+            2530.176,
+            2464.534
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176551864465725,
+              1793176551867566667
+            ],
+            [
+              1793176551868540381,
+              1793176551871265117
+            ],
+            [
+              1793176551871798320,
+              1793176551874225091
+            ],
+            [
+              1793176551874819945,
+              1793176551877834169
+            ],
+            [
+              1793176551878363722,
+              1793176551880719449
+            ],
+            [
+              1793176551881299455,
+              1793176551883996206
+            ],
+            [
+              1793176551884596212,
+              1793176551887142130
+            ],
+            [
+              1793176551887690309,
+              1793176551890185541
+            ],
+            [
+              1793176551890810663,
+              1793176551893537838
+            ],
+            [
+              1793176551894129964,
+              1793176551896818813
+            ],
+            [
+              1793176551897334816,
+              1793176551899770526
+            ],
+            [
+              1793176551900379919,
+              1793176551902950384
+            ],
+            [
+              1793176551903574072,
+              1793176551906210533
+            ],
+            [
+              1793176551906823952,
+              1793176551909397942
+            ],
+            [
+              1793176551909974657,
+              1793176551912416496
+            ],
+            [
+              1793176551912950156,
+              1793176551915393421
+            ],
+            [
+              1793176551916009363,
+              1793176551918686737
+            ],
+            [
+              1793176551919275018,
+              1793176551922264700
+            ],
+            [
+              1793176551922844431,
+              1793176551925376892
+            ],
+            [
+              1793176551925932604,
+              1793176551928401162
+            ]
+          ],
+          [
+            [
+              1793176551864469033,
+              1793176551867595452
+            ],
+            [
+              1793176551868556195,
+              1793176551871269436
+            ],
+            [
+              1793176551871809551,
+              1793176551874235378
+            ],
+            [
+              1793176551874823426,
+              1793176551877832040
+            ],
+            [
+              1793176551878366384,
+              1793176551880705155
+            ],
+            [
+              1793176551881298934,
+              1793176551884007638
+            ],
+            [
+              1793176551884595957,
+              1793176551887159601
+            ],
+            [
+              1793176551887692914,
+              1793176551890177576
+            ],
+            [
+              1793176551890810489,
+              1793176551893527233
+            ],
+            [
+              1793176551894133516,
+              1793176551896831345
+            ],
+            [
+              1793176551897335172,
+              1793176551899756283
+            ],
+            [
+              1793176551900383296,
+              1793176551902976383
+            ],
+            [
+              1793176551903573576,
+              1793176551906200730
+            ],
+            [
+              1793176551906826309,
+              1793176551909421580
+            ],
+            [
+              1793176551909974200,
+              1793176551912413920
+            ],
+            [
+              1793176551912950433,
+              1793176551915379765
+            ],
+            [
+              1793176551916012802,
+              1793176551918687022
+            ],
+            [
+              1793176551919277533,
+              1793176551922275967
+            ],
+            [
+              1793176551922847324,
+              1793176551925378753
+            ],
+            [
+              1793176551925937619,
+              1793176551928403454
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1148777608,
+            "gin_bytes": 0,
+            "notify_bytes": 42467160,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1148777608,
+            "gin_bytes": 0,
+            "notify_bytes": 42467160,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    },
+    {
+      "name": "123-fp8",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "123",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-fp8",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-fp8.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/123-fp8",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "8a46152b52f99cc5abbb451d4e613e07e546409ee4ca350e52fd0d64a7c0e94f",
+          "4f5e60fb2db968b1a7db8dea0b843818695c9bbfd3b5580e48fa0879298df0c4"
+        ],
+        "per_rank_tokens": [
+          [
+            7972,
+            8040,
+            6622,
+            8671,
+            8054,
+            7771,
+            7571,
+            8351,
+            9297,
+            7552,
+            7762,
+            6979,
+            8916,
+            6998,
+            7498,
+            7927,
+            8474,
+            8032,
+            8124,
+            7428
+          ],
+          [
+            9690,
+            8345,
+            7338,
+            8534,
+            6683,
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8751,
+            8645,
+            7301,
+            9159,
+            6958
+          ],
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            83532,
+            67685,
+            60442,
+            55098,
+            57710,
+            61048,
+            65413,
+            61403,
+            77008,
+            63274,
+            60385,
+            63072,
+            75472,
+            64962,
+            61720,
+            61405,
+            68809,
+            59290,
+            62972,
+            64414
+          ],
+          [
+            57764,
+            63395,
+            51238,
+            82542,
+            60186,
+            74224,
+            64507,
+            67309,
+            58456,
+            69870,
+            59887,
+            68048,
+            62800,
+            66326,
+            61328,
+            54683,
+            72567,
+            75414,
+            64644,
+            59506
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          9,
+          4,
+          1,
+          4,
+          3,
+          5,
+          3,
+          1,
+          10,
+          1,
+          3,
+          9,
+          0,
+          9,
+          2,
+          3,
+          6,
+          4,
+          4,
+          6
+        ],
+        "expert_rows_max_per_step": [
+          6949,
+          3759,
+          2732,
+          5064,
+          3998,
+          3640,
+          5472,
+          4609,
+          4281,
+          3094,
+          3075,
+          3496,
+          3755,
+          3867,
+          3282,
+          3019,
+          4623,
+          4540,
+          2539,
+          3491
+        ],
+        "actual_tokens_min": 6584,
+        "actual_tokens_max": 9690,
+        "actual_tokens_mean": 8093.15,
+        "actual_tokens_std": 796.4708579100682,
+        "max_tokens_capacity": 9690,
+        "max_rows_capacity": 99916,
+        "input_tokens_per_second": 5687331.449256704,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2771.431,
+        "forward_ready_slowest_rank_p50_us": 2762.077,
+        "per_rank_forward_ready_us": [
+          [
+            3404.644,
+            2779.251,
+            2529.348,
+            3324.349,
+            2564.86,
+            2996.575,
+            2711.627,
+            2803.141,
+            3038.974,
+            2855.925,
+            2586.829,
+            2713.662,
+            3063.213,
+            2702.626,
+            2580.087,
+            2545.585,
+            2973.807,
+            3039.002,
+            2694.896,
+            2686.824
+          ],
+          [
+            3424.136,
+            2778.521,
+            2534.707,
+            3320.783,
+            2539.531,
+            2998.837,
+            2725.851,
+            2800.403,
+            3022.136,
+            2866.729,
+            2570.06,
+            2744.903,
+            3047.901,
+            2733.99,
+            2582.45,
+            2529.224,
+            2974.423,
+            3051.116,
+            2691.02,
+            2687.105
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 471.03200000000004,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          3434.702,
+          2788.895,
+          2544.376,
+          3334.754,
+          2574.741,
+          3008.051,
+          2739.936,
+          2812.81,
+          3048.281,
+          2875.34,
+          2595.988,
+          2753.967,
+          3072.296,
+          2743.008,
+          2592.812,
+          2555.158,
+          2983.638,
+          3061.15,
+          2704.432,
+          2696.209
+        ],
+        "per_rank_wall_us": [
+          [
+            3414.757,
+            2788.895,
+            2539.253,
+            3334.754,
+            2574.741,
+            3005.563,
+            2721.394,
+            2812.81,
+            3048.281,
+            2864.891,
+            2595.988,
+            2723.425,
+            3072.296,
+            2711.762,
+            2589.772,
+            2555.158,
+            2983.595,
+            3049.997,
+            2704.432,
+            2695.971
+          ],
+          [
+            3434.702,
+            2788.541,
+            2544.376,
+            3331.458,
+            2549.013,
+            3008.051,
+            2739.936,
+            2809.889,
+            3031.515,
+            2875.34,
+            2578.621,
+            2753.967,
+            3057.162,
+            2743.008,
+            2592.812,
+            2538.583,
+            2983.638,
+            3061.15,
+            2700.215,
+            2696.209
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176561397549461,
+              1793176561400967855
+            ],
+            [
+              1793176561401588060,
+              1793176561404380217
+            ],
+            [
+              1793176561404924472,
+              1793176561407465248
+            ],
+            [
+              1793176561408087883,
+              1793176561411423990
+            ],
+            [
+              1793176561412000606,
+              1793176561414577522
+            ],
+            [
+              1793176561415201761,
+              1793176561418208930
+            ],
+            [
+              1793176561418826040,
+              1793176561421549181
+            ],
+            [
+              1793176561422153733,
+              1793176561424968114
+            ],
+            [
+              1793176561425596958,
+              1793176561428647254
+            ],
+            [
+              1793176561429259397,
+              1793176561432125808
+            ],
+            [
+              1793176561432685786,
+              1793176561435283212
+            ],
+            [
+              1793176561435912325,
+              1793176561438637566
+            ],
+            [
+              1793176561439247392,
+              1793176561442321108
+            ],
+            [
+              1793176561442955070,
+              1793176561445668397
+            ],
+            [
+              1793176561446256619,
+              1793176561448847684
+            ],
+            [
+              1793176561449406270,
+              1793176561451962960
+            ],
+            [
+              1793176561452594042,
+              1793176561455579579
+            ],
+            [
+              1793176561456182440,
+              1793176561459233805
+            ],
+            [
+              1793176561459818527,
+              1793176561462524204
+            ],
+            [
+              1793176561463117711,
+              1793176561465815000
+            ]
+          ],
+          [
+            [
+              1793176561397554101,
+              1793176561400993094
+            ],
+            [
+              1793176561401591739,
+              1793176561404383841
+            ],
+            [
+              1793176561404927761,
+              1793176561407473918
+            ],
+            [
+              1793176561408091190,
+              1793176561411424473
+            ],
+            [
+              1793176561412000808,
+              1793176561414552095
+            ],
+            [
+              1793176561415205403,
+              1793176561418215227
+            ],
+            [
+              1793176561418826265,
+              1793176561421567771
+            ],
+            [
+              1793176561422148986,
+              1793176561424960375
+            ],
+            [
+              1793176561425598973,
+              1793176561428632603
+            ],
+            [
+              1793176561429260664,
+              1793176561432137620
+            ],
+            [
+              1793176561432685162,
+              1793176561435265186
+            ],
+            [
+              1793176561435910373,
+              1793176561438666181
+            ],
+            [
+              1793176561439249495,
+              1793176561442308195
+            ],
+            [
+              1793176561442957556,
+              1793176561445701942
+            ],
+            [
+              1793176561446257832,
+              1793176561448852168
+            ],
+            [
+              1793176561449405482,
+              1793176561451945434
+            ],
+            [
+              1793176561452595993,
+              1793176561455581507
+            ],
+            [
+              1793176561456183765,
+              1793176561459246640
+            ],
+            [
+              1793176561459816640,
+              1793176561462518353
+            ],
+            [
+              1793176561463119685,
+              1793176561465817331
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1148777608,
+            "gin_bytes": 0,
+            "notify_bytes": 42467160,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1148777608,
+            "gin_bytes": 0,
+            "notify_bytes": 42467160,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    },
+    {
+      "name": "124-fp8",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "124",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-fp8",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-fp8.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-fp8",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 124,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "9a5eadbddb0995e3a5117e013d1c9421ea54be7eacd93059d5600e80c866b527",
+          "201663631cd4ae4625150eebf52728983b01733b701fb1ed702b83424a157a69"
+        ],
+        "per_rank_tokens": [
+          [
+            9690,
+            8345,
+            7338,
+            8534,
+            6683,
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062
+          ],
+          [
+            8516,
+            8930,
+            6925,
+            8223,
+            7810,
+            9740,
+            8847,
+            7929,
+            8330,
+            8110,
+            8888,
+            8723,
+            7266,
+            9858,
+            8052,
+            6749,
+            7969,
+            6785,
+            9850,
+            8589
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436
+          ],
+          [
+            8989,
+            8044,
+            8388,
+            5758,
+            7432
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            71915,
+            70697,
+            57497,
+            75309,
+            60760,
+            83406,
+            71222,
+            68866,
+            64680,
+            77802,
+            58083,
+            71609,
+            65770,
+            73659,
+            63204,
+            47611,
+            68840,
+            70351,
+            71643,
+            74680
+          ],
+          [
+            73733,
+            67503,
+            56607,
+            58747,
+            55184,
+            67618,
+            68906,
+            56470,
+            63048,
+            59806,
+            71197,
+            73463,
+            59302,
+            80509,
+            64276,
+            59053,
+            68496,
+            54377,
+            69781,
+            58528
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          2,
+          5,
+          0,
+          5,
+          5,
+          6,
+          3,
+          2,
+          5,
+          2,
+          5,
+          11,
+          5,
+          1,
+          0,
+          4,
+          1,
+          2,
+          13,
+          1
+        ],
+        "expert_rows_max_per_step": [
+          3949,
+          6361,
+          3622,
+          4366,
+          2330,
+          5915,
+          3329,
+          3847,
+          4007,
+          5555,
+          3796,
+          5845,
+          3908,
+          4717,
+          3862,
+          2995,
+          3525,
+          3108,
+          5528,
+          3787
+        ],
+        "actual_tokens_min": 6584,
+        "actual_tokens_max": 9858,
+        "actual_tokens_mean": 8294.4,
+        "actual_tokens_std": 897.9178915691568,
+        "max_tokens_capacity": 9858,
+        "max_rows_capacity": 99790,
+        "input_tokens_per_second": 5428746.4672347605,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2927.0645,
+        "forward_ready_slowest_rank_p50_us": 2918.0905000000002,
+        "per_rank_forward_ready_us": [
+          [
+            5540.912,
+            2956.604,
+            2501.704,
+            3087.046,
+            2571.921,
+            3376.153,
+            2912.149,
+            2821.623,
+            2717.143,
+            3178.597,
+            2893.34,
+            3115.134,
+            2706.564,
+            3270.751,
+            2653.804,
+            2478.614,
+            2905.821,
+            2838.413,
+            3009.19,
+            3038.993
+          ],
+          [
+            3056.674,
+            2996.236,
+            2495.711,
+            3080.558,
+            2584.628,
+            3387.396,
+            2911.796,
+            2814.708,
+            2705.604,
+            3175.677,
+            2924.032,
+            3115.43,
+            2698.369,
+            3278.142,
+            2652.256,
+            2481.693,
+            2888.476,
+            2814.033,
+            3031.801,
+            3055.64
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 475.8995,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          5688.696,
+          3004.828,
+          2510.898,
+          3096.445,
+          2594.015,
+          3396.031,
+          2921.468,
+          2855.064,
+          2776.272,
+          3188.24,
+          2932.661,
+          3126.565,
+          2715.692,
+          3286.852,
+          2663.079,
+          2490.188,
+          2915.234,
+          2847.441,
+          3040.86,
+          3064.132
+        ],
+        "per_rank_wall_us": [
+          [
+            5688.696,
+            2965.919,
+            2510.898,
+            3096.445,
+            2581.163,
+            3385.178,
+            2921.468,
+            2855.064,
+            2776.272,
+            3188.24,
+            2905.517,
+            3126.565,
+            2715.692,
+            3279.904,
+            2663.079,
+            2488.038,
+            2915.234,
+            2847.441,
+            3018.096,
+            3048.437
+          ],
+          [
+            3065.512,
+            3004.828,
+            2504.434,
+            3090.076,
+            2594.015,
+            3396.031,
+            2920.309,
+            2823.142,
+            2715.204,
+            3184.815,
+            2932.661,
+            3124.357,
+            2707.133,
+            3286.852,
+            2660.835,
+            2490.188,
+            2897.123,
+            2825.37,
+            3040.86,
+            3064.132
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176569185867662,
+              1793176569191565006
+            ],
+            [
+              1793176569192262286,
+              1793176569195231389
+            ],
+            [
+              1793176569195778166,
+              1793176569198290573
+            ],
+            [
+              1793176569198899036,
+              1793176569201996968
+            ],
+            [
+              1793176569202557429,
+              1793176569205140698
+            ],
+            [
+              1793176569205853127,
+              1793176569209240043
+            ],
+            [
+              1793176569209880388,
+              1793176569212803481
+            ],
+            [
+              1793176569213386893,
+              1793176569216244460
+            ],
+            [
+              1793176569216911952,
+              1793176569219695514
+            ],
+            [
+              1793176569220503686,
+              1793176569223693701
+            ],
+            [
+              1793176569224289559,
+              1793176569227196559
+            ],
+            [
+              1793176569227871870,
+              1793176569231000222
+            ],
+            [
+              1793176569231598176,
+              1793176569234315166
+            ],
+            [
+              1793176569234974718,
+              1793176569238256000
+            ],
+            [
+              1793176569238824556,
+              1793176569241489009
+            ],
+            [
+              1793176569241995535,
+              1793176569244485061
+            ],
+            [
+              1793176569245120724,
+              1793176569248037776
+            ],
+            [
+              1793176569248652115,
+              1793176569251501129
+            ],
+            [
+              1793176569252162076,
+              1793176569255181614
+            ],
+            [
+              1793176569255827004,
+              1793176569258876836
+            ]
+          ],
+          [
+            [
+              1793176569185863155,
+              1793176569188932157
+            ],
+            [
+              1793176569192243623,
+              1793176569195251984
+            ],
+            [
+              1793176569195778520,
+              1793176569198284479
+            ],
+            [
+              1793176569198898320,
+              1793176569201989874
+            ],
+            [
+              1793176569202558650,
+              1793176569205154961
+            ],
+            [
+              1793176569205856176,
+              1793176569209253932
+            ],
+            [
+              1793176569209881825,
+              1793176569212803881
+            ],
+            [
+              1793176569213389103,
+              1793176569216213723
+            ],
+            [
+              1793176569216902949,
+              1793176569219620435
+            ],
+            [
+              1793176569220499319,
+              1793176569223685626
+            ],
+            [
+              1793176569224287381,
+              1793176569227221650
+            ],
+            [
+              1793176569227866318,
+              1793176569230992590
+            ],
+            [
+              1793176569231594523,
+              1793176569234303109
+            ],
+            [
+              1793176569234975259,
+              1793176569238263493
+            ],
+            [
+              1793176569238824985,
+              1793176569241487238
+            ],
+            [
+              1793176569241994540,
+              1793176569244486082
+            ],
+            [
+              1793176569245119093,
+              1793176569248018205
+            ],
+            [
+              1793176569248652159,
+              1793176569251479059
+            ],
+            [
+              1793176569252168000,
+              1793176569255210398
+            ],
+            [
+              1793176569255828622,
+              1793176569258894071
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1157423752,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1157423752,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    },
+    {
+      "name": "124-bf16",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "124",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-bf16.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/124-bf16",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 124,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "9a5eadbddb0995e3a5117e013d1c9421ea54be7eacd93059d5600e80c866b527",
+          "201663631cd4ae4625150eebf52728983b01733b701fb1ed702b83424a157a69"
+        ],
+        "per_rank_tokens": [
+          [
+            9690,
+            8345,
+            7338,
+            8534,
+            6683,
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062
+          ],
+          [
+            8516,
+            8930,
+            6925,
+            8223,
+            7810,
+            9740,
+            8847,
+            7929,
+            8330,
+            8110,
+            8888,
+            8723,
+            7266,
+            9858,
+            8052,
+            6749,
+            7969,
+            6785,
+            9850,
+            8589
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436
+          ],
+          [
+            8989,
+            8044,
+            8388,
+            5758,
+            7432
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            71915,
+            70697,
+            57497,
+            75309,
+            60760,
+            83406,
+            71222,
+            68866,
+            64680,
+            77802,
+            58083,
+            71609,
+            65770,
+            73659,
+            63204,
+            47611,
+            68840,
+            70351,
+            71643,
+            74680
+          ],
+          [
+            73733,
+            67503,
+            56607,
+            58747,
+            55184,
+            67618,
+            68906,
+            56470,
+            63048,
+            59806,
+            71197,
+            73463,
+            59302,
+            80509,
+            64276,
+            59053,
+            68496,
+            54377,
+            69781,
+            58528
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          2,
+          5,
+          0,
+          5,
+          5,
+          6,
+          3,
+          2,
+          5,
+          2,
+          5,
+          11,
+          5,
+          1,
+          0,
+          4,
+          1,
+          2,
+          13,
+          1
+        ],
+        "expert_rows_max_per_step": [
+          3949,
+          6361,
+          3622,
+          4366,
+          2330,
+          5915,
+          3329,
+          3847,
+          4007,
+          5555,
+          3796,
+          5845,
+          3908,
+          4717,
+          3862,
+          2995,
+          3525,
+          3108,
+          5528,
+          3787
+        ],
+        "actual_tokens_min": 6584,
+        "actual_tokens_max": 9858,
+        "actual_tokens_mean": 8294.4,
+        "actual_tokens_std": 897.9178915691568,
+        "max_tokens_capacity": 9858,
+        "max_rows_capacity": 99790,
+        "input_tokens_per_second": 5982657.908874103,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "bf16",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": false,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2626.1895,
+        "forward_ready_slowest_rank_p50_us": 2617.1345,
+        "per_rank_forward_ready_us": [
+          [
+            4823.259,
+            2600.429,
+            2311.874,
+            2972.413,
+            2447.872,
+            3135.345,
+            2675.083,
+            2583.755,
+            2466.48,
+            2814.083,
+            2589.996,
+            2720.986,
+            2475.614,
+            3084.794,
+            2481.155,
+            2323.96,
+            2614.074,
+            2620.052,
+            2627.967,
+            2752.283
+          ],
+          [
+            4816.428,
+            2608.302,
+            2303.373,
+            2965.837,
+            2472.954,
+            3144.752,
+            2674.984,
+            2584.056,
+            2473.58,
+            2803.234,
+            2614.217,
+            2709.598,
+            2459.596,
+            3090.731,
+            2501.487,
+            2330.03,
+            2605.03,
+            2598.743,
+            2660.715,
+            2761.906
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 444.301,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          4833.865,
+          2617.592,
+          2321.414,
+          2982.704,
+          2481.523,
+          3153.865,
+          2684.196,
+          2593.906,
+          2483.214,
+          2822.787,
+          2622.929,
+          2729.794,
+          2484.985,
+          3100.614,
+          2510.725,
+          2339.438,
+          2623.287,
+          2629.092,
+          2669.623,
+          2770.735
+        ],
+        "per_rank_wall_us": [
+          [
+            4833.865,
+            2610.023,
+            2321.414,
+            2982.704,
+            2456.799,
+            3145.409,
+            2684.196,
+            2593.906,
+            2476.192,
+            2822.787,
+            2598.805,
+            2729.794,
+            2484.985,
+            3093.916,
+            2491.605,
+            2333.546,
+            2623.287,
+            2629.092,
+            2636.909,
+            2761.599
+          ],
+          [
+            4826.702,
+            2617.592,
+            2312.792,
+            2975.943,
+            2481.523,
+            3153.865,
+            2683.941,
+            2593.378,
+            2483.214,
+            2812.247,
+            2622.929,
+            2718.256,
+            2468.455,
+            3100.614,
+            2510.725,
+            2339.438,
+            2614.026,
+            2607.714,
+            2669.623,
+            2770.735
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176577231752349,
+              1793176577236589477
+            ],
+            [
+              1793176577236978260,
+              1793176577239591119
+            ],
+            [
+              1793176577239918564,
+              1793176577242241450
+            ],
+            [
+              1793176577242618852,
+              1793176577245603196
+            ],
+            [
+              1793176577245938285,
+              1793176577248396934
+            ],
+            [
+              1793176577248813885,
+              1793176577251960564
+            ],
+            [
+              1793176577252349132,
+              1793176577255034876
+            ],
+            [
+              1793176577255379049,
+              1793176577257974422
+            ],
+            [
+              1793176577258326762,
+              1793176577260804788
+            ],
+            [
+              1793176577261185658,
+              1793176577264009747
+            ],
+            [
+              1793176577264369290,
+              1793176577266969230
+            ],
+            [
+              1793176577267358067,
+              1793176577270089134
+            ],
+            [
+              1793176577270448528,
+              1793176577272934669
+            ],
+            [
+              1793176577273320340,
+              1793176577276415457
+            ],
+            [
+              1793176577276843424,
+              1793176577279336470
+            ],
+            [
+              1793176577279650338,
+              1793176577281985051
+            ],
+            [
+              1793176577282378382,
+              1793176577285003456
+            ],
+            [
+              1793176577285382541,
+              1793176577288012897
+            ],
+            [
+              1793176577288391258,
+              1793176577291029299
+            ],
+            [
+              1793176577291425009,
+              1793176577294187923
+            ]
+          ],
+          [
+            [
+              1793176577231751031,
+              1793176577236581512
+            ],
+            [
+              1793176577236978865,
+              1793176577239599959
+            ],
+            [
+              1793176577239920163,
+              1793176577242234609
+            ],
+            [
+              1793176577242614910,
+              1793176577245592237
+            ],
+            [
+              1793176577245928923,
+              1793176577248412129
+            ],
+            [
+              1793176577248814177,
+              1793176577251969522
+            ],
+            [
+              1793176577252346929,
+              1793176577255032427
+            ],
+            [
+              1793176577255379742,
+              1793176577257974308
+            ],
+            [
+              1793176577258325849,
+              1793176577260810434
+            ],
+            [
+              1793176577261184674,
+              1793176577263997967
+            ],
+            [
+              1793176577264369546,
+              1793176577266993607
+            ],
+            [
+              1793176577267359511,
+              1793176577270079146
+            ],
+            [
+              1793176577270448334,
+              1793176577272918024
+            ],
+            [
+              1793176577273320978,
+              1793176577276422938
+            ],
+            [
+              1793176577276826910,
+              1793176577279338958
+            ],
+            [
+              1793176577279647847,
+              1793176577281988441
+            ],
+            [
+              1793176577282374641,
+              1793176577284990406
+            ],
+            [
+              1793176577285383432,
+              1793176577287992327
+            ],
+            [
+              1793176577288390242,
+              1793176577291060979
+            ],
+            [
+              1793176577291424922,
+              1793176577294196860
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1157423752,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1157423752,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    },
+    {
+      "name": "125-bf16",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "125",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-bf16.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-bf16",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 125,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "09b8a562c014c9ea37fd3456eb2d146d183dab3790f67d40487ac59efd186356",
+          "91ed2fc6a9893bee4a243e6c09e0689f0a1f00af4f4272978c912231a18ae90b"
+        ],
+        "per_rank_tokens": [
+          [
+            8516,
+            8930,
+            6925,
+            8223,
+            7810,
+            9740,
+            8847,
+            7929,
+            8330,
+            8110,
+            8888,
+            8723,
+            7266,
+            9858,
+            8052,
+            6749,
+            7969,
+            6785,
+            9850,
+            8589
+          ],
+          [
+            7929,
+            7273,
+            8371,
+            9005,
+            7794,
+            8754,
+            8355,
+            8250,
+            8684,
+            9054,
+            7812,
+            9146,
+            7012,
+            8209,
+            9251,
+            8326,
+            7266,
+            6791,
+            8310,
+            8908
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8989,
+            8044,
+            8388,
+            5758,
+            7432
+          ],
+          [
+            7819,
+            7038,
+            9454,
+            8035,
+            7024
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            64573,
+            64250,
+            61403,
+            78109,
+            60000,
+            69751,
+            67095,
+            67297,
+            61156,
+            66198,
+            64929,
+            60464,
+            60624,
+            69315,
+            66339,
+            70785,
+            66138,
+            58416,
+            68751,
+            69660
+          ],
+          [
+            66987,
+            65374,
+            60965,
+            59715,
+            64832,
+            78201,
+            70521,
+            62135,
+            74956,
+            71114,
+            68671,
+            82488,
+            53600,
+            75221,
+            72085,
+            49815,
+            55742,
+            50192,
+            76529,
+            70316
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          12,
+          8,
+          0,
+          9,
+          0,
+          1,
+          1,
+          5,
+          2,
+          0,
+          2,
+          7,
+          3,
+          4,
+          2,
+          2,
+          9,
+          4,
+          6,
+          2
+        ],
+        "expert_rows_max_per_step": [
+          3638,
+          5082,
+          3097,
+          4465,
+          4263,
+          6207,
+          3562,
+          3026,
+          3210,
+          4186,
+          3536,
+          2830,
+          4117,
+          3610,
+          3793,
+          5741,
+          2665,
+          3699,
+          4547,
+          4399
+        ],
+        "actual_tokens_min": 6749,
+        "actual_tokens_max": 9858,
+        "actual_tokens_mean": 8264.725,
+        "actual_tokens_std": 815.1263701874698,
+        "max_tokens_capacity": 9858,
+        "max_rows_capacity": 98872,
+        "input_tokens_per_second": 6155310.083038752,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "bf16",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": false,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2640.6245,
+        "forward_ready_slowest_rank_p50_us": 2631.29,
+        "per_rank_forward_ready_us": [
+          [
+            2940.078,
+            2502.022,
+            2432.194,
+            2899.185,
+            2467.407,
+            3027.764,
+            2649.831,
+            2554.122,
+            2672.169,
+            2624.205,
+            2539.001,
+            3601.845,
+            2360.305,
+            2741.027,
+            2613.102,
+            2578.262,
+            2481.361,
+            2293.095,
+            2797.447,
+            2670.696
+          ],
+          [
+            2924.481,
+            2476.495,
+            2442.689,
+            2909.813,
+            2472.026,
+            3005.238,
+            2635.644,
+            2553.864,
+            2670.46,
+            2637.107,
+            2516.112,
+            3601.632,
+            2359.9,
+            2714.997,
+            2625.473,
+            2596.944,
+            2470.077,
+            2296.345,
+            2764.487,
+            2674.798
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 461.1615,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          2949.312,
+          2511.237,
+          2452.676,
+          2920.49,
+          2481.052,
+          3036.396,
+          2659.082,
+          2563.404,
+          2681.594,
+          2646.638,
+          2548.04,
+          3611.941,
+          2369.285,
+          2749.89,
+          2634.611,
+          2606.662,
+          2489.823,
+          2305.578,
+          2806.153,
+          2684.072
+        ],
+        "per_rank_wall_us": [
+          [
+            2949.312,
+            2511.237,
+            2441.536,
+            2909.579,
+            2476.273,
+            3036.396,
+            2659.082,
+            2563.404,
+            2681.594,
+            2632.506,
+            2548.04,
+            3610.927,
+            2369.285,
+            2749.89,
+            2621.959,
+            2586.463,
+            2489.823,
+            2302.046,
+            2806.153,
+            2678.951
+          ],
+          [
+            2934.891,
+            2485.403,
+            2452.676,
+            2920.49,
+            2481.052,
+            3015.006,
+            2645.026,
+            2563.187,
+            2680.233,
+            2646.638,
+            2525.344,
+            3611.941,
+            2369.174,
+            2723.547,
+            2634.611,
+            2606.662,
+            2479.569,
+            2305.578,
+            2773.743,
+            2684.072
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176586471252301,
+              1793176586474205565
+            ],
+            [
+              1793176586474798257,
+              1793176586477312946
+            ],
+            [
+              1793176586477862781,
+              1793176586480305885
+            ],
+            [
+              1793176586480932242,
+              1793176586483843210
+            ],
+            [
+              1793176586484401441,
+              1793176586486879777
+            ],
+            [
+              1793176586487509959,
+              1793176586490547600
+            ],
+            [
+              1793176586491127936,
+              1793176586493788549
+            ],
+            [
+              1793176586494323502,
+              1793176586496888224
+            ],
+            [
+              1793176586497466331,
+              1793176586500149820
+            ],
+            [
+              1793176586500745410,
+              1793176586503379067
+            ],
+            [
+              1793176586503955750,
+              1793176586506504965
+            ],
+            [
+              1793176586507086090,
+              1793176586510698676
+            ],
+            [
+              1793176586511204856,
+              1793176586513575474
+            ],
+            [
+              1793176586514178719,
+              1793176586516930084
+            ],
+            [
+              1793176586517499811,
+              1793176586520123256
+            ],
+            [
+              1793176586520672550,
+              1793176586523260262
+            ],
+            [
+              1793176586523797228,
+              1793176586526288711
+            ],
+            [
+              1793176586526761517,
+              1793176586529064902
+            ],
+            [
+              1793176586529698789,
+              1793176586532506226
+            ],
+            [
+              1793176586533072530,
+              1793176586535752780
+            ]
+          ],
+          [
+            [
+              1793176586471253979,
+              1793176586474193295
+            ],
+            [
+              1793176586474800666,
+              1793176586477289436
+            ],
+            [
+              1793176586477868074,
+              1793176586480322584
+            ],
+            [
+              1793176586480934964,
+              1793176586483857295
+            ],
+            [
+              1793176586484401193,
+              1793176586486884137
+            ],
+            [
+              1793176586487509028,
+              1793176586490525894
+            ],
+            [
+              1793176586491130711,
+              1793176586493777643
+            ],
+            [
+              1793176586494326456,
+              1793176586496891317
+            ],
+            [
+              1793176586497469353,
+              1793176586500151693
+            ],
+            [
+              1793176586500748003,
+              1793176586503396379
+            ],
+            [
+              1793176586503957049,
+              1793176586506483934
+            ],
+            [
+              1793176586507086978,
+              1793176586510700974
+            ],
+            [
+              1793176586511207878,
+              1793176586513578743
+            ],
+            [
+              1793176586514177749,
+              1793176586516902650
+            ],
+            [
+              1793176586517500655,
+              1793176586520136855
+            ],
+            [
+              1793176586520674811,
+              1793176586523283189
+            ],
+            [
+              1793176586523798994,
+              1793176586526280613
+            ],
+            [
+              1793176586526761561,
+              1793176586529068738
+            ],
+            [
+              1793176586529697073,
+              1793176586532472315
+            ],
+            [
+              1793176586533072471,
+              1793176586535757866
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1153663624,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1153663624,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    },
+    {
+      "name": "125-fp8",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--seed",
+        "125",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--forward-only",
+        "--stream-ordered",
+        "--timeline-dir",
+        "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-fp8",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "status": 0,
+      "log": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-fp8.log",
+      "trace_dir": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/traces/125-fp8",
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 125,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "09b8a562c014c9ea37fd3456eb2d146d183dab3790f67d40487ac59efd186356",
+          "91ed2fc6a9893bee4a243e6c09e0689f0a1f00af4f4272978c912231a18ae90b"
+        ],
+        "per_rank_tokens": [
+          [
+            8516,
+            8930,
+            6925,
+            8223,
+            7810,
+            9740,
+            8847,
+            7929,
+            8330,
+            8110,
+            8888,
+            8723,
+            7266,
+            9858,
+            8052,
+            6749,
+            7969,
+            6785,
+            9850,
+            8589
+          ],
+          [
+            7929,
+            7273,
+            8371,
+            9005,
+            7794,
+            8754,
+            8355,
+            8250,
+            8684,
+            9054,
+            7812,
+            9146,
+            7012,
+            8209,
+            9251,
+            8326,
+            7266,
+            6791,
+            8310,
+            8908
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8989,
+            8044,
+            8388,
+            5758,
+            7432
+          ],
+          [
+            7819,
+            7038,
+            9454,
+            8035,
+            7024
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            64573,
+            64250,
+            61403,
+            78109,
+            60000,
+            69751,
+            67095,
+            67297,
+            61156,
+            66198,
+            64929,
+            60464,
+            60624,
+            69315,
+            66339,
+            70785,
+            66138,
+            58416,
+            68751,
+            69660
+          ],
+          [
+            66987,
+            65374,
+            60965,
+            59715,
+            64832,
+            78201,
+            70521,
+            62135,
+            74956,
+            71114,
+            68671,
+            82488,
+            53600,
+            75221,
+            72085,
+            49815,
+            55742,
+            50192,
+            76529,
+            70316
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          12,
+          8,
+          0,
+          9,
+          0,
+          1,
+          1,
+          5,
+          2,
+          0,
+          2,
+          7,
+          3,
+          4,
+          2,
+          2,
+          9,
+          4,
+          6,
+          2
+        ],
+        "expert_rows_max_per_step": [
+          3638,
+          5082,
+          3097,
+          4465,
+          4263,
+          6207,
+          3562,
+          3026,
+          3210,
+          4186,
+          3536,
+          2830,
+          4117,
+          3610,
+          3793,
+          5741,
+          2665,
+          3699,
+          4547,
+          4399
+        ],
+        "actual_tokens_min": 6749,
+        "actual_tokens_max": 9858,
+        "actual_tokens_mean": 8264.725,
+        "actual_tokens_std": 815.1263701874698,
+        "max_tokens_capacity": 9858,
+        "max_rows_capacity": 98872,
+        "input_tokens_per_second": 5614342.816929413,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 5,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": true,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 20,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 2929.397,
+        "forward_ready_slowest_rank_p50_us": 2920.765,
+        "per_rank_forward_ready_us": [
+          [
+            2843.716,
+            2866.267,
+            2609.429,
+            3186.801,
+            2688.967,
+            3305.554,
+            2984.718,
+            2794.362,
+            3066.76,
+            2919.687,
+            3050.34,
+            3351.97,
+            2579.658,
+            3134.874,
+            2947.938,
+            2884.734,
+            2777.614,
+            2485.125,
+            3180.292,
+            2872.512
+          ],
+          [
+            2833.303,
+            2829.366,
+            2622.985,
+            3201.61,
+            2682.831,
+            3297.985,
+            2988.446,
+            2800.747,
+            3096.083,
+            2937.336,
+            2984.273,
+            3344.222,
+            2579.244,
+            3109.863,
+            2968.253,
+            2904.194,
+            2777.835,
+            2497.565,
+            3152.941,
+            2878.272
+          ]
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": "eager training forward + device synchronize; checkpoint still live",
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 508.37,
+        "backward_slowest_rank_p50_us": null,
+        "wall_slowest_rank_samples_us": [
+          2852.249,
+          2875.06,
+          2632.481,
+          3211.266,
+          2701.399,
+          3318.515,
+          3000.764,
+          2809.566,
+          3104.909,
+          2946.272,
+          3059.422,
+          3363.889,
+          2591.8,
+          3146.823,
+          2977.901,
+          2912.522,
+          2789.163,
+          2509.359,
+          3191.856,
+          2887.722
+        ],
+        "per_rank_wall_us": [
+          [
+            2852.249,
+            2875.06,
+            2618.089,
+            3199.24,
+            2701.399,
+            3318.515,
+            3000.764,
+            2806.47,
+            3079.424,
+            2931.34,
+            3059.422,
+            3363.889,
+            2591.8,
+            3146.823,
+            2959.468,
+            2895.92,
+            2789.163,
+            2498.463,
+            3191.856,
+            2884.785
+          ],
+          [
+            2842.44,
+            2838.556,
+            2632.481,
+            3211.266,
+            2691.671,
+            3307.293,
+            2996.999,
+            2809.566,
+            3104.909,
+            2946.272,
+            2994.727,
+            3353.527,
+            2588.239,
+            3118.695,
+            2977.901,
+            2912.522,
+            2786.816,
+            2509.359,
+            3161.694,
+            2887.722
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793176594174371785,
+              1793176594177227924
+            ],
+            [
+              1793176594177836615,
+              1793176594180720025
+            ],
+            [
+              1793176594181266810,
+              1793176594183886468
+            ],
+            [
+              1793176594184537861,
+              1793176594187738921
+            ],
+            [
+              1793176594188310977,
+              1793176594191014804
+            ],
+            [
+              1793176594191706044,
+              1793176594195026432
+            ],
+            [
+              1793176594195674878,
+              1793176594198678236
+            ],
+            [
+              1793176594199278753,
+              1793176594202086868
+            ],
+            [
+              1793176594202711349,
+              1793176594205793143
+            ],
+            [
+              1793176594206425689,
+              1793176594209358826
+            ],
+            [
+              1793176594210915218,
+              1793176594213976300
+            ],
+            [
+              1793176594214603792,
+              1793176594217969541
+            ],
+            [
+              1793176594218503319,
+              1793176594221096751
+            ],
+            [
+              1793176594221800209,
+              1793176594224948727
+            ],
+            [
+              1793176594225556113,
+              1793176594228517230
+            ],
+            [
+              1793176594229108716,
+              1793176594232006040
+            ],
+            [
+              1793176594232584908,
+              1793176594235376103
+            ],
+            [
+              1793176594235948815,
+              1793176594238449170
+            ],
+            [
+              1793176594239176924,
+              1793176594242370473
+            ],
+            [
+              1793176594243024354,
+              1793176594245910900
+            ]
+          ],
+          [
+            [
+              1793176594174374362,
+              1793176594177220587
+            ],
+            [
+              1793176594177836135,
+              1793176594180683392
+            ],
+            [
+              1793176594181270839,
+              1793176594183905062
+            ],
+            [
+              1793176594184541383,
+              1793176594187754374
+            ],
+            [
+              1793176594188311792,
+              1793176594191005623
+            ],
+            [
+              1793176594191693569,
+              1793176594195002321
+            ],
+            [
+              1793176594195654207,
+              1793176594198652944
+            ],
+            [
+              1793176594199277506,
+              1793176594202088555
+            ],
+            [
+              1793176594202695132,
+              1793176594205801888
+            ],
+            [
+              1793176594206423616,
+              1793176594209371325
+            ],
+            [
+              1793176594210957548,
+              1793176594213955555
+            ],
+            [
+              1793176594214603539,
+              1793176594217958977
+            ],
+            [
+              1793176594218501304,
+              1793176594221090990
+            ],
+            [
+              1793176594221793026,
+              1793176594224913085
+            ],
+            [
+              1793176594225554583,
+              1793176594228533818
+            ],
+            [
+              1793176594229106474,
+              1793176594232020241
+            ],
+            [
+              1793176594232572929,
+              1793176594235361569
+            ],
+            [
+              1793176594235939913,
+              1793176594238450504
+            ],
+            [
+              1793176594239175034,
+              1793176594242338025
+            ],
+            [
+              1793176594243021332,
+              1793176594245910372
+            ]
+          ]
+        ],
+        "measurement_scope": "eager training forward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1153663624,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1153663624,
+            "gin_bytes": 0,
+            "notify_bytes": 43207336,
+            "notify_slots_in_use": 0,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so"
+      }
+    }
+  ],
+  "matched_first_tasks": [
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 4,
+      "kind": "fc1",
+      "block": 1,
+      "column": 0,
+      "bf16_us": 12.864,
+      "fp8_us": 17.728,
+      "delta_us": 4.864000000000001
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.152,
+      "fp8_us": 17.664,
+      "delta_us": 4.512000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 6,
+      "kind": "fc1",
+      "block": 1,
+      "column": 2,
+      "bf16_us": 12.992,
+      "fp8_us": 17.664,
+      "delta_us": 4.672000000000001
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.088,
+      "fp8_us": 17.728,
+      "delta_us": 4.640000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 5,
+      "kind": "fc1",
+      "block": 1,
+      "column": 1,
+      "bf16_us": 13.056,
+      "fp8_us": 17.6,
+      "delta_us": 4.544000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 7,
+      "kind": "fc1",
+      "block": 1,
+      "column": 3,
+      "bf16_us": 13.088,
+      "fp8_us": 17.664,
+      "delta_us": 4.576000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.376,
+      "fp8_us": 17.824,
+      "delta_us": 4.448000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 0,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.28,
+      "fp8_us": 17.696,
+      "delta_us": 4.416000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 1,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.28,
+      "fp8_us": 17.728,
+      "delta_us": 4.448000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 1,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.472,
+      "fp8_us": 17.664,
+      "delta_us": 4.192000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 1,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.504,
+      "fp8_us": 17.856,
+      "delta_us": 4.352000000000002
+    },
+    {
+      "seed": 123,
+      "rank": 1,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.536,
+      "fp8_us": 17.792,
+      "delta_us": 4.256000000000002
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.536,
+      "fp8_us": 18.016,
+      "delta_us": 4.479999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 6,
+      "kind": "fc1",
+      "block": 1,
+      "column": 2,
+      "bf16_us": 13.536,
+      "fp8_us": 18.08,
+      "delta_us": 4.543999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 10,
+      "kind": "fc1",
+      "block": 2,
+      "column": 2,
+      "bf16_us": 13.472,
+      "fp8_us": 18.08,
+      "delta_us": 4.607999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.44,
+      "fp8_us": 17.888,
+      "delta_us": 4.448000000000002
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 5,
+      "kind": "fc1",
+      "block": 1,
+      "column": 1,
+      "bf16_us": 13.6,
+      "fp8_us": 18.144,
+      "delta_us": 4.543999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.6,
+      "fp8_us": 18.144,
+      "delta_us": 4.543999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 9,
+      "kind": "fc1",
+      "block": 2,
+      "column": 1,
+      "bf16_us": 13.664,
+      "fp8_us": 18.176,
+      "delta_us": 4.511999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 4,
+      "kind": "fc1",
+      "block": 1,
+      "column": 0,
+      "bf16_us": 13.696,
+      "fp8_us": 17.984,
+      "delta_us": 4.288000000000002
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 7,
+      "kind": "fc1",
+      "block": 1,
+      "column": 3,
+      "bf16_us": 13.696,
+      "fp8_us": 18.144,
+      "delta_us": 4.447999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 8,
+      "kind": "fc1",
+      "block": 2,
+      "column": 0,
+      "bf16_us": 13.696,
+      "fp8_us": 18.08,
+      "delta_us": 4.383999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 11,
+      "kind": "fc1",
+      "block": 2,
+      "column": 3,
+      "bf16_us": 13.664,
+      "fp8_us": 18.112,
+      "delta_us": 4.447999999999999
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.76,
+      "fp8_us": 17.888,
+      "delta_us": 4.128000000000002
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 20,
+      "kind": "fc1",
+      "block": 5,
+      "column": 0,
+      "bf16_us": 19.84,
+      "fp8_us": 28.48,
+      "delta_us": 8.64
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 21,
+      "kind": "fc1",
+      "block": 5,
+      "column": 1,
+      "bf16_us": 19.968,
+      "fp8_us": 28.448,
+      "delta_us": 8.48
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 22,
+      "kind": "fc1",
+      "block": 5,
+      "column": 2,
+      "bf16_us": 20.032,
+      "fp8_us": 28.448,
+      "delta_us": 8.416
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 16,
+      "kind": "fc1",
+      "block": 4,
+      "column": 0,
+      "bf16_us": 20.128,
+      "fp8_us": 28.608,
+      "delta_us": 8.48
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 17,
+      "kind": "fc1",
+      "block": 4,
+      "column": 1,
+      "bf16_us": 20.16,
+      "fp8_us": 28.832,
+      "delta_us": 8.672
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 23,
+      "kind": "fc1",
+      "block": 5,
+      "column": 3,
+      "bf16_us": 20.16,
+      "fp8_us": 28.544,
+      "delta_us": 8.384
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 19,
+      "kind": "fc1",
+      "block": 4,
+      "column": 3,
+      "bf16_us": 20.096,
+      "fp8_us": 28.96,
+      "delta_us": 8.864
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 18,
+      "kind": "fc1",
+      "block": 4,
+      "column": 2,
+      "bf16_us": 20.192,
+      "fp8_us": 28.8,
+      "delta_us": 8.608
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 14,
+      "kind": "fc1",
+      "block": 3,
+      "column": 2,
+      "bf16_us": 20.672,
+      "fp8_us": 30.656,
+      "delta_us": 9.983999999999998
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 12,
+      "kind": "fc1",
+      "block": 3,
+      "column": 0,
+      "bf16_us": 20.768,
+      "fp8_us": 30.72,
+      "delta_us": 9.951999999999998
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 15,
+      "kind": "fc1",
+      "block": 3,
+      "column": 3,
+      "bf16_us": 20.832,
+      "fp8_us": 30.848,
+      "delta_us": 10.015999999999998
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 13,
+      "kind": "fc1",
+      "block": 3,
+      "column": 1,
+      "bf16_us": 20.768,
+      "fp8_us": 30.912,
+      "delta_us": 10.143999999999998
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 28,
+      "kind": "fc1",
+      "block": 7,
+      "column": 0,
+      "bf16_us": 27.488,
+      "fp8_us": 40.224,
+      "delta_us": 12.735999999999997
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 29,
+      "kind": "fc1",
+      "block": 7,
+      "column": 1,
+      "bf16_us": 27.52,
+      "fp8_us": 40.32,
+      "delta_us": 12.8
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 31,
+      "kind": "fc1",
+      "block": 7,
+      "column": 3,
+      "bf16_us": 27.616,
+      "fp8_us": 40.16,
+      "delta_us": 12.543999999999997
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 30,
+      "kind": "fc1",
+      "block": 7,
+      "column": 2,
+      "bf16_us": 27.648,
+      "fp8_us": 40.032,
+      "delta_us": 12.383999999999997
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 35,
+      "kind": "fc1",
+      "block": 8,
+      "column": 3,
+      "bf16_us": 28.096,
+      "fp8_us": 39.808,
+      "delta_us": 11.712
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 32,
+      "kind": "fc1",
+      "block": 8,
+      "column": 0,
+      "bf16_us": 28.224,
+      "fp8_us": 39.744,
+      "delta_us": 11.52
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 33,
+      "kind": "fc1",
+      "block": 8,
+      "column": 1,
+      "bf16_us": 28.224,
+      "fp8_us": 39.872,
+      "delta_us": 11.648
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 34,
+      "kind": "fc1",
+      "block": 8,
+      "column": 2,
+      "bf16_us": 28.224,
+      "fp8_us": 39.616,
+      "delta_us": 11.392
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 24,
+      "kind": "fc1",
+      "block": 6,
+      "column": 0,
+      "bf16_us": 30.176,
+      "fp8_us": 43.392,
+      "delta_us": 13.216000000000005
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 25,
+      "kind": "fc1",
+      "block": 6,
+      "column": 1,
+      "bf16_us": 30.208,
+      "fp8_us": 43.52,
+      "delta_us": 13.312000000000005
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 26,
+      "kind": "fc1",
+      "block": 6,
+      "column": 2,
+      "bf16_us": 30.144,
+      "fp8_us": 43.264,
+      "delta_us": 13.120000000000005
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 27,
+      "kind": "fc1",
+      "block": 6,
+      "column": 3,
+      "bf16_us": 30.208,
+      "fp8_us": 43.392,
+      "delta_us": 13.184000000000005
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 42,
+      "kind": "fc1",
+      "block": 10,
+      "column": 2,
+      "bf16_us": 35.328,
+      "fp8_us": 51.2,
+      "delta_us": 15.872
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 41,
+      "kind": "fc1",
+      "block": 10,
+      "column": 1,
+      "bf16_us": 35.424,
+      "fp8_us": 51.264,
+      "delta_us": 15.840000000000003
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 43,
+      "kind": "fc1",
+      "block": 10,
+      "column": 3,
+      "bf16_us": 35.36,
+      "fp8_us": 51.296,
+      "delta_us": 15.936
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 40,
+      "kind": "fc1",
+      "block": 10,
+      "column": 0,
+      "bf16_us": 35.488,
+      "fp8_us": 51.264,
+      "delta_us": 15.776000000000003
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 38,
+      "kind": "fc1",
+      "block": 9,
+      "column": 2,
+      "bf16_us": 38.368,
+      "fp8_us": 55.584,
+      "delta_us": 17.216
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 39,
+      "kind": "fc1",
+      "block": 9,
+      "column": 3,
+      "bf16_us": 38.464,
+      "fp8_us": 55.648,
+      "delta_us": 17.184000000000005
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 36,
+      "kind": "fc1",
+      "block": 9,
+      "column": 0,
+      "bf16_us": 38.592,
+      "fp8_us": 55.616,
+      "delta_us": 17.024
+    },
+    {
+      "seed": 124,
+      "rank": 0,
+      "cta": 37,
+      "kind": "fc1",
+      "block": 9,
+      "column": 1,
+      "bf16_us": 38.624,
+      "fp8_us": 55.616,
+      "delta_us": 16.991999999999997
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.408,
+      "fp8_us": 17.088,
+      "delta_us": 3.6800000000000015
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 4,
+      "kind": "fc1",
+      "block": 1,
+      "column": 0,
+      "bf16_us": 13.504,
+      "fp8_us": 17.184,
+      "delta_us": 3.6800000000000015
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 5,
+      "kind": "fc1",
+      "block": 1,
+      "column": 1,
+      "bf16_us": 13.472,
+      "fp8_us": 17.28,
+      "delta_us": 3.8080000000000016
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 9,
+      "kind": "fc1",
+      "block": 2,
+      "column": 1,
+      "bf16_us": 13.536,
+      "fp8_us": 17.344,
+      "delta_us": 3.8080000000000016
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 8,
+      "kind": "fc1",
+      "block": 2,
+      "column": 0,
+      "bf16_us": 13.568,
+      "fp8_us": 17.152,
+      "delta_us": 3.5840000000000014
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.536,
+      "fp8_us": 17.248,
+      "delta_us": 3.7120000000000015
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.6,
+      "fp8_us": 16.864,
+      "delta_us": 3.264000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 7,
+      "kind": "fc1",
+      "block": 1,
+      "column": 3,
+      "bf16_us": 13.6,
+      "fp8_us": 16.864,
+      "delta_us": 3.264000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.664,
+      "fp8_us": 16.896,
+      "delta_us": 3.232000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 6,
+      "kind": "fc1",
+      "block": 1,
+      "column": 2,
+      "bf16_us": 13.696,
+      "fp8_us": 16.928,
+      "delta_us": 3.232000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 10,
+      "kind": "fc1",
+      "block": 2,
+      "column": 2,
+      "bf16_us": 13.568,
+      "fp8_us": 17.088,
+      "delta_us": 3.5200000000000014
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 11,
+      "kind": "fc1",
+      "block": 2,
+      "column": 3,
+      "bf16_us": 13.664,
+      "fp8_us": 17.472,
+      "delta_us": 3.8080000000000016
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 12,
+      "kind": "fc1",
+      "block": 3,
+      "column": 0,
+      "bf16_us": 20.544,
+      "fp8_us": 30.048,
+      "delta_us": 9.503999999999998
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 13,
+      "kind": "fc1",
+      "block": 3,
+      "column": 1,
+      "bf16_us": 20.64,
+      "fp8_us": 29.76,
+      "delta_us": 9.120000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 14,
+      "kind": "fc1",
+      "block": 3,
+      "column": 2,
+      "bf16_us": 20.64,
+      "fp8_us": 29.792,
+      "delta_us": 9.152000000000001
+    },
+    {
+      "seed": 124,
+      "rank": 1,
+      "cta": 15,
+      "kind": "fc1",
+      "block": 3,
+      "column": 3,
+      "bf16_us": 20.64,
+      "fp8_us": 30.112,
+      "delta_us": 9.471999999999998
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 4,
+      "kind": "fc1",
+      "block": 1,
+      "column": 0,
+      "bf16_us": 13.152,
+      "fp8_us": 18.176,
+      "delta_us": 5.023999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.184,
+      "fp8_us": 17.728,
+      "delta_us": 4.544000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 6,
+      "kind": "fc1",
+      "block": 1,
+      "column": 2,
+      "bf16_us": 13.216,
+      "fp8_us": 17.984,
+      "delta_us": 4.7680000000000025
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.248,
+      "fp8_us": 18.08,
+      "delta_us": 4.831999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 7,
+      "kind": "fc1",
+      "block": 1,
+      "column": 3,
+      "bf16_us": 13.248,
+      "fp8_us": 18.112,
+      "delta_us": 4.863999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 10,
+      "kind": "fc1",
+      "block": 2,
+      "column": 2,
+      "bf16_us": 13.408,
+      "fp8_us": 17.792,
+      "delta_us": 4.384000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 5,
+      "kind": "fc1",
+      "block": 1,
+      "column": 1,
+      "bf16_us": 13.28,
+      "fp8_us": 18.144,
+      "delta_us": 4.863999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.376,
+      "fp8_us": 18.208,
+      "delta_us": 4.831999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 8,
+      "kind": "fc1",
+      "block": 2,
+      "column": 0,
+      "bf16_us": 13.344,
+      "fp8_us": 18.176,
+      "delta_us": 4.831999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 9,
+      "kind": "fc1",
+      "block": 2,
+      "column": 1,
+      "bf16_us": 13.376,
+      "fp8_us": 18.112,
+      "delta_us": 4.735999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 11,
+      "kind": "fc1",
+      "block": 2,
+      "column": 3,
+      "bf16_us": 13.504,
+      "fp8_us": 17.92,
+      "delta_us": 4.416000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.504,
+      "fp8_us": 17.824,
+      "delta_us": 4.320000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 16,
+      "kind": "fc1",
+      "block": 4,
+      "column": 0,
+      "bf16_us": 20.288,
+      "fp8_us": 28.768,
+      "delta_us": 8.48
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 17,
+      "kind": "fc1",
+      "block": 4,
+      "column": 1,
+      "bf16_us": 20.384,
+      "fp8_us": 28.8,
+      "delta_us": 8.416
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 20,
+      "kind": "fc1",
+      "block": 5,
+      "column": 0,
+      "bf16_us": 20.352,
+      "fp8_us": 28.672,
+      "delta_us": 8.32
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 18,
+      "kind": "fc1",
+      "block": 4,
+      "column": 2,
+      "bf16_us": 20.416,
+      "fp8_us": 28.896,
+      "delta_us": 8.48
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 21,
+      "kind": "fc1",
+      "block": 5,
+      "column": 1,
+      "bf16_us": 20.384,
+      "fp8_us": 28.8,
+      "delta_us": 8.416
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 22,
+      "kind": "fc1",
+      "block": 5,
+      "column": 2,
+      "bf16_us": 20.352,
+      "fp8_us": 28.608,
+      "delta_us": 8.256
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 13,
+      "kind": "fc1",
+      "block": 3,
+      "column": 1,
+      "bf16_us": 20.512,
+      "fp8_us": 31.072,
+      "delta_us": 10.559999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 12,
+      "kind": "fc1",
+      "block": 3,
+      "column": 0,
+      "bf16_us": 20.544,
+      "fp8_us": 30.976,
+      "delta_us": 10.431999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 14,
+      "kind": "fc1",
+      "block": 3,
+      "column": 2,
+      "bf16_us": 20.48,
+      "fp8_us": 31.008,
+      "delta_us": 10.527999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 19,
+      "kind": "fc1",
+      "block": 4,
+      "column": 3,
+      "bf16_us": 20.512,
+      "fp8_us": 28.864,
+      "delta_us": 8.352
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 23,
+      "kind": "fc1",
+      "block": 5,
+      "column": 3,
+      "bf16_us": 20.512,
+      "fp8_us": 28.8,
+      "delta_us": 8.288
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 15,
+      "kind": "fc1",
+      "block": 3,
+      "column": 3,
+      "bf16_us": 20.576,
+      "fp8_us": 31.232,
+      "delta_us": 10.655999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 30,
+      "kind": "fc1",
+      "block": 7,
+      "column": 2,
+      "bf16_us": 27.008,
+      "fp8_us": 40.288,
+      "delta_us": 13.279999999999998
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 31,
+      "kind": "fc1",
+      "block": 7,
+      "column": 3,
+      "bf16_us": 27.04,
+      "fp8_us": 40.544,
+      "delta_us": 13.503999999999998
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 28,
+      "kind": "fc1",
+      "block": 7,
+      "column": 0,
+      "bf16_us": 27.264,
+      "fp8_us": 40.0,
+      "delta_us": 12.736
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 29,
+      "kind": "fc1",
+      "block": 7,
+      "column": 1,
+      "bf16_us": 27.328,
+      "fp8_us": 40.096,
+      "delta_us": 12.767999999999997
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 32,
+      "kind": "fc1",
+      "block": 8,
+      "column": 0,
+      "bf16_us": 27.36,
+      "fp8_us": 39.872,
+      "delta_us": 12.512
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 34,
+      "kind": "fc1",
+      "block": 8,
+      "column": 2,
+      "bf16_us": 27.456,
+      "fp8_us": 39.872,
+      "delta_us": 12.416
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 33,
+      "kind": "fc1",
+      "block": 8,
+      "column": 1,
+      "bf16_us": 27.456,
+      "fp8_us": 40.064,
+      "delta_us": 12.608
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 35,
+      "kind": "fc1",
+      "block": 8,
+      "column": 3,
+      "bf16_us": 27.52,
+      "fp8_us": 40.0,
+      "delta_us": 12.48
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 24,
+      "kind": "fc1",
+      "block": 6,
+      "column": 0,
+      "bf16_us": 28.672,
+      "fp8_us": 43.552,
+      "delta_us": 14.879999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 25,
+      "kind": "fc1",
+      "block": 6,
+      "column": 1,
+      "bf16_us": 28.672,
+      "fp8_us": 43.616,
+      "delta_us": 14.943999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 26,
+      "kind": "fc1",
+      "block": 6,
+      "column": 2,
+      "bf16_us": 28.8,
+      "fp8_us": 43.648,
+      "delta_us": 14.848000000000003
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 27,
+      "kind": "fc1",
+      "block": 6,
+      "column": 3,
+      "bf16_us": 28.832,
+      "fp8_us": 43.584,
+      "delta_us": 14.752000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 40,
+      "kind": "fc1",
+      "block": 10,
+      "column": 0,
+      "bf16_us": 34.08,
+      "fp8_us": 52.544,
+      "delta_us": 18.464
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 41,
+      "kind": "fc1",
+      "block": 10,
+      "column": 1,
+      "bf16_us": 34.144,
+      "fp8_us": 52.512,
+      "delta_us": 18.368000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 46,
+      "kind": "fc1",
+      "block": 11,
+      "column": 2,
+      "bf16_us": 34.336,
+      "fp8_us": 51.552,
+      "delta_us": 17.216
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 42,
+      "kind": "fc1",
+      "block": 10,
+      "column": 2,
+      "bf16_us": 34.432,
+      "fp8_us": 52.16,
+      "delta_us": 17.727999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 43,
+      "kind": "fc1",
+      "block": 10,
+      "column": 3,
+      "bf16_us": 34.432,
+      "fp8_us": 52.16,
+      "delta_us": 17.727999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 44,
+      "kind": "fc1",
+      "block": 11,
+      "column": 0,
+      "bf16_us": 34.464,
+      "fp8_us": 51.36,
+      "delta_us": 16.896
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 47,
+      "kind": "fc1",
+      "block": 11,
+      "column": 3,
+      "bf16_us": 34.432,
+      "fp8_us": 51.584,
+      "delta_us": 17.152
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 45,
+      "kind": "fc1",
+      "block": 11,
+      "column": 1,
+      "bf16_us": 34.496,
+      "fp8_us": 51.168,
+      "delta_us": 16.671999999999997
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 38,
+      "kind": "fc1",
+      "block": 9,
+      "column": 2,
+      "bf16_us": 36.8,
+      "fp8_us": 57.44,
+      "delta_us": 20.64
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 39,
+      "kind": "fc1",
+      "block": 9,
+      "column": 3,
+      "bf16_us": 37.024,
+      "fp8_us": 57.632,
+      "delta_us": 20.607999999999997
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 36,
+      "kind": "fc1",
+      "block": 9,
+      "column": 0,
+      "bf16_us": 37.248,
+      "fp8_us": 57.536,
+      "delta_us": 20.288000000000004
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 37,
+      "kind": "fc1",
+      "block": 9,
+      "column": 1,
+      "bf16_us": 37.28,
+      "fp8_us": 57.472,
+      "delta_us": 20.192
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 56,
+      "kind": "fc1",
+      "block": 14,
+      "column": 0,
+      "bf16_us": 41.152,
+      "fp8_us": 62.304,
+      "delta_us": 21.152
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 57,
+      "kind": "fc1",
+      "block": 14,
+      "column": 1,
+      "bf16_us": 41.184,
+      "fp8_us": 62.4,
+      "delta_us": 21.216
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 58,
+      "kind": "fc1",
+      "block": 14,
+      "column": 2,
+      "bf16_us": 41.376,
+      "fp8_us": 62.208,
+      "delta_us": 20.832
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 59,
+      "kind": "fc1",
+      "block": 14,
+      "column": 3,
+      "bf16_us": 41.344,
+      "fp8_us": 62.208,
+      "delta_us": 20.863999999999997
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 53,
+      "kind": "fc1",
+      "block": 13,
+      "column": 1,
+      "bf16_us": 42.592,
+      "fp8_us": 64.736,
+      "delta_us": 22.144000000000005
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 54,
+      "kind": "fc1",
+      "block": 13,
+      "column": 2,
+      "bf16_us": 42.624,
+      "fp8_us": 64.576,
+      "delta_us": 21.95199999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 52,
+      "kind": "fc1",
+      "block": 13,
+      "column": 0,
+      "bf16_us": 42.624,
+      "fp8_us": 64.64,
+      "delta_us": 22.016
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 55,
+      "kind": "fc1",
+      "block": 13,
+      "column": 3,
+      "bf16_us": 42.752,
+      "fp8_us": 64.512,
+      "delta_us": 21.759999999999998
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 48,
+      "kind": "fc1",
+      "block": 12,
+      "column": 0,
+      "bf16_us": 45.056,
+      "fp8_us": 71.296,
+      "delta_us": 26.24000000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 49,
+      "kind": "fc1",
+      "block": 12,
+      "column": 1,
+      "bf16_us": 45.216,
+      "fp8_us": 71.2,
+      "delta_us": 25.984
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 50,
+      "kind": "fc1",
+      "block": 12,
+      "column": 2,
+      "bf16_us": 45.248,
+      "fp8_us": 71.392,
+      "delta_us": 26.144
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 51,
+      "kind": "fc1",
+      "block": 12,
+      "column": 3,
+      "bf16_us": 45.248,
+      "fp8_us": 71.232,
+      "delta_us": 25.984
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 70,
+      "kind": "fc1",
+      "block": 17,
+      "column": 2,
+      "bf16_us": 48.448,
+      "fp8_us": 72.8,
+      "delta_us": 24.351999999999997
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 68,
+      "kind": "fc1",
+      "block": 17,
+      "column": 0,
+      "bf16_us": 48.512,
+      "fp8_us": 72.768,
+      "delta_us": 24.256
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 71,
+      "kind": "fc1",
+      "block": 17,
+      "column": 3,
+      "bf16_us": 48.544,
+      "fp8_us": 72.864,
+      "delta_us": 24.320000000000007
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 69,
+      "kind": "fc1",
+      "block": 17,
+      "column": 1,
+      "bf16_us": 48.672,
+      "fp8_us": 72.672,
+      "delta_us": 24.0
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 64,
+      "kind": "fc1",
+      "block": 16,
+      "column": 0,
+      "bf16_us": 51.36,
+      "fp8_us": 78.368,
+      "delta_us": 27.007999999999996
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 65,
+      "kind": "fc1",
+      "block": 16,
+      "column": 1,
+      "bf16_us": 51.424,
+      "fp8_us": 78.24,
+      "delta_us": 26.815999999999995
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 67,
+      "kind": "fc1",
+      "block": 16,
+      "column": 3,
+      "bf16_us": 51.456,
+      "fp8_us": 78.24,
+      "delta_us": 26.783999999999992
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 66,
+      "kind": "fc1",
+      "block": 16,
+      "column": 2,
+      "bf16_us": 51.52,
+      "fp8_us": 78.24,
+      "delta_us": 26.71999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 62,
+      "kind": "fc1",
+      "block": 15,
+      "column": 2,
+      "bf16_us": 53.088,
+      "fp8_us": 82.272,
+      "delta_us": 29.184000000000005
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 63,
+      "kind": "fc1",
+      "block": 15,
+      "column": 3,
+      "bf16_us": 53.184,
+      "fp8_us": 82.432,
+      "delta_us": 29.248000000000005
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 61,
+      "kind": "fc1",
+      "block": 15,
+      "column": 1,
+      "bf16_us": 53.408,
+      "fp8_us": 82.272,
+      "delta_us": 28.864000000000004
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 60,
+      "kind": "fc1",
+      "block": 15,
+      "column": 0,
+      "bf16_us": 53.6,
+      "fp8_us": 82.496,
+      "delta_us": 28.895999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 80,
+      "kind": "fc1",
+      "block": 20,
+      "column": 0,
+      "bf16_us": 56.288,
+      "fp8_us": 83.68,
+      "delta_us": 27.39200000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 81,
+      "kind": "fc1",
+      "block": 20,
+      "column": 1,
+      "bf16_us": 56.32,
+      "fp8_us": 83.776,
+      "delta_us": 27.455999999999996
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 83,
+      "kind": "fc1",
+      "block": 20,
+      "column": 3,
+      "bf16_us": 56.288,
+      "fp8_us": 83.904,
+      "delta_us": 27.616
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 82,
+      "kind": "fc1",
+      "block": 20,
+      "column": 2,
+      "bf16_us": 56.384,
+      "fp8_us": 83.776,
+      "delta_us": 27.391999999999996
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 78,
+      "kind": "fc1",
+      "block": 19,
+      "column": 2,
+      "bf16_us": 60.416,
+      "fp8_us": 91.456,
+      "delta_us": 31.040000000000006
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 79,
+      "kind": "fc1",
+      "block": 19,
+      "column": 3,
+      "bf16_us": 60.544,
+      "fp8_us": 91.488,
+      "delta_us": 30.944000000000003
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 77,
+      "kind": "fc1",
+      "block": 19,
+      "column": 1,
+      "bf16_us": 60.544,
+      "fp8_us": 91.36,
+      "delta_us": 30.816000000000003
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 76,
+      "kind": "fc1",
+      "block": 19,
+      "column": 0,
+      "bf16_us": 60.736,
+      "fp8_us": 91.424,
+      "delta_us": 30.68800000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 73,
+      "kind": "fc1",
+      "block": 18,
+      "column": 1,
+      "bf16_us": 60.832,
+      "fp8_us": 93.376,
+      "delta_us": 32.544000000000004
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 72,
+      "kind": "fc1",
+      "block": 18,
+      "column": 0,
+      "bf16_us": 60.864,
+      "fp8_us": 93.376,
+      "delta_us": 32.51200000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 74,
+      "kind": "fc1",
+      "block": 18,
+      "column": 2,
+      "bf16_us": 60.864,
+      "fp8_us": 93.312,
+      "delta_us": 32.448
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 75,
+      "kind": "fc1",
+      "block": 18,
+      "column": 3,
+      "bf16_us": 60.896,
+      "fp8_us": 93.216,
+      "delta_us": 32.31999999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 92,
+      "kind": "fc1",
+      "block": 23,
+      "column": 0,
+      "bf16_us": 64.448,
+      "fp8_us": 98.72,
+      "delta_us": 34.272000000000006
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 93,
+      "kind": "fc1",
+      "block": 23,
+      "column": 1,
+      "bf16_us": 64.64,
+      "fp8_us": 99.008,
+      "delta_us": 34.367999999999995
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 94,
+      "kind": "fc1",
+      "block": 23,
+      "column": 2,
+      "bf16_us": 64.64,
+      "fp8_us": 98.592,
+      "delta_us": 33.952
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 95,
+      "kind": "fc1",
+      "block": 23,
+      "column": 3,
+      "bf16_us": 64.672,
+      "fp8_us": 98.624,
+      "delta_us": 33.952
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 85,
+      "kind": "fc1",
+      "block": 21,
+      "column": 1,
+      "bf16_us": 66.944,
+      "fp8_us": 103.488,
+      "delta_us": 36.544
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 84,
+      "kind": "fc1",
+      "block": 21,
+      "column": 0,
+      "bf16_us": 67.008,
+      "fp8_us": 103.328,
+      "delta_us": 36.32000000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 86,
+      "kind": "fc1",
+      "block": 21,
+      "column": 2,
+      "bf16_us": 67.168,
+      "fp8_us": 103.456,
+      "delta_us": 36.288
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 87,
+      "kind": "fc1",
+      "block": 21,
+      "column": 3,
+      "bf16_us": 67.2,
+      "fp8_us": 103.392,
+      "delta_us": 36.19199999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 91,
+      "kind": "fc1",
+      "block": 22,
+      "column": 3,
+      "bf16_us": 68.544,
+      "fp8_us": 102.688,
+      "delta_us": 34.144000000000005
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 89,
+      "kind": "fc1",
+      "block": 22,
+      "column": 1,
+      "bf16_us": 68.576,
+      "fp8_us": 102.272,
+      "delta_us": 33.69600000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 88,
+      "kind": "fc1",
+      "block": 22,
+      "column": 0,
+      "bf16_us": 68.608,
+      "fp8_us": 102.272,
+      "delta_us": 33.664
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 90,
+      "kind": "fc1",
+      "block": 22,
+      "column": 2,
+      "bf16_us": 68.608,
+      "fp8_us": 102.656,
+      "delta_us": 34.048
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 96,
+      "kind": "fc1",
+      "block": 24,
+      "column": 0,
+      "bf16_us": 73.632,
+      "fp8_us": 113.408,
+      "delta_us": 39.775999999999996
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 98,
+      "kind": "fc1",
+      "block": 24,
+      "column": 2,
+      "bf16_us": 73.696,
+      "fp8_us": 113.728,
+      "delta_us": 40.032
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 99,
+      "kind": "fc1",
+      "block": 24,
+      "column": 3,
+      "bf16_us": 73.696,
+      "fp8_us": 113.696,
+      "delta_us": 40.0
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 97,
+      "kind": "fc1",
+      "block": 24,
+      "column": 1,
+      "bf16_us": 73.792,
+      "fp8_us": 113.376,
+      "delta_us": 39.584
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 106,
+      "kind": "fc1",
+      "block": 26,
+      "column": 2,
+      "bf16_us": 74.464,
+      "fp8_us": 112.064,
+      "delta_us": 37.599999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 107,
+      "kind": "fc1",
+      "block": 26,
+      "column": 3,
+      "bf16_us": 74.496,
+      "fp8_us": 112.064,
+      "delta_us": 37.568
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 104,
+      "kind": "fc1",
+      "block": 26,
+      "column": 0,
+      "bf16_us": 74.56,
+      "fp8_us": 112.032,
+      "delta_us": 37.471999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 105,
+      "kind": "fc1",
+      "block": 26,
+      "column": 1,
+      "bf16_us": 74.688,
+      "fp8_us": 112.032,
+      "delta_us": 37.343999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 100,
+      "kind": "fc1",
+      "block": 25,
+      "column": 0,
+      "bf16_us": 76.064,
+      "fp8_us": 114.72,
+      "delta_us": 38.656000000000006
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 101,
+      "kind": "fc1",
+      "block": 25,
+      "column": 1,
+      "bf16_us": 76.032,
+      "fp8_us": 114.88,
+      "delta_us": 38.848
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 102,
+      "kind": "fc1",
+      "block": 25,
+      "column": 2,
+      "bf16_us": 76.096,
+      "fp8_us": 114.528,
+      "delta_us": 38.432
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 103,
+      "kind": "fc1",
+      "block": 25,
+      "column": 3,
+      "bf16_us": 76.16,
+      "fp8_us": 114.848,
+      "delta_us": 38.688
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 120,
+      "kind": "fc1",
+      "block": 30,
+      "column": 0,
+      "bf16_us": 79.392,
+      "fp8_us": 120.288,
+      "delta_us": 40.896
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 121,
+      "kind": "fc1",
+      "block": 30,
+      "column": 1,
+      "bf16_us": 79.392,
+      "fp8_us": 120.352,
+      "delta_us": 40.96000000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 123,
+      "kind": "fc1",
+      "block": 30,
+      "column": 3,
+      "bf16_us": 79.616,
+      "fp8_us": 120.192,
+      "delta_us": 40.57599999999999
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 122,
+      "kind": "fc1",
+      "block": 30,
+      "column": 2,
+      "bf16_us": 79.648,
+      "fp8_us": 120.384,
+      "delta_us": 40.736000000000004
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 111,
+      "kind": "fc1",
+      "block": 27,
+      "column": 3,
+      "bf16_us": 80.96,
+      "fp8_us": 122.688,
+      "delta_us": 41.72800000000001
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 109,
+      "kind": "fc1",
+      "block": 27,
+      "column": 1,
+      "bf16_us": 81.024,
+      "fp8_us": 122.592,
+      "delta_us": 41.568
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 110,
+      "kind": "fc1",
+      "block": 27,
+      "column": 2,
+      "bf16_us": 81.024,
+      "fp8_us": 122.496,
+      "delta_us": 41.471999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 108,
+      "kind": "fc1",
+      "block": 27,
+      "column": 0,
+      "bf16_us": 81.056,
+      "fp8_us": 122.592,
+      "delta_us": 41.536
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 118,
+      "kind": "fc1",
+      "block": 29,
+      "column": 2,
+      "bf16_us": 82.464,
+      "fp8_us": 123.072,
+      "delta_us": 40.608000000000004
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 119,
+      "kind": "fc1",
+      "block": 29,
+      "column": 3,
+      "bf16_us": 82.464,
+      "fp8_us": 123.104,
+      "delta_us": 40.64
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 117,
+      "kind": "fc1",
+      "block": 29,
+      "column": 1,
+      "bf16_us": 82.624,
+      "fp8_us": 123.008,
+      "delta_us": 40.384
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 116,
+      "kind": "fc1",
+      "block": 29,
+      "column": 0,
+      "bf16_us": 82.688,
+      "fp8_us": 122.976,
+      "delta_us": 40.288
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 112,
+      "kind": "fc1",
+      "block": 28,
+      "column": 0,
+      "bf16_us": 83.744,
+      "fp8_us": 124.992,
+      "delta_us": 41.248000000000005
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 113,
+      "kind": "fc1",
+      "block": 28,
+      "column": 1,
+      "bf16_us": 83.776,
+      "fp8_us": 124.96,
+      "delta_us": 41.184
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 114,
+      "kind": "fc1",
+      "block": 28,
+      "column": 2,
+      "bf16_us": 83.84,
+      "fp8_us": 125.184,
+      "delta_us": 41.343999999999994
+    },
+    {
+      "seed": 125,
+      "rank": 0,
+      "cta": 115,
+      "kind": "fc1",
+      "block": 28,
+      "column": 3,
+      "bf16_us": 83.872,
+      "fp8_us": 125.184,
+      "delta_us": 41.312
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 10,
+      "kind": "fc1",
+      "block": 2,
+      "column": 2,
+      "bf16_us": 13.024,
+      "fp8_us": 17.76,
+      "delta_us": 4.736000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 0,
+      "kind": "fc1",
+      "block": 0,
+      "column": 0,
+      "bf16_us": 13.152,
+      "fp8_us": 17.888,
+      "delta_us": 4.736000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 5,
+      "kind": "fc1",
+      "block": 1,
+      "column": 1,
+      "bf16_us": 13.248,
+      "fp8_us": 17.888,
+      "delta_us": 4.640000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 8,
+      "kind": "fc1",
+      "block": 2,
+      "column": 0,
+      "bf16_us": 13.248,
+      "fp8_us": 17.888,
+      "delta_us": 4.640000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 11,
+      "kind": "fc1",
+      "block": 2,
+      "column": 3,
+      "bf16_us": 13.312,
+      "fp8_us": 17.856,
+      "delta_us": 4.544000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 7,
+      "kind": "fc1",
+      "block": 1,
+      "column": 3,
+      "bf16_us": 13.28,
+      "fp8_us": 17.984,
+      "delta_us": 4.704000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 1,
+      "kind": "fc1",
+      "block": 0,
+      "column": 1,
+      "bf16_us": 13.312,
+      "fp8_us": 17.92,
+      "delta_us": 4.608000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 4,
+      "kind": "fc1",
+      "block": 1,
+      "column": 0,
+      "bf16_us": 13.312,
+      "fp8_us": 17.92,
+      "delta_us": 4.608000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 9,
+      "kind": "fc1",
+      "block": 2,
+      "column": 1,
+      "bf16_us": 13.312,
+      "fp8_us": 17.888,
+      "delta_us": 4.576000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 2,
+      "kind": "fc1",
+      "block": 0,
+      "column": 2,
+      "bf16_us": 13.344,
+      "fp8_us": 17.888,
+      "delta_us": 4.544000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 3,
+      "kind": "fc1",
+      "block": 0,
+      "column": 3,
+      "bf16_us": 13.344,
+      "fp8_us": 17.952,
+      "delta_us": 4.608000000000002
+    },
+    {
+      "seed": 125,
+      "rank": 1,
+      "cta": 6,
+      "kind": "fc1",
+      "block": 1,
+      "column": 2,
+      "bf16_us": 13.344,
+      "fp8_us": 17.888,
+      "delta_us": 4.544000000000002
+    }
+  ],
+  "matched_first_task_means": {
+    "bf16_us": 36.62476923076923,
+    "fp8_us": 54.316,
+    "delta_us": 17.69123076923077
+  },
+  "build_command": "WEFTMOE_DEVICE_TIMELINE=1 NVCCFLAGS='-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 -I/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/configs/profiles/qwen35b' python build_native.py lib --output build/fp8-fwd-timeline/libweftmoe.so --jobs 4",
+  "extension_build_command": "WEFTMOE_DEVICE_TIMELINE=1 python tools/build_tensor_runtime.py --library build/fp8-fwd-timeline/libweftmoe.so",
+  "sha256": {
+    "src/cuda/weftmoe_pf/local_compute.cuh": "17a3e308bae09acb749aacea78c767e9bd597573bb6f2b870403a7491ad17505",
+    "src/cuda/weftmoe_pf/local_kernel.cuh": "fee09daaee353babc8362b8f0630c7e4b91bdd1f79ccc7af4d66152e0f8851c0",
+    "src/cuda/weftmoe_pf/local_schedule.cuh": "46021945d444f3fbee471baa540183f4a8548524cd43fc746ea2821d1dbe9f64",
+    "build/fp8-fwd-timeline/libweftmoe.so": "081efab1e5ad874ed2a2129d2b54cbd48e0de469e77d37ab2f61b148aa24f373",
+    "build/fp8-fwd-timeline/_runtime.cpython-312-x86_64-linux-gnu.so": "d44ec459eac94bdf6db7cabee3d7ce7276e6b723bd5e3e381009f6f7e8f7c0f5"
+  }
+}

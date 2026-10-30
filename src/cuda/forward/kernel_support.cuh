@@ -128,19 +128,55 @@ CUtensorMap make_bf16_tma_map(void *base, std::uint64_t inner,
   return map;
 }
 
+CUtensorMap make_fp8_tma_map(void *base, std::uint64_t inner,
+                              std::uint64_t outer, std::uint32_t box_outer,
+                              const char *field,
+                              std::uint64_t row_stride_bytes = 0ULL,
+                              bool packed_ring = false) {
+  if (!base || inner == 0 || outer == 0 || inner > UINT32_MAX ||
+      outer > UINT32_MAX || box_outer == 0)
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
+                    field, 0, "nonzero uint32 dimensions and valid base",
+                    "invalid");
+  if (packed_ring && (inner % 128U || outer % 128U || box_outer != 128U ||
+                      row_stride_bytes < inner + inner / 32U))
+    transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
+                    field, 0, "M128 slots with room for FP8 data and scales", "invalid");
+  CUtensorMap map{};
+  const cuuint64_t dims[3] = {inner, packed_ring ? 128U : outer, outer / 128U};
+  const cuuint64_t strides[2] = {
+      packed_ring ? inner : row_stride_bytes ? row_stride_bytes : inner,
+      row_stride_bytes * 128U};
+  const cuuint32_t box[3] = {128U, box_outer, 1U};
+  const cuuint32_t element_strides[3] = {1U, 1U, 1U};
+  const auto result = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, packed_ring ? 3U : 2U, base, dims, strides, box,
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    const char *text = nullptr;
+    (void)cuGetErrorString(result, &text);
+    transport_error(NotifyErrorCode::CudaFailure, "forward-tma-map", field, 0,
+                    "cuTensorMapEncodeTiled success",
+                    text ? text : "unknown CUDA driver error");
+  }
+  return map;
+}
+
 // Describe original [expert, gate/up, channel, hidden] storage in the order
 // consumed by GMMA: [expert, channel/8, gate/up, channel%8, hidden].
 CUtensorMap make_packed_w1_tma_map(void *base, std::uint64_t hidden,
                                   std::uint64_t intermediate,
                                   std::uint32_t experts, std::uint32_t tile_n,
-                                  std::uint32_t tile_k, const char *field) {
+                                  std::uint32_t tile_k, const char *field, bool fp8 = false) {
   if (!base || !hidden || !intermediate || !experts || !tile_n || !tile_k ||
       hidden > UINT32_MAX || intermediate > UINT32_MAX ||
       intermediate % 8U || tile_n % 16U)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
                     field, 0, "valid packed gate/up dimensions", "invalid");
   CUtensorMap map{};
-  const auto row_bytes = checked_mul(hidden, 2ULL, field);
+  const auto row_bytes = checked_mul(hidden, fp8 ? 1ULL : 2ULL, field);
   const auto projection_bytes = checked_mul(intermediate, row_bytes, field);
   const cuuint64_t dims[5] = {hidden, 8U, 2U, intermediate / 8U, experts};
   const cuuint64_t strides[4] = {
@@ -149,7 +185,7 @@ CUtensorMap make_packed_w1_tma_map(void *base, std::uint64_t hidden,
   const cuuint32_t box[5] = {tile_k, 8U, 2U, tile_n / 16U, 1U};
   const cuuint32_t element_strides[5] = {1U, 1U, 1U, 1U, 1U};
   const auto result = cuTensorMapEncodeTiled(
-      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, base, dims, strides, box,
+      &map, fp8 ? CU_TENSOR_MAP_DATA_TYPE_UINT8 : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, base, dims, strides, box,
       element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -800,6 +836,7 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.source = append(cursor, config.max_nodes, metadata.bytes,
                             "ring source replicas");
     const auto packet =
+        config.fp8_workspace ? packets.rows * fp8::source_pitch(config.max_hidden_size) :
         static_forward::packet_bytes(packets.rows, config.max_hidden_size);
     const auto returning = static_forward::packet_bytes(
         static_forward::kNetworkReturnPackets.rows, config.max_hidden_size);
@@ -835,9 +872,8 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
       network.contexts = weftmoe_pf::kNetworkOwners - 1U;
       network.input =
           append(cursor,
-                 checked_mul(config.max_tokens_per_rank, config.max_hidden_size,
-                             "registered pull input"),
-                 sizeof(transport::BFloat16), "immutable pull input");
+                 config.max_tokens_per_rank,
+                 config.fp8_workspace ? fp8::source_pitch(config.max_hidden_size) : config.max_hidden_size * 2U, "immutable pull input");
     }
     network.return_rows = std::max(
         network.rings.slots() * static_forward::kNetworkReturnPackets.rows,
@@ -1171,10 +1207,13 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       rank_links, config.ring_slots_per_source_channel, "ingress slots");
   layout.execution_epoch =
       append(cursor, 1, sizeof(std::uint64_t), "execution epoch");
-  layout.input = append(cursor,
-                        checked_mul(config.max_tokens_per_rank,
-                                    config.max_hidden_size, "input elements"),
-                        sizeof(transport::BFloat16), "input");
+  const auto x_pitch = config.fp8_workspace
+      ? fp8::source_pitch(config.max_hidden_size)
+      : config.max_hidden_size * sizeof(transport::BFloat16);
+  const auto s_pitch = config.fp8_workspace
+      ? fp8::source_pitch(config.max_intermediate_size)
+      : config.max_intermediate_size * sizeof(transport::BFloat16);
+  layout.input = append(cursor, config.max_tokens_per_rank, x_pitch, "input");
   layout.ring_headers =
       append(cursor, ring_slots, sizeof(transport::TransportSlotHeader),
              "ring headers");
@@ -1233,8 +1272,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
       append(cursor, routes, sizeof(std::uint32_t), "packet claim bitmap");
   layout.canonical_rows = append(
       cursor,
-      checked_mul(activation_rows, config.max_hidden_size, "canonical rows"),
-      sizeof(transport::BFloat16), "canonical rows");
+      activation_rows, x_pitch, "canonical rows");
   layout.canonical_gates =
       append(cursor, activation_rows, sizeof(float), "canonical route gates");
   const auto route_elements =
@@ -1275,11 +1313,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
         sizeof(transport::BFloat16), "Socket receive payload");
   }
   if (config.max_intermediate_size != 0) {
-    const auto forward_elements =
-        checked_mul(activation_rows, config.max_intermediate_size,
-                    "forward gated U elements");
-    layout.forward_s = append(cursor, forward_elements,
-                              sizeof(transport::BFloat16), "forward gated U");
+    layout.forward_s = append(cursor, activation_rows, s_pitch, "forward gated U");
     if (config.enable_backward_state) {
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
       // Dispatch must not overwrite the diagnostic's prefilled Return fixture.
@@ -1533,6 +1567,7 @@ struct PoolSlot {
   std::uint64_t transport_epoch = 0;
   bool completion_recorded = false;
   CUtensorMap forward_x_map{};
+  CUtensorMap forward_fp8_x_map{}, forward_fp8_s_map{};
   CUtensorMap forward_s_map{};
   CUtensorMap decode_x_map[2]{};
   CUtensorMap decode_s_map[2]{};

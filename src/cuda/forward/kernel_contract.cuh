@@ -21,6 +21,7 @@ struct ForwardKernelArgs {
   std::uint32_t *fused_source_routes = nullptr;
   std::uint64_t max_routes_per_rank = 0;
   std::size_t source_input_offset = 0;
+  bool fp8_source_x = false;
   std::size_t fused_source_gates_offset = 0;
   bool fused_inference_routes = false;
   bool training_counts_ready = false;
@@ -28,6 +29,7 @@ struct ForwardKernelArgs {
   const float *gates;
   const transport::BFloat16 *w1;
   const transport::BFloat16 *w2;
+  fp8::Weights fp8;
   std::uint64_t hidden;
   std::uint64_t intermediate;
   std::uint64_t max_destination_rows;
@@ -97,6 +99,12 @@ struct ForwardKernelArgs {
   std::size_t status_offset;
   std::size_t forward_s_offset;
   transport::BFloat16 *saved_x = nullptr;
+  std::uint8_t *fp8_x_data = nullptr;
+  float *fp8_x_scales = nullptr;
+  std::uint64_t fp8_x_pitch = 0, fp8_s_pitch = 0;
+  bool fp8_ab_quantized = false;
+  std::uint8_t *fp8_ab_data = nullptr;
+  float *fp8_ab_scales = nullptr;
   CUtensorMap saved_x_map{};
   transport::BFloat16 *saved_ab = nullptr;
   std::uint64_t saved_rows = 0;

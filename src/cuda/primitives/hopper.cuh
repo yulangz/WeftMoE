@@ -82,6 +82,35 @@ struct BF16MMASelector {
   using type = BF16Mma<N, A, B, StageK, SwizzleBytes>;
 };
 
+// Hopper FP8 uses K-major shared operands and K32 instruction atoms.
+// Scaling is applied by the caller after each K128 accumulation interval.
+template <int Columns> struct FP8Mma {
+  static constexpr int M = 64, N = Columns, K = 32;
+  static constexpr int kNumAccum = Columns / 2;
+  static constexpr auto operation() {
+    using namespace cute::SM90::GMMA;
+    static_assert(Columns == 64 || Columns == 128 || Columns == 256);
+    if constexpr (Columns == 64)
+      return MMA_64x64x32_F32E4M3E4M3_SS_TN<>{};
+    else if constexpr (Columns == 128)
+      return MMA_64x128x32_F32E4M3E4M3_SS_TN<>{};
+    else
+      return MMA_64x256x32_F32E4M3E4M3_SS_TN<>{};
+  }
+  template <size_t... I>
+  CUTLASS_DEVICE static void apply(uint64_t const &a, uint64_t const &b,
+                                  float *d, bool accumulate,
+                                  cute::index_sequence<I...>) {
+    decltype(operation())::fma(a, b, d[I]...,
+        accumulate ? cute::SM90::GMMA::ScaleOut::One
+                   : cute::SM90::GMMA::ScaleOut::Zero);
+  }
+  CUTLASS_DEVICE static void wgmma(uint64_t const &a, uint64_t const &b,
+                                  float *d, bool accumulate) {
+    apply(a, b, d, accumulate, cute::make_index_sequence<kNumAccum>{});
+  }
+};
+
 template <class Pointer>
 CUTLASS_DEVICE cute::GmmaDescriptor make_smem_desc(
     Pointer pointer, const int& layout, const uint32_t& leading = 0,

@@ -1,0 +1,5 @@
+{
+  "src/cuda/fp8/api.hpp": "b5d284abb714a21df4fa0bcd8ce429838f58c82c9f8df62d1f935218b5605134",
+  "src/cuda/activation_transport.cu": "64429fc0afb19e45105125925a187e355b91a51fd3f35b13604cb02a49220d84",
+  "src/cuda/weftmoe_pf/backward_kernel.cuh": "da4ae8b44101c3d84c022c4a6d88202b288805dcdeccbfbfed4e5dff34d1f2ec"
+}

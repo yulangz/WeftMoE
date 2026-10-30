@@ -11,10 +11,6 @@ namespace weftmoe_pf::backward_stream {
 static_assert(!WEFTMOE_PF_BWD_STRIPED_SIGNALS ||
                   kPutWorkers <= static_forward::kNetworkPackets.lanes,
               "Striped Return signals require one channel lane per Put worker");
-#if WEFTMOE_PF_BWD_RETURN_SPANS
-static_assert(WEFTMOE_PF_WINDOW_ORDERED_TAPE,
-              "Return spans require a window-ordered tape");
-#endif
 
 // Dispatch fills the compact dY cache already needed by dW2. Communication
 // windows do not pad GEMM; Return reuses Forward's registered TX as an M ring.
@@ -48,11 +44,7 @@ __device__ __forceinline__ auto *canonical_rows(const BackwardKernelArgs &a) {
 __device__ __forceinline__ unsigned ordered_block(const BackwardKernelArgs &a,
                                                   unsigned position) {
   const auto layout = directory_layout(a);
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
   const auto offset = layout.du_completed;
-#else
-  const auto offset = layout.phase;
-#endif
   return unsigned(
       backward_pipeline_detail::scheduler_words(a)[offset + position]);
 }
@@ -68,17 +60,18 @@ network_blocks(const BackwardKernelArgs &a) {
 
 struct NetworkSchedule {
   const BackwardKernelArgs &a;
-  unsigned depth, all, begin = 0U, index = blockIdx.x;
+  unsigned depth, all, swiglu_tiles, begin = 0U, index = blockIdx.x;
 
   __device__ NetworkSchedule(const ForwardKernelArgs &f,
                              const BackwardKernelArgs &args)
-      : a(args), depth(network_depth(f)), all(network_blocks(a)) {}
+      : a(args), depth(network_depth(f)), all(network_blocks(a)),
+        swiglu_tiles(args.fp8 ? unsigned(args.intermediate / 128U) : 2U) {}
 
   __device__ __forceinline__ bool next(Task &t) {
     while (begin < all) {
       constexpr unsigned Wave = WEFTMOE_PF_BWD_WAVE_BLOCKS;
       const auto blocks = min(Wave ? min(Wave, depth) : depth, all - begin);
-      const auto du = blocks * kDuTiles, epilogue = blocks * 2U;
+      const auto du = blocks * kDuTiles, epilogue = blocks * swiglu_tiles;
       const auto total = du + epilogue + blocks * kDxTiles;
       if (index < total) {
         const auto phase = index < du              ? Phase::Du
@@ -89,7 +82,7 @@ struct NetworkSchedule {
                                                               : du + epilogue);
         const auto columns = phase == Phase::Du   ? kDuTiles
                              : phase == Phase::Dx ? kDxTiles
-                                                  : 2U;
+                                                  : swiglu_tiles;
         const auto position = begin + linear / columns;
         const auto block = ordered_block(a, position);
         const auto desc = directory(a)[block];
@@ -112,11 +105,13 @@ struct NetworkSchedule {
 
 // NIC requests and RX forwarding remain live during dW.
 struct alignas(16) NetworkShared {
-  unsigned char pull[3][4096];
+  unsigned char pull[3][local::kPullBufferBytes];
   local::Barrier pull_full[3];
 };
 constexpr auto kNetworkCommOffset = (kSharedBytes + 15U) & ~std::size_t{15U};
 constexpr auto kNetworkSharedBytes = kNetworkCommOffset + sizeof(NetworkShared);
+constexpr auto kFP8NetworkCommOffset = (kFP8SharedBytes + 15U) & ~std::size_t{15U};
+constexpr auto kFP8NetworkSharedBytes = kFP8NetworkCommOffset + sizeof(NetworkShared);
 
 __device__ __forceinline__ std::size_t tx_base(const ForwardKernelArgs &f) {
   return f.static_network.ring_region +
@@ -124,9 +119,8 @@ __device__ __forceinline__ std::size_t tx_base(const ForwardKernelArgs &f) {
 }
 
 // Keep the BWD planner's physical directory for RX fanout. A window-ordered
-// tape shares this stable expert/source order with FWD; the legacy tape does
-// not. Canonical reverse rows reuse the idle route-header arena, never a second
-// activation payload.
+// tape shares this stable expert/source order with FWD. Canonical reverse rows
+// reuse the idle route-header arena, never a second activation payload.
 __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
   const auto tid = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   const auto stride = std::uint64_t(gridDim.x) * blockDim.x;
@@ -181,17 +175,12 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
         ring::window_source(f, desc.window, identity.source).row_base +
             prefix[f.rank * owned + desc.tile.expert] + ordinal};
     const auto block = padded / kM;
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
     // Tape rows are monotonic in window within each expert. Only the last
     // valid row of an M block publishes its last-required-window key.
     if ((padded + 1U) % kM == 0U ||
         saved + 1U == a.dispatch.expert_row_prefix[desc.tile.expert + 1U])
       words[layout.phase + block] =
           (static_cast<unsigned long long>(desc.window) << 32U) | block;
-#else
-    atomicMax(words + layout.phase + block,
-              (static_cast<unsigned long long>(desc.window) << 32U) | block);
-#endif
   }
   for (auto peer = tid; peer < f.static_network.rings.nodes; peer += stride) {
     if (peer == f.node)
@@ -216,7 +205,6 @@ __global__ void prepare_network(ForwardKernelArgs f, BackwardKernelArgs a) {
 // last-window keys. Merge those sorted runs in one launch by finding each
 // block's rank. The old dU counter arena holds the immutable task permutation;
 // stream BWD uses ring slots for dU completion instead.
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
 __global__ void order_windows(BackwardKernelArgs a) {
   const auto block = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (block >= network_blocks(a))
@@ -242,33 +230,6 @@ __global__ void order_windows(BackwardKernelArgs a) {
     position += unsigned(lo - begin);
   }
   words[layout.du_completed + position] = key;
-}
-#endif
-
-// The key is (last required source window, canonical block). Sort only this
-// static task permutation; saved rows and GEMM reduction order stay unchanged.
-// Ping-pong through the old phase/DU-counter arrays, without new storage.
-__global__ void merge_order(const unsigned long long *input,
-                            unsigned long long *output, std::uint64_t count,
-                            std::uint64_t width) {
-  const auto index = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= count)
-    return;
-  const auto begin = index / (2U * width) * (2U * width);
-  const auto middle = min(begin + width, count);
-  const auto end = min(middle + width, count);
-  const auto other = index < middle ? middle : begin;
-  auto first = other, last = index < middle ? end : middle;
-  const auto key = input[index];
-  while (first < last) {
-    const auto probe = (first + last) / 2U;
-    if (input[probe] < key)
-      first = probe + 1U;
-    else
-      last = probe;
-  }
-  output[begin + index - (index < middle ? begin : middle) + first - other] =
-      key;
 }
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
@@ -315,8 +276,12 @@ __device__ __noinline__ void pull_canonical(const ForwardKernelArgs &f,
       f, worker, workers,
       [&](std::uint64_t block, unsigned row, float, const char *input) {
         const auto saved = f.checkpoint.rows[block * kM + row];
-        copy.warp_copy(input, reinterpret_cast<char *>(a.dr + saved * a.hidden),
-                       unsigned(a.hidden * 2U));
+        if (a.fp8)
+          network::copy_fp8_row(copy, input, reinterpret_cast<std::uint8_t *>(a.dr),
+              mapping[saved], unsigned(a.hidden), fp8::source_pitch(unsigned(a.hidden)));
+        else
+          copy.warp_copy(input, reinterpret_cast<char *>(a.dr + saved * a.hidden),
+                         unsigned(a.hidden * 2U));
         if (!lane) {
           ring::arrive(
               *reinterpret_cast<std::uint64_t *>(ready + mapping[saved] / kM),

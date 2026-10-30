@@ -128,7 +128,9 @@ def main():
         weights = ((w1.detach(), w2.detach()),
                    (w1.detach() * 0.9, w2.detach() * 1.1))
         results = []
-        for asynchronous in (False, True):
+        # Repeat the async case: peer binding agreements must not overtake a
+        # preceding resident MoE on another stream, even with rank skew.
+        for asynchronous in (False, True, True, True):
             forward = runtime.forward_async if asynchronous else runtime.forward
             backward = runtime.backward_async if asynchronous else runtime.backward
             tapes, values = [], []
@@ -139,7 +141,11 @@ def main():
                                g, *packed)
                 tapes.append(tape)
                 values.append(tape.output.clone())
-            for tape, pair in reversed(list(zip(tapes, weights))):
+            for index, (tape, pair) in enumerate(reversed(list(zip(tapes, weights)))):
+                if asynchronous and index == 0 and rank == world - 1:
+                    # Keep this rank's first Backward queued while peers can
+                    # already enter preparation for the next retained tape.
+                    torch.cuda._sleep(20_000_000)
                 for target, source in zip(packed, pair):
                     target.copy_(source)
                 values.extend(value.clone() for value in backward(
@@ -154,8 +160,9 @@ def main():
                 assert not tail.query(), "retiring completed tapes drained later stream work"
                 torch.cuda.synchronize()
             results.append(values)
-        for actual, expected in zip(*results):
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for values in results[1:]:
+            for actual, expected in zip(values, results[0], strict=True):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         del tape, tapes, results, values, packed, weights
         assert runtime.native.usage()["notify_slots_in_use"] == 0
         print(rank, "STREAM_ORDERED_TRAINING_PASS", flush=True)

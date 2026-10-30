@@ -19,6 +19,8 @@ struct alignas(64) ComputeSlot {
   // Unlike fc2_done (S read retirement), this publishes FC2's remote stores.
   std::uint64_t fc2_published;
   std::uint64_t activation_ready; // BWD SwiGLU halves; independent of Return.
+  std::uint64_t fp8_first_ready, fp8_second_ready;
+  std::uint64_t fp8_swiglu_ready; // Local BWD feature tiles, before activation_ready.
 };
 
 struct alignas(64) ContributionSlot {

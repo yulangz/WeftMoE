@@ -16,7 +16,7 @@ DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
                 local_prefill_streaming=0, local_prefill_fast_math=0,
                 local_pull_warps=2, local_compact_return=0,
                 local_compact_return_max_tokens=0,
-                ordered_dispatch=0, coalesce_get=0, window_ordered_tape=0,
+                ordered_dispatch=0, coalesce_get=0,
                 backward_return_pending=1, backward_wave_blocks=64,
                 backward_dynamic_dw=0,
                 network_credit_windows=1, network_get_workers=64,
@@ -37,7 +37,6 @@ MACROS = {
     "network_credit_windows": "WEFTMOE_PF_CREDIT_WINDOWS",
     "ordered_dispatch": "WEFTMOE_PF_ORDERED_DISPATCH",
     "coalesce_get": "WEFTMOE_PF_COALESCE_GET",
-    "window_ordered_tape": "WEFTMOE_PF_WINDOW_ORDERED_TAPE",
     "backward_return_pending": "WEFTMOE_PF_BWD_RETURN_PENDING",
     "backward_wave_blocks": "WEFTMOE_PF_BWD_WAVE_BLOCKS",
     "backward_dynamic_dw": "WEFTMOE_PF_BWD_DYNAMIC_DW",
@@ -81,7 +80,7 @@ def validate(config):
                    local_compact_return=(0, 1),
                    backward_dynamic_dw=(0, 1),
                    ordered_dispatch=(0, 1), coalesce_get=(0, 1),
-                   window_ordered_tape=(0, 1), backward_return_pending=(1, 2, 4, 8),
+                   backward_return_pending=(1, 2, 4, 8),
                    backward_return_spans=(0, 1), backward_striped_signals=(0, 1),
                    network_private_dr=(0, 1), network_vector_pull=(0, 1),
                    decode_math_m=(0, 16, 64), decode_stages=(2, 3),
@@ -105,8 +104,6 @@ def validate(config):
             "network workers exceed the configured CTA count")
     require(1 <= v["network_credit_windows"] <= 8,
             "network credit windows exceed the compiled eight-window directory")
-    require(not v["backward_return_spans"] or v["window_ordered_tape"],
-            "precomputed Return spans require a window-ordered tape")
     require(not v["backward_striped_signals"] or
             v["network_lanes"] >= v["network_workers"] - v["network_get_workers"],
             "striped Return signals require one channel lane per Put worker")

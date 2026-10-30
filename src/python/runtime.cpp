@@ -9,6 +9,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <weftmoe/cuda/backward.hpp>
+#include "python/fp8.hpp"
 #if WEFTMOE_DEVICE_TIMELINE
 #include "cuda/profiling/device_timeline_host.hpp"
 #endif
@@ -45,6 +46,8 @@ struct Tape {
   DeviceForwardHandle forward;
   NcclSession generation;
   py::object output;
+  py::object fp8_weights = py::none();
+  bool fp32_weight_gradients = true;
 };
 
 void check_cuda(cudaError_t error) {
@@ -166,6 +169,8 @@ public:
     capacity.max_inflight_generations = 1;
     capacity.channels = 1;
     capacity.ring_slots_per_source_channel = 1;
+    capacity.fp8_workspace = tuning.contains("fp8_workspace") &&
+                             tuning["fp8_workspace"].cast<bool>();
     capacity.enable_backward_state = training;
     capacity.stream_ordered_training = training;
     capacity.decode_only = tuning.contains("decode_only") &&
@@ -341,7 +346,8 @@ public:
   execute_forward(py::object x, py::object routes, py::object gates,
                   py::object w1, py::object w2, bool synchronize,
                   std::optional<unsigned> layer = std::nullopt,
-                  bool retain_backward_state = true) {
+                  bool retain_backward_state = true,
+                  py::object fp8_weights = py::none()) {
     cudaStreamCaptureStatus status;
     if (cudaStreamIsCapturing(stream_, &status) != cudaSuccess ||
         status != cudaStreamCaptureStatusNone)
@@ -375,7 +381,39 @@ public:
     input = producer.publish_activations(
         static_cast<const transport::BFloat16 *>(pointer(x)), elements(x),
         tokens, hidden_, owner(x));
-    if (layer) {
+    if (!fp8_weights.is_none()) {
+      if (fp8_weights.is(cached_fp8_weights_)) {
+        weights = cached_fp8_lease_;
+      } else {
+      const auto count = config_.num_experts / config_.topology.world_size;
+      FP8WeightBuffers fp8;
+      const auto matrix = [&](const char *name, unsigned rows, unsigned columns,
+                              CudaTensorBuffer &data, CudaTensorBuffer &scales) {
+        auto value = fp8_weights.attr(name);
+        auto q = value.attr("data"), s = value.attr("scales");
+        weftmoe::python_fp8::check(q, "torch.float8_e4m3fn", {count, rows, columns});
+        weftmoe::python_fp8::check(s, "torch.float32", {count, rows / 128U, columns / 128U});
+        data = binding(q);
+        scales = binding(s);
+      };
+      matrix("w1", 2U * intermediate_, hidden_, fp8.w1, fp8.s1);
+      matrix("w2", hidden_, intermediate_, fp8.w2, fp8.s2);
+      if (!fp8_weights.attr("w1_t").is_none()) {
+        matrix("w1_t", hidden_, 2U * intermediate_, fp8.w1_t, fp8.s1_t);
+        matrix("w2_t", intermediate_, hidden_, fp8.w2_t, fp8.s2_t);
+      }
+      fp8.version = fp8_weights.attr("version").cast<std::uint64_t>();
+      // Cache one immutable version, without retaining the current input.
+      // Forward tapes independently own their leases when a new version arrives.
+      auto weight_producer = make_external_cuda_producer(
+          context, execution_.device_ordinal(), stream_, owner(fp8_weights), "fp8-weights");
+      weights = weight_producer.publish_fp8_weights(fp8, count, rank_ * count,
+                                                    hidden_, intermediate_);
+      cached_fp8_weights_ = fp8_weights;
+      cached_fp8_lease_ = weights;
+      }
+      tape->fp8_weights = fp8_weights;
+    } else if (layer) {
       weights = prepared_inference_weights(*layer, producer, w1, w2);
     } else {
       auto packed_w1 = empty({elements(w1)}, "bfloat16");
@@ -392,9 +430,9 @@ public:
     tape->output = empty({tokens, hidden_}, "bfloat16");
     ForwardTensorBuffers buffers;
     buffers.output = binding(tape->output);
-    if (deferred_training_notify_ && fc.retain_backward_state) {
-      fc.tensor_factory = [&] {
-        return prepare_forward_tensors(tape->dispatch, execution_, fc, buffers,
+    if ((deferred_training_notify_ || !fp8_weights.is_none()) && fc.retain_backward_state) {
+      fc.tensor_factory = [&](const ForwardMegaKernelConfig &storage_config) {
+        return prepare_forward_tensors(tape->dispatch, execution_, storage_config, buffers,
                                        allocator());
       };
     } else {
@@ -414,11 +452,24 @@ public:
                         ? local_->run(tape->dispatch, input, weights, fc)
                         : local_->enqueue(tape->dispatch, input, weights, fc);
 #endif
+    last_forward_tensor_bytes_ = tape->forward.tensors().bytes();
     return tape;
   }
 
   py::tuple backward(std::shared_ptr<Tape> tape, py::object dy) {
     return execute_backward(std::move(tape), std::move(dy), true);
+  }
+
+  std::shared_ptr<Tape> forward_fp8(py::object x, py::object routes,
+                                   py::object gates, py::object weights,
+                                   bool synchronize, bool retain_backward_state,
+                                   bool fp32_weight_gradients) {
+    weights.attr("wait")(py::arg("training") = training_ && retain_backward_state);
+    auto tape = execute_forward(x, routes, gates, weights.attr("w1").attr("data"),
+        weights.attr("w2").attr("data"), synchronize, std::nullopt,
+        retain_backward_state, weights);
+    tape->fp32_weight_gradients = fp32_weight_gradients;
+    return tape;
   }
 
   py::tuple backward_async(std::shared_ptr<Tape> tape, py::object dy) {
@@ -430,6 +481,8 @@ public:
     reap_training();
     if (!training_ || !tape->forward)
       throw std::invalid_argument("backward requires a live training tape");
+    if (!tape->fp8_weights.is_none())
+      tape->fp8_weights.attr("wait")(py::arg("training") = true);
     auto context = make_rank_collective_context(tape->generation.session(),
                                                 rank_, execution_.token());
     auto producer = make_external_cuda_producer(
@@ -441,12 +494,15 @@ public:
     auto local_experts = config_.num_experts / config_.topology.world_size;
     auto dx = empty({tokens, hidden_}, "bfloat16");
     auto dg = empty({tokens, config_.top_k}, "float32");
-    auto dw1 = empty({local_experts, 2 * intermediate_, hidden_}, "bfloat16");
-    auto dw2 = empty({local_experts, hidden_, intermediate_}, "bfloat16");
+    const bool fp32 = !tape->fp8_weights.is_none() && tape->fp32_weight_gradients;
+    auto dw1 = empty({local_experts, 2 * intermediate_, hidden_}, fp32 ? "float32" : "bfloat16");
+    auto dw2 = empty({local_experts, hidden_, intermediate_}, fp32 ? "float32" : "bfloat16");
     BackwardMegaKernelConfig bc{hidden_, intermediate_};
+    bc.fp32_weight_gradients = fp32;
     bc.tensors = BackwardMegaKernel().prepare_tensors(
         tape->forward, bc,
         {binding(dx), binding(dg), binding(dw1), binding(dw2)}, allocator());
+    last_backward_tensor_bytes_ = bc.tensors.bytes();
     auto backward = BackwardMegaKernel().enqueue(tape->forward, input, bc);
     if (synchronize)
       backward.wait();
@@ -462,6 +518,8 @@ public:
     auto n = notify_pool_.usage();
     py::dict result;
     result["compute_bytes"] = p.compute_device_bytes;
+    result["last_forward_tensor_bytes"] = last_forward_tensor_bytes_;
+    result["last_backward_tensor_bytes"] = last_backward_tensor_bytes_;
     result["gin_bytes"] = p.gin_registered_bytes;
     result["notify_bytes"] = n.device_bytes;
     result["notify_slots_in_use"] = n.slots_in_use;
@@ -476,6 +534,8 @@ public:
     plans_.clear();
     buckets_.clear();
     inference_weights_.clear();
+    cached_fp8_lease_ = {};
+    cached_fp8_weights_ = py::none();
     pool_.retire_peer_mappings();
   }
 
@@ -578,6 +638,7 @@ public:
   }
 
 private:
+  std::uint64_t last_forward_tensor_bytes_ = 0, last_backward_tensor_bytes_ = 0;
   ForwardWeightLease publish_inference_weights(
       ExternalCudaProducer &producer, const py::object &w1,
       const py::object &w2, const py::object &packed_w1) {
@@ -743,6 +804,8 @@ private:
   // Destroy graph executables before their metadata, packed weights and
   // workspace.
   std::map<unsigned, InferenceWeights> inference_weights_;
+  py::object cached_fp8_weights_ = py::none();
+  ForwardWeightLease cached_fp8_lease_;
   std::map<std::uint64_t, std::unique_ptr<InferenceBucket>> buckets_;
   std::map<std::pair<unsigned, std::uint64_t>, std::unique_ptr<InferencePlan>>
       plans_;
@@ -770,6 +833,7 @@ private:
 } // namespace
 
 PYBIND11_MODULE(_runtime, m) {
+  weftmoe::python_fp8::bind(m);
   py::class_<NcclSession>(m, "Session");
   m.def("forward_tuning_id", &forward_tuning_id);
   m.def("forward_shape", &forward_shape);
@@ -780,6 +844,12 @@ PYBIND11_MODULE(_runtime, m) {
   });
   auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape").def_readonly(
       "output", &Tape::output);
+  tape.def_property_readonly("tensor_bytes", [](const Tape &tape) {
+    return tape.forward.tensors().bytes();
+  });
+  tape.def_property_readonly("saved_x_bytes", [](const Tape &tape) {
+    return tape.forward.tensors().buffers().fc1_input.bytes;
+  });
 #if WEFTMOE_DEVICE_TIMELINE
   using namespace pybind11::literals;
   tape.def_property_readonly("timeline", [](const Tape &tape) {
@@ -818,6 +888,10 @@ PYBIND11_MODULE(_runtime, m) {
            py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("layer") = std::nullopt)
       .def("backward", &Runtime::backward)
+      .def("forward_fp8", &Runtime::forward_fp8, py::arg("x"),
+           py::arg("routes"), py::arg("gates"), py::arg("weights"),
+           py::arg("synchronize") = true, py::arg("retain_backward_state") = true,
+           py::arg("fp32_weight_gradients") = true)
       .def("forward_async", &Runtime::forward_async, py::arg("x"),
            py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("retain_backward_state") = true)

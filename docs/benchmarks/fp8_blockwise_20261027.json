@@ -1,0 +1,5552 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-27",
+  "base_revision": "b9b263e64503107ca616fcb07ec7f5ee744120eb",
+  "environment": {
+    "gpu": "NVIDIA L20X",
+    "architecture": "SM90",
+    "visible_devices": "0,1",
+    "world": 2,
+    "cuda": "12.9",
+    "torch": "2.9.1+cu129"
+  },
+  "methodology": {
+    "metric": "median of per-sample slowest-rank forward+backward+release+device-synchronize wall time",
+    "warmups": 5,
+    "samples": 20,
+    "seed": 123,
+    "concurrent_gpu_work": false,
+    "fp8_weights_prepared_once": true,
+    "bf16_per_call_weight_packing": true,
+    "optimizer_and_weight_refresh_excluded": true,
+    "comparison_weight_gradient_dtype": "bf16",
+    "default_fp8_weight_gradient_dtype": "float32"
+  },
+  "comparisons": [
+    {
+      "model": "qwen35b",
+      "nominal_tokens_per_rank": 256,
+      "hidden": 2048,
+      "intermediate": 512,
+      "fp8_us": 1768.1970000000001,
+      "bf16_us": 2039.242,
+      "speedup": 1.153288915205715,
+      "latency_change_percent": -13.291458296759284
+    },
+    {
+      "model": "qwen35b",
+      "nominal_tokens_per_rank": 512,
+      "hidden": 2048,
+      "intermediate": 512,
+      "fp8_us": 1977.1865,
+      "bf16_us": 2211.3195,
+      "speedup": 1.1184172560352805,
+      "latency_change_percent": -10.58793177557562
+    },
+    {
+      "model": "qwen35b",
+      "nominal_tokens_per_rank": 2048,
+      "hidden": 2048,
+      "intermediate": 512,
+      "fp8_us": 2976.0699999999997,
+      "bf16_us": 2931.0855,
+      "speedup": 0.9848845961284515,
+      "latency_change_percent": 1.5347385806384617
+    },
+    {
+      "model": "qwen35b",
+      "nominal_tokens_per_rank": 8192,
+      "hidden": 2048,
+      "intermediate": 512,
+      "fp8_us": 7295.5265,
+      "bf16_us": 5643.6865,
+      "speedup": 0.7735817970094413,
+      "latency_change_percent": 29.26881214964723
+    },
+    {
+      "model": "qwen122b",
+      "nominal_tokens_per_rank": 2048,
+      "hidden": 3072,
+      "intermediate": 1024,
+      "fp8_us": 5863.5455,
+      "bf16_us": 6377.6565,
+      "speedup": 1.087679203649055,
+      "latency_change_percent": -8.061127155405746
+    }
+  ],
+  "runs": [
+    {
+      "label": "qwen35b_fp8_bf16grad",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "256",
+        "512",
+        "2048",
+        "8192",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "log": "/tmp/fp8-isolated-qwen35b_fp8_bf16grad.log",
+      "records": [
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 256,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "ea10efc2bf46b974e0e1b0de7638ad8c8c2d2568ea0292ece5422221a3f7bdd5",
+            "7c6a0dd2b5334df035edd0710bc2fba9c0dac2b18e37f7edcab479e927e85120"
+          ],
+          "per_rank_tokens": [
+            [
+              252,
+              232,
+              278,
+              239,
+              207,
+              280,
+              206,
+              264,
+              277,
+              274,
+              254,
+              248,
+              244,
+              265,
+              272,
+              262,
+              266,
+              287,
+              237,
+              284
+            ],
+            [
+              266,
+              256,
+              224,
+              279,
+              227,
+              246,
+              233,
+              246,
+              241,
+              250,
+              215,
+              262,
+              279,
+              257,
+              299,
+              264,
+              245,
+              255,
+              256,
+              252
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              259,
+              273,
+              256,
+              284,
+              248
+            ],
+            [
+              296,
+              249,
+              231,
+              219,
+              275
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              1996,
+              2120,
+              1856,
+              2169,
+              1807,
+              1792,
+              1617,
+              2226,
+              2037,
+              2096,
+              2028,
+              2283,
+              2050,
+              2211,
+              2086,
+              2363,
+              2280,
+              2177,
+              1986,
+              2051
+            ],
+            [
+              2148,
+              1784,
+              2160,
+              1975,
+              1665,
+              2416,
+              1895,
+              1854,
+              2107,
+              2096,
+              1724,
+              1797,
+              2134,
+              1965,
+              2482,
+              1845,
+              1808,
+              2159,
+              1958,
+              2237
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            129,
+            154,
+            128,
+            110,
+            121,
+            144,
+            86,
+            112,
+            145,
+            198,
+            119,
+            183,
+            164,
+            88,
+            141,
+            165,
+            135,
+            146,
+            164,
+            144
+          ],
+          "actual_tokens_min": 206,
+          "actual_tokens_max": 299,
+          "actual_tokens_mean": 254.5,
+          "actual_tokens_std": 21.303755537463342,
+          "max_tokens_capacity": 299,
+          "max_rows_capacity": 18866,
+          "input_tokens_per_second": 288178.25427275215,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 1768.1970000000001,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 364.75800000000004,
+          "backward_slowest_rank_p50_us": 1401.7795,
+          "wall_slowest_rank_samples_us": [
+            1776.438,
+            1778.212,
+            1845.028,
+            1763.781,
+            1737.181,
+            1760.409,
+            1727.844,
+            1758.422,
+            1756.12,
+            1774.773,
+            1753.464,
+            1785.122,
+            1791.266,
+            1785.436,
+            1783.974,
+            1772.613,
+            1696.43,
+            1780.855,
+            1759.485,
+            1738.505
+          ],
+          "per_rank_wall_us": [
+            [
+              1768.203,
+              1770.9,
+              1845.028,
+              1763.781,
+              1737.181,
+              1756.496,
+              1721.992,
+              1758.422,
+              1756.12,
+              1774.773,
+              1753.464,
+              1782.563,
+              1791.266,
+              1777.144,
+              1783.974,
+              1772.613,
+              1696.43,
+              1775.632,
+              1759.426,
+              1738.505
+            ],
+            [
+              1776.438,
+              1778.212,
+              1824.178,
+              1752.715,
+              1733.536,
+              1760.409,
+              1727.844,
+              1754.477,
+              1755.123,
+              1766.179,
+              1748.885,
+              1785.122,
+              1786.083,
+              1785.436,
+              1783.786,
+              1770.29,
+              1695.845,
+              1780.855,
+              1759.485,
+              1737.281
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121017032698376,
+                1793121017034470342
+              ],
+              [
+                1793121017034701515,
+                1793121017036475604
+              ],
+              [
+                1793121017036878840,
+                1793121017038726032
+              ],
+              [
+                1793121017038944878,
+                1793121017040710495
+              ],
+              [
+                1793121017040911917,
+                1793121017042651414
+              ],
+              [
+                1793121017042833657,
+                1793121017044591898
+              ],
+              [
+                1793121017044795803,
+                1793121017046519799
+              ],
+              [
+                1793121017046736453,
+                1793121017048496655
+              ],
+              [
+                1793121017048688694,
+                1793121017050447014
+              ],
+              [
+                1793121017050665326,
+                1793121017052441990
+              ],
+              [
+                1793121017052633153,
+                1793121017054388345
+              ],
+              [
+                1793121017054587980,
+                1793121017056372413
+              ],
+              [
+                1793121017056553856,
+                1793121017058346597
+              ],
+              [
+                1793121017058547708,
+                1793121017060326403
+              ],
+              [
+                1793121017060520965,
+                1793121017062306459
+              ],
+              [
+                1793121017062505664,
+                1793121017064279699
+              ],
+              [
+                1793121017064452283,
+                1793121017066150707
+              ],
+              [
+                1793121017066360663,
+                1793121017068138075
+              ],
+              [
+                1793121017068345525,
+                1793121017070106695
+              ],
+              [
+                1793121017070301203,
+                1793121017072041434
+              ]
+            ],
+            [
+              [
+                1793121017032687619,
+                1793121017034468124
+              ],
+              [
+                1793121017034695144,
+                1793121017036477145
+              ],
+              [
+                1793121017036897703,
+                1793121017038724213
+              ],
+              [
+                1793121017038951934,
+                1793121017040706500
+              ],
+              [
+                1793121017040916563,
+                1793121017042652571
+              ],
+              [
+                1793121017042836133,
+                1793121017044598503
+              ],
+              [
+                1793121017044789845,
+                1793121017046519773
+              ],
+              [
+                1793121017046741476,
+                1793121017048498032
+              ],
+              [
+                1793121017048687994,
+                1793121017050445812
+              ],
+              [
+                1793121017050671084,
+                1793121017052439192
+              ],
+              [
+                1793121017052633815,
+                1793121017054384252
+              ],
+              [
+                1793121017054586234,
+                1793121017056373180
+              ],
+              [
+                1793121017056553210,
+                1793121017058340891
+              ],
+              [
+                1793121017058544077,
+                1793121017060331291
+              ],
+              [
+                1793121017060520742,
+                1793121017062306300
+              ],
+              [
+                1793121017062508949,
+                1793121017064280916
+              ],
+              [
+                1793121017064452425,
+                1793121017066150353
+              ],
+              [
+                1793121017066356357,
+                1793121017068139042
+              ],
+              [
+                1793121017068345130,
+                1793121017070106316
+              ],
+              [
+                1793121017070303085,
+                1793121017072041894
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 316312968,
+              "gin_bytes": 0,
+              "notify_bytes": 1428024,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 316312968,
+              "gin_bytes": 0,
+              "notify_bytes": 1428024,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 512,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "d54d0bcb9c20eeba3a5dff525922101159fb159fde171e5a7960160b03d8f448",
+            "17af1a9a107f2be9bf4066ae0a2c292ca75a96ef1f316e3b7b5c92068f361787"
+          ],
+          "per_rank_tokens": [
+            [
+              591,
+              604,
+              498,
+              529,
+              537,
+              501,
+              575,
+              397,
+              524,
+              612,
+              502,
+              627,
+              560,
+              475,
+              502,
+              432,
+              457,
+              541,
+              625,
+              406
+            ],
+            [
+              437,
+              508,
+              557,
+              558,
+              533,
+              473,
+              467,
+              425,
+              484,
+              518,
+              497,
+              516,
+              519,
+              556,
+              637,
+              480,
+              491,
+              569,
+              527,
+              569
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              535,
+              513,
+              521,
+              559,
+              363
+            ],
+            [
+              641,
+              426,
+              594,
+              592,
+              613
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              4142,
+              4991,
+              4311,
+              4506,
+              4558,
+              3949,
+              4266,
+              3203,
+              4035,
+              5123,
+              4010,
+              4521,
+              4179,
+              3491,
+              4584,
+              3825,
+              3814,
+              4245,
+              4725,
+              3694
+            ],
+            [
+              4082,
+              3905,
+              4129,
+              4190,
+              4002,
+              3843,
+              4070,
+              3373,
+              4029,
+              3917,
+              3982,
+              4623,
+              4453,
+              4757,
+              4528,
+              3471,
+              3770,
+              4635,
+              4491,
+              4106
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            289,
+            177,
+            404,
+            237,
+            449,
+            180,
+            187,
+            236,
+            366,
+            302,
+            277,
+            342,
+            311,
+            229,
+            268,
+            206,
+            267,
+            209,
+            207,
+            235
+          ],
+          "actual_tokens_min": 397,
+          "actual_tokens_max": 637,
+          "actual_tokens_mean": 520.4,
+          "actual_tokens_std": 59.16451639285155,
+          "max_tokens_capacity": 641,
+          "max_rows_capacity": 21507,
+          "input_tokens_per_second": 513884.05298496125,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 1977.1865,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 372.03499999999997,
+          "backward_slowest_rank_p50_us": 1610.4675,
+          "wall_slowest_rank_samples_us": [
+            1985.911,
+            2002.692,
+            2096.156,
+            1997.684,
+            2023.307,
+            1901.15,
+            1912.458,
+            1866.217,
+            1908.924,
+            2004.485,
+            1906.02,
+            1998.834,
+            1968.462,
+            1947.919,
+            3174.423,
+            1917.14,
+            1945.626,
+            2001.486,
+            2014.191,
+            1934.107
+          ],
+          "per_rank_wall_us": [
+            [
+              1985.559,
+              1997.984,
+              1952.879,
+              1997.684,
+              2018.088,
+              1892.286,
+              1912.458,
+              1866.217,
+              1908.541,
+              2000.405,
+              1906.02,
+              1998.834,
+              1968.462,
+              1947.919,
+              3174.423,
+              1915.713,
+              1942.834,
+              2001.486,
+              2007.378,
+              1933.689
+            ],
+            [
+              1985.911,
+              2002.692,
+              2096.156,
+              1988.532,
+              2023.307,
+              1901.15,
+              1909.725,
+              1861.926,
+              1908.924,
+              2004.485,
+              1901.838,
+              1998.776,
+              1965.635,
+              1946.483,
+              3139.132,
+              1917.14,
+              1945.626,
+              2001.252,
+              2014.191,
+              1934.107
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121017960442895,
+                1793121017962430810
+              ],
+              [
+                1793121017962631644,
+                1793121017964631533
+              ],
+              [
+                1793121017964845619,
+                1793121017966800179
+              ],
+              [
+                1793121017967168200,
+                1793121017969167649
+              ],
+              [
+                1793121017969377033,
+                1793121017971397213
+              ],
+              [
+                1793121017971612103,
+                1793121017973506286
+              ],
+              [
+                1793121017973690517,
+                1793121017975604964
+              ],
+              [
+                1793121017975779228,
+                1793121017977647164
+              ],
+              [
+                1793121017977829933,
+                1793121017979740658
+              ],
+              [
+                1793121017979931182,
+                1793121017981933304
+              ],
+              [
+                1793121017982123402,
+                1793121017984031051
+              ],
+              [
+                1793121017984228516,
+                1793121017986229078
+              ],
+              [
+                1793121017986412981,
+                1793121017988383286
+              ],
+              [
+                1793121017988587947,
+                1793121017990537538
+              ],
+              [
+                1793121017990859435,
+                1793121017994035587
+              ],
+              [
+                1793121017994233618,
+                1793121017996150905
+              ],
+              [
+                1793121017996332766,
+                1793121017998277540
+              ],
+              [
+                1793121017998461889,
+                1793121018000465074
+              ],
+              [
+                1793121018000669393,
+                1793121018002678564
+              ],
+              [
+                1793121018002885123,
+                1793121018004820760
+              ]
+            ],
+            [
+              [
+                1793121017960438458,
+                1793121017962426404
+              ],
+              [
+                1793121017962629264,
+                1793121017964633844
+              ],
+              [
+                1793121017964848267,
+                1793121017966946913
+              ],
+              [
+                1793121017967179531,
+                1793121017969169977
+              ],
+              [
+                1793121017969372150,
+                1793121017971397350
+              ],
+              [
+                1793121017971606988,
+                1793121017973509661
+              ],
+              [
+                1793121017973691203,
+                1793121017975602932
+              ],
+              [
+                1793121017975777688,
+                1793121017977641289
+              ],
+              [
+                1793121017977827848,
+                1793121017979738757
+              ],
+              [
+                1793121017979928564,
+                1793121017981934514
+              ],
+              [
+                1793121017982127420,
+                1793121017984031099
+              ],
+              [
+                1793121017984227930,
+                1793121017986228178
+              ],
+              [
+                1793121017986413893,
+                1793121017988381321
+              ],
+              [
+                1793121017988593854,
+                1793121017990542443
+              ],
+              [
+                1793121017990895208,
+                1793121017994036377
+              ],
+              [
+                1793121017994236722,
+                1793121017996155475
+              ],
+              [
+                1793121017996332484,
+                1793121017998280101
+              ],
+              [
+                1793121017998459674,
+                1793121018000462524
+              ],
+              [
+                1793121018000666025,
+                1793121018002682019
+              ],
+              [
+                1793121018002888192,
+                1793121018004824077
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 376175752,
+              "gin_bytes": 0,
+              "notify_bytes": 2930792,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 376175752,
+              "gin_bytes": 0,
+              "notify_bytes": 2930792,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 2048,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "82f71a20d7c2f2ce37894fbd63374688c10184e41cb06de4c7029ce194ef6b3b",
+            "11e278228be8a7946badb0516748639f763cc8bd941c1b3e4a9f2ef70c56635e"
+          ],
+          "per_rank_tokens": [
+            [
+              2178,
+              1965,
+              1993,
+              2278,
+              1896,
+              2110,
+              2089,
+              1942,
+              2354,
+              2010,
+              2276,
+              1949,
+              1692,
+              2340,
+              2217,
+              2247,
+              2191,
+              2150,
+              1834,
+              2227
+            ],
+            [
+              2476,
+              2105,
+              2221,
+              1755,
+              1763,
+              2038,
+              2017,
+              1821,
+              1888,
+              2051,
+              1765,
+              1920,
+              2219,
+              1894,
+              2110,
+              2121,
+              2185,
+              1927,
+              1874,
+              1998
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              1913,
+              1994,
+              2209,
+              1806,
+              2210
+            ],
+            [
+              2109,
+              2307,
+              2248,
+              2207,
+              2252
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              17792,
+              15441,
+              17212,
+              16566,
+              13909,
+              16700,
+              14418,
+              16018,
+              18895,
+              16139,
+              14772,
+              15914,
+              14566,
+              18121,
+              18601,
+              17899,
+              18374,
+              15157,
+              16435,
+              16039
+            ],
+            [
+              19440,
+              17119,
+              16500,
+              15698,
+              15363,
+              16484,
+              18430,
+              14086,
+              15041,
+              16349,
+              17556,
+              15038,
+              16722,
+              15751,
+              16015,
+              17045,
+              16634,
+              17459,
+              13229,
+              17761
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            0,
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            1331,
+            1218,
+            823,
+            1019,
+            1294,
+            970,
+            905,
+            1178,
+            808,
+            555,
+            747,
+            1187,
+            1465,
+            861,
+            866,
+            1085,
+            1212,
+            927,
+            1200,
+            1389
+          ],
+          "actual_tokens_min": 1692,
+          "actual_tokens_max": 2476,
+          "actual_tokens_mean": 2052.15,
+          "actual_tokens_std": 183.7818747863891,
+          "max_tokens_capacity": 2476,
+          "max_rows_capacity": 35987,
+          "input_tokens_per_second": 1372209.7682559264,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 2976.0699999999997,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 383.0055,
+          "backward_slowest_rank_p50_us": 2601.8525,
+          "wall_slowest_rank_samples_us": [
+            3143.521,
+            2924.014,
+            2979.651,
+            3089.693,
+            2883.309,
+            2907.358,
+            3017.088,
+            2869.881,
+            3025.445,
+            2870.283,
+            2972.489,
+            2865.761,
+            2952.554,
+            3027.288,
+            3384.902,
+            3006.395,
+            3029.017,
+            2970.258,
+            2898.177,
+            3003.216
+          ],
+          "per_rank_wall_us": [
+            [
+              3136.097,
+              2922.003,
+              2979.019,
+              3089.693,
+              2863.254,
+              2903.541,
+              3010.437,
+              2857.457,
+              3024.16,
+              2870.283,
+              2972.489,
+              2855.738,
+              2948.267,
+              3024.456,
+              3377.971,
+              2997.919,
+              3029.017,
+              2970.258,
+              2891.848,
+              2999.223
+            ],
+            [
+              3143.521,
+              2924.014,
+              2979.651,
+              2929.871,
+              2883.309,
+              2907.358,
+              3017.088,
+              2869.881,
+              3025.445,
+              2868.829,
+              2967.667,
+              2865.761,
+              2952.554,
+              3027.288,
+              3384.902,
+              3006.395,
+              3025.563,
+              2970.006,
+              2898.177,
+              3003.216
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121018910416035,
+                1793121018913554390
+              ],
+              [
+                1793121018913758617,
+                1793121018916682296
+              ],
+              [
+                1793121018916895261,
+                1793121018919876299
+              ],
+              [
+                1793121018920090984,
+                1793121018923183464
+              ],
+              [
+                1793121018923472254,
+                1793121018926337715
+              ],
+              [
+                1793121018926542843,
+                1793121018929448397
+              ],
+              [
+                1793121018929669299,
+                1793121018932681646
+              ],
+              [
+                1793121018932926202,
+                1793121018935785627
+              ],
+              [
+                1793121018935986310,
+                1793121018939012401
+              ],
+              [
+                1793121018939205601,
+                1793121018942077586
+              ],
+              [
+                1793121018942288606,
+                1793121018945262862
+              ],
+              [
+                1793121018945464961,
+                1793121018948322480
+              ],
+              [
+                1793121018948542220,
+                1793121018951492165
+              ],
+              [
+                1793121018951695475,
+                1793121018954721811
+              ],
+              [
+                1793121018954938291,
+                1793121018958318638
+              ],
+              [
+                1793121018958584780,
+                1793121018961584687
+              ],
+              [
+                1793121018961780491,
+                1793121018964811707
+              ],
+              [
+                1793121018964998660,
+                1793121018967970959
+              ],
+              [
+                1793121018968168361,
+                1793121018971061829
+              ],
+              [
+                1793121018971265176,
+                1793121018974266109
+              ]
+            ],
+            [
+              [
+                1793121018910412234,
+                1793121018913558053
+              ],
+              [
+                1793121018913756574,
+                1793121018916682485
+              ],
+              [
+                1793121018916893478,
+                1793121018919875231
+              ],
+              [
+                1793121018920085057,
+                1793121018923016679
+              ],
+              [
+                1793121018923452712,
+                1793121018926338026
+              ],
+              [
+                1793121018926538688,
+                1793121018929448013
+              ],
+              [
+                1793121018929662532,
+                1793121018932681390
+              ],
+              [
+                1793121018932916709,
+                1793121018935788297
+              ],
+              [
+                1793121018935982765,
+                1793121018939010413
+              ],
+              [
+                1793121018939204449,
+                1793121018942075074
+              ],
+              [
+                1793121018942291932,
+                1793121018945261342
+              ],
+              [
+                1793121018945462584,
+                1793121018948330174
+              ],
+              [
+                1793121018948536472,
+                1793121018951490688
+              ],
+              [
+                1793121018951693990,
+                1793121018954723084
+              ],
+              [
+                1793121018954933997,
+                1793121018958320806
+              ],
+              [
+                1793121018958573950,
+                1793121018961581996
+              ],
+              [
+                1793121018961778282,
+                1793121018964805939
+              ],
+              [
+                1793121018964997802,
+                1793121018967969859
+              ],
+              [
+                1793121018968164555,
+                1793121018971064318
+              ],
+              [
+                1793121018971261141,
+                1793121018974265955
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 8192,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "8a46152b52f99cc5abbb451d4e613e07e546409ee4ca350e52fd0d64a7c0e94f",
+            "4f5e60fb2db968b1a7db8dea0b843818695c9bbfd3b5580e48fa0879298df0c4"
+          ],
+          "per_rank_tokens": [
+            [
+              7972,
+              8040,
+              6622,
+              8671,
+              8054,
+              7771,
+              7571,
+              8351,
+              9297,
+              7552,
+              7762,
+              6979,
+              8916,
+              6998,
+              7498,
+              7927,
+              8474,
+              8032,
+              8124,
+              7428
+            ],
+            [
+              9690,
+              8345,
+              7338,
+              8534,
+              6683,
+              9138,
+              8669,
+              7738,
+              7636,
+              9091,
+              7272,
+              9411,
+              8368,
+              9413,
+              7883,
+              6584,
+              9198,
+              8806,
+              7828,
+              8062
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              8751,
+              8645,
+              7301,
+              9159,
+              6958
+            ],
+            [
+              8681,
+              7887,
+              8407,
+              8318,
+              8436
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              83532,
+              67685,
+              60442,
+              55098,
+              57710,
+              61048,
+              65413,
+              61403,
+              77008,
+              63274,
+              60385,
+              63072,
+              75472,
+              64962,
+              61720,
+              61405,
+              68809,
+              59290,
+              62972,
+              64414
+            ],
+            [
+              57764,
+              63395,
+              51238,
+              82542,
+              60186,
+              74224,
+              64507,
+              67309,
+              58456,
+              69870,
+              59887,
+              68048,
+              62800,
+              66326,
+              61328,
+              54683,
+              72567,
+              75414,
+              64644,
+              59506
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            9,
+            4,
+            1,
+            4,
+            3,
+            5,
+            3,
+            1,
+            10,
+            1,
+            3,
+            9,
+            0,
+            9,
+            2,
+            3,
+            6,
+            4,
+            4,
+            6
+          ],
+          "expert_rows_max_per_step": [
+            6949,
+            3759,
+            2732,
+            5064,
+            3998,
+            3640,
+            5472,
+            4609,
+            4281,
+            3094,
+            3075,
+            3496,
+            3755,
+            3867,
+            3282,
+            3019,
+            4623,
+            4540,
+            2539,
+            3491
+          ],
+          "actual_tokens_min": 6584,
+          "actual_tokens_max": 9690,
+          "actual_tokens_mean": 8093.15,
+          "actual_tokens_std": 796.4708579100682,
+          "max_tokens_capacity": 9690,
+          "max_rows_capacity": 99916,
+          "input_tokens_per_second": 2191835.855255365,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 7295.5265,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 456.207,
+          "backward_slowest_rank_p50_us": 6849.105,
+          "wall_slowest_rank_samples_us": [
+            8638.497,
+            7407.814,
+            6727.909,
+            8605.308,
+            6792.817,
+            7818.91,
+            6967.448,
+            7420.806,
+            8057.839,
+            7366.545,
+            6607.794,
+            7224.508,
+            7916.82,
+            7155.834,
+            6765.599,
+            6630.444,
+            7635.47,
+            7964.129,
+            7052.498,
+            6939.29
+          ],
+          "per_rank_wall_us": [
+            [
+              8638.497,
+              7407.814,
+              6727.909,
+              8605.308,
+              6792.817,
+              7816.441,
+              6964.362,
+              7420.806,
+              8057.839,
+              7366.545,
+              6607.794,
+              7224.508,
+              7913.86,
+              7153.158,
+              6765.599,
+              6628.445,
+              7635.47,
+              7907.146,
+              7052.498,
+              6939.29
+            ],
+            [
+              8634.004,
+              7407.643,
+              6727.86,
+              8602.919,
+              6778.522,
+              7818.91,
+              6967.448,
+              7416.823,
+              8053.15,
+              7356.822,
+              6598.333,
+              7224.395,
+              7916.82,
+              7155.834,
+              6756.313,
+              6630.444,
+              7628.887,
+              7964.129,
+              7031.187,
+              6931.165
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121019936309960,
+                1793121019944950920
+              ],
+              [
+                1793121019945251925,
+                1793121019952662095
+              ],
+              [
+                1793121019952977105,
+                1793121019959707292
+              ],
+              [
+                1793121019960022290,
+                1793121019968629675
+              ],
+              [
+                1793121019968929470,
+                1793121019975724334
+              ],
+              [
+                1793121019976052253,
+                1793121019983871149
+              ],
+              [
+                1793121019984188826,
+                1793121019991155116
+              ],
+              [
+                1793121019991451602,
+                1793121019998874332
+              ],
+              [
+                1793121019999194328,
+                1793121020007254529
+              ],
+              [
+                1793121020007578718,
+                1793121020014947193
+              ],
+              [
+                1793121020015230291,
+                1793121020021839817
+              ],
+              [
+                1793121020022153235,
+                1793121020029379555
+              ],
+              [
+                1793121020029716523,
+                1793121020037632088
+              ],
+              [
+                1793121020037963070,
+                1793121020045118139
+              ],
+              [
+                1793121020045433785,
+                1793121020052201319
+              ],
+              [
+                1793121020052494560,
+                1793121020059124901
+              ],
+              [
+                1793121020059451161,
+                1793121020067088920
+              ],
+              [
+                1793121020067397248,
+                1793121020075311090
+              ],
+              [
+                1793121020075882603,
+                1793121020082938057
+              ],
+              [
+                1793121020083308091,
+                1793121020090249995
+              ]
+            ],
+            [
+              [
+                1793121019936314666,
+                1793121019944951430
+              ],
+              [
+                1793121019945255804,
+                1793121019952666324
+              ],
+              [
+                1793121019952972872,
+                1793121019959702931
+              ],
+              [
+                1793121019960024723,
+                1793121019968630698
+              ],
+              [
+                1793121019968941892,
+                1793121019975723251
+              ],
+              [
+                1793121019976053205,
+                1793121019983874285
+              ],
+              [
+                1793121019984189853,
+                1793121019991159493
+              ],
+              [
+                1793121019991454751,
+                1793121019998873731
+              ],
+              [
+                1793121019999196756,
+                1793121020007252395
+              ],
+              [
+                1793121020007586347,
+                1793121020014945278
+              ],
+              [
+                1793121020015229878,
+                1793121020021830288
+              ],
+              [
+                1793121020022154294,
+                1793121020029380891
+              ],
+              [
+                1793121020029715092,
+                1793121020037634214
+              ],
+              [
+                1793121020037964495,
+                1793121020045122974
+              ],
+              [
+                1793121020045443646,
+                1793121020052202148
+              ],
+              [
+                1793121020052496927,
+                1793121020059129350
+              ],
+              [
+                1793121020059456317,
+                1793121020067087684
+              ],
+              [
+                1793121020067397133,
+                1793121020075365580
+              ],
+              [
+                1793121020075907144,
+                1793121020082941388
+              ],
+              [
+                1793121020083323707,
+                1793121020090258615
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 1148777608,
+              "gin_bytes": 0,
+              "notify_bytes": 42467160,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 1148777608,
+              "gin_bytes": 0,
+              "notify_bytes": 42467160,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        }
+      ]
+    },
+    {
+      "label": "qwen35b_bf16",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "256",
+        "512",
+        "2048",
+        "8192",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--stream-ordered"
+      ],
+      "log": "/tmp/fp8-isolated-qwen35b_bf16.log",
+      "records": [
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 256,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "ea10efc2bf46b974e0e1b0de7638ad8c8c2d2568ea0292ece5422221a3f7bdd5",
+            "7c6a0dd2b5334df035edd0710bc2fba9c0dac2b18e37f7edcab479e927e85120"
+          ],
+          "per_rank_tokens": [
+            [
+              252,
+              232,
+              278,
+              239,
+              207,
+              280,
+              206,
+              264,
+              277,
+              274,
+              254,
+              248,
+              244,
+              265,
+              272,
+              262,
+              266,
+              287,
+              237,
+              284
+            ],
+            [
+              266,
+              256,
+              224,
+              279,
+              227,
+              246,
+              233,
+              246,
+              241,
+              250,
+              215,
+              262,
+              279,
+              257,
+              299,
+              264,
+              245,
+              255,
+              256,
+              252
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              259,
+              273,
+              256,
+              284,
+              248
+            ],
+            [
+              296,
+              249,
+              231,
+              219,
+              275
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              1996,
+              2120,
+              1856,
+              2169,
+              1807,
+              1792,
+              1617,
+              2226,
+              2037,
+              2096,
+              2028,
+              2283,
+              2050,
+              2211,
+              2086,
+              2363,
+              2280,
+              2177,
+              1986,
+              2051
+            ],
+            [
+              2148,
+              1784,
+              2160,
+              1975,
+              1665,
+              2416,
+              1895,
+              1854,
+              2107,
+              2096,
+              1724,
+              1797,
+              2134,
+              1965,
+              2482,
+              1845,
+              1808,
+              2159,
+              1958,
+              2237
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            129,
+            154,
+            128,
+            110,
+            121,
+            144,
+            86,
+            112,
+            145,
+            198,
+            119,
+            183,
+            164,
+            88,
+            141,
+            165,
+            135,
+            146,
+            164,
+            144
+          ],
+          "actual_tokens_min": 206,
+          "actual_tokens_max": 299,
+          "actual_tokens_mean": 254.5,
+          "actual_tokens_std": 21.303755537463342,
+          "max_tokens_capacity": 299,
+          "max_rows_capacity": 18866,
+          "input_tokens_per_second": 248593.48103888633,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "bf16",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": false,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 2039.242,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 382.38149999999996,
+          "backward_slowest_rank_p50_us": 1656.7895,
+          "wall_slowest_rank_samples_us": [
+            2098.59,
+            2131.626,
+            2091.789,
+            2120.801,
+            2101.224,
+            2047.082,
+            2024.827,
+            2012.782,
+            2037.587,
+            1998.865,
+            2021.397,
+            2034.437,
+            2049.414,
+            2032.326,
+            2048.747,
+            1983.273,
+            1973.589,
+            2082.877,
+            2040.897,
+            2018.26
+          ],
+          "per_rank_wall_us": [
+            [
+              2091.265,
+              2131.626,
+              2091.789,
+              2120.801,
+              2101.224,
+              2047.08,
+              2024.827,
+              2012.489,
+              2034.298,
+              1998.865,
+              2021.397,
+              2034.437,
+              2044.551,
+              2032.326,
+              2048.747,
+              1982.59,
+              1973.346,
+              2078.59,
+              2033.143,
+              2017.955
+            ],
+            [
+              2098.59,
+              2121.244,
+              2076.455,
+              2108.974,
+              2092.755,
+              2047.082,
+              2012.157,
+              2012.782,
+              2037.587,
+              1996.261,
+              2014.907,
+              2034.386,
+              2049.414,
+              2029.16,
+              2045.916,
+              1983.273,
+              1973.589,
+              2082.877,
+              2040.897,
+              2018.26
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121028093488921,
+                1793121028095584059
+              ],
+              [
+                1793121028095816082,
+                1793121028097951040
+              ],
+              [
+                1793121028098182852,
+                1793121028100276413
+              ],
+              [
+                1793121028100489621,
+                1793121028102612316
+              ],
+              [
+                1793121028102813173,
+                1793121028104916866
+              ],
+              [
+                1793121028105119577,
+                1793121028107168472
+              ],
+              [
+                1793121028110467622,
+                1793121028112494587
+              ],
+              [
+                1793121028112690936,
+                1793121028114705278
+              ],
+              [
+                1793121028114887072,
+                1793121028116923331
+              ],
+              [
+                1793121028117110650,
+                1793121028119111119
+              ],
+              [
+                1793121028119298165,
+                1793121028121321405
+              ],
+              [
+                1793121028121491080,
+                1793121028123527560
+              ],
+              [
+                1793121028123715728,
+                1793121028125761992
+              ],
+              [
+                1793121028125933920,
+                1793121028127967915
+              ],
+              [
+                1793121028128134767,
+                1793121028130185216
+              ],
+              [
+                1793121028130356299,
+                1793121028132340667
+              ],
+              [
+                1793121028132512730,
+                1793121028134487893
+              ],
+              [
+                1793121028134662624,
+                1793121028136742893
+              ],
+              [
+                1793121028136919555,
+                1793121028138954418
+              ],
+              [
+                1793121028139125332,
+                1793121028141144943
+              ]
+            ],
+            [
+              [
+                1793121028093484341,
+                1793121028095588092
+              ],
+              [
+                1793121028095829804,
+                1793121028097954876
+              ],
+              [
+                1793121028098202492,
+                1793121028100281194
+              ],
+              [
+                1793121028100507659,
+                1793121028102618689
+              ],
+              [
+                1793121028102819632,
+                1793121028104915102
+              ],
+              [
+                1793121028105116953,
+                1793121028107165725
+              ],
+              [
+                1793121028110482155,
+                1793121028112496606
+              ],
+              [
+                1793121028112690844,
+                1793121028114705183
+              ],
+              [
+                1793121028114882353,
+                1793121028116921934
+              ],
+              [
+                1793121028117116172,
+                1793121028119114330
+              ],
+              [
+                1793121028119303085,
+                1793121028121319806
+              ],
+              [
+                1793121028121489775,
+                1793121028123526085
+              ],
+              [
+                1793121028123711725,
+                1793121028125762797
+              ],
+              [
+                1793121028125934603,
+                1793121028127965479
+              ],
+              [
+                1793121028128133601,
+                1793121028130181433
+              ],
+              [
+                1793121028130358462,
+                1793121028132343316
+              ],
+              [
+                1793121028132510597,
+                1793121028134486077
+              ],
+              [
+                1793121028134658895,
+                1793121028136743419
+              ],
+              [
+                1793121028136915119,
+                1793121028138957512
+              ],
+              [
+                1793121028139122941,
+                1793121028141142873
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 316312968,
+              "gin_bytes": 0,
+              "notify_bytes": 1428024,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 316312968,
+              "gin_bytes": 0,
+              "notify_bytes": 1428024,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 512,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "d54d0bcb9c20eeba3a5dff525922101159fb159fde171e5a7960160b03d8f448",
+            "17af1a9a107f2be9bf4066ae0a2c292ca75a96ef1f316e3b7b5c92068f361787"
+          ],
+          "per_rank_tokens": [
+            [
+              591,
+              604,
+              498,
+              529,
+              537,
+              501,
+              575,
+              397,
+              524,
+              612,
+              502,
+              627,
+              560,
+              475,
+              502,
+              432,
+              457,
+              541,
+              625,
+              406
+            ],
+            [
+              437,
+              508,
+              557,
+              558,
+              533,
+              473,
+              467,
+              425,
+              484,
+              518,
+              497,
+              516,
+              519,
+              556,
+              637,
+              480,
+              491,
+              569,
+              527,
+              569
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              535,
+              513,
+              521,
+              559,
+              363
+            ],
+            [
+              641,
+              426,
+              594,
+              592,
+              613
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              4142,
+              4991,
+              4311,
+              4506,
+              4558,
+              3949,
+              4266,
+              3203,
+              4035,
+              5123,
+              4010,
+              4521,
+              4179,
+              3491,
+              4584,
+              3825,
+              3814,
+              4245,
+              4725,
+              3694
+            ],
+            [
+              4082,
+              3905,
+              4129,
+              4190,
+              4002,
+              3843,
+              4070,
+              3373,
+              4029,
+              3917,
+              3982,
+              4623,
+              4453,
+              4757,
+              4528,
+              3471,
+              3770,
+              4635,
+              4491,
+              4106
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            289,
+            177,
+            404,
+            237,
+            449,
+            180,
+            187,
+            236,
+            366,
+            302,
+            277,
+            342,
+            311,
+            229,
+            268,
+            206,
+            267,
+            209,
+            207,
+            235
+          ],
+          "actual_tokens_min": 397,
+          "actual_tokens_max": 637,
+          "actual_tokens_mean": 520.4,
+          "actual_tokens_std": 59.16451639285155,
+          "max_tokens_capacity": 641,
+          "max_rows_capacity": 21507,
+          "input_tokens_per_second": 469013.13831615634,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "bf16",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": false,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 2211.3195,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 399.46950000000004,
+          "backward_slowest_rank_p50_us": 1815.7965,
+          "wall_slowest_rank_samples_us": [
+            2278.102,
+            2243.098,
+            2245.064,
+            2229.693,
+            2209.241,
+            2138.011,
+            2339.165,
+            2126.671,
+            2314.537,
+            2283.821,
+            2123.116,
+            2235.832,
+            2182.587,
+            2177.401,
+            2213.398,
+            2166.535,
+            2171.849,
+            2204.075,
+            2293.876,
+            2206.48
+          ],
+          "per_rank_wall_us": [
+            [
+              2278.102,
+              2243.098,
+              2245.064,
+              2229.693,
+              2209.241,
+              2138.011,
+              2338.283,
+              2126.671,
+              2292.678,
+              2259.971,
+              2111.583,
+              2223.543,
+              2182.587,
+              2177.401,
+              2213.398,
+              2163.569,
+              2165.184,
+              2204.075,
+              2283.578,
+              2206.48
+            ],
+            [
+              2251.022,
+              2219.973,
+              2237.507,
+              2217.3,
+              2204.758,
+              2135.245,
+              2339.165,
+              2120.51,
+              2314.537,
+              2283.821,
+              2123.116,
+              2235.832,
+              2180.733,
+              2177.25,
+              2205.081,
+              2166.535,
+              2171.849,
+              2203.26,
+              2293.876,
+              2204.006
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121029073719124,
+                1793121029075999444
+              ],
+              [
+                1793121029076230462,
+                1793121029078475386
+              ],
+              [
+                1793121029078710466,
+                1793121029080957474
+              ],
+              [
+                1793121029081183572,
+                1793121029083414942
+              ],
+              [
+                1793121029083613690,
+                1793121029085824878
+              ],
+              [
+                1793121029085993999,
+                1793121029088133871
+              ],
+              [
+                1793121029088311424,
+                1793121029090651974
+              ],
+              [
+                1793121029090838327,
+                1793121029092967569
+              ],
+              [
+                1793121029093252405,
+                1793121029095548417
+              ],
+              [
+                1793121029095811555,
+                1793121029098073432
+              ],
+              [
+                1793121029098266068,
+                1793121029100379865
+              ],
+              [
+                1793121029100581654,
+                1793121029102807075
+              ],
+              [
+                1793121029102987814,
+                1793121029105172163
+              ],
+              [
+                1793121029105356354,
+                1793121029107535504
+              ],
+              [
+                1793121029107712388,
+                1793121029109927563
+              ],
+              [
+                1793121029110109212,
+                1793121029112274414
+              ],
+              [
+                1793121029112450822,
+                1793121029114618047
+              ],
+              [
+                1793121029114798373,
+                1793121029117004063
+              ],
+              [
+                1793121029117298869,
+                1793121029119583993
+              ],
+              [
+                1793121029119776999,
+                1793121029121985192
+              ]
+            ],
+            [
+              [
+                1793121029073741784,
+                1793121029075995694
+              ],
+              [
+                1793121029076252609,
+                1793121029078474765
+              ],
+              [
+                1793121029078722901,
+                1793121029080962699
+              ],
+              [
+                1793121029081196551,
+                1793121029083415806
+              ],
+              [
+                1793121029083620286,
+                1793121029085827151
+              ],
+              [
+                1793121029085998877,
+                1793121029088135740
+              ],
+              [
+                1793121029088308725,
+                1793121029090649692
+              ],
+              [
+                1793121029090839478,
+                1793121029092961864
+              ],
+              [
+                1793121029093225161,
+                1793121029095541686
+              ],
+              [
+                1793121029095793672,
+                1793121029098078971
+              ],
+              [
+                1793121029098259344,
+                1793121029100384169
+              ],
+              [
+                1793121029100575280,
+                1793121029102812759
+              ],
+              [
+                1793121029102984921,
+                1793121029105167282
+              ],
+              [
+                1793121029105358321,
+                1793121029107537244
+              ],
+              [
+                1793121029107715204,
+                1793121029109921929
+              ],
+              [
+                1793121029110105794,
+                1793121029112274000
+              ],
+              [
+                1793121029112449030,
+                1793121029114622838
+              ],
+              [
+                1793121029114797074,
+                1793121029117001926
+              ],
+              [
+                1793121029117286530,
+                1793121029119582398
+              ],
+              [
+                1793121029119783581,
+                1793121029121989366
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 376175752,
+              "gin_bytes": 0,
+              "notify_bytes": 2930792,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 376175752,
+              "gin_bytes": 0,
+              "notify_bytes": 2930792,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 2048,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "82f71a20d7c2f2ce37894fbd63374688c10184e41cb06de4c7029ce194ef6b3b",
+            "11e278228be8a7946badb0516748639f763cc8bd941c1b3e4a9f2ef70c56635e"
+          ],
+          "per_rank_tokens": [
+            [
+              2178,
+              1965,
+              1993,
+              2278,
+              1896,
+              2110,
+              2089,
+              1942,
+              2354,
+              2010,
+              2276,
+              1949,
+              1692,
+              2340,
+              2217,
+              2247,
+              2191,
+              2150,
+              1834,
+              2227
+            ],
+            [
+              2476,
+              2105,
+              2221,
+              1755,
+              1763,
+              2038,
+              2017,
+              1821,
+              1888,
+              2051,
+              1765,
+              1920,
+              2219,
+              1894,
+              2110,
+              2121,
+              2185,
+              1927,
+              1874,
+              1998
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              1913,
+              1994,
+              2209,
+              1806,
+              2210
+            ],
+            [
+              2109,
+              2307,
+              2248,
+              2207,
+              2252
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              17792,
+              15441,
+              17212,
+              16566,
+              13909,
+              16700,
+              14418,
+              16018,
+              18895,
+              16139,
+              14772,
+              15914,
+              14566,
+              18121,
+              18601,
+              17899,
+              18374,
+              15157,
+              16435,
+              16039
+            ],
+            [
+              19440,
+              17119,
+              16500,
+              15698,
+              15363,
+              16484,
+              18430,
+              14086,
+              15041,
+              16349,
+              17556,
+              15038,
+              16722,
+              15751,
+              16015,
+              17045,
+              16634,
+              17459,
+              13229,
+              17761
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            0,
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            1331,
+            1218,
+            823,
+            1019,
+            1294,
+            970,
+            905,
+            1178,
+            808,
+            555,
+            747,
+            1187,
+            1465,
+            861,
+            866,
+            1085,
+            1212,
+            927,
+            1200,
+            1389
+          ],
+          "actual_tokens_min": 1692,
+          "actual_tokens_max": 2476,
+          "actual_tokens_mean": 2052.15,
+          "actual_tokens_std": 183.7818747863891,
+          "max_tokens_capacity": 2476,
+          "max_rows_capacity": 35987,
+          "input_tokens_per_second": 1389653.2909334966,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "bf16",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": false,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 2931.0855,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 402.1295,
+          "backward_slowest_rank_p50_us": 2535.6139999999996,
+          "wall_slowest_rank_samples_us": [
+            3077.921,
+            2938.529,
+            2923.642,
+            2866.161,
+            2829.594,
+            2873.019,
+            2986.779,
+            2826.3,
+            2979.273,
+            2879.166,
+            2948.449,
+            2847.29,
+            2920.478,
+            2922.894,
+            2966.016,
+            3224.956,
+            3273.775,
+            2960.549,
+            2851.343,
+            2973.276
+          ],
+          "per_rank_wall_us": [
+            [
+              3068.083,
+              2932.848,
+              2923.642,
+              2866.161,
+              2828.31,
+              2868.02,
+              2986.44,
+              2821.568,
+              2974.334,
+              2879.166,
+              2948.449,
+              2838.452,
+              2920.478,
+              2922.772,
+              2966.016,
+              3224.956,
+              3273.775,
+              2955.915,
+              2851.343,
+              2973.276
+            ],
+            [
+              3077.921,
+              2938.529,
+              2913.32,
+              2865.111,
+              2829.594,
+              2873.019,
+              2986.779,
+              2826.3,
+              2979.273,
+              2873.568,
+              2934.414,
+              2847.29,
+              2903.496,
+              2922.894,
+              2963.814,
+              3213.908,
+              3244.89,
+              2960.549,
+              2844.925,
+              2969.104
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121030427130314,
+                1793121030430200722
+              ],
+              [
+                1793121030430439986,
+                1793121030433374781
+              ],
+              [
+                1793121030433588628,
+                1793121030436514094
+              ],
+              [
+                1793121030436717160,
+                1793121030439585075
+              ],
+              [
+                1793121030439809742,
+                1793121030442640345
+              ],
+              [
+                1793121030442832735,
+                1793121030445702540
+              ],
+              [
+                1793121030445890609,
+                1793121030448878881
+              ],
+              [
+                1793121030449090338,
+                1793121030451913678
+              ],
+              [
+                1793121030452118631,
+                1793121030455094949
+              ],
+              [
+                1793121030455290646,
+                1793121030458171432
+              ],
+              [
+                1793121030458360415,
+                1793121030461310662
+              ],
+              [
+                1793121030461502619,
+                1793121030464342677
+              ],
+              [
+                1793121030464558780,
+                1793121030467480840
+              ],
+              [
+                1793121030467693264,
+                1793121030470617740
+              ],
+              [
+                1793121030470822324,
+                1793121030473790136
+              ],
+              [
+                1793121030474001276,
+                1793121030477243012
+              ],
+              [
+                1793121030478437004,
+                1793121030481713530
+              ],
+              [
+                1793121030481937253,
+                1793121030484895211
+              ],
+              [
+                1793121030485092333,
+                1793121030487945403
+              ],
+              [
+                1793121030488142648,
+                1793121030491117494
+              ]
+            ],
+            [
+              [
+                1793121030427119581,
+                1793121030430199777
+              ],
+              [
+                1793121030430431045,
+                1793121030433371477
+              ],
+              [
+                1793121030433600228,
+                1793121030436515438
+              ],
+              [
+                1793121030436715875,
+                1793121030439582792
+              ],
+              [
+                1793121030439804015,
+                1793121030442635638
+              ],
+              [
+                1793121030442830574,
+                1793121030445705281
+              ],
+              [
+                1793121030445893053,
+                1793121030448881425
+              ],
+              [
+                1793121030449086530,
+                1793121030451914463
+              ],
+              [
+                1793121030452113607,
+                1793121030455094959
+              ],
+              [
+                1793121030455295303,
+                1793121030458170684
+              ],
+              [
+                1793121030458372020,
+                1793121030461308205
+              ],
+              [
+                1793121030461500231,
+                1793121030464349372
+              ],
+              [
+                1793121030464570024,
+                1793121030467475458
+              ],
+              [
+                1793121030467690592,
+                1793121030470615268
+              ],
+              [
+                1793121030470819568,
+                1793121030473785278
+              ],
+              [
+                1793121030474008170,
+                1793121030477224808
+              ],
+              [
+                1793121030478462198,
+                1793121030481709699
+              ],
+              [
+                1793121030481932001,
+                1793121030484894697
+              ],
+              [
+                1793121030485098898,
+                1793121030487945631
+              ],
+              [
+                1793121030488147572,
+                1793121030491118366
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        },
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 8192,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "8a46152b52f99cc5abbb451d4e613e07e546409ee4ca350e52fd0d64a7c0e94f",
+            "4f5e60fb2db968b1a7db8dea0b843818695c9bbfd3b5580e48fa0879298df0c4"
+          ],
+          "per_rank_tokens": [
+            [
+              7972,
+              8040,
+              6622,
+              8671,
+              8054,
+              7771,
+              7571,
+              8351,
+              9297,
+              7552,
+              7762,
+              6979,
+              8916,
+              6998,
+              7498,
+              7927,
+              8474,
+              8032,
+              8124,
+              7428
+            ],
+            [
+              9690,
+              8345,
+              7338,
+              8534,
+              6683,
+              9138,
+              8669,
+              7738,
+              7636,
+              9091,
+              7272,
+              9411,
+              8368,
+              9413,
+              7883,
+              6584,
+              9198,
+              8806,
+              7828,
+              8062
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              8751,
+              8645,
+              7301,
+              9159,
+              6958
+            ],
+            [
+              8681,
+              7887,
+              8407,
+              8318,
+              8436
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              83532,
+              67685,
+              60442,
+              55098,
+              57710,
+              61048,
+              65413,
+              61403,
+              77008,
+              63274,
+              60385,
+              63072,
+              75472,
+              64962,
+              61720,
+              61405,
+              68809,
+              59290,
+              62972,
+              64414
+            ],
+            [
+              57764,
+              63395,
+              51238,
+              82542,
+              60186,
+              74224,
+              64507,
+              67309,
+              58456,
+              69870,
+              59887,
+              68048,
+              62800,
+              66326,
+              61328,
+              54683,
+              72567,
+              75414,
+              64644,
+              59506
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            9,
+            4,
+            1,
+            4,
+            3,
+            5,
+            3,
+            1,
+            10,
+            1,
+            3,
+            9,
+            0,
+            9,
+            2,
+            3,
+            6,
+            4,
+            4,
+            6
+          ],
+          "expert_rows_max_per_step": [
+            6949,
+            3759,
+            2732,
+            5064,
+            3998,
+            3640,
+            5472,
+            4609,
+            4281,
+            3094,
+            3075,
+            3496,
+            3755,
+            3867,
+            3282,
+            3019,
+            4623,
+            4540,
+            2539,
+            3491
+          ],
+          "actual_tokens_min": 6584,
+          "actual_tokens_max": 9690,
+          "actual_tokens_mean": 8093.15,
+          "actual_tokens_std": 796.4708579100682,
+          "max_tokens_capacity": 9690,
+          "max_rows_capacity": 99916,
+          "input_tokens_per_second": 2828322.8409702037,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "bf16",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": false,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 5643.6865,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 454.3985,
+          "backward_slowest_rank_p50_us": 5154.183999999999,
+          "wall_slowest_rank_samples_us": [
+            6451.937,
+            5616.149,
+            5286.13,
+            6258.082,
+            5254.004,
+            5998.082,
+            5554.561,
+            6062.499,
+            6050.891,
+            5820.341,
+            5374.13,
+            5671.224,
+            5921.293,
+            5599.775,
+            5415.034,
+            5332.938,
+            5851.773,
+            6002.838,
+            5495.493,
+            5441.471
+          ],
+          "per_rank_wall_us": [
+            [
+              6451.937,
+              5615.146,
+              5276.379,
+              6254.746,
+              5253.158,
+              5998.082,
+              5554.561,
+              6062.499,
+              6049.737,
+              5820.341,
+              5368.287,
+              5671.224,
+              5919.47,
+              5598.662,
+              5404.268,
+              5330.728,
+              5849.691,
+              5997.278,
+              5492.735,
+              5438.199
+            ],
+            [
+              6443.895,
+              5616.149,
+              5286.13,
+              6258.082,
+              5254.004,
+              5991.871,
+              5540.333,
+              6061.467,
+              6050.891,
+              5819.863,
+              5374.13,
+              5670.583,
+              5921.293,
+              5599.775,
+              5415.034,
+              5332.938,
+              5851.773,
+              6002.838,
+              5495.493,
+              5441.471
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121031825112339,
+                1793121031831567366
+              ],
+              [
+                1793121031831881666,
+                1793121031837499115
+              ],
+              [
+                1793121031837779145,
+                1793121031843057595
+              ],
+              [
+                1793121031843363927,
+                1793121031849620794
+              ],
+              [
+                1793121031849910327,
+                1793121031855165856
+              ],
+              [
+                1793121031855485291,
+                1793121031861485250
+              ],
+              [
+                1793121031861792524,
+                1793121031867353667
+              ],
+              [
+                1793121031868135336,
+                1793121031874200213
+              ],
+              [
+                1793121031874533644,
+                1793121031880585494
+              ],
+              [
+                1793121031880904574,
+                1793121031886726745
+              ],
+              [
+                1793121031887008597,
+                1793121031892378666
+              ],
+              [
+                1793121031892702204,
+                1793121031898375270
+              ],
+              [
+                1793121031898679362,
+                1793121031904600715
+              ],
+              [
+                1793121031904922984,
+                1793121031910546124
+              ],
+              [
+                1793121031911578385,
+                1793121031916984726
+              ],
+              [
+                1793121031917279751,
+                1793121031922612382
+              ],
+              [
+                1793121031922934047,
+                1793121031928786104
+              ],
+              [
+                1793121031929096368,
+                1793121031935095519
+              ],
+              [
+                1793121031935387951,
+                1793121031940882496
+              ],
+              [
+                1793121031941172028,
+                1793121031946612038
+              ]
+            ],
+            [
+              [
+                1793121031825115869,
+                1793121031831564580
+              ],
+              [
+                1793121031831881660,
+                1793121031837499789
+              ],
+              [
+                1793121031837772645,
+                1793121031843060847
+              ],
+              [
+                1793121031843362746,
+                1793121031849623167
+              ],
+              [
+                1793121031849911306,
+                1793121031855167758
+              ],
+              [
+                1793121031855488612,
+                1793121031861482521
+              ],
+              [
+                1793121031861793902,
+                1793121031867336227
+              ],
+              [
+                1793121031868140508,
+                1793121031874204488
+              ],
+              [
+                1793121031874531048,
+                1793121031880584418
+              ],
+              [
+                1793121031880904992,
+                1793121031886727120
+              ],
+              [
+                1793121031887009395,
+                1793121031892385469
+              ],
+              [
+                1793121031892704393,
+                1793121031898376904
+              ],
+              [
+                1793121031898680853,
+                1793121031904604156
+              ],
+              [
+                1793121031904924033,
+                1793121031910571307
+              ],
+              [
+                1793121031911570118,
+                1793121031916987361
+              ],
+              [
+                1793121031917278462,
+                1793121031922613365
+              ],
+              [
+                1793121031922935140,
+                1793121031928789077
+              ],
+              [
+                1793121031929094380,
+                1793121031935099292
+              ],
+              [
+                1793121031935388535,
+                1793121031940885883
+              ],
+              [
+                1793121031941172740,
+                1793121031946616041
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 1148777608,
+              "gin_bytes": 0,
+              "notify_bytes": 42467160,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 1148777608,
+              "gin_bytes": 0,
+              "notify_bytes": 42467160,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        }
+      ]
+    },
+    {
+      "label": "qwen35b_fp8_fp32grad",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "2048",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--stream-ordered",
+        "--fp8"
+      ],
+      "log": "/tmp/fp8-isolated-qwen35b_fp8_fp32grad.log",
+      "records": [
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 2048,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "82f71a20d7c2f2ce37894fbd63374688c10184e41cb06de4c7029ce194ef6b3b",
+            "11e278228be8a7946badb0516748639f763cc8bd941c1b3e4a9f2ef70c56635e"
+          ],
+          "per_rank_tokens": [
+            [
+              2178,
+              1965,
+              1993,
+              2278,
+              1896,
+              2110,
+              2089,
+              1942,
+              2354,
+              2010,
+              2276,
+              1949,
+              1692,
+              2340,
+              2217,
+              2247,
+              2191,
+              2150,
+              1834,
+              2227
+            ],
+            [
+              2476,
+              2105,
+              2221,
+              1755,
+              1763,
+              2038,
+              2017,
+              1821,
+              1888,
+              2051,
+              1765,
+              1920,
+              2219,
+              1894,
+              2110,
+              2121,
+              2185,
+              1927,
+              1874,
+              1998
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              1913,
+              1994,
+              2209,
+              1806,
+              2210
+            ],
+            [
+              2109,
+              2307,
+              2248,
+              2207,
+              2252
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              17792,
+              15441,
+              17212,
+              16566,
+              13909,
+              16700,
+              14418,
+              16018,
+              18895,
+              16139,
+              14772,
+              15914,
+              14566,
+              18121,
+              18601,
+              17899,
+              18374,
+              15157,
+              16435,
+              16039
+            ],
+            [
+              19440,
+              17119,
+              16500,
+              15698,
+              15363,
+              16484,
+              18430,
+              14086,
+              15041,
+              16349,
+              17556,
+              15038,
+              16722,
+              15751,
+              16015,
+              17045,
+              16634,
+              17459,
+              13229,
+              17761
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            0,
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            1331,
+            1218,
+            823,
+            1019,
+            1294,
+            970,
+            905,
+            1178,
+            808,
+            555,
+            747,
+            1187,
+            1465,
+            861,
+            866,
+            1085,
+            1212,
+            927,
+            1200,
+            1389
+          ],
+          "actual_tokens_min": 1692,
+          "actual_tokens_max": 2476,
+          "actual_tokens_mean": 2052.15,
+          "actual_tokens_std": 183.7818747863891,
+          "max_tokens_capacity": 2476,
+          "max_rows_capacity": 35987,
+          "input_tokens_per_second": 1291603.4916061352,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 2048,
+          "intermediate": 512,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "float32",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 3198.2325,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 382.6015,
+          "backward_slowest_rank_p50_us": 2816.9579999999996,
+          "wall_slowest_rank_samples_us": [
+            3369.927,
+            3140.976,
+            3202.603,
+            3119.27,
+            3045.1,
+            3138.202,
+            3247.603,
+            3041.262,
+            3253.673,
+            3102.743,
+            3207.641,
+            3055.121,
+            3135.715,
+            3265.639,
+            3236.463,
+            3200.571,
+            3231.249,
+            3195.894,
+            3131.473,
+            3232.435
+          ],
+          "per_rank_wall_us": [
+            [
+              3369.927,
+              3140.976,
+              3199.075,
+              3110.191,
+              3044.203,
+              3138.202,
+              3247.603,
+              3041.262,
+              3253.673,
+              3102.743,
+              3197.38,
+              3054.238,
+              3135.715,
+              3265.639,
+              3236.463,
+              3198.425,
+              3230.159,
+              3186.575,
+              3131.473,
+              3223.155
+            ],
+            [
+              3366.137,
+              3133.438,
+              3202.603,
+              3119.27,
+              3045.1,
+              3131.711,
+              3241.931,
+              3036.433,
+              3252.518,
+              3100.883,
+              3207.641,
+              3055.121,
+              3130.563,
+              3261.031,
+              3236.398,
+              3200.571,
+              3231.249,
+              3195.894,
+              3118.087,
+              3232.435
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121039363428900,
+                1793121039366802648
+              ],
+              [
+                1793121039367022248,
+                1793121039370166417
+              ],
+              [
+                1793121039370380154,
+                1793121039373581253
+              ],
+              [
+                1793121039373813955,
+                1793121039376926160
+              ],
+              [
+                1793121039377155811,
+                1793121039380202541
+              ],
+              [
+                1793121039380428124,
+                1793121039383568242
+              ],
+              [
+                1793121039383784924,
+                1793121039387034547
+              ],
+              [
+                1793121039387241170,
+                1793121039390284156
+              ],
+              [
+                1793121039390503741,
+                1793121039393759759
+              ],
+              [
+                1793121039393978665,
+                1793121039397083157
+              ],
+              [
+                1793121039397352076,
+                1793121039400551552
+              ],
+              [
+                1793121039400783871,
+                1793121039403840143
+              ],
+              [
+                1793121039404055431,
+                1793121039407192929
+              ],
+              [
+                1793121039407410970,
+                1793121039410678492
+              ],
+              [
+                1793121039410892720,
+                1793121039414131057
+              ],
+              [
+                1793121039414357695,
+                1793121039417558070
+              ],
+              [
+                1793121039417788042,
+                1793121039421020329
+              ],
+              [
+                1793121039421253570,
+                1793121039424442060
+              ],
+              [
+                1793121039424660980,
+                1793121039427794544
+              ],
+              [
+                1793121039428046597,
+                1793121039431271777
+              ]
+            ],
+            [
+              [
+                1793121039363434151,
+                1793121039366804365
+              ],
+              [
+                1793121039367024769,
+                1793121039370161526
+              ],
+              [
+                1793121039370383475,
+                1793121039373588230
+              ],
+              [
+                1793121039373810205,
+                1793121039376931604
+              ],
+              [
+                1793121039377151041,
+                1793121039380198807
+              ],
+              [
+                1793121039380433684,
+                1793121039383567322
+              ],
+              [
+                1793121039383787489,
+                1793121039387031367
+              ],
+              [
+                1793121039387244679,
+                1793121039390282982
+              ],
+              [
+                1793121039390499648,
+                1793121039393754498
+              ],
+              [
+                1793121039393976974,
+                1793121039397079774
+              ],
+              [
+                1793121039397342802,
+                1793121039400552150
+              ],
+              [
+                1793121039400786161,
+                1793121039403843449
+              ],
+              [
+                1793121039404057605,
+                1793121039407189859
+              ],
+              [
+                1793121039407417635,
+                1793121039410680460
+              ],
+              [
+                1793121039410896437,
+                1793121039414134665
+              ],
+              [
+                1793121039414364257,
+                1793121039417566655
+              ],
+              [
+                1793121039417793243,
+                1793121039421026720
+              ],
+              [
+                1793121039421249667,
+                1793121039424447290
+              ],
+              [
+                1793121039424667098,
+                1793121039427787157
+              ],
+              [
+                1793121039428037343,
+                1793121039431271502
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 525208968,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final/_runtime.cpython-312-x86_64-linux-gnu.so"
+        }
+      ]
+    },
+    {
+      "label": "qwen122b_bf16",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen122b",
+        "--tokens",
+        "2048",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--stream-ordered"
+      ],
+      "log": "/tmp/fp8-isolated-qwen122b_bf16.log",
+      "records": [
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 2048,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "82f71a20d7c2f2ce37894fbd63374688c10184e41cb06de4c7029ce194ef6b3b",
+            "11e278228be8a7946badb0516748639f763cc8bd941c1b3e4a9f2ef70c56635e"
+          ],
+          "per_rank_tokens": [
+            [
+              2178,
+              1965,
+              1993,
+              2278,
+              1896,
+              2110,
+              2089,
+              1942,
+              2354,
+              2010,
+              2276,
+              1949,
+              1692,
+              2340,
+              2217,
+              2247,
+              2191,
+              2150,
+              1834,
+              2227
+            ],
+            [
+              2476,
+              2105,
+              2221,
+              1755,
+              1763,
+              2038,
+              2017,
+              1821,
+              1888,
+              2051,
+              1765,
+              1920,
+              2219,
+              1894,
+              2110,
+              2121,
+              2185,
+              1927,
+              1874,
+              1998
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              1913,
+              1994,
+              2209,
+              1806,
+              2210
+            ],
+            [
+              2109,
+              2307,
+              2248,
+              2207,
+              2252
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              17792,
+              15441,
+              17212,
+              16566,
+              13909,
+              16700,
+              14418,
+              16018,
+              18895,
+              16139,
+              14772,
+              15914,
+              14566,
+              18121,
+              18601,
+              17899,
+              18374,
+              15157,
+              16435,
+              16039
+            ],
+            [
+              19440,
+              17119,
+              16500,
+              15698,
+              15363,
+              16484,
+              18430,
+              14086,
+              15041,
+              16349,
+              17556,
+              15038,
+              16722,
+              15751,
+              16015,
+              17045,
+              16634,
+              17459,
+              13229,
+              17761
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            0,
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            1331,
+            1218,
+            823,
+            1019,
+            1294,
+            970,
+            905,
+            1178,
+            808,
+            555,
+            747,
+            1187,
+            1465,
+            861,
+            866,
+            1085,
+            1212,
+            927,
+            1200,
+            1389
+          ],
+          "actual_tokens_min": 1692,
+          "actual_tokens_max": 2476,
+          "actual_tokens_mean": 2052.15,
+          "actual_tokens_std": 183.7818747863891,
+          "max_tokens_capacity": 2476,
+          "max_rows_capacity": 35987,
+          "input_tokens_per_second": 642866.63478465,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 3072,
+          "intermediate": 1024,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "bf16",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": false,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 6377.6565,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 409.738,
+          "backward_slowest_rank_p50_us": 5978.736,
+          "wall_slowest_rank_samples_us": [
+            6646.738,
+            6368.743,
+            6367.687,
+            6246.238,
+            6160.959,
+            6339.701,
+            6527.147,
+            6208.832,
+            6609.622,
+            6301.972,
+            6454.288,
+            6174.681,
+            6454.134,
+            6392.585,
+            6492.392,
+            6408.961,
+            6515.721,
+            6386.57,
+            6267.686,
+            6362.791
+          ],
+          "per_rank_wall_us": [
+            [
+              6641.739,
+              6368.743,
+              6367.687,
+              6246.238,
+              6160.682,
+              6339.439,
+              6519.055,
+              6208.832,
+              6606.637,
+              6301.199,
+              6450.942,
+              6174.681,
+              6454.134,
+              6382.662,
+              6486.833,
+              6405.381,
+              6513.704,
+              6386.57,
+              6267.295,
+              6359.174
+            ],
+            [
+              6646.738,
+              6363.27,
+              6366.064,
+              6242.928,
+              6160.959,
+              6339.701,
+              6527.147,
+              6199.493,
+              6609.622,
+              6301.972,
+              6454.288,
+              6168.451,
+              6447.77,
+              6392.585,
+              6492.392,
+              6408.961,
+              6515.721,
+              6378.343,
+              6267.686,
+              6362.791
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121046482017362,
+                1793121046488663021
+              ],
+              [
+                1793121046488885165,
+                1793121046495257001
+              ],
+              [
+                1793121046495491359,
+                1793121046501860984
+              ],
+              [
+                1793121046502090125,
+                1793121046508338238
+              ],
+              [
+                1793121046508545513,
+                1793121046514708664
+              ],
+              [
+                1793121046514927195,
+                1793121046521268568
+              ],
+              [
+                1793121046521513905,
+                1793121046528034970
+              ],
+              [
+                1793121046528254618,
+                1793121046534465122
+              ],
+              [
+                1793121046534689764,
+                1793121046541298567
+              ],
+              [
+                1793121046541546645,
+                1793121046547849806
+              ],
+              [
+                1793121046548074783,
+                1793121046554527763
+              ],
+              [
+                1793121046554744301,
+                1793121046560920963
+              ],
+              [
+                1793121046561137449,
+                1793121046567593501
+              ],
+              [
+                1793121046567844901,
+                1793121046574229674
+              ],
+              [
+                1793121046574463575,
+                1793121046580952305
+              ],
+              [
+                1793121046581197365,
+                1793121046587604529
+              ],
+              [
+                1793121046587853224,
+                1793121046594369164
+              ],
+              [
+                1793121046594590432,
+                1793121046600978721
+              ],
+              [
+                1793121046601186534,
+                1793121046607455593
+              ],
+              [
+                1793121046607676286,
+                1793121046614037128
+              ]
+            ],
+            [
+              [
+                1793121046482015576,
+                1793121046488666132
+              ],
+              [
+                1793121046488887912,
+                1793121046495254843
+              ],
+              [
+                1793121046495484934,
+                1793121046501852913
+              ],
+              [
+                1793121046502088490,
+                1793121046508333310
+              ],
+              [
+                1793121046508545964,
+                1793121046514709163
+              ],
+              [
+                1793121046514925023,
+                1793121046521266486
+              ],
+              [
+                1793121046521507024,
+                1793121046528036267
+              ],
+              [
+                1793121046528265151,
+                1793121046534466382
+              ],
+              [
+                1793121046534687380,
+                1793121046541299079
+              ],
+              [
+                1793121046541543653,
+                1793121046547847293
+              ],
+              [
+                1793121046548074158,
+                1793121046554530474
+              ],
+              [
+                1793121046554748377,
+                1793121046560918907
+              ],
+              [
+                1793121046561143282,
+                1793121046567592847
+              ],
+              [
+                1793121046567840560,
+                1793121046574234875
+              ],
+              [
+                1793121046574457154,
+                1793121046580951244
+              ],
+              [
+                1793121046581192999,
+                1793121046587603845
+              ],
+              [
+                1793121046587849964,
+                1793121046594367806
+              ],
+              [
+                1793121046594595781,
+                1793121046600975923
+              ],
+              [
+                1793121046601189732,
+                1793121046607459267
+              ],
+              [
+                1793121046607674457,
+                1793121046614038936
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 796178824,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 796178824,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+        }
+      ]
+    },
+    {
+      "label": "qwen122b_fp8_bf16grad",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen122b",
+        "--tokens",
+        "2048",
+        "--warmups",
+        "5",
+        "--samples",
+        "20",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "log": "/tmp/fp8-isolated-qwen122b_fp8_bf16grad.log",
+      "records": [
+        {
+          "schema_version": 3,
+          "workload": "variable_tokens_random_routes",
+          "route_trace": null,
+          "backend": "pf",
+          "world": 2,
+          "nominal_tokens_per_rank": 2048,
+          "seed": 123,
+          "token_std_fraction": 0.1,
+          "token_truncation_std": 3,
+          "route_bias_std": 0.5,
+          "route_distribution": "random",
+          "workload_sha256_per_rank": [
+            "82f71a20d7c2f2ce37894fbd63374688c10184e41cb06de4c7029ce194ef6b3b",
+            "11e278228be8a7946badb0516748639f763cc8bd941c1b3e4a9f2ef70c56635e"
+          ],
+          "per_rank_tokens": [
+            [
+              2178,
+              1965,
+              1993,
+              2278,
+              1896,
+              2110,
+              2089,
+              1942,
+              2354,
+              2010,
+              2276,
+              1949,
+              1692,
+              2340,
+              2217,
+              2247,
+              2191,
+              2150,
+              1834,
+              2227
+            ],
+            [
+              2476,
+              2105,
+              2221,
+              1755,
+              1763,
+              2038,
+              2017,
+              1821,
+              1888,
+              2051,
+              1765,
+              1920,
+              2219,
+              1894,
+              2110,
+              2121,
+              2185,
+              1927,
+              1874,
+              1998
+            ]
+          ],
+          "per_rank_warmup_tokens": [
+            [
+              1913,
+              1994,
+              2209,
+              1806,
+              2210
+            ],
+            [
+              2109,
+              2307,
+              2248,
+              2207,
+              2252
+            ]
+          ],
+          "per_rank_received_rows": [
+            [
+              17792,
+              15441,
+              17212,
+              16566,
+              13909,
+              16700,
+              14418,
+              16018,
+              18895,
+              16139,
+              14772,
+              15914,
+              14566,
+              18121,
+              18601,
+              17899,
+              18374,
+              15157,
+              16435,
+              16039
+            ],
+            [
+              19440,
+              17119,
+              16500,
+              15698,
+              15363,
+              16484,
+              18430,
+              14086,
+              15041,
+              16349,
+              17556,
+              15038,
+              16722,
+              15751,
+              16015,
+              17045,
+              16634,
+              17459,
+              13229,
+              17761
+            ]
+          ],
+          "expert_rows_min_per_step": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            2,
+            0,
+            2,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0
+          ],
+          "expert_rows_max_per_step": [
+            1331,
+            1218,
+            823,
+            1019,
+            1294,
+            970,
+            905,
+            1178,
+            808,
+            555,
+            747,
+            1187,
+            1465,
+            861,
+            866,
+            1085,
+            1212,
+            927,
+            1200,
+            1389
+          ],
+          "actual_tokens_min": 1692,
+          "actual_tokens_max": 2476,
+          "actual_tokens_mean": 2052.15,
+          "actual_tokens_std": 183.7818747863891,
+          "max_tokens_capacity": 2476,
+          "max_rows_capacity": 35987,
+          "input_tokens_per_second": 699115.9606029257,
+          "experts": 256,
+          "top_k": 8,
+          "hidden": 3072,
+          "intermediate": 1024,
+          "warmups": 5,
+          "priming_steps": 0,
+          "compiled_graphs_during_measurement": null,
+          "forward_only": false,
+          "backward_only": false,
+          "compute_dtype": "fp8_e4m3fn",
+          "weight_grad_dtype": "bf16",
+          "weights_prepared_once": true,
+          "stream_ordered": true,
+          "accumulate_main_grad": false,
+          "samples": 20,
+          "sample_pause_ms": 0,
+          "wall_slowest_rank_p50_us": 5863.5455,
+          "forward_ready_slowest_rank_p50_us": null,
+          "per_rank_forward_ready_us": [
+            [],
+            []
+          ],
+          "backward_ready_slowest_rank_p50_us": null,
+          "per_rank_backward_ready_us": [
+            [],
+            []
+          ],
+          "per_rank_stage_profiles": null,
+          "window_padding": null,
+          "communication": null,
+          "per_rank_allocator_delta": null,
+          "per_rank_stage_kernel_us": null,
+          "forward_ready_timing_scope": null,
+          "backward_ready_timing_scope": null,
+          "forward_slowest_rank_p50_us": 404.22,
+          "backward_slowest_rank_p50_us": 5462.7425,
+          "wall_slowest_rank_samples_us": [
+            6282.938,
+            5825.972,
+            5863.781,
+            5689.707,
+            5660.504,
+            5787.937,
+            5987.937,
+            5689.401,
+            6106.575,
+            5659.046,
+            5885.406,
+            5663.112,
+            5830.444,
+            5966.368,
+            6023.875,
+            5863.31,
+            6042.917,
+            5926.349,
+            5759.171,
+            5899.248
+          ],
+          "per_rank_wall_us": [
+            [
+              6279.16,
+              5825.972,
+              5863.781,
+              5689.707,
+              5654.66,
+              5774.375,
+              5976.981,
+              5678.392,
+              6106.575,
+              5658.594,
+              5878.473,
+              5661.466,
+              5830.444,
+              5959.576,
+              6016.842,
+              5862.246,
+              6039.4,
+              5911.296,
+              5751.416,
+              5897.643
+            ],
+            [
+              6282.938,
+              5818.07,
+              5862.404,
+              5689.175,
+              5660.504,
+              5787.937,
+              5987.937,
+              5689.401,
+              6102.719,
+              5659.046,
+              5885.406,
+              5663.112,
+              5829.096,
+              5966.368,
+              6023.875,
+              5863.31,
+              6042.917,
+              5926.349,
+              5759.171,
+              5899.248
+            ]
+          ],
+          "measurement_intervals_ns_per_rank": [
+            [
+              [
+                1793121057617368338,
+                1793121057623650946
+              ],
+              [
+                1793121057623924243,
+                1793121057629753917
+              ],
+              [
+                1793121057630077948,
+                1793121057635943666
+              ],
+              [
+                1793121057636225488,
+                1793121057641917282
+              ],
+              [
+                1793121057642248582,
+                1793121057647906180
+              ],
+              [
+                1793121057648265546,
+                1793121057654042058
+              ],
+              [
+                1793121057654344147,
+                1793121057660323440
+              ],
+              [
+                1793121057660640141,
+                1793121057666320545
+              ],
+              [
+                1793121057666621184,
+                1793121057672730052
+              ],
+              [
+                1793121057673016381,
+                1793121057678676916
+              ],
+              [
+                1793121057678973908,
+                1793121057684854244
+              ],
+              [
+                1793121057685114964,
+                1793121057690778433
+              ],
+              [
+                1793121057691065802,
+                1793121057696898297
+              ],
+              [
+                1793121057697228676,
+                1793121057703190250
+              ],
+              [
+                1793121057703495512,
+                1793121057709514395
+              ],
+              [
+                1793121057709827346,
+                1793121057715691504
+              ],
+              [
+                1793121057715977831,
+                1793121057722019652
+              ],
+              [
+                1793121057722343384,
+                1793121057728256744
+              ],
+              [
+                1793121057728539913,
+                1793121057734293212
+              ],
+              [
+                1793121057734584275,
+                1793121057740483781
+              ]
+            ],
+            [
+              [
+                1793121057617369998,
+                1793121057623656827
+              ],
+              [
+                1793121057623932817,
+                1793121057629754789
+              ],
+              [
+                1793121057630080108,
+                1793121057635945112
+              ],
+              [
+                1793121057636220395,
+                1793121057641911711
+              ],
+              [
+                1793121057642237045,
+                1793121057647900145
+              ],
+              [
+                1793121057648253003,
+                1793121057654043026
+              ],
+              [
+                1793121057654336539,
+                1793121057660326849
+              ],
+              [
+                1793121057660633423,
+                1793121057666325167
+              ],
+              [
+                1793121057666627060,
+                1793121057672732324
+              ],
+              [
+                1793121057673013895,
+                1793121057678674856
+              ],
+              [
+                1793121057678968097,
+                1793121057684855453
+              ],
+              [
+                1793121057685113526,
+                1793121057690778708
+              ],
+              [
+                1793121057691068548,
+                1793121057696899718
+              ],
+              [
+                1793121057697221501,
+                1793121057703189683
+              ],
+              [
+                1793121057703489114,
+                1793121057709514800
+              ],
+              [
+                1793121057709822906,
+                1793121057715688099
+              ],
+              [
+                1793121057715973064,
+                1793121057722018112
+              ],
+              [
+                1793121057722333507,
+                1793121057728261793
+              ],
+              [
+                1793121057728531376,
+                1793121057734292389
+              ],
+              [
+                1793121057734581842,
+                1793121057740483038
+              ]
+            ]
+          ],
+          "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+          "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+          "checkpoint": "routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+          "implementation": {},
+          "gpu": "NVIDIA L20X",
+          "per_rank_workspace": [
+            {
+              "compute_bytes": 796178824,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            },
+            {
+              "compute_bytes": 796178824,
+              "gin_bytes": 0,
+              "notify_bytes": 10939768,
+              "notify_slots_in_use": 1,
+              "separate_forward_notify": true
+            }
+          ],
+          "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-blockwise-final-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "primitives": "37 passed",
+    "cpu": "44 passed, 82 subtests passed",
+    "public_headers": "16 passed",
+    "retired_api_checks": "34 passed",
+    "distributed": [
+      {
+        "profile": "qwen35b",
+        "world": 4,
+        "tokens": 2049
+      },
+      {
+        "profile": "qwen35b",
+        "world": 2,
+        "tokens": 1,
+        "zero_rank": true
+      },
+      {
+        "profile": "qwen122b",
+        "world": 2,
+        "tokens": 257
+      },
+      {
+        "profile": "flash",
+        "world": 2,
+        "tokens": 257
+      }
+    ],
+    "bf16_regression": "torchrun_tensor_runtime.py passed, including graph/offload and workspace release"
+  },
+  "limitations": [
+    "Not all measured workloads match BF16; qwen35b 8192 tokens remains slower.",
+    "FP8 weight preparation and optimizer updates are excluded; these results are not complete optimizer-step timings.",
+    "Multi-node GIN compiled but not run on a multi-node system."
+  ],
+  "source_sha256": {
+    "benchmarks/torchrun_training.py": "d6c4c474da13257608548a974aad40a526bfb7883a3783e73883ad0893cf5307",
+    "build_native.py": "14008fcfff7adda3e77b738aed8ca2168f88cc24c25304d608fdbf52e974e821",
+    "configs/profiles/flash/weftmoe_forward_tuning_generated.hpp": "e6bd14de38f36ca73dcf8cf1fd053d15988082735078a207e6a029371d3da2e2",
+    "configs/profiles/qwen122b/weftmoe_forward_tuning_generated.hpp": "4e2190e154a6ee0681dd3171f3a7e4db9043f98efa67989d6faaf1e090d19a7f",
+    "configs/profiles/qwen35b/weftmoe_forward_tuning_generated.hpp": "32a71ae69cf55481820f2c3cce3a8ec2c9072e7ab00d6627520fc2b4e1649b7b",
+    "include/weftmoe/api/errors.hpp": "0c58b48dce2100bfdbab559fc006f1057f18cfb8fa96ee281b2138830fc0dae7",
+    "include/weftmoe/api/notify_dispatch.hpp": "8a7571a12e785c9de1730ecba913f5eb49b5a55865d3c4fafe0a6c49e2298aaf",
+    "include/weftmoe/config/runtime_config.hpp": "8c36855720272cd3b073a0d66f4bc2a72952eaf7426067e97b1ba1b0ec6fe1a3",
+    "include/weftmoe/cuda/activation_transport.hpp": "544ac963483410db4b0409592b1d9ac5e9c899344664999724366451c91f224e",
+    "include/weftmoe/cuda/backward.hpp": "962d1b0e749e9d7b96a28ffd817b43c33e2ea19eb4ebfef08ce00b5277e9d6a1",
+    "include/weftmoe/cuda/control_protocol.hpp": "02ae394baf1890823537f206649488d1ecacdf1530b51413d50595bfb028b41c",
+    "include/weftmoe/cuda/device_notify.hpp": "7c3932b52122745055e8d84b753aca19ad77a0914e49b7b21b201eb993a9a3f1",
+    "include/weftmoe/cuda/nccl_count_exchange.hpp": "212ff8f7bba3c757504daa885c393185da1ff65f9f97395f753a7846a53682dc",
+    "include/weftmoe/cuda/tensor_storage.hpp": "ccbc9f7489fb3e241a84e9cb786b7cd7d28be338ca717c8c1c6f886ae0f22ab3",
+    "include/weftmoe/kernels/persistent_contract.hpp": "30fc0ba4f791331465b6459dbc775eec0846ced9fc73f4ead8d2d4ba3f52c5ab",
+    "include/weftmoe/metadata/dispatch_handle.hpp": "fe8b88afe0b9676852da15d721cd0cd238654670450dcfa87329c0401f308003",
+    "include/weftmoe/metadata/serialize.hpp": "0477b30296423a7f962efad51af59cca60d7ee2476a15b8d2796d017fdbd39e6",
+    "include/weftmoe/scoreboard/workspace_plan.hpp": "b558413434afec46d6ff2204e9ff321970fcdc117f869de0cc1a4997aa8f0b15",
+    "include/weftmoe/transport/activation_protocol.hpp": "dee9377e32523ed609cdaed71feaf5ba0d827e85ef10e26a01699dd75dfdb04b",
+    "include/weftmoe/transport/count_exchange.hpp": "0d19d31afcced21d93fb3507aab983f6ab9204cd86792f468afa8f99c270a8da",
+    "include/weftmoe/version.hpp": "394264eb04fea52cf39e5310ded9e1510225470d492d3e40bfaedc52485f7f3d",
+    "src/cuda/activation_transport.cu": "e5e2ac2ec3d4bd2c906973fd6bfb966c97e9c637d8b9edb9c312b3172f53f52b",
+    "src/cuda/activation_transport_internal.hpp": "9c538fdc343f01f5fb9f3113758f1a3647e859c2aa5fab2c96e9e56b5742ae78",
+    "src/cuda/backward/cluster_task.cuh": "3a08306ffc81855acfc2231c2a977180c5eb07116f96dc5379b6693e81f769ed",
+    "src/cuda/backward/compute_kernels.cuh": "3f3a3477f7d79da469b22dd36d02876415965a597b2dbb3a40759c11faa1b2fb",
+    "src/cuda/backward/device_kernels.cuh": "b1e916da1029def6c9c0c4d73988cd2bc4657c3ede762a6e0001412e9783736b",
+    "src/cuda/backward/kernel_contract.cuh": "9ab9bc01a4109a185efaf09a20788ddb3b7adc04b0e8fbd5cc750d6c6a859c1e",
+    "src/cuda/backward/peer_payload.hpp": "453722424e19c534b82db473fbe8ef5c42b40544c34389aee7b781197565a6eb",
+    "src/cuda/backward/peer_workspace.cuh": "9c2ec7adaac34d77a8530227527c25a67f3298a6884e9e3ac7f948848fb803de",
+    "src/cuda/backward/pipeline_kernels.cuh": "8763185e728c150bc2153156467265f726255afe0657cdb6aabe504c4860e966",
+    "src/cuda/backward/pipeline_state.cuh": "2a93236a092ab1c91f617efbb16bafad870dab9a78898c30c9825d2ea8bd41e2",
+    "src/cuda/backward/scheduler.cuh": "831a4902c08105fe2d59db9bda8fd4a1d596e583a0bad22d65e5cf85fca0926c",
+    "src/cuda/backward/swiglu.cuh": "e03645c0976ee65a4c89cb9fd3456be9802f9550c467cf6ac04e1a0078e627f6",
+    "src/cuda/backward/tuning_config.hpp": "1a095f57c86ff77a722e6caf5ad8c0ad5085f6aafabfcbd911e34bf0f207de39",
+    "src/cuda/backward_stub.cpp": "1036228bdf147ffd2a36ac5e9726013b49b795f7bc3298d617ccdc026c8b437b",
+    "src/cuda/communication/activation_ring.cuh": "c02bb541006a4eb3603c6f76ea5651f2fa6b0a19f436ca9aad9066f2949411e1",
+    "src/cuda/communication/chunk_ring.cuh": "77c2bcb53be217c8eb993ff138bf7639217248c25217dd5f3280695a61c8466c",
+    "src/cuda/communication/gin_sender.cuh": "d1540b25f8cf8fd5c220060b4eceee2a3256c8916345927b3a610d457b266116",
+    "src/cuda/communication/gin_sender_state.cuh": "6d11f2a5a9352599f2578155cf58b3da8f53c485fb3ecc36334c3dc79feda8bc",
+    "src/cuda/communication/local_notification.cuh": "d039a8857ea14791c72bb9e9b54b458cd617b674f431b4865b2459f3c8b63e1d",
+    "src/cuda/communication/nccl_device.cuh": "c2796fc316026fbb4574f09e06697ccd893c2e3ec778c6ec36cdc314a4ac3425",
+    "src/cuda/communication/nccl_device_assert_trap.cuh": "e194847d16e48595cc42cd939a06508d044a310f27610ff131564bd82d5de4ec",
+    "src/cuda/communication/notification_pipeline.cuh": "60c537948a6f8300eba881134ff2f435551fead930427fe4c0ed0de7837abace",
+    "src/cuda/communication/return_layout.hpp": "0a7ff3fcba9965b13dd3aeb92bd7880b3ec5df05ea63a3b3929cb2784d6fc237",
+    "src/cuda/communication/return_queue.cuh": "b43a29fd4b4500079873d05b8b876e654ca4387623877e127b91412a74aed260",
+    "src/cuda/communication/row_prefetch.cuh": "8349cd05acdc2f7f6dbed5cc10f554597fe96ad356badeaf1c9ebbbd016d5189",
+    "src/cuda/communication/sequence.hpp": "7535a80efbb6d677e4e3c403f52eae94df4d3fd8ea53aab24c10f85cc86b1e3a",
+    "src/cuda/communication/tuning_config.hpp": "4c90920453e570d5b83b7a645a8ae1ccb28bf00bc3830c5c0ab39a0bab2c7fcb",
+    "src/cuda/communication/worker_pipeline.cuh": "c650dc60257ce0839eae5c3589c543747674c2915bcdc275bba49d79e3f7231e",
+    "src/cuda/control_protocol.cpp": "d0138c84be987caa6533e38c875d3bc2c86aeaa3eba73173ffeb12572494a3ef",
+    "src/cuda/cuda_internal.hpp": "e12b8392c97ac677468e346b4103958bc879712a79c6691c6946408993650508",
+    "src/cuda/device_communicator.cuh": "4e501631a12a3010a641f7be0dc7b913b009d209dface6e58e3e87eaa96135ec",
+    "src/cuda/device_notify.cu": "107884fe618e9abd9c3fa933a5346cbf01cbf2f467d1aedf7c0e213b727d40b8",
+    "src/cuda/device_notify_bridge.hpp": "c154a1c6f68eca98c1f3b1810af2d8f750c5b247583d1c9afd9e1d6ad6cb1b89",
+    "src/cuda/device_notify_internal.hpp": "4e487762b4ac3a21b1ebc7103e47aa8f9fbe00da93d0a51eb4d306185bab41cf",
+    "src/cuda/forward/compute_kernel.cuh": "9ef2fb51097a5fc8c678ed82b8b8a1b7c140e5342da04ff0e4e025bf43a86d3a",
+    "src/cuda/forward/kernel_contract.cuh": "5c7ff8351c137a85eb8342f7c1b82d8ebe3c6770f26287b4e69787ea646105e8",
+    "src/cuda/forward/kernel_support.cuh": "dd76456a2fbd9dbeda8439dc7846e64ee8ffef5319c3c15b5bf1abf409a581d3",
+    "src/cuda/forward/kernels/primitives.cuh": "c4d94b67e5da5c45d1adc928499b34526a4892a7c813f8b30672e2801f815d9a",
+    "src/cuda/forward/support/fallback_kernels.cuh": "c2f7d2a98a05a56c03ea77e317705088c81f046fe003436c6e87d612a5fbcd6a",
+    "src/cuda/forward/support/fixture_kernels.cuh": "2f7eb1c8a0ea1639a8b590426204776320e62ab94578d55b24c15fa381a8765b",
+    "src/cuda/forward/support/transport_kernels.cuh": "2c01bf534e0746572cb6a158d408873f2a58a1d76045b5ba0baeedcf88617c4e",
+    "src/cuda/forward/tuning_config.hpp": "6abb192813947cb4ff4c2f8beabc808643e45ab79a11b3d2578e1d6dc9db7622",
+    "src/cuda/fp8/api.hpp": "bbcab1e84f52e399ebe14d8671117b897114a54ee490f656534c435c034971e1",
+    "src/cuda/fp8/gemm.cuh": "f98ecefb6434a2908418a77286585fc2dc7b6ec76cbeb08b32753ce532cd5cfe",
+    "src/cuda/fp8/quantization.cuh": "ba817e5e828824baea62eaa9d5282912195861badcf44e241f2b944d7cf74ec1",
+    "src/cuda/fp8/tile.cuh": "d008b16cad013961b4db59de4d36b804af686d169f6a4e8e3ba4dda428a498ff",
+    "src/cuda/fp8.cu": "ab6730ad61cd5466e4cdb29d00543bfc7f100fc7f077dbee24d37ab00257b99e",
+    "src/cuda/nccl_protocol_internal.hpp": "6d01098f861b276c13c5610b39db871f4cf538194b2e283e2340f5f9b09e69d2",
+    "src/cuda/notify/communication.cuh": "e8bbddc88512b52f9cd73054ba12f629b1467d7597a3c6f469d81213a23fa0ef",
+    "src/cuda/notify/local_notify.cuh": "803dd12a75a9c7941f270f89b9963413653d490add727714574dea543f2b2bc6",
+    "src/cuda/notify/materialize.cuh": "f4e7111c0a115aadf72f33dfd70fe98ca4d9fca2c8bf20ba74adc63a5ef92a01",
+    "src/cuda/notify/radix.cuh": "ba68639e27f161e06d7fcbf7237aa23ab542cc8a7cd727b4f8549b5dc84785de",
+    "src/cuda/notify/single_node_inference.cuh": "821d482db10113ce91a09c3480909392f153d951f85282095fcf20f7118787e0",
+    "src/cuda/notify/training_counts.cuh": "4a584b296edbc5236a9131e5d2bc16c922f4cd380f810501f117fc75c8c02393",
+    "src/cuda/pipeline/atomics.cuh": "4ed16c8c49f5929db1be80411d3e752c7dff1bfd2ba3f722d8118dd4ba2c05dd",
+    "src/cuda/pipeline/contracts.hpp": "bc3edf846aac9f1fe810ec12006f0644c1e092a2a3b23b95e11db7c0fd6debc8",
+    "src/cuda/pipeline/state.cuh": "6b2a33951b0bca3847a74492c24df63079f9d6e0841742905345bf67e07b413f",
+    "src/cuda/primitives/address_range.cuh": "670948b0b37fdbd748db6024c6506cfbb016b2ab85e97ee74a4aa2a0f6f5170e",
+    "src/cuda/primitives/hopper.cuh": "7f2c92be2570485a7625e66795d8c8a9eee1a58d0ba30149cd65b5a29bdc9a67",
+    "src/cuda/primitives/programmatic_launch.cuh": "8e3beab91ad20791eb3d4cb8048f9c4a8d0d4345c44b684c13a6646ea6cc356a",
+    "src/cuda/profiling/device_timeline.cuh": "1fe80f681be7a3b2e8d04a7f720b49fa2798b44ca6b277b5cfde90b1587bf0d9",
+    "src/cuda/profiling/device_timeline_host.hpp": "9d21cd89536522668aeb098639c88f18b7d95d5c51d2f71d346a2f14d44cc86c",
+    "src/cuda/profiling/device_timeline_types.hpp": "d4b1e352a586661b801f1ea593da80d446316dc1cfa1dbec863ca8549aa886ad",
+    "src/cuda/stream_completion.cuh": "c1a2dc0305c87d9334cf21b8d06fdec9ed3fb3f9d359293c16e1210fa8c1c317",
+    "src/cuda/tensor_preparation.cuh": "99f0a564225a439cb5007e6ad4f3dfb7d9d68b9267c5e44302c011df190ff60a",
+    "src/cuda/tensor_storage.cuh": "b144a211a11c0d71e984fba9626593388545377d8267e305008e1e10d629b7d6",
+    "src/cuda/testing/api.hpp": "f9cb0c97153040c5413098a9bad42831c539f5df56592133d098e99f02ff0ceb",
+    "src/cuda/testing/generation_scheduler.hpp": "9050451db6729f7aef248384f7174c05cbe67dcff84a3b229db727fef72287c7",
+    "src/cuda/transport_generation_completion.cuh": "f1c63ece5e004f53bd0da328ddedf6033a97dbf24e922b546cc7291cfa356a41",
+    "src/cuda/unified_worker_tuning.hpp": "232b658294b35178ee10f81d37ed5b5573eb4f2646c071451878192039f29c8d",
+    "src/cuda/weftmoe_dt/compute.cuh": "510b8d6d24ecd49fb88a2ec2d0deb8f54e02967e009ee349c08fb577f50424b4",
+    "src/cuda/weftmoe_dt/kernel.cuh": "9953dd45b82bbb06841990c1dde27d8de7896da7b55d50cbf185faf78214296b",
+    "src/cuda/weftmoe_dt/schedule.cuh": "fdc37471252dea8e72f2e4ad464be7b1a5b62f443c3148c28d818f032af1dc56",
+    "src/cuda/weftmoe_pf/backward_kernel.cuh": "1d6019d18632f4effce3351c6a079a7a3c39e31c99abc10058c7702ff2a6abdb",
+    "src/cuda/weftmoe_pf/backward_network.cuh": "15992fa11b3b6421e2842e89b1b4b441334248b777301230e012ab86fb810a1f",
+    "src/cuda/weftmoe_pf/backward_schedule.cuh": "099d366aea07ad995cc0f0a1af0aa74072687a450d9ed6dd5e31560c62ba800b",
+    "src/cuda/weftmoe_pf/backward_weights.cuh": "79b244b8dd5c12a4296175207954e777d1a6223fac4c40c61b626244dd0fe1a9",
+    "src/cuda/weftmoe_pf/checkpoint_copy.cuh": "9117b427c7ffdb436bf92de5b9c284a7fbe0c376208d68bbed76e450f3764dde",
+    "src/cuda/weftmoe_pf/collective.cuh": "718e024c00196d52fb342219c6532c3c9c6ed9fb8dbb4d915f5096c387abea7d",
+    "src/cuda/weftmoe_pf/compute_ring.hpp": "09782d4895e102ca53e7100362552d1008f818589aa1c38592d59845e85090aa",
+    "src/cuda/weftmoe_pf/fc1_epilogue.cuh": "c33a91fd286891a1ceed2ba8de18af951663a6761f9e76288123113af6df53b7",
+    "src/cuda/weftmoe_pf/fc2_epilogue.cuh": "18ba779a3d3c6100ed120005195d486a4652524c9ff34536e86582288fefacac",
+    "src/cuda/weftmoe_pf/fp8_wgrad.cuh": "278784f866a6ecf44b86c549cb2537eb4a241c3e9cbe5be7f4bc8d9a7ae3dac7",
+    "src/cuda/weftmoe_pf/initialize.cuh": "ae800006a7c555016ed283f72da9ca2646486fe1f2753cdc14a22cbb871f5d3d",
+    "src/cuda/weftmoe_pf/local_compute.cuh": "0fd30a55231e4628506000221901ba924730663a9fa87f84a1cbd79ab7711905",
+    "src/cuda/weftmoe_pf/local_kernel.cuh": "7b5e18c9a02e36caec33daf02702c0c698ee318e5ba563fded0a7fc1dde26631",
+    "src/cuda/weftmoe_pf/local_schedule.cuh": "46021945d444f3fbee471baa540183f4a8548524cd43fc746ea2821d1dbe9f64",
+    "src/cuda/weftmoe_pf/memory_order.cuh": "5a961f0f468e2f5639ec748bba9695265995d869f1d6c253770c501d7121f786",
+    "src/cuda/weftmoe_pf/network_access.cuh": "ad823b98a9230d5f2f33dd06f1c7349f4a6043e713cbc17112e010f519ccedc7",
+    "src/cuda/weftmoe_pf/network_collective.cuh": "95a337b8ae3b77b98c683f5b3c628095a1d08e5d870da3e2d9e435062270c675",
+    "src/cuda/weftmoe_pf/network_kernel.cuh": "160568d5531ff637d555d4a4611e2659d78a3f9155b0ec0392b20e9b6aeacdc8",
+    "src/cuda/weftmoe_pf/network_layout.hpp": "4b561bda440e3c3614b809958fabda33bb796e7cf1125b695b1dfac4d17e7709",
+    "src/cuda/weftmoe_pf/network_plan.cuh": "e8ec1bf8ecc81a1bbcc1733195104252f954393797c210223fbadfb9e7bc31b1",
+    "src/cuda/weftmoe_pf/network_return.cuh": "11ccedefeda5862cdc50625ee0311de84af4c73eff02c9f6c4804bfb485567e3",
+    "src/cuda/weftmoe_pf/network_ring.cuh": "292dab6671cfff42e57e694b83b387898387015e9600e1ccbb1dad27a4d1980e",
+    "src/cuda/weftmoe_pf/network_schedule.cuh": "95a5c6c2ed328bc5039d362c8d76f59a04a26bb55088a9f93ae09d0eef5af775",
+    "src/cuda/weftmoe_pf/network_transport.cuh": "6c3127f15913e657a8da4c355abc1b725f26f163e44fa0f58a5ed69886e6c301",
+    "src/cuda/weftmoe_pf/network_workers.cuh": "113e6e069f8fd978deb245fd0b26512b50de36c11c2779f89c8c3bf8724fcfa9",
+    "src/cuda/weftmoe_pf/packet_plan.cuh": "528a8fb492bcb41fe58499d1cdecd949a16355a96474a8b5146236f0384e10e6",
+    "src/cuda/weftmoe_pf/plan.hpp": "d61a40f55b1b449a101e7f6d79b35b0e6cb0c66290a706aa88e54edb30635980",
+    "src/cuda/weftmoe_pf/return_plan.cuh": "d887e287277b00c44f5395485e9bf489a0f1634edb4009e2f14c55be2359b4b8",
+    "src/cuda/weftmoe_pf/ring_access.cuh": "168a5e766c9f1d69448d3ae1246c9cbc94c5612b3cc3f70f3f1c296662116e98",
+    "src/cuda/weftmoe_pf/ring_admission.cuh": "11602356ff679e58dd230cffc4a48b20aae5628a4325c83382510ebb0f4e6497",
+    "src/cuda/weftmoe_pf/ring_layout.hpp": "3ea6081d1143cc930e198a494e360df310970693c5781e05620ce0ce0787243f",
+    "src/cuda/weftmoe_pf/ring_plan.cuh": "d88b69807127cf84faab36dfa07ee25f583806c9a7480a7dfa3dbb4251dbf1c4",
+    "src/cuda/weftmoe_pf/route_plan.cuh": "4fdfa7597307a200a04588bd0a19aa2fcb36bdf6b3ea11b61cee70d367a4a0b2",
+    "src/cuda/weftmoe_pf/single_node_route_exchange.cuh": "c088c003c04dd9e6ea6dbee04b7fcc7f4f8206ba4def1eb0094d31f47dda1563",
+    "src/cuda/weftmoe_pf/source_plan.cuh": "28d8f69edd739e28430054a5151598ddb85e343a9cad5f1b8153326f51fd061b",
+    "src/cuda/weftmoe_pf/source_row_decoder.cuh": "60f53a59176935eba1d85a85feaab6ce78c8cd3235ebfe0e391746ed7610b5bf",
+    "src/cuda/weftmoe_pf/split_notify.cuh": "cb8b4a787c0f7b7fbf2c1a4a2c9c0ed0537534b31fc1055034d4eacec52e676d",
+    "src/cuda/weftmoe_pf/training_plan.cuh": "d7988745bbcc6c5fe3db46502caaba0d911c1aa50de9dc0bb7c092274b25b3bc",
+    "src/cuda/weftmoe_pf/window_geometry.cuh": "32e7bd6fce5dd10299bbd4d8ae256527507279e10b5c1d693f18a486c1581ae8",
+    "src/python/fp8.hpp": "4bb482557a56d1194812f3feec4c7af412573e8fa034dd21dc01d2eb5c35fe11",
+    "src/python/runtime.cpp": "3c412e6cbe89e23778ea254bca419bd2d16ab3f5defae5a2312cbb42f4c801e3",
+    "tests/test_fp8.py": "b2d37419bea19dd379765c8fa8f4631c8387b1cf7114ac06971704da6d160419",
+    "tests/torchrun_fp8.py": "ef8884a85ca0d1f399b8113db7dc6cc5365a301bbc3655002d32f46031a26b7b",
+    "weftmoe/__init__.py": "4803e5863e42164917dde7b39c5399743e4213f1cee1f346a4f0284c734798c4",
+    "weftmoe/_sglang_kernels.py": "d386f7e076e17ca3353f42988d52eeab1e5d4c4eaf38dd2d383b1b61d5c67648",
+    "weftmoe/awex.py": "d1c0e837f032d105da2810c024dcd3a5022e8b20660ef0414713bcf38cf53942",
+    "weftmoe/config.py": "230cf711672fdd490594c2cf1c61ebbd1882943e2afd0657cfcd126581ea4acc",
+    "weftmoe/fp8.py": "c9e093c25f1358c6f36e7cf58158bf530b7fbe25954b3e1317beed7d304aa37e",
+    "weftmoe/include/weftmoe/api/errors.hpp": "0c58b48dce2100bfdbab559fc006f1057f18cfb8fa96ee281b2138830fc0dae7",
+    "weftmoe/include/weftmoe/api/notify_dispatch.hpp": "8a7571a12e785c9de1730ecba913f5eb49b5a55865d3c4fafe0a6c49e2298aaf",
+    "weftmoe/include/weftmoe/config/runtime_config.hpp": "8c36855720272cd3b073a0d66f4bc2a72952eaf7426067e97b1ba1b0ec6fe1a3",
+    "weftmoe/include/weftmoe/cuda/activation_transport.hpp": "88a586b5e3f359cf9051dce81a13c1217ad71125a84967126b33d5a0b895dc82",
+    "weftmoe/include/weftmoe/cuda/backward.hpp": "a86929210ac590b434bae613d34d6a0021d5c1c4db39db76c7b534c0e030e5c2",
+    "weftmoe/include/weftmoe/cuda/control_protocol.hpp": "02ae394baf1890823537f206649488d1ecacdf1530b51413d50595bfb028b41c",
+    "weftmoe/include/weftmoe/cuda/device_notify.hpp": "12b27bf2d10ca52926ca43e0827dc57e56bfffeee763a5ed7cf97f8fefd5ff2d",
+    "weftmoe/include/weftmoe/cuda/nccl_count_exchange.hpp": "6c602cbb9a0067e50439416efd7f185063fa69e02958796413a82567aa3f983c",
+    "weftmoe/include/weftmoe/metadata/dispatch_handle.hpp": "fe8b88afe0b9676852da15d721cd0cd238654670450dcfa87329c0401f308003",
+    "weftmoe/include/weftmoe/scoreboard/workspace_plan.hpp": "b558413434afec46d6ff2204e9ff321970fcdc117f869de0cc1a4997aa8f0b15",
+    "weftmoe/include/weftmoe/transport/activation_protocol.hpp": "dee9377e32523ed609cdaed71feaf5ba0d827e85ef10e26a01699dd75dfdb04b",
+    "weftmoe/include/weftmoe/transport/count_exchange.hpp": "0d19d31afcced21d93fb3507aab983f6ab9204cd86792f468afa8f99c270a8da",
+    "weftmoe/include/weftmoe/version.hpp": "3687476ceefb43f4ce359be0655016142736739fe2479245682062509e7fb195",
+    "weftmoe/library.py": "eb3a1ff1e0d3dd112568a6bee1a69e945df893a64631cef76e45c5718b69c8a5",
+    "weftmoe/megatron.py": "26dd3d9c1346bed45152c195aaa5c256fba3f56f206ab3715315565ac9fa412f",
+    "weftmoe/runtime.py": "e37e0476de2ed3cf0edaedc4333b104ffe96dcc9cc94afe53c971696250e4561",
+    "weftmoe/sglang.py": "62529d6c13d1d59712323149ffd75d3fe81233657930b1bd4db781f6a80f62f1",
+    "weftmoe/tuning.py": "93391249dc7db5ab48c6823c5441e05cf5fda5b1a63554ddb63a5a5e38f5aa9c"
+  }
+}

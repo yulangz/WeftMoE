@@ -40,6 +40,9 @@ struct BackwardMegaKernelConfig {
   std::uint64_t hidden_size = 0;
   std::uint64_t intermediate_size = 0;
   BackwardTensorStorage tensors{};
+  // FP8 Wgrad can retain the promoted FP32 result for optimizer accumulation.
+  // BF16 kernels currently require false.
+  bool fp32_weight_gradients = false;
 };
 
 struct BackwardMegaKernelTimings {

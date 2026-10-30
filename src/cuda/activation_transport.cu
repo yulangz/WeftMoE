@@ -6,6 +6,9 @@
 #include "cuda/primitives/address_range.cuh"
 #include "cuda/primitives/hopper.cuh"
 #include "cuda/primitives/programmatic_launch.cuh"
+#include "cuda/fp8/tile.cuh"
+#include "cuda/fp8/column.cuh"
+#include "cuda/fp8/source.cuh"
 
 #include <cooperative_groups.h>
 #include <cub/block/block_radix_sort.cuh>
@@ -578,6 +581,8 @@ struct ForwardAllocation {
 
 struct ForwardWeightLease::Impl {
   std::shared_ptr<ForwardAllocation> allocation;
+  FP8WeightBuffers fp8_buffers;
+  fp8::Weights fp8;
   const transport::BFloat16 *w1 = nullptr;
   const transport::BFloat16 *w2 = nullptr;
   const transport::BFloat16 *w1_interleaved = nullptr;
@@ -980,6 +985,86 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
         "Backward W2 MN-major", backward_tuning::kActivationTileK);
+  }
+  return ForwardWeightLease(std::move(impl));
+}
+
+ForwardWeightLease ExternalCudaProducer::publish_fp8_weights(
+    const FP8WeightBuffers &buffers, std::uint32_t owned_experts,
+    std::uint32_t global_expert_begin, std::uint64_t hidden_size,
+    std::uint64_t intermediate_size) const {
+  if (!state_ || !owned_experts || !hidden_size || !intermediate_size ||
+      hidden_size % 128U || intermediate_size % 128U)
+    throw std::invalid_argument("FP8 weights require nonempty experts and H/I multiples of 128");
+  const auto w2_bytes = checked_mul(checked_mul(owned_experts, hidden_size,
+      "FP8 weight rows"), intermediate_size, "FP8 weight bytes");
+  const auto w1_bytes = checked_mul(w2_bytes, 2U, "FP8 W1 bytes");
+  auto impl = std::make_shared<ForwardWeightLease::Impl>();
+  auto allocation = std::make_shared<ForwardAllocation>();
+  allocation->device = state_->backend->device;
+  allocation->external_producer = state_->backend;
+  const auto validate = [&](const CudaTensorBuffer &buffer, std::uint64_t bytes,
+                            std::uint64_t alignment = 1U) {
+    if (!buffer.owner)
+      throw std::invalid_argument("FP8 weights and scales require allocation owners");
+    if (reinterpret_cast<std::uintptr_t>(buffer.data) % alignment)
+      throw std::invalid_argument("FP8 weights/scales have invalid pointer alignment");
+    validate_external_cuda_range(buffer.data, bytes, buffer.bytes, 1U,
+                                 allocation->device, "FP8 weights/scales");
+    allocation->bytes = checked_add(allocation->bytes, bytes, "FP8 weight allocation");
+  };
+  validate(buffers.w1, w1_bytes);
+  validate(buffers.s1, w1_bytes / (128U * 128U) * sizeof(float), alignof(float));
+  validate(buffers.w2, w2_bytes);
+  validate(buffers.s2, w2_bytes / (128U * 128U) * sizeof(float), alignof(float));
+  const bool transposed = buffers.w1_t.data || buffers.s1_t.data ||
+                          buffers.w2_t.data || buffers.s2_t.data;
+  if (transposed) {
+    validate(buffers.w1_t, w1_bytes);
+    validate(buffers.s1_t, w1_bytes / (128U * 128U) * sizeof(float), alignof(float));
+    validate(buffers.w2_t, w2_bytes);
+    validate(buffers.s2_t, w2_bytes / (128U * 128U) * sizeof(float), alignof(float));
+  }
+  const auto &context = state_->backend->context;
+  internal::throw_cuda("fp8-weight-publish",
+      cudaEventCreateWithFlags(&allocation->ready, cudaEventDisableTiming),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "create FP8 weight readiness");
+  internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
+  internal::throw_cuda("fp8-weight-publish",
+      internal::record_input_ready(allocation->ready, state_->backend->stream,
+                                  allocation->ready_capture_id),
+      context.calling_rank(), context.session().world_size(),
+      context.session().identity(), context.session().generation(),
+      ExchangeKind::ExpertCounts, "record FP8 weight readiness");
+  impl->allocation = std::move(allocation);
+  impl->fp8_buffers = buffers;
+  impl->fp8 = {static_cast<const std::uint8_t *>(buffers.w1.data),
+               static_cast<const std::uint8_t *>(buffers.w2.data),
+               static_cast<const float *>(buffers.s1.data),
+               static_cast<const float *>(buffers.s2.data),
+               static_cast<const std::uint8_t *>(buffers.w1_t.data),
+               static_cast<const std::uint8_t *>(buffers.w2_t.data),
+               static_cast<const float *>(buffers.s1_t.data),
+               static_cast<const float *>(buffers.s2_t.data)};
+  impl->session_identity = context.session().stable_identity_bytes();
+  impl->execution = state_->execution;
+  impl->owned_experts = owned_experts;
+  impl->global_expert_begin = global_expert_begin;
+  impl->hidden = hidden_size;
+  impl->intermediate = intermediate_size;
+  impl->device = state_->backend->device;
+  impl->w1_interleaved_map = make_packed_w1_tma_map(
+      buffers.w1.data, hidden_size, intermediate_size, owned_experts,
+      forward_tuning::kFc1TileN, 128U, "FP8 W1", true);
+  impl->w2_map = make_fp8_tma_map(buffers.w2.data, intermediate_size,
+      std::uint64_t(owned_experts) * hidden_size, forward_tuning::kFc2TileN, "FP8 W2");
+  if (transposed) {
+    impl->backward_w1_map = make_fp8_tma_map(buffers.w1_t.data, 2U * intermediate_size,
+        std::uint64_t(owned_experts) * hidden_size, backward_tuning::kDxTileN, "FP8 W1 transposed");
+    impl->backward_w2_map = make_fp8_tma_map(buffers.w2_t.data, hidden_size,
+        std::uint64_t(owned_experts) * intermediate_size, backward_tuning::kDabTileN, "FP8 W2 transposed");
   }
   return ForwardWeightLease(std::move(impl));
 }
@@ -1927,6 +2012,7 @@ ActivationTransportResourcePool prepare_activation_transport_pool(
         old.enable_backward_state == config.enable_backward_state &&
         old.stream_ordered_training == config.stream_ordered_training &&
         old.decode_only == config.decode_only &&
+        old.fp8_workspace == config.fp8_workspace &&
         old.static_forward_window_tokens ==
             config.static_forward_window_tokens &&
         old.static_forward_contribution_windows ==
@@ -1978,6 +2064,10 @@ make_activation_pool_state(const CollectiveSession &session,
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
                     "transport-pool-create", "max_world_size", 0,
                     ">= session world", std::to_string(config.max_world_size));
+  if (config.fp8_workspace && (!WEFTMOE_FP8_SOURCE_X || !WEFTMOE_FP8_SOURCE_DY ||
+      !WEFTMOE_FP8_PACKED_RING || forward_tuning::kFc1TileN != 256U ||
+      (!local_prefill_streaming(config) && !network_prefill_streaming(config)) || config.enable_socket_fallback))
+    throw std::invalid_argument("Compact FP8 workspace requires PF N256 with source quantization");
   auto state = std::make_shared<ActivationPoolState>();
   state->config = config;
   state->layout = make_layout(config);
@@ -2130,6 +2220,16 @@ make_activation_pool_state(const CollectiveSession &session,
             at<void>(slot.device, state->layout.forward_s),
             config.max_intermediate_size, activation_rows,
             forward_tuning::kTileM, "gated SwiGLU U", forward_tuning::kTileK);
+        slot.forward_fp8_x_map = make_fp8_tma_map(
+            at<void>(slot.device, state->layout.canonical_rows), config.max_hidden_size,
+            activation_rows, 128U, "FP8 ring X", config.fp8_workspace ? fp8::source_pitch(config.max_hidden_size) : config.max_hidden_size * 2U,
+            WEFTMOE_FP8_PACKED_RING && forward_tuning::kFc1TileN == 256U &&
+            state->layout.static_ring.depth != 0U);
+        slot.forward_fp8_s_map = make_fp8_tma_map(
+            at<void>(slot.device, state->layout.forward_s), config.max_intermediate_size,
+            activation_rows, 128U, "FP8 ring S", config.fp8_workspace ? fp8::source_pitch(config.max_intermediate_size) : config.max_intermediate_size * 2U,
+            WEFTMOE_FP8_PACKED_RING && forward_tuning::kFc1TileN == 256U &&
+            state->layout.static_ring.depth != 0U);
         if (weftmoe_dt::eligible(config, state->layout.static_ring)) {
           for (unsigned variant = 0U; variant < 2U; ++variant) {
             const auto rows = variant ? 64U : weftmoe_dt::kM;
@@ -2779,7 +2879,9 @@ BFloat16OutputGradientLease ExternalCudaProducer::publish_output_gradients(
     const transport::BFloat16 *device_data, std::uint64_t capacity_elements,
     std::uint64_t num_tokens, std::uint64_t hidden_size,
     std::shared_ptr<const void> allocation_owner) const {
-  if (!state_ || !allocation_owner || num_tokens == 0 || hidden_size == 0)
+  // A rank with no source tokens still participates in expert computation and
+  // collectives. Its empty dY lease must carry the same readiness/provenance.
+  if (!state_ || !allocation_owner || hidden_size == 0)
     transport_error(NotifyErrorCode::InvalidHandle,
                     "external-output-gradient-publish", "producer/owner/shape",
                     0, "valid and nonzero", "empty");
@@ -2939,7 +3041,7 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
         if (!use_gin || !weftmoe_pf::kNetworkPrivateDr) {
           auto &workspace = *slot.backward_peer_workspace;
           workspace.prepare(0, workspace.initial_rows, workspace.max_routes,
-                            capacity.max_hidden_size);
+                            capacity.max_hidden_size, !capacity.fp8_workspace);
         }
       }
 }
@@ -4384,6 +4486,10 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     std::to_string(id.top_k));
   const auto &activation = *activations.impl_;
   const auto &weight = *weights.impl_;
+  if (weight.fp8.w1 && config.retain_backward_state && !weight.fp8.w1_t)
+    throw std::invalid_argument("FP8 training requires pretransposed weights");
+  if (weight.fp8.w1 && state->config.decode_only)
+    throw std::invalid_argument("FP8 currently requires the PF runtime");
   if ((!use_gin && id.num_nodes != 1) ||
       (use_gin && id.num_nodes != gin_backend->num_nodes) ||
       id.world_size != backend->nccl->world ||
@@ -4521,18 +4627,34 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                     std::to_string(view.sizes.owned_expert_count),
                     std::to_string(weight.owned_experts));
   ForwardTensorStorage tensors;
+  const bool source_fp8 = WEFTMOE_FP8_SOURCE_X && WEFTMOE_FP8_PACKED_RING &&
+      weight.fp8.w1 && standalone_notify && forward_tuning::kFc1TileN == 256U &&
+      (!config.retain_backward_state || WEFTMOE_FP8_STREAMED_WGRAD);
+  auto storage_config = config;
+  if (weight.fp8.w1 && !source_fp8)
+    throw std::invalid_argument("FP8 requires source quantization and PF N256");
+  if (state->config.fp8_workspace && !source_fp8)
+    throw std::invalid_argument("Compact FP8 workspace requires source FP8 PF N256");
+  storage_config.fp8_x_checkpoint = source_fp8 && config.retain_backward_state;
+  storage_config.fp8_ab_checkpoint = source_fp8 && config.retain_backward_state;
   const bool allocate_training_tape = training_ring && !config.tensors;
   const auto prepare_storage = [&] {
     if (config.tensors)
       tensors = config.tensors;
     else if (config.tensor_factory)
-      tensors = config.tensor_factory();
+      tensors = config.tensor_factory(storage_config);
     else
-      tensors = prepare_forward_tensors(dispatch, backend->execution, config);
+      tensors = prepare_forward_tensors(dispatch, backend->execution, storage_config);
     if (!tensors)
       throw std::invalid_argument(
           "Forward tensor preparation returned empty storage");
-    const auto &data = *tensors.impl_;
+    auto &data = *tensors.impl_;
+    if (data.fp8_ab_checkpoint != storage_config.fp8_ab_checkpoint)
+      throw std::invalid_argument("AB checkpoint format does not match Forward compute path");
+    if (storage_config.fp8_x_checkpoint && data.x)
+      throw std::invalid_argument("source FP8 requires tensor storage prepared without a BF16 X checkpoint");
+    if (data.training && !storage_config.fp8_x_checkpoint && !data.x)
+      throw std::invalid_argument("this Forward path requires a BF16 X checkpoint");
     if (data.tokens != id.num_tokens || data.hidden != config.hidden_size ||
         data.intermediate != config.intermediate_size ||
         data.rows < dispatch.received_row_capacity() ||
@@ -4540,16 +4662,40 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         data.completion.device != backend->execution.device_ordinal())
       throw std::runtime_error(
           "Forward tensor storage does not match this invocation");
-    const auto writes = {data.output, data.x, data.ab};
+    // This cache belongs to the retained tape, never to a recycled ring slot.
+    if (WEFTMOE_FP8_STREAMED_WGRAD && weight.fp8.w1 && data.training &&
+        standalone_notify && forward_tuning::kFc1TileN == 256U) {
+      const auto rows = std::max<std::uint64_t>(1U,
+          ActivationTransportBridge::padded_received_rows(dispatch));
+      const auto elements = checked_mul(rows, data.hidden, "FP8 saved X");
+      std::size_t cursor = 0;
+      append(cursor, elements, 1U, "FP8 saved X data");
+      const auto sf_offset = append(cursor, elements / 128U, 4U, "FP8 saved X scales");
+      if (!data.fp8_x || data.fp8_x->bytes < cursor) {
+        const auto binding = data.allocator ? data.allocator(cursor) : CudaTensorBuffer{};
+        if (data.allocator && !binding.owner)
+          throw std::runtime_error("tensor allocator returned no owner");
+        data.fp8_x = tensor_storage_detail::allocate(cursor, data.completion.device, binding);
+      }
+      data.fp8_sf_offset = sf_offset;
+    }
+    const auto writes = {data.output, data.x, data.ab, data.fp8_x};
+    tensor_storage_detail::validate_disjoint(
+        {data.output, data.x, data.ab, data.gates, data.headers, data.fp8_x});
     tensor_storage_detail::validate_input_disjoint(
         writes, activation.pointer,
         id.num_tokens * config.hidden_size * sizeof(transport::BFloat16));
     const auto w2_bytes = static_cast<std::uint64_t>(weight.owned_experts) *
                           config.hidden_size * config.intermediate_size *
                           sizeof(transport::BFloat16);
-    tensor_storage_detail::validate_input_disjoint(writes, weight.w1,
-                                                   2 * w2_bytes);
-    tensor_storage_detail::validate_input_disjoint(writes, weight.w2, w2_bytes);
+    if (weight.fp8.w1) {
+      const auto &b = weight.fp8_buffers;
+      for (const auto *buffer : {&b.w1, &b.s1, &b.w2, &b.s2, &b.w1_t, &b.s1_t, &b.w2_t, &b.s2_t})
+        tensor_storage_detail::validate_input_disjoint(writes, buffer->data, buffer->bytes);
+    } else {
+      tensor_storage_detail::validate_input_disjoint(writes, weight.w1, 2 * w2_bytes);
+      tensor_storage_detail::validate_input_disjoint(writes, weight.w2, w2_bytes);
+    }
   };
   if (!allocate_training_tape)
     prepare_storage();
@@ -4563,6 +4709,16 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   auto &slot = state->slots[lease->index];
   GinExecution communication(state->gin_resources, exec->stream,
                              serialized_graph_replay);
+  // On a host-side preparation failure, do not release an input owner while
+  // source preparation is still reading it. Successful calls transfer that
+  // lifetime to the Forward handle and its normal completion protocol.
+  struct SourcePreparationGuard {
+    cudaStream_t stream = nullptr;
+    ~SourcePreparationGuard() {
+      if (stream)
+        (void)cudaStreamSynchronize(stream);
+    }
+  } source_preparation_guard;
   const auto &layout = state->layout;
 #if WEFTMOE_DEBUG_VALIDATE
   const auto debug_forward_host_phase = [&](const char *phase) {
@@ -4714,6 +4870,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                   "single-node source route capacity");
   args.max_tokens_per_rank = state->config.max_tokens_per_rank;
   args.source_input_offset = layout.input;
+  args.fp8_source_x = source_fp8;
+  args.fp8_x_pitch = state->config.fp8_workspace ? fp8::source_pitch(config.hidden_size) : config.hidden_size * 2U;
+  args.fp8_s_pitch = state->config.fp8_workspace ? fp8::source_pitch(config.intermediate_size) : config.intermediate_size * 2U;
   args.network_pull = network_prefill;
   args.fused_source_gates_offset = layout.fused_source_gates;
   args.input = activation.pointer;
@@ -4722,6 +4881,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                    : ActivationTransportBridge::gate_pointer(dispatch);
   args.w1 = weight.w1;
   args.w2 = weight.w2;
+  args.fp8 = weight.fp8;
   args.hidden = config.hidden_size;
   args.intermediate = config.intermediate_size;
   args.max_destination_rows = state->config.max_destination_rows_per_rank;
@@ -4890,23 +5050,32 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.outgoing_sequence_offset = layout.outgoing_route_sequence;
   args.status_offset = layout.status;
   args.forward_s_offset = layout.forward_s;
+  args.fp8_ab_quantized = source_fp8;
   const auto bind_storage = [&] {
     const auto &data = *tensors.impl_;
     args.output = static_cast<transport::BFloat16 *>(data.output->data);
     if (!data.training)
       return;
-    args.saved_x = static_cast<transport::BFloat16 *>(data.x->data);
+    args.saved_x = data.x ? static_cast<transport::BFloat16 *>(data.x->data) : nullptr;
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
-    if ((!training_ring || !use_gin) && data.rows)
+    if ((!training_ring || !use_gin) && data.rows && data.x)
       args.saved_x_map = make_bf16_tma_store_map(
           data.x->data, config.hidden_size, data.rows, "saved FC1 X", 0U,
           training_ring ? 32U : 128U);
 #endif
-    args.saved_ab = static_cast<transport::BFloat16 *>(data.ab->data);
+    args.saved_ab = data.fp8_ab_checkpoint ? nullptr : static_cast<transport::BFloat16 *>(data.ab->data);
+    if (data.fp8_ab_checkpoint) {
+      args.fp8_ab_data = at<std::uint8_t>(data.ab->data, 0);
+      args.fp8_ab_scales = at<float>(data.ab->data, data.fp8_ab_sf_offset);
+    }
     args.checkpoint.gates = static_cast<float *>(data.gates->data);
     args.checkpoint.headers =
         static_cast<LocalP2pRouteHeader *>(data.headers->data);
     args.saved_rows = data.rows;
+    if (weight.fp8.w1 && data.fp8_x) {
+      args.fp8_x_data = at<std::uint8_t>(data.fp8_x->data, 0);
+      args.fp8_x_scales = at<float>(data.fp8_x->data, data.fp8_sf_offset);
+    }
   };
   if (!allocate_training_tape)
     bind_storage();
@@ -4987,11 +5156,13 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
   args.forward_reduce_cta_count = forward_main_compute_ctas;
   if (network_prefill && forward_main_compute_ctas < weftmoe_pf::kNetworkOwners)
     throw std::invalid_argument("PF network requires a CTA per network owner");
-  auto kStaticUnified = weftmoe_pf::local::kernel;
-  const bool decode = args.fused_inference_routes &&
+  auto kStaticUnified = weight.fp8.w1 ? weftmoe_pf::local::kernel<true>
+                                      : weftmoe_pf::local::kernel<false>;
+  const bool decode = !weight.fp8.w1 && args.fused_inference_routes &&
                       weftmoe_dt::eligible(state->config, layout.static_ring);
   if (network_prefill)
-    kStaticUnified = weftmoe_pf::network::kernel;
+    kStaticUnified = weight.fp8.w1 ? weftmoe_pf::network::kernel<true>
+                                   : weftmoe_pf::network::kernel<false>;
   // Arithmetic variants share the same physical blocks and rank
   // protocol, so unequal sources can select different M shapes.
   const bool wide_decode =
@@ -5032,7 +5203,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                      : sizeof(weftmoe_pf::local::Shared);
   const bool pdl = programmatic_launch::enabled();
   if (network_prefill)
-    smem = weftmoe_pf::network::kSharedBytes;
+    smem = weight.fp8.w1 ? weftmoe_pf::local::kFP8SharedBytes : weftmoe_pf::network::kSharedBytes;
+  else if (weight.fp8.w1 && weftmoe_pf::local::kN == 256U)
+    smem = weftmoe_pf::local::kFP8SharedBytes;
   auto error =
       network_prefill
           ? backend->prepare_unified_launch<weftmoe_pf::network::Resources>(
@@ -5083,6 +5256,24 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                         " resident CTAs",
                     std::to_string(max_active_clusters) + " resident clusters");
   if (standalone_notify) {
+    if (source_fp8) {
+      source_preparation_guard.stream = exec->stream;
+      // A separate source kernel replaces BF16 staging. Notify follows on this
+      // stream and its existing peer publication also publishes the FP8 packet.
+      // The auxiliary-stream experiment added host overhead without useful
+      // overlap for these short kernels; no cross-stream events are needed.
+      if (id.num_tokens) {
+        const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+            (id.num_tokens + 3U) / 4U, 4U * sms));
+        fp8::prepare_source_x<forward_tuning::kMainHidden><<<blocks, 128, 0, exec->stream>>>(
+            reinterpret_cast<const __nv_bfloat16 *>(activation.pointer),
+            network_prefill ? at<std::uint8_t>(slot.gin_window, args.static_network.input)
+                            : at<std::uint8_t>(slot.device, layout.input), id.num_tokens);
+        internal::throw_cuda("fp8-source", cudaGetLastError(), id.calling_rank, id.world_size,
+            backend->session.session().identity(), id.generation,
+            ExchangeKind::ExpertCounts, "launch source quantization");
+      }
+    }
     args.training_counts_ready = !split_notify;
     const auto notify = network_prefill ? weftmoe_pf::notify_kernel<true>
                                         : weftmoe_pf::notify_kernel<false>;
@@ -5123,7 +5314,9 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         slot.decode_s_map[wide_decode], weight.decode_w1_map, weight.decode_w2_map);
   else
     launch_forward = cudaLaunchKernelEx(
-        &launch, kStaticUnified, args, slot.forward_x_map, slot.forward_s_map,
+        &launch, kStaticUnified, args,
+        weight.fp8.w1 ? slot.forward_fp8_x_map : slot.forward_x_map,
+        weight.fp8.w1 ? slot.forward_fp8_s_map : slot.forward_s_map,
         weight.w1_interleaved_map, weight.w2_map, ordinary_output_store_map);
 #if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("kernel_launch_returned");
@@ -5132,6 +5325,8 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
                        id.world_size, backend->session.session().identity(),
                        id.generation, ExchangeKind::ExpertCounts,
                        "single persistent WGMMA/TMA forward launch");
+  if (args.fp8_x_data)
+    tensors.impl_->fp8_x_columns_queued = false;
 
   const auto &data = *tensors.impl_;
   if (config.retain_backward_state && !training_ring) {
@@ -5569,6 +5764,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
     lease->release_on(exec->stream);
     result->slot.reset();
   }
+  source_preparation_guard.stream = nullptr;
   return DeviceForwardHandle(std::move(result));
 }
 
@@ -5809,8 +6005,15 @@ download_forward_backward_state_for_validation(
         impl.identity.generation, ExchangeKind::ExpertCounts, name);
     internal::record_cuda_api(internal::CudaApiAuditKind::DeviceToHost, bytes);
   };
-  copy(result.canonical_x.data(), saved.x->data, x_elements,
-       "cudaMemcpy(retained canonical X)");
+  if (saved.x)
+    copy(result.canonical_x.data(), saved.x->data, x_elements,
+         "cudaMemcpy(retained canonical X)");
+  else
+    result.canonical_x.clear(); // FP8-only tape has no exact BF16 X to download.
+  if (saved.fp8_ab_checkpoint) {
+    result.fc1_ab.clear(); // This API downloads BF16 storage only.
+    return result;
+  }
   const auto *ab = static_cast<const transport::BFloat16 *>(saved.ab->data);
   copy(result.fc1_ab.data(), ab, plane_elements, "cudaMemcpy(retained FC1 A)");
   const auto b_plane_stride = checked_mul(saved.rows, impl.intermediate,
@@ -5968,6 +6171,8 @@ BackwardTensorStorage BackwardMegaKernel::prepare_tensors(
     throw std::invalid_argument(
         "Backward tensors require a retained Forward tape");
   const auto &retained = *forward.impl_;
+  if (config.fp32_weight_gradients && !retained.pf_args.fp8.w1)
+    throw std::invalid_argument("FP32 weight gradients currently require FP8 compute");
   const auto depth = retained.pf_args.ring.depth;
   if (!weftmoe_pf::backward_stream::kEnabled || !depth ||
       (retained.pf_args.use_gin && !retained.pf_args.network_pull))
@@ -5977,7 +6182,10 @@ BackwardTensorStorage BackwardMegaKernel::prepare_tensors(
   result.impl_ = BackwardTensorStorage::Impl::make(
       retained.dispatch, retained.backend->execution, config, bindings,
       allocator, depth,
-      retained.pf_args.use_gin && weftmoe_pf::kNetworkPrivateDr);
+      retained.pf_args.use_gin &&
+          (weftmoe_pf::kNetworkPrivateDr || retained.pf_args.fp8.w1),
+      retained.pf_args.fp8.w1 != nullptr,
+      retained.pf_args.fp8_x_data != nullptr);
   return result;
 }
 
@@ -6026,7 +6234,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto gin_backend =
       std::dynamic_pointer_cast<GinBackendState>(retained.backend);
   const bool use_gin = static_cast<bool>(gin_backend);
-  const bool private_dr = use_gin && weftmoe_pf::kNetworkPrivateDr;
+  // FP8 dispatch writes padded canonical packets, never the optional BF16
+  // peer cache (which streamed Wgrad deliberately does not allocate).
+  const bool private_dr = use_gin &&
+      (weftmoe_pf::kNetworkPrivateDr || retained.pf_args.fp8.w1);
   const bool valid_local =
       local_backend && identity.world == local_backend->peer_slot_bases.size();
   const bool valid_gin =
@@ -6088,20 +6299,29 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       data.padded_rows <
           ActivationTransportBridge::padded_received_rows(retained.dispatch) ||
       data.pf_depth != retained.pf_args.ring.depth ||
+      data.streamed_fp8_wgrad != (retained.pf_args.fp8_x_data != nullptr) ||
       data.private_dr != private_dr || data.completion.device != pool->device)
     throw std::runtime_error(
         "Backward tensor storage does not match this invocation");
   const auto writes = {data.dx, data.dgate, data.dw1, data.dw2, data.workspace};
   for (const auto &input :
        {saved.output, saved.x, saved.ab, saved.gates, saved.headers})
+    if (input)
     tensor_storage_detail::validate_input_disjoint(writes, input->data,
                                                    input->bytes);
+  if (saved.fp8_x)
+    tensor_storage_detail::validate_input_disjoint(writes, saved.fp8_x->data,
+                                                  saved.fp8_x->bytes);
   tensor_storage_detail::validate_input_disjoint(writes, gradient.pointer,
                                                  data.dx->bytes);
-  tensor_storage_detail::validate_input_disjoint(
-      writes, retained.weights.impl_->w1, data.dw1->bytes);
-  tensor_storage_detail::validate_input_disjoint(
-      writes, retained.weights.impl_->w2, data.dw2->bytes);
+  if (retained.weights.impl_->fp8.w1) {
+    const auto &b = retained.weights.impl_->fp8_buffers;
+    for (const auto *buffer : {&b.w1, &b.s1, &b.w2, &b.s2, &b.w1_t, &b.s1_t, &b.w2_t, &b.s2_t})
+      tensor_storage_detail::validate_input_disjoint(writes, buffer->data, buffer->bytes);
+  } else {
+    tensor_storage_detail::validate_input_disjoint(writes, retained.weights.impl_->w1, data.dw1->bytes);
+    tensor_storage_detail::validate_input_disjoint(writes, retained.weights.impl_->w2, data.dw2->bytes);
+  }
 
   auto &slot = pool->slots[lease->index];
   GinExecution communication(pool->gin_resources, exec->stream);
@@ -6114,7 +6334,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     peer_workspace.prepare(identity.generation, view.sizes.incoming_row_count,
                            checked_mul(identity.tokens, dispatch_id.top_k,
                                        "Backward source routes"),
-                           config.hidden_size);
+                           config.hidden_size, !data.streamed_fp8_wgrad);
   SlotFailureGuard failure_guard{lease, false};
   const auto scheduler_mblock_capacity =
       (layout.backward_padded_capacity_rows + backward_tuning::kTileM - 1ULL) /
@@ -6151,7 +6371,34 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   args.local_base = slot.device;
   args.peer_bases = at<void *>(slot.device, layout.peer_bases);
   args.saved_gates = static_cast<const float *>(saved.gates->data);
-  args.saved_ab = static_cast<const transport::BFloat16 *>(saved.ab->data);
+  args.saved_ab = saved.fp8_ab_checkpoint ? nullptr : static_cast<const transport::BFloat16 *>(saved.ab->data);
+  if (saved.fp8_ab_checkpoint) {
+    args.fp8_ab_data = at<const std::uint8_t>(saved.ab->data, 0);
+    args.fp8_ab_scales = at<const float>(saved.ab->data, saved.fp8_ab_sf_offset);
+  }
+  args.fp8_du_ring = data.streamed_fp8_wgrad;
+  args.saved_x = saved.x ? static_cast<const transport::BFloat16 *>(saved.x->data) : nullptr;
+  args.fp8 = retained.weights.impl_->fp8.w1 != nullptr;
+  if (data.fp8_compute != args.fp8)
+    throw std::invalid_argument("Backward compute dtype does not match prepared storage");
+  if (args.fp8) {
+    args.fp8_wgrad_data = at<std::uint8_t>(data.workspace->data, data.fp8_wgrad_offset);
+    args.fp8_wgrad_scales = at<float>(data.workspace->data, data.fp8_scales_offset);
+    args.fp8_wgrad_ready = at<unsigned long long>(data.workspace->data, data.fp8_ready_offset);
+    args.fp8_wgrad_rows = data.padded_rows;
+    if (data.streamed_fp8_wgrad) {
+      args.fp8_x_data = retained.pf_args.fp8_x_data;
+      args.fp8_x_scales = retained.pf_args.fp8_x_scales;
+      if (!saved.fp8_x_columns_queued) {
+        args.fp8_x_row_data = args.fp8_x_data;
+        args.fp8_x_row_scales = args.fp8_x_scales;
+      }
+    }
+  }
+  args.fp32_weight_gradients = config.fp32_weight_gradients;
+  if (data.fp32_weight_gradients != config.fp32_weight_gradients ||
+      (config.fp32_weight_gradients && !args.fp8))
+    throw std::invalid_argument("Backward weight-gradient dtype does not match prepared storage");
   args.saved_rows = saved.rows;
   args.peer_payloads = private_dr ? nullptr : peer_workspace.device_payloads();
   args.dr = private_dr
@@ -6168,13 +6415,20 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   pf_args.timeline = {};
 #endif
   pf_args.source_input_offset = layout.input;
+  // Reuse the source packet protocol for dY. The streamed column cache is
+  // required because this Pull path does not materialize canonical BF16 dR.
+  pf_args.fp8_source_x = WEFTMOE_FP8_SOURCE_DY && WEFTMOE_FP8_PACKED_RING &&
+      args.fp8 && args.fp8_x_data &&
+      forward_tuning::kFc1TileN == 256U;
   pf_args.input = gradient.pointer;
   pf_args.training_counts_ready = true;
   pf_args.saved_x = args.dr;
   pf_args.output = static_cast<transport::BFloat16 *>(data.dx->data);
   args.activation_stride = std::max<std::uint64_t>(
       config.hidden_size, 2ULL * config.intermediate_size);
-  if (use_gin) {
+  args.fp8_activation_pitch = pool->config.fp8_workspace
+      ? fp8::source_pitch(args.activation_stride) : args.activation_stride * 2U;
+  if (use_gin && !args.fp8) {
     dab_map = make_bf16_tma_map(
         args.dab, 2ULL * config.intermediate_size, data.padded_rows, 128U,
         "PF Backward canonical dAB", 64U);
@@ -6188,6 +6442,11 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     args.dx_rows =
         at<transport::BFloat16>(data.workspace->data, data.pf_dab_offset);
   }
+
+  if (args.fp8)
+    dab_map = make_fp8_tma_map(args.dx_rows, 2U * config.intermediate_size,
+        std::uint64_t(data.pf_depth) * 128U, 128U, "FP8 dAB ring", args.fp8_activation_pitch,
+        WEFTMOE_FP8_PACKED_RING && forward_tuning::kFc1TileN == 256U);
 
   args.dw1 = static_cast<transport::BFloat16 *>(data.dw1->data);
   args.dw2 = static_cast<transport::BFloat16 *>(data.dw2->data);
@@ -6226,16 +6485,16 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                              static_cast<int>(exec->device)),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "query Backward SM count");
-  const auto x_map = make_bf16_tma_map_mn(
-      saved.rows ? saved.x->data : at<void>(slot.device, layout.canonical_rows),
+  const auto x_map = args.fp8_x_data ? CUtensorMap{} : make_bf16_tma_map_mn(
+      saved.rows && saved.x ? saved.x->data : at<void>(slot.device, layout.canonical_rows),
       config.hidden_size, std::max<std::uint64_t>(saved.rows, 1),
       "saved X for dW1");
-  const auto dw1_map =
+  const auto dw1_map = config.fp32_weight_gradients ? CUtensorMap{} :
       make_bf16_tma_store_map(data.dw1->data, config.hidden_size,
                               static_cast<std::uint64_t>(data.experts) * 2ULL *
                                   config.intermediate_size,
                               "caller dW1");
-  const auto dw2_map = make_bf16_tma_store_map(
+  const auto dw2_map = config.fp32_weight_gradients ? CUtensorMap{} : make_bf16_tma_store_map(
       data.dw2->data, config.intermediate_size,
       static_cast<std::uint64_t>(data.experts) * config.hidden_size,
       "caller dW2");
@@ -6269,10 +6528,32 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                                  gradient.allocation->ready_capture_id),
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "wait dY producer");
+  // Keep dY alive on host-side launch failures, as for source X preparation.
+  struct SourcePreparationGuard {
+    cudaStream_t stream = nullptr;
+    ~SourcePreparationGuard() {
+      if (stream)
+        (void)cudaStreamSynchronize(stream);
+    }
+  } source_preparation_guard;
+  if (pf_args.fp8_source_x && identity.tokens) {
+    source_preparation_guard.stream = transport_stream;
+    const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+        (identity.tokens + 3U) / 4U, 4U * sm_count));
+    fp8::prepare_source_x<backward_tuning::kMainHidden>
+        <<<blocks, 128, 0, transport_stream>>>(
+            reinterpret_cast<const __nv_bfloat16 *>(gradient.pointer),
+            use_gin ? at<std::uint8_t>(slot.gin_window, pf_args.static_network.input)
+                    : at<std::uint8_t>(slot.device, layout.input), identity.tokens);
+    internal::throw_cuda("fp8-source-dy", cudaGetLastError(), identity.rank,
+                         identity.world, "backward", identity.generation,
+                         ExchangeKind::ExpertCounts,
+                         "launch source dY quantization");
+  }
   // Only count/route metadata belongs to the tape. The physical PF plan
   // belongs to the shared execution workspace and may contain a later layer.
-  // Rebuild it from retained counts (no count notify), staging dY in the same
-  // planner just as Forward stages X.
+  // Rebuild it from retained counts (no count notify). The planner publishes
+  // the preceding FP8 packet, or stages BF16 dY on the fallback path.
   const auto planner = use_gin ? weftmoe_pf::notify_kernel<true, true>
                               : weftmoe_pf::notify_kernel<false>;
   constexpr std::size_t planner_smem = 64U * 1024U;
@@ -6312,30 +6593,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     const auto blocks =
         ActivationTransportBridge::padded_received_rows(retained.dispatch) /
         backward_tuning::kTileM;
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
     if (blocks)
       weftmoe_pf::backward_stream::
           order_windows<<<(blocks + 255U) / 256U, 256, 0, transport_stream>>>(
               args);
-#else
-    auto *words = at<unsigned long long>(slot.device, args.scheduler_offset);
-    auto *order = words + scheduler_layout.phase;
-    auto *scratch = words + scheduler_layout.du_completed;
-    for (std::uint64_t width = 1U; width < blocks; width *= 2U) {
-      weftmoe_pf::backward_stream::
-          merge_order<<<(blocks + 255U) / 256U, 256, 0, transport_stream>>>(
-              order, scratch, blocks, width);
-      std::swap(order, scratch);
-    }
-    if (order != words + scheduler_layout.phase)
-      internal::throw_cuda(
-          "backward-plan",
-          cudaMemcpyAsync(words + scheduler_layout.phase, order,
-                          blocks * sizeof(unsigned long long),
-                          cudaMemcpyDeviceToDevice, transport_stream),
-          identity.rank, identity.world, "backward", identity.generation,
-          ExchangeKind::ExpertCounts, "publish static PF Backward order");
-#endif
   } else {
     weftmoe_pf::backward_stream::prepare<false>
         <<<dim3(128U, view.sizes.owned_expert_count), 256, 0,
@@ -6368,10 +6629,15 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
       identity.rank, identity.world, "backward", identity.generation,
       ExchangeKind::ExpertCounts, "record Backward compute start");
 
-  const auto kernel = use_gin ? weftmoe_pf::backward_stream::kernel<true>
-                              : weftmoe_pf::backward_stream::kernel<false>;
-  const auto smem = use_gin ? weftmoe_pf::backward_stream::kNetworkSharedBytes
-                            : weftmoe_pf::backward_stream::kSharedBytes;
+  const auto kernel = args.fp8
+      ? (use_gin ? weftmoe_pf::backward_stream::kernel<true, true>
+                 : weftmoe_pf::backward_stream::kernel<false, true>)
+      : (use_gin ? weftmoe_pf::backward_stream::kernel<true, false>
+                 : weftmoe_pf::backward_stream::kernel<false, false>);
+  const auto smem = use_gin ? (args.fp8 ? weftmoe_pf::backward_stream::kFP8NetworkSharedBytes
+                                             : weftmoe_pf::backward_stream::kNetworkSharedBytes)
+      : args.fp8 ? weftmoe_pf::backward_stream::kFP8SharedBytes
+                 : weftmoe_pf::backward_stream::kSharedBytes;
   const auto entry = reinterpret_cast<const void *>(kernel);
   int clusters = 0;
   internal::throw_cuda(
@@ -6399,17 +6665,21 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
   const auto dr_rows =
       std::max(view.sizes.incoming_row_count, std::uint64_t{1});
   const auto dr_map =
-      private_dr
+      use_gin && args.fp8
+          ? make_fp8_tma_map(args.dr, config.hidden_size, std::max<std::uint64_t>(128U, data.padded_rows),
+                            128U, "FP8 canonical dR", fp8::source_pitch(config.hidden_size), true)
+      : private_dr
           ? make_bf16_tma_map(args.dr, config.hidden_size, dr_rows,
                               backward_tuning::kActivationTileM,
                               "private Backward dR", backward_tuning::kTileK)
           : peer_workspace.buffer->dr_map;
-  const auto dr_mn_map =
+  const auto dr_mn_map = args.fp8 ? CUtensorMap{} :
       private_dr ? make_bf16_tma_map_mn(args.dr, config.hidden_size, dr_rows,
                                         "private Backward dR MN")
                  : peer_workspace.buffer->dr_mn_map;
   const auto launch_result = cudaLaunchKernelEx(
-      &launch, kernel, pf_args, args, use_gin ? dr_map : slot.forward_x_map,
+      &launch, kernel, pf_args, args,
+      use_gin ? dr_map : args.fp8 ? slot.forward_fp8_x_map : slot.forward_x_map,
       dab_map, retained.weights.impl_->backward_w2_map,
       retained.weights.impl_->backward_w1_map, dr_mn_map, data.u_mn_map,
       data.dab_mn_map, x_map, dw2_map, dw1_map);
@@ -6417,6 +6687,10 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
                        identity.world, "backward", identity.generation,
                        ExchangeKind::ExpertCounts,
                        "launch unified Backward workers");
+  // First use converts each complete block in place. Later uses of this tape
+  // reuse its column layout; stream joins below order them after this launch.
+  if (args.fp8_x_row_data)
+    saved.fp8_x_columns_queued = true;
   for (auto event : {slot.backward_transport_done,
                      record ? record->computed : slot.backward_compute_done,
                      slot.backward_join_compute})
@@ -6614,8 +6888,8 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
           identity.rank, identity.world, "backward", identity.generation,
           ExchangeKind::ExpertCounts, "wait Backward completion");
     const auto &status = record ? record->host->status : *slot.host_status;
-    if (diagnostic_progress)
-      diagnostic_status(*slot.host_status, false);
+    if (diagnostic_progress || (record && std::getenv("WEFTMOE_BACKWARD_PROGRESS")))
+      diagnostic_status(status, false);
     ActivationTransportBridge::finish_completed(consumer);
 
     result->audit.specialization =
@@ -6696,6 +6970,7 @@ DeviceBackwardHandle BackwardMegaKernel::enqueue(
     lease->release_on(exec->stream);
     result->slot.reset();
   }
+  source_preparation_guard.stream = nullptr;
   return DeviceBackwardHandle(std::move(result));
 }
 
@@ -6804,10 +7079,20 @@ BackwardValidationBridge::download(const DeviceBackwardHandle &handle,
        result.dx.size() * sizeof(transport::BFloat16), "download dX");
   copy(result.dgate.data(), data.dgate->data,
        result.dgate.size() * sizeof(float), "download dGate");
-  copy(result.dw1.data(), data.dw1->data,
-       result.dw1.size() * sizeof(transport::BFloat16), "download dW1");
-  copy(result.dw2.data(), data.dw2->data,
-       result.dw2.size() * sizeof(transport::BFloat16), "download dW2");
+  const auto copy_weight = [&](auto &host, const void *device, const char *name) {
+    if (data.fp32_weight_gradients) {
+      // The legacy validation format is BF16. Convert explicitly rather than
+      // interpreting the first half of an FP32 allocation as BF16 elements.
+      std::vector<float> values(host.size());
+      copy(values.data(), device, values.size() * sizeof(float), name);
+      for (std::size_t i = 0; i < values.size(); ++i)
+        host[i] = transport::float_to_bfloat16(values[i]);
+    } else {
+      copy(host.data(), device, host.size() * sizeof(transport::BFloat16), name);
+    }
+  };
+  copy_weight(result.dw1, data.dw1->data, "download dW1");
+  copy_weight(result.dw2, data.dw2->data, "download dW2");
   return result;
 }
 testing::GinPutSignalProbeResult

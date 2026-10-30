@@ -146,6 +146,136 @@ __device__ __forceinline__ void pull(const ForwardKernelArgs &a, Storage &s) {
   }
 }
 
+// Source-quantized Pull only copies FP8 packets into the ring. The fallback
+// quantizes BF16 TMA payloads and optionally writes a BF16 checkpoint.
+template <unsigned ReadTiles, bool WaitFc2, bool SourceQuantized = false, class Storage>
+__device__ __forceinline__ void pull_fp8(
+    const ForwardKernelArgs &a, Storage &s, transport::BFloat16 *checkpoint) {
+  const auto warp = (threadIdx.x - kMathThreads - 32U) / 32U;
+  const auto lane = threadIdx.x % 32U;
+  const auto owned = a.dispatch.sizes.owned_expert_count;
+  unsigned expert = 0, begin = 0, phase = 0, peer_rows = 0;
+  SourceRowCursor cursor(a);
+  auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
+  // Source quantization precedes Notify on the same stream. Notify's existing
+  // system release/acquire publication covers the packet as well as routes.
+  if constexpr (SourceQuantized)
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+  for (unsigned linear = blockIdx.x * kPullWarps + warp;; linear += gridDim.x * kPullWarps) {
+    while (expert < owned && linear >= begin + a.ring.expert_rows[expert])
+      begin += a.ring.expert_rows[expert++];
+    if (expert == owned)
+      break;
+    unsigned source, ordinal;
+    cursor.decode(expert, linear - begin, source, ordinal);
+    const auto logical = unsigned(a.ring.expert_blocks[expert]) * kM + linear - begin;
+    const auto block = logical / kM, generation = block / a.ring.depth + 1U;
+    const auto row = block % a.ring.depth * kM + logical % kM;
+    auto &slot = a.ring.slots[block % a.ring.depth];
+    if (!lane)
+      while (ring::acquire(WaitFc2 ? slot.fc2_done : slot.fc1_done) <
+          std::uint64_t(generation - 1U) * ReadTiles) {}
+    const auto route = __shfl_sync(0xffffffffU,
+        lane ? 0U : unsigned(source_routes(a, a.rank, source, expert)[ordinal]), 0);
+    const auto token = route / a.dispatch.identity.top_k;
+    // Backward may only need the row identity after dR moves to its FP8 cache.
+    const auto saved = (checkpoint || a.checkpoint.headers) ? __shfl_sync(0xffffffffU,
+        lane ? 0ULL : static_cast<unsigned long long>(ring::source_metadata(a, source, a.checkpoint.source_rows)[route]), 0) : 0ULL;
+    if (!lane) {
+      const auto gate = peer_at<float>(a.peer_bases[source], a.fused_source_gates_offset)[route];
+      if (a.checkpoint.headers) {
+        a.checkpoint.rows[logical] = saved;
+        a.checkpoint.gates[saved] = gate;
+        a.checkpoint.headers[saved] = {
+            transport::kActivationTransportSchemaVersion, source, a.rank, 0U,
+            a.dispatch.identity.generation, execution_epoch(a), route, route,
+            token, saved, a.rank * owned + expert, unsigned(route % a.dispatch.identity.top_k)};
+      }
+      a.ring.rows[logical] = {route, source, gate, token, contribution_output(a, source, route)};
+      gates[row] = gate;
+    }
+    const auto *input = peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
+        std::uint64_t(token) * a.hidden * 2U;
+    constexpr bool Packed = WEFTMOE_FP8_PACKED_RING && kN == 256U;
+    auto *base = peer_at<std::uint8_t>(a.local_base, a.canonical_rows_offset);
+    auto *output = Packed ? fp8::ring_row(base, row, unsigned(a.hidden), unsigned(a.fp8_x_pitch))
+                          : base + std::uint64_t(row) * a.hidden * 2U;
+    auto *scales = Packed ? fp8::ring_scales(base, row, unsigned(a.hidden), unsigned(a.fp8_x_pitch)) : nullptr;
+    if constexpr (SourceQuantized) {
+      constexpr auto Hidden = forward_tuning::kMainHidden;
+      constexpr auto Pitch = fp8::source_pitch(Hidden);
+      const auto *packet = peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
+          std::uint64_t(token) * Pitch;
+      for (unsigned offset = 0; offset < Pitch; offset += 4096U) {
+        const auto bytes = min(4096U, Pitch - offset);
+        if (!lane) {
+          cute::SM90_BULK_COPY_G2S::copy(packet + offset,
+              reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]), s.pull[warp], bytes);
+          s.pull_full[warp].arrive_and_expect_tx(bytes);
+          s.pull_full[warp].wait(phase);
+          phase ^= 1U;
+        }
+        __syncwarp();
+        for (unsigned index = lane * 16U; index < bytes && offset + index < Hidden; index += 512U)
+          *reinterpret_cast<uint4 *>(output + offset + index) =
+              *reinterpret_cast<const uint4 *>(s.pull[warp] + index);
+        const auto sf_begin = max(offset, unsigned(Hidden));
+        const auto sf_end = min(offset + bytes, unsigned(Hidden + Hidden / 128U * 4U));
+        for (unsigned address = sf_begin + lane * 4U; address < sf_end; address += 128U)
+          scales[(address - Hidden) / 4U * 128U] =
+              *reinterpret_cast<const float *>(s.pull[warp] + address - offset);
+        __syncwarp();
+      }
+    } else {
+    for (unsigned offset = 0; offset < a.hidden * 2U; offset += 4096U) {
+      const auto bytes = min(4096U, unsigned(a.hidden * 2U) - offset);
+      if (!lane) {
+        cute::SM90_BULK_COPY_G2S::copy(input + offset,
+            reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]), s.pull[warp], bytes);
+        s.pull_full[warp].arrive_and_expect_tx(bytes);
+        s.pull_full[warp].wait(phase);
+        phase ^= 1U;
+        if (checkpoint) {
+          cute::SM90_BULK_COPY_S2G::copy(s.pull[warp],
+              checkpoint + saved * a.hidden + offset / 2U, bytes);
+          cute::tma_store_arrive();
+        }
+      }
+      __syncwarp();
+      for (unsigned column = lane * 8U; column < bytes / 2U; column += 256U) {
+        const auto value = reinterpret_cast<const uint4 *>(s.pull[warp])[column / 8U];
+        fp8::store_fp8_eight(value, output, unsigned(a.hidden), offset / 2U + column,
+            scales, Packed ? 128U : 1U);
+      }
+      // Checkpoint DMA and quantization only read this stage, so they can
+      // overlap. Drain the DMA before Pull reuses the shared payload.
+      if (!lane && checkpoint)
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+      __syncwarp();
+    }
+    }
+    __threadfence();
+    __syncwarp();
+    if (!lane) {
+      const auto rows = unsigned(a.ring.expert_rows[expert]);
+      const auto tail = linear - begin + 1U == rows ? (kM - rows % kM) % kM : 0U;
+      arrive(slot.x_full, 1U + tail);
+      peer_rows += source != a.rank;
+    }
+    __syncwarp();
+  }
+  if (!lane) {
+    auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
+    if (peer_rows)
+      atomicAdd(&status->actual_dispatch_peer_bytes, std::uint64_t(peer_rows) *
+          (SourceQuantized ? fp8::source_pitch(unsigned(a.hidden)) : a.hidden * 2ULL));
+    if constexpr (SourceQuantized)
+      if (peer_rows)
+        atomicAdd(&status->actual_return_peer_bytes, std::uint64_t(peer_rows) * a.hidden * 2ULL);
+    atomicMax(&status->dispatch_complete_clock, device_globaltimer_ns());
+  }
+}
+
 template <bool Network = false, unsigned BaseThread = 0U,
           unsigned Threads = kMathThreads>
 __device__ __forceinline__ void combine(const ForwardKernelArgs &a) {
@@ -251,6 +381,7 @@ __device__ __forceinline__ void prepare(const ForwardKernelArgs &a,
 
 #endif
 
+template <bool FP8 = false>
 __global__ __launch_bounds__(kThreads, 1) void kernel(
     const __grid_constant__ ForwardKernelArgs a,
     const __grid_constant__ CUtensorMap x_map,
@@ -262,6 +393,7 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   extern __shared__ __align__(1024) unsigned char storage[];
   auto &s = *reinterpret_cast<Shared *>(storage);
   programmatic_launch::wait();
+  WEFTMOE_TIMELINE_RECORD(a.timeline, MainEnter, Kernel, 0U, 0U, 0U);
   // Notify initialized the ring/status on this stream. Its clock includes the
   // planner and launch gap (and the optional training allocation boundary).
   auto *status = peer_at<TransportDeviceStatus>(a.local_base, a.status_offset);
@@ -275,18 +407,24 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
     cutlass::arch::fence_barrier_init();
   }
   if (threadIdx.x >= kMathThreads)
-    cutlass::arch::warpgroup_reg_dealloc<Resources::kUnifiedControlRegisters>();
+    cutlass::arch::warpgroup_reg_dealloc<FP8 ? fp8::kControlRegisters : Resources::kUnifiedControlRegisters>();
   __syncthreads();
   cute::cluster_sync();
   forward_compute_detail::observe_compute_cluster(a);
   if (threadIdx.x < kMathThreads) {
-    cutlass::arch::warpgroup_reg_alloc<Resources::kUnifiedMathRegisters>();
-    compute(a, s, output_map);
+    cutlass::arch::warpgroup_reg_alloc<FP8 ? fp8::kMathRegisters : Resources::kUnifiedMathRegisters>();
+    compute<FP8, std::conditional_t<FP8, FP8Schedule, Schedule>>(a, s, output_map);
     before_combine<kMathThreads>(a);
   } else if (threadIdx.x < kMathThreads + 32U) {
-    produce(a, s, x_map, s_map, w1_map, w2_map);
+    produce<FP8, std::conditional_t<FP8, FP8Schedule, Schedule>>(a, s, x_map, s_map, w1_map, w2_map);
   } else if (threadIdx.x < kMathThreads + 32U * (1U + kPullWarps)) {
-    pull(a, s);
+    if constexpr (FP8) {
+      if (a.fp8_source_x)
+        pull_fp8<kFc1Tiles, false, true>(a, s, nullptr);
+      else
+        pull_fp8<kFc1Tiles, false>(a, s, a.saved_x);
+    } else
+      pull(a, s);
   }
   collective_scope_sync<kThreads, kCollectiveJoinBarrier>();
   if (threadIdx.x < kMathThreads) {
@@ -297,7 +435,8 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   } else if (blockIdx.x == 0U && threadIdx.x == kMathThreads) {
     status->fc1_tasks_done = a.ring.state->blocks * kFc1Tiles;
     status->fc2_tasks_done = a.ring.state->blocks * kFc2Tiles;
-    status->actual_return_peer_bytes = status->actual_dispatch_peer_bytes;
+    if (!a.fp8_source_x)
+      status->actual_return_peer_bytes = status->actual_dispatch_peer_bytes;
     // No payload cleanup: the next invocation's route exchange waits for all
     // peers to leave this kernel before any new FC2 contribution can arrive.
     atomicMax(&status->complete_clock, device_globaltimer_ns());

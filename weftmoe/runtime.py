@@ -46,6 +46,7 @@ class TensorRuntime:
         input_layout: str = "dp",
         interconnect: str | None = None,
         decode_only: bool = False,
+        fp8_workspace: bool = False,
         session=None,
     ):
         if group is None:
@@ -67,6 +68,8 @@ class TensorRuntime:
         self.experts, self.top_k = experts, top_k
         self.hidden, self.intermediate = hidden, intermediate
         self.training = training
+        self.decode_only = decode_only
+        self.fp8_workspace = fp8_workspace
         self.max_tokens = max_tokens
         self.stream = stream
         if self.stream is None:
@@ -93,6 +96,7 @@ class TensorRuntime:
                 decision = dict(profile=tuning, key=key, error=None)
             except (OSError, ValueError, KeyError, AttributeError) as error:
                 decision = dict(profile=None, key=None, error=str(error))
+        decision["fp8_workspace"] = fp8_workspace
         decision["decode_only"] = decode_only
         decision["reuse_session"] = session is not None
         decisions = [None] * self.world
@@ -124,6 +128,8 @@ class TensorRuntime:
             training,
             max_saved if training else 1,
         )
+        if fp8_workspace:
+            tuning = dict(tuning or {}, fp8_workspace=True)
         if decode_only:
             tuning = dict(tuning or {}, decode_only=True, window_tokens=max_tokens)
         if session is not None:
@@ -135,6 +141,8 @@ class TensorRuntime:
             )
 
     def _check(self, x, routes, gates, w1, w2):
+        if self.fp8_workspace:
+            raise ValueError("Compact FP8 workspace requires forward_fp8 or moe(..., fp8_weights=...)")
         if self.training and torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Runtime must be invoked on its preparation stream")
         if x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.max_tokens:
@@ -169,6 +177,55 @@ class TensorRuntime:
     def forward(self, x, routes, gates, w1, w2):
         self._check(x, routes, gates, w1, w2)
         return self.native.forward(x, routes, gates, w1, w2)
+
+    def forward_fp8(self, x, routes, gates, weights, *,
+                    synchronize=True, retain_backward_state=True,
+                    weight_grad_dtype=torch.float32):
+        """PF forward with prequantized weights and online activation casts.
+
+        Prepare weights with weftmoe.fp8.prepare_fp8_weights before this call.
+        Backward consumes the returned tape through the usual backward API.
+        """
+        from .fp8 import PreparedFP8Weights
+
+        if weight_grad_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("weight_grad_dtype must be torch.bfloat16 or torch.float32")
+        if not isinstance(weights, PreparedFP8Weights):
+            raise TypeError("weights must be PreparedFP8Weights")
+        if self.decode_only:
+            raise ValueError("FP8 currently requires a PF runtime")
+        if self.training and torch.cuda.current_stream() != self.stream:
+            raise RuntimeError("Runtime must be invoked on its preparation stream")
+        if x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.max_tokens:
+            raise ValueError("Activation shape exceeds prepared capacity")
+        for value, dtype, shape in (
+            (x, torch.bfloat16, (x.shape[0], self.hidden)),
+            (routes, torch.int32, (x.shape[0], self.top_k)),
+            (gates, torch.float32, (x.shape[0], self.top_k)),
+        ):
+            if (value.shape != shape or value.dtype != dtype or not value.is_cuda
+                    or value.device != x.device or not value.is_contiguous()):
+                raise ValueError(f"Expected contiguous CUDA {dtype} of shape {shape}")
+        if (weights.w1.shape != (self.experts // self.world, 2 * self.intermediate, self.hidden)
+                or weights.w2.shape != (self.experts // self.world, self.hidden, self.intermediate)
+                or weights.w1.data.device != x.device):
+            raise ValueError("Prepared FP8 weights do not match runtime shape/device")
+        # Native calls run on the preparation stream. Include preparation of
+        # weights and caller-produced inputs in its dependency chain.
+        caller = torch.cuda.current_stream(x.device)
+        if caller == self.stream:
+            return self.native.forward_fp8(x, routes, gates, weights,
+                                           synchronize, retain_backward_state,
+                                           weight_grad_dtype == torch.float32)
+        self.stream.wait_stream(caller)
+        with torch.cuda.stream(self.stream):
+            for value in (x, routes, gates):
+                value.record_stream(self.stream)
+            tape = self.native.forward_fp8(x, routes, gates, weights,
+                                          synchronize, retain_backward_state,
+                                          weight_grad_dtype == torch.float32)
+        caller.wait_stream(self.stream)
+        return tape
 
     def backward(self, tape, dy):
         if torch.cuda.current_stream() != self.stream:
@@ -272,8 +329,34 @@ class _MoE(torch.autograd.Function):
         return None, dx, None, dg, dw1, dw2
 
 
-def moe(runtime, x, routes, gates, w1, w2):
+class _MoEFP8(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, runtime, x, routes, gates, w1, w2, weights):
+        if (w1.shape != weights.w1.shape or w2.shape != weights.w2.shape
+                or w1.dtype not in (torch.bfloat16, torch.float32)
+                or w2.dtype not in (torch.bfloat16, torch.float32)
+                or w1.device != x.device or w2.device != x.device):
+            raise ValueError("FP8 autograd requires matching BF16/FP32 parameter tensors")
+        ctx.runtime = runtime
+        ctx.save_for_backward(w1, w2)
+        weights.validate_parameters(w1, w2)
+        grad_dtype = torch.bfloat16 if w1.dtype == w2.dtype == torch.bfloat16 else torch.float32
+        ctx.tape = runtime.forward_fp8(x, routes, gates, weights, weight_grad_dtype=grad_dtype)
+        return ctx.tape.output
+
+    @staticmethod
+    def backward(ctx, dy):
+        w1, w2 = ctx.saved_tensors  # Detect optimizer updates before backward.
+        dx, dg, dw1, dw2 = ctx.runtime.backward(ctx.tape, dy)
+        ctx.tape = None
+        ctx.runtime = None
+        return None, dx, None, dg, dw1.to(w1.dtype), dw2.to(w2.dtype), None
+
+
+def moe(runtime, x, routes, gates, w1, w2, *, fp8_weights=None):
     """Apply the fused operation, preserving router and expert autograd edges."""
     if torch.is_grad_enabled() and not runtime.training:
         raise ValueError("Autograd requires a runtime prepared with training=True")
+    if fp8_weights is not None:
+        return _MoEFP8.apply(runtime, x, routes, gates, w1, w2, fp8_weights)
     return _MoE.apply(runtime, x, routes, gates, w1, w2)

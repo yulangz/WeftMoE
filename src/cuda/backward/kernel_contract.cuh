@@ -15,6 +15,23 @@ struct BackwardKernelArgs {
 
   const float *saved_gates = nullptr;
   const transport::BFloat16 *saved_ab = nullptr;
+  const transport::BFloat16 *saved_x = nullptr;
+  bool fp8 = false;
+  bool fp32_weight_gradients = false;
+  // Tape-owned column cache, produced once in place by designated dU tiles.
+  std::uint8_t *fp8_x_data = nullptr;
+  float *fp8_x_scales = nullptr;
+  // Aliases the cache only on its first BWD, while it still holds row FP8.
+  const std::uint8_t *fp8_x_row_data = nullptr;
+  const float *fp8_x_row_scales = nullptr;
+  const std::uint8_t *fp8_ab_data = nullptr;
+  const float *fp8_ab_scales = nullptr;
+  bool fp8_du_ring = false;
+  std::uint64_t fp8_activation_pitch = 0;
+  std::uint8_t *fp8_wgrad_data = nullptr;
+  float *fp8_wgrad_scales = nullptr;
+  unsigned long long *fp8_wgrad_ready = nullptr;
+  std::uint64_t fp8_wgrad_rows = 0;
   std::uint64_t saved_rows = 0;
   const backward_detail::PeerPayload *peer_payloads = nullptr;
   // Stable, IPC-visible dR owned by the execution slot. Logical TMA bounds

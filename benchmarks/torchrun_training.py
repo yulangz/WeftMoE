@@ -5,6 +5,8 @@ Input preparation is untimed. This exercises changing communication sizes, not
 a full training step: expert weights are fixed and there is no optimizer.
 Forward-only retains X/GU until device completion and reports both cache-ready
 and release-inclusive wall time. Default PF timing includes weight packing.
+FP8 prepares fixed weights (fused quantization plus W/W.T output) before timing;
+source activation quantization remains inside the measured FWD/BWD calls.
 Backward-only prepares and synchronizes a fresh Forward tape outside timing;
 its cache-ready measurement ends with gradients live, before external release.
 """
@@ -33,6 +35,8 @@ from benchmarks.workload import make_workload
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
+    parser.add_argument("--fp8", action="store_true",
+                        help="PF block-wise FP8; quantize fixed weights and emit W/W.T outside timing")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"), default="flex",
                         help="Megatron communication backend: NCCL all-to-all or DeepEP")
     parser.add_argument("--deepep-num-sms", type=int, default=20)
@@ -57,6 +61,8 @@ def main():
                         help="Time training forward with saved X/GU, tape release and synchronize, without backward")
     mode.add_argument("--backward-only", action="store_true",
                       help="Time backward on a fresh, synchronized Forward tape; Forward is untimed")
+    parser.add_argument("--weight-grad-dtype", choices=("bf16", "float32"),
+                        help="FP8 dW output type; default float32. Use bf16 to match BF16 baseline output.")
     parser.add_argument("--prepared-weights", action="store_true",
                         help="Reuse immutable PF weights; default includes per-call packing as in training")
     parser.add_argument("--stream-ordered", action="store_true",
@@ -69,6 +75,10 @@ def main():
                         help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
     parser.add_argument("--trace-stage-kernels", action="store_true",
                         help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
+    parser.add_argument("--cuda-trace-dir", type=Path,
+                        help="Export CUPTI CPU/CUDA traces with FWD/BWD ranges after warmup; diagnostic only")
+    parser.add_argument("--ncu-range", action="store_true",
+                        help="Bracket one measured iteration with cudaProfilerStart/Stop for NCU app-range replay")
     parser.add_argument("--report-window-padding", action="store_true",
                         help="Compare hypothetical per-window and canonical M128 padding, outside timing")
     parser.add_argument("--report-communication", action="store_true",
@@ -86,6 +96,11 @@ def main():
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
     args = parser.parse_args()
     resolve_model(args)
+    if args.weight_grad_dtype is not None and not args.fp8:
+        parser.error("--weight-grad-dtype is an FP8 option; BF16 already returns BF16 dW")
+    if args.fp8 and (args.backend != "pf" or args.prepared_weights or args.verify):
+        parser.error("--fp8 requires PF timing without --prepared-weights/--verify; "
+                     "use tests/torchrun_fp8.py for FP8 numerical verification")
     if args.backward_identity and (args.backend != "pf" or not args.verify):
         parser.error("--backward-identity requires PF --verify and an identity diagnostic build")
     if args.prepared_weights and (args.backend != "pf" or not args.forward_only):
@@ -98,6 +113,12 @@ def main():
         parser.error("--profile-stages requires --backend pf --forward-only")
     if args.trace_stage_kernels and (args.backend != "pf" or not args.forward_only):
         parser.error("--trace-stage-kernels requires --backend pf --forward-only")
+    if args.cuda_trace_dir and (args.backend != "pf" or args.verify or args.trace_stage_kernels):
+        parser.error("--cuda-trace-dir requires PF timing without --verify/--trace-stage-kernels")
+    if args.cuda_trace_dir and args.prepared_weights:
+        parser.error("--cuda-trace-dir does not support the direct --prepared-weights inference entrypoint")
+    if args.ncu_range and (args.samples != 1 or args.verify or args.cuda_trace_dir or args.trace_stage_kernels):
+        parser.error("--ncu-range requires --samples 1 and no other tracing/verification mode")
     if args.timeline_dir and (args.backend != "pf" or not args.forward_only or args.verify):
         parser.error("--timeline-dir requires PF forward-only diagnostics without --verify")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
@@ -206,10 +227,21 @@ def main():
             runtime = TensorRuntime(
                 group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
                 hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
-                max_rows=max_rows, training=True, max_saved=2)
+                max_rows=max_rows, training=True, max_saved=2,
+                fp8_workspace=args.fp8 and os.environ.get("TEST_FP8_COMPACT", "1") == "1")
             if args.stream_ordered:
                 runtime.forward = runtime.forward_async
                 runtime.backward = runtime.backward_async
+            if args.fp8:
+                from weftmoe.fp8 import prepare_fp8_weights
+                fp8_weights = prepare_fp8_weights(w1, w2)
+
+                def fp8_forward(x, routes, gates, _w1, _w2):
+                    return runtime.forward_fp8(x, routes, gates, fp8_weights,
+                                               synchronize=not args.stream_ordered,
+                                               weight_grad_dtype=torch.bfloat16 if args.weight_grad_dtype == "bf16" else torch.float32)
+
+                runtime.forward = fp8_forward
             if args.accumulate_main_grad:
                 main_dw1 = torch.zeros_like(w1, dtype=torch.float32)
                 main_dw2 = torch.zeros_like(w2, dtype=torch.float32)
@@ -256,11 +288,20 @@ def main():
                         errors=per_rank_errors)), flush=True)
             runtime.close()
             continue
+        if args.cuda_trace_dir:
+            def traced_call(function, label):
+                def call(*a, **kw):
+                    with torch.profiler.record_function(label):
+                        return function(*a, **kw)
+                return call
+            runtime.forward = traced_call(runtime.forward, "weftmoe.forward")
+            runtime.backward = traced_call(runtime.backward, "weftmoe.backward")
         samples = []
         forward_samples = []
         forward_ready_samples = []
         backward_ready_samples = []
         stage_profiles = []
+        checkpoint_layout = "routed BF16 X + BF16 FC1 gate/up"
         measurement_intervals_ns = []
         priming_steps = len(batches) if args.prime_trace else 0
         input_rng_state = generator.get_state()
@@ -272,11 +313,12 @@ def main():
                 generator.set_state(input_rng_state)
             if args.backend == "megatron" and iteration == priming_steps + args.warmups:
                 compile_graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-            if (args.profile_stages or args.trace_stage_kernels) and iteration == priming_steps + args.warmups:
+            if (args.profile_stages or args.trace_stage_kernels or args.cuda_trace_dir) and iteration == priming_steps + args.warmups:
                 allocator_before = torch.cuda.memory_stats()
-                if args.trace_stage_kernels:
+                if args.trace_stage_kernels or args.cuda_trace_dir:
                     kernel_probe = torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CUDA])
+                        activities=([torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+                                    if args.cuda_trace_dir else [torch.profiler.ProfilerActivity.CUDA]))
                     kernel_probe.start()
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
@@ -292,6 +334,9 @@ def main():
                 time.sleep(args.sample_pause_ms / 1000)
                 dist.barrier()
                 torch.cuda.synchronize()
+            ncu_active = args.ncu_range and iteration >= priming_steps + args.warmups
+            if ncu_active:
+                torch.cuda.cudart().cudaProfilerStart()
             interval_start = time.time_ns()
             start = time.perf_counter_ns()
             if not args.backward_only:
@@ -301,6 +346,12 @@ def main():
                 else:
                     tape = runtime.forward(x, routes, gates, w1, w2)
                 forward_end = time.perf_counter_ns()
+            # Backward consumes the native Forward handle. Inspect checkpoint
+            # storage while the tape is still live, including BWD-only runs.
+            if iteration == 0 and args.fp8 and getattr(tape, "saved_x_bytes", None) == 0:
+                checkpoint_layout = ("row FP8 X + row FP8 FC1 gate/up; BWD column conversion once"
+                                     if hasattr(tape, "tensor_bytes")
+                                     else "column FP8 X + BF16 FC1 gate/up (legacy)")
             if args.forward_only:
                 # Keep the checkpoint alive until it is usable by Backward.
                 torch.cuda.synchronize()
@@ -316,6 +367,8 @@ def main():
                 del tape
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - start) / 1000
+            if ncu_active:
+                torch.cuda.cudart().cudaProfilerStop()
             if iteration >= priming_steps + args.warmups:
                 samples.append(elapsed)
                 if not args.backward_only:
@@ -338,6 +391,10 @@ def main():
         stage_kernels = None
         if kernel_probe is not None:
             kernel_probe.stop()
+            if args.cuda_trace_dir:
+                args.cuda_trace_dir.mkdir(parents=True, exist_ok=True)
+                kernel_probe.export_chrome_trace(str(args.cuda_trace_dir / f"t{tokens}.rank{rank}.json"))
+        if kernel_probe is not None and args.trace_stage_kernels:
             stage_kernels = {}
             local = world == int(os.environ.get("LOCAL_WORLD_SIZE", world))
             split_notify = runtime.native.usage().get("separate_forward_notify",
@@ -350,12 +407,29 @@ def main():
                 events = sorted((event for event in kernel_probe.events()
                                  if event.device_type == torch.autograd.DeviceType.CUDA
                                  and name in event.name), key=lambda event: event.time_range.start)
-                expected = 0 if label == "weight_repack" and args.prepared_weights else args.samples
+                expected = (0 if label == "weight_repack" and
+                            (args.prepared_weights or args.fp8) else args.samples)
                 if ((label == "mini_notify" and split_notify) or
                         (label == "standalone_notify" and not split_notify)):
                     expected = 0
                 assert len(events) == expected, (label, len(events), expected)
                 stage_kernels[label] = [event.time_range.elapsed_us() for event in events]
+            quant_events = sorted((event for event in kernel_probe.events()
+                                   if event.device_type == torch.autograd.DeviceType.CUDA
+                                   and "fp8::prepare_source_x" in event.name),
+                                  key=lambda event: event.time_range.start)
+            stage_kernels["source_quantization"] = [event.time_range.elapsed_us() for event in quant_events]
+            if quant_events:
+                assert len(quant_events) == args.samples
+                notify_events = sorted((event for event in kernel_probe.events()
+                                        if event.device_type == torch.autograd.DeviceType.CUDA
+                                        and "weftmoe_pf::notify_kernel" in event.name),
+                                       key=lambda event: event.time_range.start)
+                assert len(notify_events) == len(quant_events)
+                stage_kernels["quant_notify_overlap"] = [
+                    max(0.0, min(q.time_range.end, n.time_range.end) -
+                        max(q.time_range.start, n.time_range.start))
+                    for q, n in zip(quant_events, notify_events)]
         if args.profile_stages:
             allocator_after = torch.cuda.memory_stats()
             allocator_delta = {key: allocator_after[key] - allocator_before[key]
@@ -416,7 +490,12 @@ def main():
                 intermediate=args.intermediate, warmups=args.warmups,
                 priming_steps=priming_steps, compiled_graphs_during_measurement=compile_graphs,
                 forward_only=args.forward_only, backward_only=args.backward_only,
-                weights_prepared_once=args.prepared_weights,
+                compute_dtype="fp8_e4m3fn" if args.fp8 else "bf16",
+                weight_grad_dtype=(args.weight_grad_dtype or "float32") if args.fp8 else "bf16",
+                weights_prepared_once=args.prepared_weights or args.fp8,
+                weight_preparation_in_timing=(False if args.fp8 or args.prepared_weights else None),
+                fp8_weight_preparation=("fused_quantize_transpose" if args.fp8 else None),
+                cuda_trace_dir=str(args.cuda_trace_dir) if args.cuda_trace_dir else None,
                 stream_ordered=args.stream_ordered,
                 accumulate_main_grad=args.accumulate_main_grad,
                 samples=args.samples, sample_pause_ms=args.sample_pause_ms,
@@ -451,7 +530,7 @@ def main():
                                    if args.forward_only else
                                    "eager forward+backward+release+device synchronize; input preparation excluded"),
                 forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
-                checkpoint="routed X + FC1 gate/up; recompute gated SwiGLU in backward",
+                checkpoint=checkpoint_layout + "; recompute gated SwiGLU in backward",
                 implementation=getattr(runtime, "metadata", {}),
                 gpu=torch.cuda.get_device_name(), per_rank_workspace=workspace,
                 extension=os.environ.get("WEFTMOE_TENSOR_EXTENSION")

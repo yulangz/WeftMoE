@@ -1,0 +1,4249 @@
+{
+  "gpu": "NVIDIA L20X",
+  "records": [
+    {
+      "label": "fp8-dual-weight-qwen35b-correctness",
+      "kind": "distributed_correctness",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "tests/torchrun_fp8.py"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so",
+        "TEST_TOKENS": "257",
+        "TEST_EXPERTS": "32",
+        "TEST_ROW_SCALES": "1",
+        "TEST_HIDDEN": "2048",
+        "TEST_INTERMEDIATE": "512"
+      },
+      "status": 0,
+      "elapsed_s": 9.302246332168579,
+      "result": null,
+      "stdout": "W1029 08:03:10.128000 261325 torch/distributed/run.py:803] \nW1029 08:03:10.128000 261325 torch/distributed/run.py:803] *****************************************\nW1029 08:03:10.128000 261325 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:10.128000 261325 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n1 FP8_BEGIN skew False\n0 FP8_BEGIN skew False\n01  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n01  FP8_BACKWARD_DONEFP8_BACKWARD_DONE\n\n1 y relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 0.0 max_abs 0.0\n1 dg relative_l2 1.1295614399386977e-07 max_abs 3.5762786865234375e-07\n1 dw1 relative_l2 0.0 max_abs 0.0\n1 dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_PARITY_PASS skew False {'compute_bytes': 21930120, 'last_forward_tensor_bytes': 5917640, 'last_backward_tensor_bytes': 115923152, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_BEGIN skew True\n0 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.0490153812270364e-07 max_abs 3.5762786865234375e-07\n0 dw1 relative_l2 0.0 max_abs 0.0\n0 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew False {'compute_bytes': 21930120, 'last_forward_tensor_bytes': 5957632, 'last_backward_tensor_bytes': 115951880, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n0 FP8_BEGIN skew True\n01  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n0 FP8_BACKWARD_DONE\n1 FP8_BACKWARD_DONE\n0 y relative_l2 0.0 max_abs 0.0\n1 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.017023691929353e-07 max_abs 2.384185791015625e-07\n1 dg relative_l2 1.1814164224688284e-07 max_abs 3.5762786865234375e-07\n0 dw1 relative_l2 0.0 max_abs 0.0\n1 dw1 relative_l2 0.0 max_abs 0.0\n0 dw2 relative_l2 0.0 max_abs 0.0\n1 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew True {'compute_bytes': 21930120, 'last_forward_tensor_bytes': 4363208, 'last_backward_tensor_bytes': 112163080, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_PARITY_PASS skew True {'compute_bytes': 21930120, 'last_forward_tensor_bytes': 1026112, 'last_backward_tensor_bytes': 108349504, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dg relative_l2 1.208261721785675e-07 max_abs 12.384185791015625e-07 \nasync_dx relative_l2 0.0 max_abs 0.0\n1 async_dg relative_l2 1.328181724602473e-07 max_abs 3.5762786865234375e-07\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dg relative_l2 1.1343171735234137e-07 max_abs 4.76837158203125e-07\n0 async_dg relative_l2 1.0855978160861923e-07 max_abs 4.76837158203125e-07\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dg relative_l2 1.1919651399239228e-07 max_abs 2.980232238769531e-07\n0 async_dg relative_l2 1.1990617565516004e-07 max_abs 2.5331974029541016e-07\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_MULTIVERSION_ASYNC_PASS\n1 FP8_MULTIVERSION_ASYNC_PASS\n01  FP8_CACHED_VERSION_CHECK_PASSFP8_CACHED_VERSION_CHECK_PASS\n\n1 checkpoint_y relative_l2 0.0 max_abs 0.0\n0 checkpoint_y relative_l2 0.0 max_abs 0.0\n1 checkpoint_dx relative_l2 0.0 max_abs 0.0\n0 checkpoint_dx relative_l2 0.0 max_abs 0.0\n1 checkpoint_dg relative_l2 1.159668343575504e-07 max_abs 4.76837158203125e-07\n0 checkpoint_dg relative_l2 1.351160108242766e-07 max_abs 4.76837158203125e-07\n1 checkpoint_dw1 relative_l2 0.0 max_abs 0.0\n0 checkpoint_dw1 relative_l2 0.0 max_abs 0.0\n1 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n0 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_CHECKPOINT_PASS\n0 FP8_CHECKPOINT_PASS\n1 FP8_OPTIMIZER_PASS\n0 FP8_OPTIMIZER_PASS\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\n0 inference relative_l2 0.0 max_abs 0.0\n1 inference relative_l2 0.0 max_abs 0.0\n1 FP8_INFERENCE_PASS\n0 FP8_INFERENCE_PASS\n",
+      "native_sha256": "fe2687f7bf0bf0120dff89568421794a95b7a4da4e323476ec9ed327c7a67686",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-qwen122b-correctness",
+      "kind": "distributed_correctness",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "tests/torchrun_fp8.py"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so",
+        "TEST_TOKENS": "257",
+        "TEST_EXPERTS": "32",
+        "TEST_ROW_SCALES": "1",
+        "TEST_HIDDEN": "3072",
+        "TEST_INTERMEDIATE": "1024"
+      },
+      "status": 0,
+      "elapsed_s": 10.750777244567871,
+      "result": null,
+      "stdout": "W1029 08:03:19.460000 261500 torch/distributed/run.py:803] \nW1029 08:03:19.460000 261500 torch/distributed/run.py:803] *****************************************\nW1029 08:03:19.460000 261500 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:19.460000 261500 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n01  FP8_BEGINFP8_BEGIN  skewskew  FalseFalse\n\n01  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n01  FP8_BACKWARD_DONEFP8_BACKWARD_DONE\n\n0 y relative_l2 0.0 max_abs 0.0\n1 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.436013832289973e-07 max_abs 7.152557373046875e-07\n1 dg relative_l2 1.3032642698362906e-07 max_abs 9.5367431640625e-07\n0 dw1 relative_l2 0.0 max_abs 0.0\n1 dw1 relative_l2 0.0 max_abs 0.0\n0 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew False {'compute_bytes': 33475720, 'last_forward_tensor_bytes': 9187328, 'last_backward_tensor_bytes': 329867528, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n0 FP8_BEGIN skew True\n1 dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_PARITY_PASS skew False {'compute_bytes': 33475720, 'last_forward_tensor_bytes': 9122440, 'last_backward_tensor_bytes': 329824464, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_BEGIN skew True\n01  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n01  FP8_BACKWARD_DONEFP8_BACKWARD_DONE\n\n0 y relative_l2 0.0 max_abs 0.0\n1 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.197955441512022e-07 max_abs 7.152557373046875e-07\n1 dg relative_l2 1.443103343490293e-07 max_abs 7.152557373046875e-07\n0 dw1 relative_l2 0.0 max_abs 0.0\n1 dw1 relative_l2 0.0 max_abs 0.0\n0 dw2 relative_l2 0.0 max_abs 0.0\n1 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew True {'compute_bytes': 33475720, 'last_forward_tensor_bytes': 7041672, 'last_backward_tensor_bytes': 323375368, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_PARITY_PASS skew True {'compute_bytes': 33475720, 'last_forward_tensor_bytes': 1539168, 'last_backward_tensor_bytes': 316846736, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 2.4561566078773467e-06 max_abs 3.0517578125e-05\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dg relative_l2 1.2661075743380934e-07 max_abs 3.5762786865234375e-07\n0 async_dg relative_l2 1.0525058513621843e-07 max_abs 2.980232238769531e-07\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw1 relative_l2 8.60619309150934e-07 max_abs 0.0001220703125\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dg relative_l2 1.2799532100871147e-07 max_abs 9.5367431640625e-07\n1 async_dg relative_l2 1.5402416408960562e-07 max_abs 1.0132789611816406e-06\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dg relative_l2 1.0323477539486703e-07 max_abs 4.76837158203125e-07\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dg relative_l2 1.420519453176894e-07 max_abs 5.364418029785156e-07\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 FP8_MULTIVERSION_ASYNC_PASS\n0 FP8_CACHED_VERSION_CHECK_PASS\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_MULTIVERSION_ASYNC_PASS\n1 FP8_CACHED_VERSION_CHECK_PASS\n0 checkpoint_y relative_l2 0.0 max_abs 0.0\n0 checkpoint_dx relative_l2 0.0 max_abs 0.0\n1 checkpoint_y relative_l2 0.0 max_abs 0.0\n0 checkpoint_dg relative_l2 1.279560848388428e-07 max_abs 9.5367431640625e-07\n1 checkpoint_dx relative_l2 0.0 max_abs 0.0\n1 checkpoint_dg relative_l2 1.5472586767373286e-07 max_abs 9.5367431640625e-07\n0 checkpoint_dw1 relative_l2 0.0 max_abs 0.0\n1 checkpoint_dw1 relative_l2 0.0 max_abs 0.0\n0 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_CHECKPOINT_PASS\n1 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_CHECKPOINT_PASS\n0 FP8_OPTIMIZER_PASS\n1 FP8_OPTIMIZER_PASS\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\n1 inference relative_l2 0.0 max_abs 0.0\n0 inference relative_l2 0.0 max_abs 0.0\n0 FP8_INFERENCE_PASS\n1 FP8_INFERENCE_PASS\n",
+      "native_sha256": "097c68602be4eaee068068d47dad84b283954e4f30674f6cd3a9e6f30c1e5a43",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-flash-correctness",
+      "kind": "distributed_correctness",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "tests/torchrun_fp8.py"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so",
+        "TEST_TOKENS": "257",
+        "TEST_EXPERTS": "32",
+        "TEST_ROW_SCALES": "1",
+        "TEST_HIDDEN": "4096",
+        "TEST_INTERMEDIATE": "2048"
+      },
+      "status": 0,
+      "elapsed_s": 10.652783632278442,
+      "result": null,
+      "stdout": "W1029 08:03:30.266000 261786 torch/distributed/run.py:803] \nW1029 08:03:30.266000 261786 torch/distributed/run.py:803] *****************************************\nW1029 08:03:30.266000 261786 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:30.266000 261786 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n10  FP8_BEGINFP8_BEGIN  skewskew  FalseFalse\n\n10  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n01  FP8_BACKWARD_DONEFP8_BACKWARD_DONE\n\n0 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.7101272931085987e-07 max_abs 7.62939453125e-06\n1 y relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 4.415264629642479e-05 max_abs 0.001953125\n1 dg relative_l2 1.562696354540094e-07 max_abs 3.814697265625e-06\n0 dw1 relative_l2 0.0 max_abs 0.0\n1 dw1 relative_l2 3.058302900171839e-05 max_abs 0.00390625\n0 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew False {'compute_bytes': 48481928, 'last_forward_tensor_bytes': 12957696, 'last_backward_tensor_bytes': 855673096, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n0 FP8_BEGIN skew True\n1 dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_PARITY_PASS skew False {'compute_bytes': 48481928, 'last_forward_tensor_bytes': 12857352, 'last_backward_tensor_bytes': 855615696, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_BEGIN skew True\n01  FP8_FORWARD_DONEFP8_FORWARD_DONE\n\n10  FP8_BACKWARD_DONEFP8_BACKWARD_DONE\n\n0 y relative_l2 0.0 max_abs 0.0\n1 y relative_l2 0.0 max_abs 0.0\n0 dx relative_l2 0.0 max_abs 0.0\n1 dx relative_l2 0.0 max_abs 0.0\n0 dg relative_l2 1.372194020632378e-07 max_abs 4.291534423828125e-06\n1 dg relative_l2 1.417256072500095e-07 max_abs 3.814697265625e-06\n0 dw1 relative_l2 0.0 max_abs 0.0\n1 dw1 relative_l2 0.0 max_abs 0.0\n0 dw2 relative_l2 0.0 max_abs 0.0\n1 dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_PARITY_PASS skew True {'compute_bytes': 48481928, 'last_forward_tensor_bytes': 10790920, 'last_backward_tensor_bytes': 844855560, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n1 FP8_PARITY_PASS skew True {'compute_bytes': 48481928, 'last_forward_tensor_bytes': 2052224, 'last_backward_tensor_bytes': 833991440, 'gin_bytes': 0, 'notify_bytes': 653304, 'notify_slots_in_use': 0, 'separate_forward_notify': True}\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 0.0 max_abs 0.0\n0 async_dg relative_l2 1.505335944784747e-07 max_abs 2.86102294921875e-06\n1 async_dg relative_l2 1.4443232032590458e-07 max_abs 1.9073486328125e-06\n0 async_dw1 relative_l2 0.0 max_abs 0.0\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 0.0 max_abs 0.0\n1 async_dx relative_l2 5.6914406741270795e-05 max_abs 0.001953125\n0 async_dg relative_l2 1.6100811706110107e-07 max_abs 7.62939453125e-06\n1 async_dg relative_l2 1.5568485878247884e-07 max_abs 5.7220458984375e-06\n0 async_dw1 relative_l2 3.4268672607140616e-05 max_abs 0.0078125\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 async_y relative_l2 0.0 max_abs 0.0\n1 async_y relative_l2 0.0 max_abs 0.0\n0 async_dx relative_l2 2.1368063244153745e-05 max_abs 0.0009765625\n1 async_dx relative_l2 2.242775008198805e-05 max_abs 0.0009765625\n0 async_dg relative_l2 1.513989360546475e-07 max_abs 3.814697265625e-06\n1 async_dg relative_l2 1.380976613063467e-07 max_abs 3.814697265625e-06\n0 async_dw1 relative_l2 2.6807488211488817e-06 max_abs 0.00048828125\n1 async_dw1 relative_l2 0.0 max_abs 0.0\n0 async_dw2 relative_l2 0.0 max_abs 0.0\n1 async_dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_MULTIVERSION_ASYNC_PASS\n0 FP8_CACHED_VERSION_CHECK_PASS\n1 FP8_MULTIVERSION_ASYNC_PASS\n1 FP8_CACHED_VERSION_CHECK_PASS\n0 checkpoint_y relative_l2 0.0 max_abs 0.0\n0 checkpoint_dx relative_l2 0.0 max_abs 0.0\n0 checkpoint_dg relative_l2 1.3135871768099605e-07 max_abs 4.291534423828125e-06\n1 checkpoint_y relative_l2 0.0 max_abs 0.0\n1 checkpoint_dx relative_l2 3.629798811743967e-05 max_abs 0.00390625\n1 checkpoint_dg relative_l2 1.846769350777322e-07 max_abs 5.7220458984375e-06\n0 checkpoint_dw1 relative_l2 5.765584205619234e-07 max_abs 0.00011444091796875\n1 checkpoint_dw1 relative_l2 0.0 max_abs 0.0\n0 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n0 FP8_CHECKPOINT_PASS\n1 checkpoint_dw2 relative_l2 0.0 max_abs 0.0\n1 FP8_CHECKPOINT_PASS\n01  FP8_OPTIMIZER_PASSFP8_OPTIMIZER_PASS\n\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\n1 inference relative_l2 0.0 max_abs 0.0\n0 inference relative_l2 0.0 max_abs 0.0\n1 FP8_INFERENCE_PASS\n0 FP8_INFERENCE_PASS\n",
+      "native_sha256": "9b532818b1c725bbbd5477db5911496c7539863f744a71bb31058f8e9173ddd2",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-preparation",
+      "kind": "preparation_diagnostic",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_fp8_weight_preparation.py",
+        "--output",
+        "docs/benchmarks/fp8_dual_weight_preparation_20261029.json"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 7.243951082229614,
+      "result": null,
+      "stdout": "W1029 08:03:40.910000 262009 torch/distributed/run.py:803] \nW1029 08:03:40.910000 262009 torch/distributed/run.py:803] *****************************************\nW1029 08:03:40.910000 262009 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:40.910000 262009 torch/distributed/run.py:803] *****************************************\n[Gloo] Rank [Gloo] Rank 10 is connected to  is connected to 11 peer ranks.  peer ranks. Expected number of connected peer ranks is : Expected number of connected peer ranks is : 11\n\n{\"profile\": \"qwen35b\", \"shapes\": [[128, 1024, 2048], [128, 2048, 512]], \"max_rank_p50_ms\": {\"separate\": 2.9714720249176025, \"fused\": 1.27675199508667}, \"speedup\": 2.327368225272199}\n{\"profile\": \"qwen122b\", \"shapes\": [[128, 2048, 3072], [128, 3072, 1024]], \"max_rank_p50_ms\": {\"separate\": 8.79431962966919, \"fused\": 3.772480010986328}, \"speedup\": 2.3311772637782338}\n{\"profile\": \"flash\", \"shapes\": [[128, 4096, 4096], [128, 4096, 2048]], \"max_rank_p50_ms\": {\"separate\": 23.407968521118164, \"fused\": 9.985919952392578}, \"speedup\": 2.3440973523435593}\n",
+      "native_sha256": "fe2687f7bf0bf0120dff89568421794a95b7a4da4e323476ec9ed327c7a67686",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-qwen35b-8192-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "8192",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 8.224447965621948,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "a71aa402b95cb2a07d43f84f3ef44a7c338ca6b5753e4b34b883b5ae0a1ffeba",
+          "e77fcb2774d4824735da2d046b2d266ee85ba6b16965d3348dc7aea738e35ff9"
+        ],
+        "per_rank_tokens": [
+          [
+            7771,
+            7571,
+            8351,
+            9297,
+            7552,
+            7762,
+            6979,
+            8916,
+            6998,
+            7498,
+            7927,
+            8474,
+            8032,
+            8124,
+            7428,
+            9038,
+            7557,
+            9238,
+            8354,
+            8279,
+            8251,
+            9908,
+            6466,
+            6643,
+            7241,
+            8709,
+            8348,
+            7453,
+            9393,
+            7148
+          ],
+          [
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062,
+            8138,
+            8915,
+            7357,
+            8584,
+            9068,
+            8719,
+            8895,
+            8442,
+            8162,
+            7644,
+            8095,
+            7290,
+            7489,
+            7746,
+            6477
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8751,
+            8645,
+            7301,
+            9159,
+            6958,
+            7972,
+            8040,
+            6622,
+            8671,
+            8054
+          ],
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436,
+            9690,
+            8345,
+            7338,
+            8534,
+            6683
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            61048,
+            65413,
+            61403,
+            77008,
+            63274,
+            60385,
+            63072,
+            75472,
+            64962,
+            61720,
+            61405,
+            68809,
+            59290,
+            62972,
+            64414,
+            58570,
+            67652,
+            56075,
+            72192,
+            75075,
+            70253,
+            73491,
+            56903,
+            57697,
+            63719,
+            63636,
+            62636,
+            57958,
+            67984,
+            46695
+          ],
+          [
+            74224,
+            64507,
+            67309,
+            58456,
+            69870,
+            59887,
+            68048,
+            62800,
+            66326,
+            61328,
+            54683,
+            72567,
+            75414,
+            64644,
+            59506,
+            78838,
+            64124,
+            76685,
+            63312,
+            63701,
+            65507,
+            76933,
+            62361,
+            60743,
+            55361,
+            70796,
+            62468,
+            61578,
+            69128,
+            62305
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          5,
+          3,
+          1,
+          10,
+          1,
+          3,
+          9,
+          0,
+          9,
+          2,
+          3,
+          6,
+          4,
+          4,
+          6,
+          3,
+          1,
+          1,
+          3,
+          4,
+          7,
+          4,
+          1,
+          6,
+          6,
+          1,
+          0,
+          5,
+          5,
+          6
+        ],
+        "expert_rows_max_per_step": [
+          3640,
+          5472,
+          4609,
+          4281,
+          3094,
+          3075,
+          3496,
+          3755,
+          3867,
+          3282,
+          3019,
+          4623,
+          4540,
+          2539,
+          3491,
+          4620,
+          3776,
+          4076,
+          3448,
+          3510,
+          3924,
+          4700,
+          2285,
+          4770,
+          2603,
+          3657,
+          4272,
+          3498,
+          3595,
+          2118
+        ],
+        "actual_tokens_min": 6466,
+        "actual_tokens_max": 9908,
+        "actual_tokens_mean": 8113.733333333334,
+        "actual_tokens_std": 814.5260967103646,
+        "max_tokens_capacity": 9908,
+        "max_rows_capacity": 99916,
+        "input_tokens_per_second": 2879451.66019028,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 5629.1975,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 458.58050000000003,
+        "backward_slowest_rank_p50_us": 5169.677,
+        "wall_slowest_rank_samples_us": [
+          6028.227,
+          5461.174,
+          5700.139,
+          6059.447,
+          5604.82,
+          5219.695,
+          5605.151,
+          6015.645,
+          5513.456,
+          5318.741,
+          5255.054,
+          5848.512,
+          5958.779,
+          5372.444,
+          5374.638,
+          6161.365,
+          5653.244,
+          6113.926,
+          5792.181,
+          6013.686,
+          5830.935,
+          6161.445,
+          5131.333,
+          5208.831,
+          5317.974,
+          5788.755,
+          5376.423,
+          5183.542,
+          5833.47,
+          5165.269
+        ],
+        "per_rank_wall_us": [
+          [
+            6028.227,
+            5451.683,
+            5663.703,
+            6049.54,
+            5600.232,
+            5215.273,
+            5605.151,
+            6013.585,
+            5508.805,
+            5318.741,
+            5248.284,
+            5847.938,
+            5951.472,
+            5372.444,
+            5374.638,
+            6161.365,
+            5653.244,
+            6110.384,
+            5788.448,
+            6007.298,
+            5828.791,
+            6161.445,
+            5130.492,
+            5202.498,
+            5311.986,
+            5785.554,
+            5366.096,
+            5176.18,
+            5833.47,
+            5160.106
+          ],
+          [
+            6023.412,
+            5461.174,
+            5700.139,
+            6059.447,
+            5604.82,
+            5219.695,
+            5598.018,
+            6015.645,
+            5513.456,
+            5317.968,
+            5255.054,
+            5848.512,
+            5958.779,
+            5348.123,
+            5369.961,
+            6159.543,
+            5652.849,
+            6113.926,
+            5792.181,
+            6013.686,
+            5830.935,
+            6155.326,
+            5131.333,
+            5208.831,
+            5317.974,
+            5788.755,
+            5376.423,
+            5183.542,
+            5827.813,
+            5165.269
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261032478695170,
+              1793261032484727561
+            ],
+            [
+              1793261032485330387,
+              1793261032490785915
+            ],
+            [
+              1793261032491407323,
+              1793261032497073498
+            ],
+            [
+              1793261032497710271,
+              1793261032503762049
+            ],
+            [
+              1793261032504375508,
+              1793261032509978499
+            ],
+            [
+              1793261032510519057,
+              1793261032515736659
+            ],
+            [
+              1793261032516340280,
+              1793261032521947866
+            ],
+            [
+              1793261032522534568,
+              1793261032528550228
+            ],
+            [
+              1793261032529173819,
+              1793261032534685137
+            ],
+            [
+              1793261032535254192,
+              1793261032540575480
+            ],
+            [
+              1793261032541173733,
+              1793261032546424303
+            ],
+            [
+              1793261032547035641,
+              1793261032552885906
+            ],
+            [
+              1793261032553499854,
+              1793261032559453355
+            ],
+            [
+              1793261032561357280,
+              1793261032566731869
+            ],
+            [
+              1793261032567308961,
+              1793261032572685792
+            ],
+            [
+              1793261032573294916,
+              1793261032579458388
+            ],
+            [
+              1793261032580086989,
+              1793261032585742750
+            ],
+            [
+              1793261032586349985,
+              1793261032592462608
+            ],
+            [
+              1793261032593065953,
+              1793261032598856488
+            ],
+            [
+              1793261032599487403,
+              1793261032605496879
+            ],
+            [
+              1793261032606113935,
+              1793261032611944886
+            ],
+            [
+              1793261032612597365,
+              1793261032618760980
+            ],
+            [
+              1793261032619327219,
+              1793261032624459914
+            ],
+            [
+              1793261032625058285,
+              1793261032630263049
+            ],
+            [
+              1793261032630819343,
+              1793261032636133887
+            ],
+            [
+              1793261032636759567,
+              1793261032642547279
+            ],
+            [
+              1793261032643133294,
+              1793261032648501560
+            ],
+            [
+              1793261032649057720,
+              1793261032654235895
+            ],
+            [
+              1793261032654848102,
+              1793261032660683850
+            ],
+            [
+              1793261032661196604,
+              1793261032666358754
+            ]
+          ],
+          [
+            [
+              1793261032478693895,
+              1793261032484722102
+            ],
+            [
+              1793261032485325759,
+              1793261032490791118
+            ],
+            [
+              1793261032491370090,
+              1793261032497072770
+            ],
+            [
+              1793261032497706080,
+              1793261032503767779
+            ],
+            [
+              1793261032504376205,
+              1793261032509984080
+            ],
+            [
+              1793261032510519329,
+              1793261032515741401
+            ],
+            [
+              1793261032516339906,
+              1793261032521940292
+            ],
+            [
+              1793261032522532679,
+              1793261032528550454
+            ],
+            [
+              1793261032529173019,
+              1793261032534688962
+            ],
+            [
+              1793261032535251508,
+              1793261032540571758
+            ],
+            [
+              1793261032541166082,
+              1793261032546423294
+            ],
+            [
+              1793261032547034674,
+              1793261032552885686
+            ],
+            [
+              1793261032553498327,
+              1793261032559460548
+            ],
+            [
+              1793261032561374417,
+              1793261032566725040
+            ],
+            [
+              1793261032567310037,
+              1793261032572682211
+            ],
+            [
+              1793261032573292521,
+              1793261032579454300
+            ],
+            [
+              1793261032580089351,
+              1793261032585744667
+            ],
+            [
+              1793261032586344280,
+              1793261032592460422
+            ],
+            [
+              1793261032593064264,
+              1793261032598858841
+            ],
+            [
+              1793261032599486676,
+              1793261032605502585
+            ],
+            [
+              1793261032606111456,
+              1793261032611944671
+            ],
+            [
+              1793261032612595826,
+              1793261032618753318
+            ],
+            [
+              1793261032619325648,
+              1793261032624459128
+            ],
+            [
+              1793261032625053705,
+              1793261032630264522
+            ],
+            [
+              1793261032630812960,
+              1793261032636133606
+            ],
+            [
+              1793261032636756243,
+              1793261032642546967
+            ],
+            [
+              1793261032643126337,
+              1793261032648505161
+            ],
+            [
+              1793261032649054549,
+              1793261032654240179
+            ],
+            [
+              1793261032654847217,
+              1793261032660676989
+            ],
+            [
+              1793261032661192816,
+              1793261032666360085
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 609528456,
+            "last_forward_tensor_bytes": 199192436,
+            "last_backward_tensor_bytes": 1091000448,
+            "gin_bytes": 0,
+            "notify_bytes": 43417992,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 609528456,
+            "last_forward_tensor_bytes": 246284524,
+            "last_backward_tensor_bytes": 1144588960,
+            "gin_bytes": 0,
+            "notify_bytes": 43417992,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:03:48.218000 262137 torch/distributed/run.py:803] \nW1029 08:03:48.218000 262137 torch/distributed/run.py:803] *****************************************\nW1029 08:03:48.218000 262137 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:48.218000 262137 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 8192, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"a71aa402b95cb2a07d43f84f3ef44a7c338ca6b5753e4b34b883b5ae0a1ffeba\", \"e77fcb2774d4824735da2d046b2d266ee85ba6b16965d3348dc7aea738e35ff9\"], \"per_rank_tokens\": [[7771, 7571, 8351, 9297, 7552, 7762, 6979, 8916, 6998, 7498, 7927, 8474, 8032, 8124, 7428, 9038, 7557, 9238, 8354, 8279, 8251, 9908, 6466, 6643, 7241, 8709, 8348, 7453, 9393, 7148], [9138, 8669, 7738, 7636, 9091, 7272, 9411, 8368, 9413, 7883, 6584, 9198, 8806, 7828, 8062, 8138, 8915, 7357, 8584, 9068, 8719, 8895, 8442, 8162, 7644, 8095, 7290, 7489, 7746, 6477]], \"per_rank_warmup_tokens\": [[8751, 8645, 7301, 9159, 6958, 7972, 8040, 6622, 8671, 8054], [8681, 7887, 8407, 8318, 8436, 9690, 8345, 7338, 8534, 6683]], \"per_rank_received_rows\": [[61048, 65413, 61403, 77008, 63274, 60385, 63072, 75472, 64962, 61720, 61405, 68809, 59290, 62972, 64414, 58570, 67652, 56075, 72192, 75075, 70253, 73491, 56903, 57697, 63719, 63636, 62636, 57958, 67984, 46695], [74224, 64507, 67309, 58456, 69870, 59887, 68048, 62800, 66326, 61328, 54683, 72567, 75414, 64644, 59506, 78838, 64124, 76685, 63312, 63701, 65507, 76933, 62361, 60743, 55361, 70796, 62468, 61578, 69128, 62305]], \"expert_rows_min_per_step\": [5, 3, 1, 10, 1, 3, 9, 0, 9, 2, 3, 6, 4, 4, 6, 3, 1, 1, 3, 4, 7, 4, 1, 6, 6, 1, 0, 5, 5, 6], \"expert_rows_max_per_step\": [3640, 5472, 4609, 4281, 3094, 3075, 3496, 3755, 3867, 3282, 3019, 4623, 4540, 2539, 3491, 4620, 3776, 4076, 3448, 3510, 3924, 4700, 2285, 4770, 2603, 3657, 4272, 3498, 3595, 2118], \"actual_tokens_min\": 6466, \"actual_tokens_max\": 9908, \"actual_tokens_mean\": 8113.733333333334, \"actual_tokens_std\": 814.5260967103646, \"max_tokens_capacity\": 9908, \"max_rows_capacity\": 99916, \"input_tokens_per_second\": 2879451.66019028, \"experts\": 256, \"top_k\": 8, \"hidden\": 2048, \"intermediate\": 512, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 5629.1975, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 458.58050000000003, \"backward_slowest_rank_p50_us\": 5169.677, \"wall_slowest_rank_samples_us\": [6028.227, 5461.174, 5700.139, 6059.447, 5604.82, 5219.695, 5605.151, 6015.645, 5513.456, 5318.741, 5255.054, 5848.512, 5958.779, 5372.444, 5374.638, 6161.365, 5653.244, 6113.926, 5792.181, 6013.686, 5830.935, 6161.445, 5131.333, 5208.831, 5317.974, 5788.755, 5376.423, 5183.542, 5833.47, 5165.269], \"per_rank_wall_us\": [[6028.227, 5451.683, 5663.703, 6049.54, 5600.232, 5215.273, 5605.151, 6013.585, 5508.805, 5318.741, 5248.284, 5847.938, 5951.472, 5372.444, 5374.638, 6161.365, 5653.244, 6110.384, 5788.448, 6007.298, 5828.791, 6161.445, 5130.492, 5202.498, 5311.986, 5785.554, 5366.096, 5176.18, 5833.47, 5160.106], [6023.412, 5461.174, 5700.139, 6059.447, 5604.82, 5219.695, 5598.018, 6015.645, 5513.456, 5317.968, 5255.054, 5848.512, 5958.779, 5348.123, 5369.961, 6159.543, 5652.849, 6113.926, 5792.181, 6013.686, 5830.935, 6155.326, 5131.333, 5208.831, 5317.974, 5788.755, 5376.423, 5183.542, 5827.813, 5165.269]], \"measurement_intervals_ns_per_rank\": [[[1793261032478695170, 1793261032484727561], [1793261032485330387, 1793261032490785915], [1793261032491407323, 1793261032497073498], [1793261032497710271, 1793261032503762049], [1793261032504375508, 1793261032509978499], [1793261032510519057, 1793261032515736659], [1793261032516340280, 1793261032521947866], [1793261032522534568, 1793261032528550228], [1793261032529173819, 1793261032534685137], [1793261032535254192, 1793261032540575480], [1793261032541173733, 1793261032546424303], [1793261032547035641, 1793261032552885906], [1793261032553499854, 1793261032559453355], [1793261032561357280, 1793261032566731869], [1793261032567308961, 1793261032572685792], [1793261032573294916, 1793261032579458388], [1793261032580086989, 1793261032585742750], [1793261032586349985, 1793261032592462608], [1793261032593065953, 1793261032598856488], [1793261032599487403, 1793261032605496879], [1793261032606113935, 1793261032611944886], [1793261032612597365, 1793261032618760980], [1793261032619327219, 1793261032624459914], [1793261032625058285, 1793261032630263049], [1793261032630819343, 1793261032636133887], [1793261032636759567, 1793261032642547279], [1793261032643133294, 1793261032648501560], [1793261032649057720, 1793261032654235895], [1793261032654848102, 1793261032660683850], [1793261032661196604, 1793261032666358754]], [[1793261032478693895, 1793261032484722102], [1793261032485325759, 1793261032490791118], [1793261032491370090, 1793261032497072770], [1793261032497706080, 1793261032503767779], [1793261032504376205, 1793261032509984080], [1793261032510519329, 1793261032515741401], [1793261032516339906, 1793261032521940292], [1793261032522532679, 1793261032528550454], [1793261032529173019, 1793261032534688962], [1793261032535251508, 1793261032540571758], [1793261032541166082, 1793261032546423294], [1793261032547034674, 1793261032552885686], [1793261032553498327, 1793261032559460548], [1793261032561374417, 1793261032566725040], [1793261032567310037, 1793261032572682211], [1793261032573292521, 1793261032579454300], [1793261032580089351, 1793261032585744667], [1793261032586344280, 1793261032592460422], [1793261032593064264, 1793261032598858841], [1793261032599486676, 1793261032605502585], [1793261032606111456, 1793261032611944671], [1793261032612595826, 1793261032618753318], [1793261032619325648, 1793261032624459128], [1793261032625053705, 1793261032630264522], [1793261032630812960, 1793261032636133606], [1793261032636756243, 1793261032642546967], [1793261032643126337, 1793261032648505161], [1793261032649054549, 1793261032654240179], [1793261032654847217, 1793261032660676989], [1793261032661192816, 1793261032666360085]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 609528456, \"last_forward_tensor_bytes\": 199192436, \"last_backward_tensor_bytes\": 1091000448, \"gin_bytes\": 0, \"notify_bytes\": 43417992, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 609528456, \"last_forward_tensor_bytes\": 246284524, \"last_backward_tensor_bytes\": 1144588960, \"gin_bytes\": 0, \"notify_bytes\": 43417992, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "fe2687f7bf0bf0120dff89568421794a95b7a4da4e323476ec9ed327c7a67686",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-qwen35b-20480-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen35b",
+        "--tokens",
+        "20480",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 10.604331970214844,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 20480,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "f5d46552292cb2d64bb83707ae5f861026255ca379266e6e80613336a3ca081c",
+          "ccc86ff6cc1f7610ca2656dba125c2e7e74a2f4afd95084721a44a512eca3dfb"
+        ],
+        "per_rank_tokens": [
+          [
+            22702,
+            23424,
+            24179,
+            18004,
+            20834,
+            22222,
+            18797,
+            21482,
+            21274,
+            19417,
+            17066,
+            22795,
+            18753,
+            20964,
+            20142,
+            22088,
+            19946,
+            18905,
+            19884,
+            21974,
+            16538,
+            20792,
+            20737,
+            20779,
+            20307,
+            18455,
+            18757,
+            21520,
+            20206,
+            19479
+          ],
+          [
+            22495,
+            17983,
+            20896,
+            18155,
+            22184,
+            18667,
+            23365,
+            18017,
+            18521,
+            21704,
+            21165,
+            19360,
+            20733,
+            19655,
+            15462,
+            22786,
+            20399,
+            19137,
+            21618,
+            17683,
+            17724,
+            19012,
+            19301,
+            17100,
+            24025,
+            20205,
+            21746,
+            22381,
+            16990,
+            22474
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            18938,
+            20452,
+            17829,
+            22325,
+            22973,
+            18593,
+            19138,
+            19475,
+            19803,
+            21898
+          ],
+          [
+            16737,
+            20798,
+            21164,
+            21908,
+            22021,
+            18594,
+            19396,
+            22736,
+            17484,
+            25019
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            166230,
+            155972,
+            187993,
+            146095,
+            162578,
+            136752,
+            189777,
+            167683,
+            156167,
+            165391,
+            135699,
+            145075,
+            155696,
+            167791,
+            150551,
+            180534,
+            168190,
+            157278,
+            156581,
+            134994,
+            134690,
+            170605,
+            134701,
+            141466,
+            189248,
+            171099,
+            172079,
+            144967,
+            159295,
+            198528
+          ],
+          [
+            195346,
+            175284,
+            172607,
+            143177,
+            181566,
+            190360,
+            147519,
+            148309,
+            162193,
+            163577,
+            170149,
+            192165,
+            160192,
+            157161,
+            134281,
+            178458,
+            154570,
+            147058,
+            175435,
+            182262,
+            139406,
+            147827,
+            185603,
+            161566,
+            165408,
+            138181,
+            151945,
+            206241,
+            138273,
+            137096
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          11,
+          9,
+          11,
+          17,
+          29,
+          43,
+          4,
+          3,
+          19,
+          5,
+          23,
+          4,
+          2,
+          10,
+          6,
+          7,
+          11,
+          8,
+          3,
+          11,
+          8,
+          32,
+          14,
+          29,
+          5,
+          4,
+          8,
+          1,
+          15,
+          8
+        ],
+        "expert_rows_max_per_step": [
+          9761,
+          16443,
+          10029,
+          8565,
+          7837,
+          10641,
+          12943,
+          11083,
+          9618,
+          12329,
+          8518,
+          17948,
+          6849,
+          7643,
+          9991,
+          10088,
+          10371,
+          8743,
+          9577,
+          9071,
+          11284,
+          10142,
+          8691,
+          7513,
+          8256,
+          13463,
+          13014,
+          9406,
+          8322,
+          10780
+        ],
+        "actual_tokens_min": 15462,
+        "actual_tokens_max": 24179,
+        "actual_tokens_mean": 20222.75,
+        "actual_tokens_std": 1974.0109897110501,
+        "max_tokens_capacity": 25019,
+        "max_rows_capacity": 222625,
+        "input_tokens_per_second": 3344381.2175356857,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 11899.7945,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 550.046,
+        "backward_slowest_rank_p50_us": 11360.079,
+        "wall_slowest_rank_samples_us": [
+          13339.067,
+          12380.097,
+          13663.295,
+          11419.362,
+          12581.72,
+          13120.869,
+          12959.337,
+          11698.89,
+          11220.002,
+          11785.618,
+          11710.715,
+          13204.329,
+          11138.137,
+          11462.68,
+          10423.405,
+          12467.052,
+          11695.407,
+          11015.456,
+          12047.94,
+          12633.354,
+          9966.759,
+          11756.545,
+          12517.64,
+          11269.659,
+          12939.575,
+          11811.057,
+          11988.532,
+          14026.383,
+          11126.945,
+          13437.198
+        ],
+        "per_rank_wall_us": [
+          [
+            13339.067,
+            12380.097,
+            13663.295,
+            10872.81,
+            12581.36,
+            13120.16,
+            12956.402,
+            11697.5,
+            11200.471,
+            11785.618,
+            11710.715,
+            13198.723,
+            11138.137,
+            11462.68,
+            10417.874,
+            12462.457,
+            11691.291,
+            11008.971,
+            12047.71,
+            12633.354,
+            9965.216,
+            11755.543,
+            12514.814,
+            11262.323,
+            12936.583,
+            11811.057,
+            11987.704,
+            14026.383,
+            11126.945,
+            13435.047
+          ],
+          [
+            13336.031,
+            12379.891,
+            12823.698,
+            11419.362,
+            12581.72,
+            13120.869,
+            12959.337,
+            11698.89,
+            11220.002,
+            11649.849,
+            11703.95,
+            13204.329,
+            11133.112,
+            11457.229,
+            10423.405,
+            12467.052,
+            11695.407,
+            11015.456,
+            12047.94,
+            12632.83,
+            9966.759,
+            11756.545,
+            12517.64,
+            11269.659,
+            12939.575,
+            11808.27,
+            11988.532,
+            14017.76,
+            10981.847,
+            13437.198
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261041855803810,
+              1793261041869147469
+            ],
+            [
+              1793261041870771048,
+              1793261041883155653
+            ],
+            [
+              1793261041884873877,
+              1793261041898540243
+            ],
+            [
+              1793261041901091610,
+              1793261041911966979
+            ],
+            [
+              1793261041913518932,
+              1793261041926103475
+            ],
+            [
+              1793261041927690224,
+              1793261041940812669
+            ],
+            [
+              1793261041942422751,
+              1793261041955381435
+            ],
+            [
+              1793261041956894801,
+              1793261041968594756
+            ],
+            [
+              1793261041970123491,
+              1793261041981326581
+            ],
+            [
+              1793261041982882147,
+              1793261041994670126
+            ],
+            [
+              1793261041996090279,
+              1793261042007803048
+            ],
+            [
+              1793261042009417704,
+              1793261042022618874
+            ],
+            [
+              1793261042023990243,
+              1793261042035130746
+            ],
+            [
+              1793261042036646052,
+              1793261042048110935
+            ],
+            [
+              1793261042049524609,
+              1793261042059944539
+            ],
+            [
+              1793261042061572733,
+              1793261042074037438
+            ],
+            [
+              1793261042075479172,
+              1793261042087172911
+            ],
+            [
+              1793261042088602443,
+              1793261042099613509
+            ],
+            [
+              1793261042101082755,
+              1793261042113132736
+            ],
+            [
+              1793261042114650015,
+              1793261042127285412
+            ],
+            [
+              1793261042128556487,
+              1793261042138523767
+            ],
+            [
+              1793261042140039733,
+              1793261042151797427
+            ],
+            [
+              1793261042154043648,
+              1793261042166563692
+            ],
+            [
+              1793261042168885776,
+              1793261042180150335
+            ],
+            [
+              1793261042182748973,
+              1793261042195688553
+            ],
+            [
+              1793261042197859685,
+              1793261042209673003
+            ],
+            [
+              1793261042212058025,
+              1793261042224048089
+            ],
+            [
+              1793261042226541294,
+              1793261042240569836
+            ],
+            [
+              1793261042242812299,
+              1793261042253941512
+            ],
+            [
+              1793261042256343833,
+              1793261042269781412
+            ]
+          ],
+          [
+            [
+              1793261041855807314,
+              1793261041869148480
+            ],
+            [
+              1793261041870773439,
+              1793261041883157540
+            ],
+            [
+              1793261041884875073,
+              1793261041897701785
+            ],
+            [
+              1793261041900544789,
+              1793261041911966463
+            ],
+            [
+              1793261041913515280,
+              1793261041926100417
+            ],
+            [
+              1793261041927686594,
+              1793261041940809674
+            ],
+            [
+              1793261041942419001,
+              1793261041955380559
+            ],
+            [
+              1793261041956893086,
+              1793261041968594639
+            ],
+            [
+              1793261041970120330,
+              1793261041981344251
+            ],
+            [
+              1793261041983021459,
+              1793261041994673661
+            ],
+            [
+              1793261041996090338,
+              1793261042007796582
+            ],
+            [
+              1793261042009416570,
+              1793261042022623472
+            ],
+            [
+              1793261042023991250,
+              1793261042035126498
+            ],
+            [
+              1793261042036645259,
+              1793261042048104745
+            ],
+            [
+              1793261042049522012,
+              1793261042059947623
+            ],
+            [
+              1793261042061571406,
+              1793261042074040618
+            ],
+            [
+              1793261042075478960,
+              1793261042087176951
+            ],
+            [
+              1793261042088600145,
+              1793261042099617627
+            ],
+            [
+              1793261042101082789,
+              1793261042113132866
+            ],
+            [
+              1793261042114650879,
+              1793261042127285837
+            ],
+            [
+              1793261042128557384,
+              1793261042138526432
+            ],
+            [
+              1793261042140039643,
+              1793261042151798439
+            ],
+            [
+              1793261042154041875,
+              1793261042166566151
+            ],
+            [
+              1793261042168884036,
+              1793261042180155979
+            ],
+            [
+              1793261042182748037,
+              1793261042195690814
+            ],
+            [
+              1793261042197859958,
+              1793261042209670450
+            ],
+            [
+              1793261042212061703,
+              1793261042224052865
+            ],
+            [
+              1793261042226542274,
+              1793261042240566467
+            ],
+            [
+              1793261042242953411,
+              1793261042253937506
+            ],
+            [
+              1793261042256345268,
+              1793261042269784680
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1336867976,
+            "last_forward_tensor_bytes": 740301312,
+            "last_backward_tensor_bytes": 1700277216,
+            "gin_bytes": 0,
+            "notify_bytes": 109456216,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1336867976,
+            "last_forward_tensor_bytes": 555158880,
+            "last_backward_tensor_bytes": 1488627776,
+            "gin_bytes": 0,
+            "notify_bytes": 109456216,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:03:56.539000 262304 torch/distributed/run.py:803] \nW1029 08:03:56.539000 262304 torch/distributed/run.py:803] *****************************************\nW1029 08:03:56.539000 262304 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:03:56.539000 262304 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 20480, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"f5d46552292cb2d64bb83707ae5f861026255ca379266e6e80613336a3ca081c\", \"ccc86ff6cc1f7610ca2656dba125c2e7e74a2f4afd95084721a44a512eca3dfb\"], \"per_rank_tokens\": [[22702, 23424, 24179, 18004, 20834, 22222, 18797, 21482, 21274, 19417, 17066, 22795, 18753, 20964, 20142, 22088, 19946, 18905, 19884, 21974, 16538, 20792, 20737, 20779, 20307, 18455, 18757, 21520, 20206, 19479], [22495, 17983, 20896, 18155, 22184, 18667, 23365, 18017, 18521, 21704, 21165, 19360, 20733, 19655, 15462, 22786, 20399, 19137, 21618, 17683, 17724, 19012, 19301, 17100, 24025, 20205, 21746, 22381, 16990, 22474]], \"per_rank_warmup_tokens\": [[18938, 20452, 17829, 22325, 22973, 18593, 19138, 19475, 19803, 21898], [16737, 20798, 21164, 21908, 22021, 18594, 19396, 22736, 17484, 25019]], \"per_rank_received_rows\": [[166230, 155972, 187993, 146095, 162578, 136752, 189777, 167683, 156167, 165391, 135699, 145075, 155696, 167791, 150551, 180534, 168190, 157278, 156581, 134994, 134690, 170605, 134701, 141466, 189248, 171099, 172079, 144967, 159295, 198528], [195346, 175284, 172607, 143177, 181566, 190360, 147519, 148309, 162193, 163577, 170149, 192165, 160192, 157161, 134281, 178458, 154570, 147058, 175435, 182262, 139406, 147827, 185603, 161566, 165408, 138181, 151945, 206241, 138273, 137096]], \"expert_rows_min_per_step\": [11, 9, 11, 17, 29, 43, 4, 3, 19, 5, 23, 4, 2, 10, 6, 7, 11, 8, 3, 11, 8, 32, 14, 29, 5, 4, 8, 1, 15, 8], \"expert_rows_max_per_step\": [9761, 16443, 10029, 8565, 7837, 10641, 12943, 11083, 9618, 12329, 8518, 17948, 6849, 7643, 9991, 10088, 10371, 8743, 9577, 9071, 11284, 10142, 8691, 7513, 8256, 13463, 13014, 9406, 8322, 10780], \"actual_tokens_min\": 15462, \"actual_tokens_max\": 24179, \"actual_tokens_mean\": 20222.75, \"actual_tokens_std\": 1974.0109897110501, \"max_tokens_capacity\": 25019, \"max_rows_capacity\": 222625, \"input_tokens_per_second\": 3344381.2175356857, \"experts\": 256, \"top_k\": 8, \"hidden\": 2048, \"intermediate\": 512, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 11899.7945, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 550.046, \"backward_slowest_rank_p50_us\": 11360.079, \"wall_slowest_rank_samples_us\": [13339.067, 12380.097, 13663.295, 11419.362, 12581.72, 13120.869, 12959.337, 11698.89, 11220.002, 11785.618, 11710.715, 13204.329, 11138.137, 11462.68, 10423.405, 12467.052, 11695.407, 11015.456, 12047.94, 12633.354, 9966.759, 11756.545, 12517.64, 11269.659, 12939.575, 11811.057, 11988.532, 14026.383, 11126.945, 13437.198], \"per_rank_wall_us\": [[13339.067, 12380.097, 13663.295, 10872.81, 12581.36, 13120.16, 12956.402, 11697.5, 11200.471, 11785.618, 11710.715, 13198.723, 11138.137, 11462.68, 10417.874, 12462.457, 11691.291, 11008.971, 12047.71, 12633.354, 9965.216, 11755.543, 12514.814, 11262.323, 12936.583, 11811.057, 11987.704, 14026.383, 11126.945, 13435.047], [13336.031, 12379.891, 12823.698, 11419.362, 12581.72, 13120.869, 12959.337, 11698.89, 11220.002, 11649.849, 11703.95, 13204.329, 11133.112, 11457.229, 10423.405, 12467.052, 11695.407, 11015.456, 12047.94, 12632.83, 9966.759, 11756.545, 12517.64, 11269.659, 12939.575, 11808.27, 11988.532, 14017.76, 10981.847, 13437.198]], \"measurement_intervals_ns_per_rank\": [[[1793261041855803810, 1793261041869147469], [1793261041870771048, 1793261041883155653], [1793261041884873877, 1793261041898540243], [1793261041901091610, 1793261041911966979], [1793261041913518932, 1793261041926103475], [1793261041927690224, 1793261041940812669], [1793261041942422751, 1793261041955381435], [1793261041956894801, 1793261041968594756], [1793261041970123491, 1793261041981326581], [1793261041982882147, 1793261041994670126], [1793261041996090279, 1793261042007803048], [1793261042009417704, 1793261042022618874], [1793261042023990243, 1793261042035130746], [1793261042036646052, 1793261042048110935], [1793261042049524609, 1793261042059944539], [1793261042061572733, 1793261042074037438], [1793261042075479172, 1793261042087172911], [1793261042088602443, 1793261042099613509], [1793261042101082755, 1793261042113132736], [1793261042114650015, 1793261042127285412], [1793261042128556487, 1793261042138523767], [1793261042140039733, 1793261042151797427], [1793261042154043648, 1793261042166563692], [1793261042168885776, 1793261042180150335], [1793261042182748973, 1793261042195688553], [1793261042197859685, 1793261042209673003], [1793261042212058025, 1793261042224048089], [1793261042226541294, 1793261042240569836], [1793261042242812299, 1793261042253941512], [1793261042256343833, 1793261042269781412]], [[1793261041855807314, 1793261041869148480], [1793261041870773439, 1793261041883157540], [1793261041884875073, 1793261041897701785], [1793261041900544789, 1793261041911966463], [1793261041913515280, 1793261041926100417], [1793261041927686594, 1793261041940809674], [1793261041942419001, 1793261041955380559], [1793261041956893086, 1793261041968594639], [1793261041970120330, 1793261041981344251], [1793261041983021459, 1793261041994673661], [1793261041996090338, 1793261042007796582], [1793261042009416570, 1793261042022623472], [1793261042023991250, 1793261042035126498], [1793261042036645259, 1793261042048104745], [1793261042049522012, 1793261042059947623], [1793261042061571406, 1793261042074040618], [1793261042075478960, 1793261042087176951], [1793261042088600145, 1793261042099617627], [1793261042101082789, 1793261042113132866], [1793261042114650879, 1793261042127285837], [1793261042128557384, 1793261042138526432], [1793261042140039643, 1793261042151798439], [1793261042154041875, 1793261042166566151], [1793261042168884036, 1793261042180155979], [1793261042182748037, 1793261042195690814], [1793261042197859958, 1793261042209670450], [1793261042212061703, 1793261042224052865], [1793261042226542274, 1793261042240566467], [1793261042242953411, 1793261042253937506], [1793261042256345268, 1793261042269784680]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 1336867976, \"last_forward_tensor_bytes\": 740301312, \"last_backward_tensor_bytes\": 1700277216, \"gin_bytes\": 0, \"notify_bytes\": 109456216, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 1336867976, \"last_forward_tensor_bytes\": 555158880, \"last_backward_tensor_bytes\": 1488627776, \"gin_bytes\": 0, \"notify_bytes\": 109456216, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "fe2687f7bf0bf0120dff89568421794a95b7a4da4e323476ec9ed327c7a67686",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-qwen122b-8192-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen122b",
+        "--tokens",
+        "8192",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 9.845699071884155,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "a71aa402b95cb2a07d43f84f3ef44a7c338ca6b5753e4b34b883b5ae0a1ffeba",
+          "e77fcb2774d4824735da2d046b2d266ee85ba6b16965d3348dc7aea738e35ff9"
+        ],
+        "per_rank_tokens": [
+          [
+            7771,
+            7571,
+            8351,
+            9297,
+            7552,
+            7762,
+            6979,
+            8916,
+            6998,
+            7498,
+            7927,
+            8474,
+            8032,
+            8124,
+            7428,
+            9038,
+            7557,
+            9238,
+            8354,
+            8279,
+            8251,
+            9908,
+            6466,
+            6643,
+            7241,
+            8709,
+            8348,
+            7453,
+            9393,
+            7148
+          ],
+          [
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062,
+            8138,
+            8915,
+            7357,
+            8584,
+            9068,
+            8719,
+            8895,
+            8442,
+            8162,
+            7644,
+            8095,
+            7290,
+            7489,
+            7746,
+            6477
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8751,
+            8645,
+            7301,
+            9159,
+            6958,
+            7972,
+            8040,
+            6622,
+            8671,
+            8054
+          ],
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436,
+            9690,
+            8345,
+            7338,
+            8534,
+            6683
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            61048,
+            65413,
+            61403,
+            77008,
+            63274,
+            60385,
+            63072,
+            75472,
+            64962,
+            61720,
+            61405,
+            68809,
+            59290,
+            62972,
+            64414,
+            58570,
+            67652,
+            56075,
+            72192,
+            75075,
+            70253,
+            73491,
+            56903,
+            57697,
+            63719,
+            63636,
+            62636,
+            57958,
+            67984,
+            46695
+          ],
+          [
+            74224,
+            64507,
+            67309,
+            58456,
+            69870,
+            59887,
+            68048,
+            62800,
+            66326,
+            61328,
+            54683,
+            72567,
+            75414,
+            64644,
+            59506,
+            78838,
+            64124,
+            76685,
+            63312,
+            63701,
+            65507,
+            76933,
+            62361,
+            60743,
+            55361,
+            70796,
+            62468,
+            61578,
+            69128,
+            62305
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          5,
+          3,
+          1,
+          10,
+          1,
+          3,
+          9,
+          0,
+          9,
+          2,
+          3,
+          6,
+          4,
+          4,
+          6,
+          3,
+          1,
+          1,
+          3,
+          4,
+          7,
+          4,
+          1,
+          6,
+          6,
+          1,
+          0,
+          5,
+          5,
+          6
+        ],
+        "expert_rows_max_per_step": [
+          3640,
+          5472,
+          4609,
+          4281,
+          3094,
+          3075,
+          3496,
+          3755,
+          3867,
+          3282,
+          3019,
+          4623,
+          4540,
+          2539,
+          3491,
+          4620,
+          3776,
+          4076,
+          3448,
+          3510,
+          3924,
+          4700,
+          2285,
+          4770,
+          2603,
+          3657,
+          4272,
+          3498,
+          3595,
+          2118
+        ],
+        "actual_tokens_min": 6466,
+        "actual_tokens_max": 9908,
+        "actual_tokens_mean": 8113.733333333334,
+        "actual_tokens_std": 814.5260967103646,
+        "max_tokens_capacity": 9908,
+        "max_rows_capacity": 99916,
+        "input_tokens_per_second": 1516335.951452531,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 3072,
+        "intermediate": 1024,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 10620.378499999999,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 508.7725,
+        "backward_slowest_rank_p50_us": 10125.303,
+        "wall_slowest_rank_samples_us": [
+          11485.399,
+          10139.835,
+          10501.203,
+          11615.582,
+          10854.355,
+          9772.478,
+          10798.33,
+          11434.297,
+          10485.553,
+          9994.794,
+          9802.234,
+          11241.227,
+          11388.051,
+          10100.052,
+          9979.507,
+          11949.85,
+          10450.537,
+          11469.584,
+          10951.898,
+          11367.198,
+          11564.683,
+          12062.902,
+          10088.75,
+          9727.749,
+          10071.53,
+          11004.995,
+          10005.392,
+          9926.42,
+          10739.554,
+          10078.925
+        ],
+        "per_rank_wall_us": [
+          [
+            11482.669,
+            10139.835,
+            10501.203,
+            11615.582,
+            10853.123,
+            9772.478,
+            10786.391,
+            11429.655,
+            10485.553,
+            9994.794,
+            9798.7,
+            11241.227,
+            11387.517,
+            10092.958,
+            9979.507,
+            11949.85,
+            10450.537,
+            11466.83,
+            10951.898,
+            11367.198,
+            11488.159,
+            12062.902,
+            10088.75,
+            9727.749,
+            10071.53,
+            11004.995,
+            10004.493,
+            9925.732,
+            10737.858,
+            10075.233
+          ],
+          [
+            11485.399,
+            10139.602,
+            10495.415,
+            11607.422,
+            10854.355,
+            9765.591,
+            10798.33,
+            11434.297,
+            10479.01,
+            9980.886,
+            9802.234,
+            11235.37,
+            11388.051,
+            10100.052,
+            9970.581,
+            11939.236,
+            10449.344,
+            11469.584,
+            10949.127,
+            11365.266,
+            11564.683,
+            11943.181,
+            10083.847,
+            9722.35,
+            10070.212,
+            10999.129,
+            10005.392,
+            9926.42,
+            10739.554,
+            10078.925
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261053230123504,
+              1793261053241611324
+            ],
+            [
+              1793261053242295040,
+              1793261053252439622
+            ],
+            [
+              1793261053253087191,
+              1793261053263598787
+            ],
+            [
+              1793261053264315325,
+              1793261053275933562
+            ],
+            [
+              1793261053276610260,
+              1793261053287466396
+            ],
+            [
+              1793261053288058623,
+              1793261053297833664
+            ],
+            [
+              1793261053298554793,
+              1793261053309343678
+            ],
+            [
+              1793261053310036207,
+              1793261053321468090
+            ],
+            [
+              1793261053322170898,
+              1793261053332658938
+            ],
+            [
+              1793261053333291731,
+              1793261053343288839
+            ],
+            [
+              1793261053343905721,
+              1793261053353706810
+            ],
+            [
+              1793261053354423558,
+              1793261053365667327
+            ],
+            [
+              1793261053366336618,
+              1793261053377726489
+            ],
+            [
+              1793261053378375080,
+              1793261053388470165
+            ],
+            [
+              1793261053389101084,
+              1793261053399082566
+            ],
+            [
+              1793261053399772297,
+              1793261053411724216
+            ],
+            [
+              1793261053412406303,
+              1793261053422859258
+            ],
+            [
+              1793261053423550171,
+              1793261053435019045
+            ],
+            [
+              1793261053435669566,
+              1793261053446623410
+            ],
+            [
+              1793261053447322989,
+              1793261053458692238
+            ],
+            [
+              1793261053459364438,
+              1793261053470862176
+            ],
+            [
+              1793261053472161249,
+              1793261053484226673
+            ],
+            [
+              1793261053485012417,
+              1793261053495103205
+            ],
+            [
+              1793261053495735542,
+              1793261053505465609
+            ],
+            [
+              1793261053506080567,
+              1793261053516154515
+            ],
+            [
+              1793261053516813584,
+              1793261053527820611
+            ],
+            [
+              1793261053528454648,
+              1793261053538461363
+            ],
+            [
+              1793261053539056955,
+              1793261053548984999
+            ],
+            [
+              1793261053549706857,
+              1793261053560446808
+            ],
+            [
+              1793261053561012037,
+              1793261053571089440
+            ]
+          ],
+          [
+            [
+              1793261053230120330,
+              1793261053241609536
+            ],
+            [
+              1793261053242299352,
+              1793261053252442801
+            ],
+            [
+              1793261053253089080,
+              1793261053263587353
+            ],
+            [
+              1793261053264321426,
+              1793261053275931052
+            ],
+            [
+              1793261053276612191,
+              1793261053287469123
+            ],
+            [
+              1793261053288059002,
+              1793261053297826806
+            ],
+            [
+              1793261053298542494,
+              1793261053309343003
+            ],
+            [
+              1793261053310033633,
+              1793261053321469915
+            ],
+            [
+              1793261053322173039,
+              1793261053332655002
+            ],
+            [
+              1793261053333299009,
+              1793261053343281916
+            ],
+            [
+              1793261053343905959,
+              1793261053353710320
+            ],
+            [
+              1793261053354424890,
+              1793261053365662404
+            ],
+            [
+              1793261053366337853,
+              1793261053377727976
+            ],
+            [
+              1793261053378375964,
+              1793261053388478010
+            ],
+            [
+              1793261053389105604,
+              1793261053399078260
+            ],
+            [
+              1793261053399777688,
+              1793261053411719197
+            ],
+            [
+              1793261053412409179,
+              1793261053422861220
+            ],
+            [
+              1793261053423550694,
+              1793261053435022388
+            ],
+            [
+              1793261053435670833,
+              1793261053446621915
+            ],
+            [
+              1793261053447321067,
+              1793261053458688449
+            ],
+            [
+              1793261053459365444,
+              1793261053470952056
+            ],
+            [
+              1793261053472275146,
+              1793261053484220727
+            ],
+            [
+              1793261053485018130,
+              1793261053495104089
+            ],
+            [
+              1793261053495738354,
+              1793261053505462829
+            ],
+            [
+              1793261053506082840,
+              1793261053516155883
+            ],
+            [
+              1793261053516815405,
+              1793261053527816706
+            ],
+            [
+              1793261053528455863,
+              1793261053538463399
+            ],
+            [
+              1793261053539056847,
+              1793261053548985255
+            ],
+            [
+              1793261053549704709,
+              1793261053560446219
+            ],
+            [
+              1793261053561011235,
+              1793261053571092088
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 862719368,
+            "last_forward_tensor_bytes": 321669204,
+            "last_backward_tensor_bytes": 2913689728,
+            "gin_bytes": 0,
+            "notify_bytes": 43417992,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 862719368,
+            "last_forward_tensor_bytes": 399956236,
+            "last_backward_tensor_bytes": 3006116512,
+            "gin_bytes": 0,
+            "notify_bytes": 43417992,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:04:07.043000 262476 torch/distributed/run.py:803] \nW1029 08:04:07.043000 262476 torch/distributed/run.py:803] *****************************************\nW1029 08:04:07.043000 262476 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:04:07.043000 262476 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 8192, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"a71aa402b95cb2a07d43f84f3ef44a7c338ca6b5753e4b34b883b5ae0a1ffeba\", \"e77fcb2774d4824735da2d046b2d266ee85ba6b16965d3348dc7aea738e35ff9\"], \"per_rank_tokens\": [[7771, 7571, 8351, 9297, 7552, 7762, 6979, 8916, 6998, 7498, 7927, 8474, 8032, 8124, 7428, 9038, 7557, 9238, 8354, 8279, 8251, 9908, 6466, 6643, 7241, 8709, 8348, 7453, 9393, 7148], [9138, 8669, 7738, 7636, 9091, 7272, 9411, 8368, 9413, 7883, 6584, 9198, 8806, 7828, 8062, 8138, 8915, 7357, 8584, 9068, 8719, 8895, 8442, 8162, 7644, 8095, 7290, 7489, 7746, 6477]], \"per_rank_warmup_tokens\": [[8751, 8645, 7301, 9159, 6958, 7972, 8040, 6622, 8671, 8054], [8681, 7887, 8407, 8318, 8436, 9690, 8345, 7338, 8534, 6683]], \"per_rank_received_rows\": [[61048, 65413, 61403, 77008, 63274, 60385, 63072, 75472, 64962, 61720, 61405, 68809, 59290, 62972, 64414, 58570, 67652, 56075, 72192, 75075, 70253, 73491, 56903, 57697, 63719, 63636, 62636, 57958, 67984, 46695], [74224, 64507, 67309, 58456, 69870, 59887, 68048, 62800, 66326, 61328, 54683, 72567, 75414, 64644, 59506, 78838, 64124, 76685, 63312, 63701, 65507, 76933, 62361, 60743, 55361, 70796, 62468, 61578, 69128, 62305]], \"expert_rows_min_per_step\": [5, 3, 1, 10, 1, 3, 9, 0, 9, 2, 3, 6, 4, 4, 6, 3, 1, 1, 3, 4, 7, 4, 1, 6, 6, 1, 0, 5, 5, 6], \"expert_rows_max_per_step\": [3640, 5472, 4609, 4281, 3094, 3075, 3496, 3755, 3867, 3282, 3019, 4623, 4540, 2539, 3491, 4620, 3776, 4076, 3448, 3510, 3924, 4700, 2285, 4770, 2603, 3657, 4272, 3498, 3595, 2118], \"actual_tokens_min\": 6466, \"actual_tokens_max\": 9908, \"actual_tokens_mean\": 8113.733333333334, \"actual_tokens_std\": 814.5260967103646, \"max_tokens_capacity\": 9908, \"max_rows_capacity\": 99916, \"input_tokens_per_second\": 1516335.951452531, \"experts\": 256, \"top_k\": 8, \"hidden\": 3072, \"intermediate\": 1024, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 10620.378499999999, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 508.7725, \"backward_slowest_rank_p50_us\": 10125.303, \"wall_slowest_rank_samples_us\": [11485.399, 10139.835, 10501.203, 11615.582, 10854.355, 9772.478, 10798.33, 11434.297, 10485.553, 9994.794, 9802.234, 11241.227, 11388.051, 10100.052, 9979.507, 11949.85, 10450.537, 11469.584, 10951.898, 11367.198, 11564.683, 12062.902, 10088.75, 9727.749, 10071.53, 11004.995, 10005.392, 9926.42, 10739.554, 10078.925], \"per_rank_wall_us\": [[11482.669, 10139.835, 10501.203, 11615.582, 10853.123, 9772.478, 10786.391, 11429.655, 10485.553, 9994.794, 9798.7, 11241.227, 11387.517, 10092.958, 9979.507, 11949.85, 10450.537, 11466.83, 10951.898, 11367.198, 11488.159, 12062.902, 10088.75, 9727.749, 10071.53, 11004.995, 10004.493, 9925.732, 10737.858, 10075.233], [11485.399, 10139.602, 10495.415, 11607.422, 10854.355, 9765.591, 10798.33, 11434.297, 10479.01, 9980.886, 9802.234, 11235.37, 11388.051, 10100.052, 9970.581, 11939.236, 10449.344, 11469.584, 10949.127, 11365.266, 11564.683, 11943.181, 10083.847, 9722.35, 10070.212, 10999.129, 10005.392, 9926.42, 10739.554, 10078.925]], \"measurement_intervals_ns_per_rank\": [[[1793261053230123504, 1793261053241611324], [1793261053242295040, 1793261053252439622], [1793261053253087191, 1793261053263598787], [1793261053264315325, 1793261053275933562], [1793261053276610260, 1793261053287466396], [1793261053288058623, 1793261053297833664], [1793261053298554793, 1793261053309343678], [1793261053310036207, 1793261053321468090], [1793261053322170898, 1793261053332658938], [1793261053333291731, 1793261053343288839], [1793261053343905721, 1793261053353706810], [1793261053354423558, 1793261053365667327], [1793261053366336618, 1793261053377726489], [1793261053378375080, 1793261053388470165], [1793261053389101084, 1793261053399082566], [1793261053399772297, 1793261053411724216], [1793261053412406303, 1793261053422859258], [1793261053423550171, 1793261053435019045], [1793261053435669566, 1793261053446623410], [1793261053447322989, 1793261053458692238], [1793261053459364438, 1793261053470862176], [1793261053472161249, 1793261053484226673], [1793261053485012417, 1793261053495103205], [1793261053495735542, 1793261053505465609], [1793261053506080567, 1793261053516154515], [1793261053516813584, 1793261053527820611], [1793261053528454648, 1793261053538461363], [1793261053539056955, 1793261053548984999], [1793261053549706857, 1793261053560446808], [1793261053561012037, 1793261053571089440]], [[1793261053230120330, 1793261053241609536], [1793261053242299352, 1793261053252442801], [1793261053253089080, 1793261053263587353], [1793261053264321426, 1793261053275931052], [1793261053276612191, 1793261053287469123], [1793261053288059002, 1793261053297826806], [1793261053298542494, 1793261053309343003], [1793261053310033633, 1793261053321469915], [1793261053322173039, 1793261053332655002], [1793261053333299009, 1793261053343281916], [1793261053343905959, 1793261053353710320], [1793261053354424890, 1793261053365662404], [1793261053366337853, 1793261053377727976], [1793261053378375964, 1793261053388478010], [1793261053389105604, 1793261053399078260], [1793261053399777688, 1793261053411719197], [1793261053412409179, 1793261053422861220], [1793261053423550694, 1793261053435022388], [1793261053435670833, 1793261053446621915], [1793261053447321067, 1793261053458688449], [1793261053459365444, 1793261053470952056], [1793261053472275146, 1793261053484220727], [1793261053485018130, 1793261053495104089], [1793261053495738354, 1793261053505462829], [1793261053506082840, 1793261053516155883], [1793261053516815405, 1793261053527816706], [1793261053528455863, 1793261053538463399], [1793261053539056847, 1793261053548985255], [1793261053549704709, 1793261053560446219], [1793261053561011235, 1793261053571092088]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 862719368, \"last_forward_tensor_bytes\": 321669204, \"last_backward_tensor_bytes\": 2913689728, \"gin_bytes\": 0, \"notify_bytes\": 43417992, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 862719368, \"last_forward_tensor_bytes\": 399956236, \"last_backward_tensor_bytes\": 3006116512, \"gin_bytes\": 0, \"notify_bytes\": 43417992, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "097c68602be4eaee068068d47dad84b283954e4f30674f6cd3a9e6f30c1e5a43",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-qwen122b-20480-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "qwen122b",
+        "--tokens",
+        "20480",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 10.69339919090271,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 20480,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "f5d46552292cb2d64bb83707ae5f861026255ca379266e6e80613336a3ca081c",
+          "ccc86ff6cc1f7610ca2656dba125c2e7e74a2f4afd95084721a44a512eca3dfb"
+        ],
+        "per_rank_tokens": [
+          [
+            22702,
+            23424,
+            24179,
+            18004,
+            20834,
+            22222,
+            18797,
+            21482,
+            21274,
+            19417,
+            17066,
+            22795,
+            18753,
+            20964,
+            20142,
+            22088,
+            19946,
+            18905,
+            19884,
+            21974,
+            16538,
+            20792,
+            20737,
+            20779,
+            20307,
+            18455,
+            18757,
+            21520,
+            20206,
+            19479
+          ],
+          [
+            22495,
+            17983,
+            20896,
+            18155,
+            22184,
+            18667,
+            23365,
+            18017,
+            18521,
+            21704,
+            21165,
+            19360,
+            20733,
+            19655,
+            15462,
+            22786,
+            20399,
+            19137,
+            21618,
+            17683,
+            17724,
+            19012,
+            19301,
+            17100,
+            24025,
+            20205,
+            21746,
+            22381,
+            16990,
+            22474
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            18938,
+            20452,
+            17829,
+            22325,
+            22973,
+            18593,
+            19138,
+            19475,
+            19803,
+            21898
+          ],
+          [
+            16737,
+            20798,
+            21164,
+            21908,
+            22021,
+            18594,
+            19396,
+            22736,
+            17484,
+            25019
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            166230,
+            155972,
+            187993,
+            146095,
+            162578,
+            136752,
+            189777,
+            167683,
+            156167,
+            165391,
+            135699,
+            145075,
+            155696,
+            167791,
+            150551,
+            180534,
+            168190,
+            157278,
+            156581,
+            134994,
+            134690,
+            170605,
+            134701,
+            141466,
+            189248,
+            171099,
+            172079,
+            144967,
+            159295,
+            198528
+          ],
+          [
+            195346,
+            175284,
+            172607,
+            143177,
+            181566,
+            190360,
+            147519,
+            148309,
+            162193,
+            163577,
+            170149,
+            192165,
+            160192,
+            157161,
+            134281,
+            178458,
+            154570,
+            147058,
+            175435,
+            182262,
+            139406,
+            147827,
+            185603,
+            161566,
+            165408,
+            138181,
+            151945,
+            206241,
+            138273,
+            137096
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          11,
+          9,
+          11,
+          17,
+          29,
+          43,
+          4,
+          3,
+          19,
+          5,
+          23,
+          4,
+          2,
+          10,
+          6,
+          7,
+          11,
+          8,
+          3,
+          11,
+          8,
+          32,
+          14,
+          29,
+          5,
+          4,
+          8,
+          1,
+          15,
+          8
+        ],
+        "expert_rows_max_per_step": [
+          9761,
+          16443,
+          10029,
+          8565,
+          7837,
+          10641,
+          12943,
+          11083,
+          9618,
+          12329,
+          8518,
+          17948,
+          6849,
+          7643,
+          9991,
+          10088,
+          10371,
+          8743,
+          9577,
+          9071,
+          11284,
+          10142,
+          8691,
+          7513,
+          8256,
+          13463,
+          13014,
+          9406,
+          8322,
+          10780
+        ],
+        "actual_tokens_min": 15462,
+        "actual_tokens_max": 24179,
+        "actual_tokens_mean": 20222.75,
+        "actual_tokens_std": 1974.0109897110501,
+        "max_tokens_capacity": 25019,
+        "max_rows_capacity": 222625,
+        "input_tokens_per_second": 1721926.3125719705,
+        "experts": 256,
+        "top_k": 8,
+        "hidden": 3072,
+        "intermediate": 1024,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 23200.2065,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 557.8254999999999,
+        "backward_slowest_rank_p50_us": 22657.2535,
+        "wall_slowest_rank_samples_us": [
+          26132.497,
+          24039.541,
+          25099.321,
+          20110.269,
+          24486.58,
+          25706.733,
+          25534.002,
+          22581.075,
+          22110.868,
+          22325.544,
+          22747.065,
+          25724.552,
+          21785.48,
+          22898.575,
+          20406.503,
+          24439.918,
+          22653.568,
+          21276.813,
+          23502.404,
+          24651.336,
+          19212.667,
+          23061.334,
+          24851.364,
+          22058.008,
+          25361.952,
+          23141.367,
+          23259.046,
+          27373.957,
+          21644.029,
+          26479.221
+        ],
+        "per_rank_wall_us": [
+          [
+            26132.026,
+            24038.959,
+            25096.226,
+            20110.269,
+            24486.58,
+            25697.76,
+            25534.002,
+            22581.075,
+            22109.363,
+            22324.043,
+            22747.065,
+            25724.552,
+            21774.775,
+            22890.871,
+            20399.945,
+            24439.918,
+            22645.321,
+            21270.645,
+            23502.404,
+            24651.336,
+            19210.325,
+            23060.452,
+            24848.523,
+            22058.008,
+            25361.952,
+            23141.367,
+            23253.167,
+            27373.957,
+            21644.029,
+            26478.521
+          ],
+          [
+            26132.497,
+            24039.541,
+            25099.321,
+            20109.145,
+            24484.575,
+            25706.733,
+            25530.454,
+            22580.075,
+            22110.868,
+            22325.544,
+            22745.832,
+            25723.949,
+            21785.48,
+            22898.575,
+            20406.503,
+            24439.119,
+            22653.568,
+            21276.813,
+            23497.235,
+            24646.932,
+            19212.667,
+            23061.334,
+            24851.364,
+            22053.699,
+            25359.405,
+            23139.054,
+            23259.046,
+            27370.772,
+            21643.308,
+            26479.221
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261061863436012,
+              1793261061889573521
+            ],
+            [
+              1793261061891105773,
+              1793261061915148705
+            ],
+            [
+              1793261061916662144,
+              1793261061941760943
+            ],
+            [
+              1793261061942938931,
+              1793261061963051517
+            ],
+            [
+              1793261061964408177,
+              1793261061988897623
+            ],
+            [
+              1793261061990335757,
+              1793261062016036107
+            ],
+            [
+              1793261062017279851,
+              1793261062042816214
+            ],
+            [
+              1793261062044225520,
+              1793261062066809069
+            ],
+            [
+              1793261062068182961,
+              1793261062090294997
+            ],
+            [
+              1793261062091573629,
+              1793261062113899696
+            ],
+            [
+              1793261062115024220,
+              1793261062137773510
+            ],
+            [
+              1793261062139246933,
+              1793261062164973964
+            ],
+            [
+              1793261062166219299,
+              1793261062187996450
+            ],
+            [
+              1793261062189357069,
+              1793261062212250262
+            ],
+            [
+              1793261062213581560,
+              1793261062233983754
+            ],
+            [
+              1793261062235412730,
+              1793261062259854841
+            ],
+            [
+              1793261062261165904,
+              1793261062283813604
+            ],
+            [
+              1793261062285027315,
+              1793261062306300386
+            ],
+            [
+              1793261062307599416,
+              1793261062331103988
+            ],
+            [
+              1793261062332510641,
+              1793261062357164116
+            ],
+            [
+              1793261062358259644,
+              1793261062377471913
+            ],
+            [
+              1793261062378817287,
+              1793261062401879806
+            ],
+            [
+              1793261062403771437,
+              1793261062428622056
+            ],
+            [
+              1793261062430536411,
+              1793261062452596568
+            ],
+            [
+              1793261062454448182,
+              1793261062479812890
+            ],
+            [
+              1793261062481540355,
+              1793261062504683913
+            ],
+            [
+              1793261062506413068,
+              1793261062529668709
+            ],
+            [
+              1793261062531638961,
+              1793261062559015102
+            ],
+            [
+              1793261062560899800,
+              1793261062582545933
+            ],
+            [
+              1793261062584370583,
+              1793261062610851417
+            ]
+          ],
+          [
+            [
+              1793261061863432565,
+              1793261061889569686
+            ],
+            [
+              1793261061891100895,
+              1793261061915144997
+            ],
+            [
+              1793261061916666168,
+              1793261061941767833
+            ],
+            [
+              1793261061942938011,
+              1793261061963049413
+            ],
+            [
+              1793261061964406723,
+              1793261061988894109
+            ],
+            [
+              1793261061990329935,
+              1793261062016038832
+            ],
+            [
+              1793261062017281549,
+              1793261062042814269
+            ],
+            [
+              1793261062044221621,
+              1793261062066804054
+            ],
+            [
+              1793261062068179407,
+              1793261062090292962
+            ],
+            [
+              1793261062091568946,
+              1793261062113897005
+            ],
+            [
+              1793261062115022921,
+              1793261062137771026
+            ],
+            [
+              1793261062139241206,
+              1793261062164967667
+            ],
+            [
+              1793261062166209499,
+              1793261062187997131
+            ],
+            [
+              1793261062189354200,
+              1793261062212254855
+            ],
+            [
+              1793261062213574651,
+              1793261062233983174
+            ],
+            [
+              1793261062235408618,
+              1793261062259849752
+            ],
+            [
+              1793261062261161933,
+              1793261062283818094
+            ],
+            [
+              1793261062285025612,
+              1793261062306304676
+            ],
+            [
+              1793261062307603407,
+              1793261062331103348
+            ],
+            [
+              1793261062332511380,
+              1793261062357160386
+            ],
+            [
+              1793261062358255036,
+              1793261062377469877
+            ],
+            [
+              1793261062378814216,
+              1793261062401877741
+            ],
+            [
+              1793261062403768722,
+              1793261062428622208
+            ],
+            [
+              1793261062430536606,
+              1793261062452592370
+            ],
+            [
+              1793261062454445497,
+              1793261062479807225
+            ],
+            [
+              1793261062481539636,
+              1793261062504680493
+            ],
+            [
+              1793261062506410905,
+              1793261062529672174
+            ],
+            [
+              1793261062531635454,
+              1793261062559008305
+            ],
+            [
+              1793261062560894759,
+              1793261062582540324
+            ],
+            [
+              1793261062584367548,
+              1793261062610849070
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1856662408,
+            "last_forward_tensor_bytes": 1207730688,
+            "last_backward_tensor_bytes": 3946628064,
+            "gin_bytes": 0,
+            "notify_bytes": 109456216,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1856662408,
+            "last_forward_tensor_bytes": 899915360,
+            "last_backward_tensor_bytes": 3581276224,
+            "gin_bytes": 0,
+            "notify_bytes": 109456216,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:04:16.959000 262647 torch/distributed/run.py:803] \nW1029 08:04:16.959000 262647 torch/distributed/run.py:803] *****************************************\nW1029 08:04:16.959000 262647 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:04:16.959000 262647 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 20480, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"f5d46552292cb2d64bb83707ae5f861026255ca379266e6e80613336a3ca081c\", \"ccc86ff6cc1f7610ca2656dba125c2e7e74a2f4afd95084721a44a512eca3dfb\"], \"per_rank_tokens\": [[22702, 23424, 24179, 18004, 20834, 22222, 18797, 21482, 21274, 19417, 17066, 22795, 18753, 20964, 20142, 22088, 19946, 18905, 19884, 21974, 16538, 20792, 20737, 20779, 20307, 18455, 18757, 21520, 20206, 19479], [22495, 17983, 20896, 18155, 22184, 18667, 23365, 18017, 18521, 21704, 21165, 19360, 20733, 19655, 15462, 22786, 20399, 19137, 21618, 17683, 17724, 19012, 19301, 17100, 24025, 20205, 21746, 22381, 16990, 22474]], \"per_rank_warmup_tokens\": [[18938, 20452, 17829, 22325, 22973, 18593, 19138, 19475, 19803, 21898], [16737, 20798, 21164, 21908, 22021, 18594, 19396, 22736, 17484, 25019]], \"per_rank_received_rows\": [[166230, 155972, 187993, 146095, 162578, 136752, 189777, 167683, 156167, 165391, 135699, 145075, 155696, 167791, 150551, 180534, 168190, 157278, 156581, 134994, 134690, 170605, 134701, 141466, 189248, 171099, 172079, 144967, 159295, 198528], [195346, 175284, 172607, 143177, 181566, 190360, 147519, 148309, 162193, 163577, 170149, 192165, 160192, 157161, 134281, 178458, 154570, 147058, 175435, 182262, 139406, 147827, 185603, 161566, 165408, 138181, 151945, 206241, 138273, 137096]], \"expert_rows_min_per_step\": [11, 9, 11, 17, 29, 43, 4, 3, 19, 5, 23, 4, 2, 10, 6, 7, 11, 8, 3, 11, 8, 32, 14, 29, 5, 4, 8, 1, 15, 8], \"expert_rows_max_per_step\": [9761, 16443, 10029, 8565, 7837, 10641, 12943, 11083, 9618, 12329, 8518, 17948, 6849, 7643, 9991, 10088, 10371, 8743, 9577, 9071, 11284, 10142, 8691, 7513, 8256, 13463, 13014, 9406, 8322, 10780], \"actual_tokens_min\": 15462, \"actual_tokens_max\": 24179, \"actual_tokens_mean\": 20222.75, \"actual_tokens_std\": 1974.0109897110501, \"max_tokens_capacity\": 25019, \"max_rows_capacity\": 222625, \"input_tokens_per_second\": 1721926.3125719705, \"experts\": 256, \"top_k\": 8, \"hidden\": 3072, \"intermediate\": 1024, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 23200.2065, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 557.8254999999999, \"backward_slowest_rank_p50_us\": 22657.2535, \"wall_slowest_rank_samples_us\": [26132.497, 24039.541, 25099.321, 20110.269, 24486.58, 25706.733, 25534.002, 22581.075, 22110.868, 22325.544, 22747.065, 25724.552, 21785.48, 22898.575, 20406.503, 24439.918, 22653.568, 21276.813, 23502.404, 24651.336, 19212.667, 23061.334, 24851.364, 22058.008, 25361.952, 23141.367, 23259.046, 27373.957, 21644.029, 26479.221], \"per_rank_wall_us\": [[26132.026, 24038.959, 25096.226, 20110.269, 24486.58, 25697.76, 25534.002, 22581.075, 22109.363, 22324.043, 22747.065, 25724.552, 21774.775, 22890.871, 20399.945, 24439.918, 22645.321, 21270.645, 23502.404, 24651.336, 19210.325, 23060.452, 24848.523, 22058.008, 25361.952, 23141.367, 23253.167, 27373.957, 21644.029, 26478.521], [26132.497, 24039.541, 25099.321, 20109.145, 24484.575, 25706.733, 25530.454, 22580.075, 22110.868, 22325.544, 22745.832, 25723.949, 21785.48, 22898.575, 20406.503, 24439.119, 22653.568, 21276.813, 23497.235, 24646.932, 19212.667, 23061.334, 24851.364, 22053.699, 25359.405, 23139.054, 23259.046, 27370.772, 21643.308, 26479.221]], \"measurement_intervals_ns_per_rank\": [[[1793261061863436012, 1793261061889573521], [1793261061891105773, 1793261061915148705], [1793261061916662144, 1793261061941760943], [1793261061942938931, 1793261061963051517], [1793261061964408177, 1793261061988897623], [1793261061990335757, 1793261062016036107], [1793261062017279851, 1793261062042816214], [1793261062044225520, 1793261062066809069], [1793261062068182961, 1793261062090294997], [1793261062091573629, 1793261062113899696], [1793261062115024220, 1793261062137773510], [1793261062139246933, 1793261062164973964], [1793261062166219299, 1793261062187996450], [1793261062189357069, 1793261062212250262], [1793261062213581560, 1793261062233983754], [1793261062235412730, 1793261062259854841], [1793261062261165904, 1793261062283813604], [1793261062285027315, 1793261062306300386], [1793261062307599416, 1793261062331103988], [1793261062332510641, 1793261062357164116], [1793261062358259644, 1793261062377471913], [1793261062378817287, 1793261062401879806], [1793261062403771437, 1793261062428622056], [1793261062430536411, 1793261062452596568], [1793261062454448182, 1793261062479812890], [1793261062481540355, 1793261062504683913], [1793261062506413068, 1793261062529668709], [1793261062531638961, 1793261062559015102], [1793261062560899800, 1793261062582545933], [1793261062584370583, 1793261062610851417]], [[1793261061863432565, 1793261061889569686], [1793261061891100895, 1793261061915144997], [1793261061916666168, 1793261061941767833], [1793261061942938011, 1793261061963049413], [1793261061964406723, 1793261061988894109], [1793261061990329935, 1793261062016038832], [1793261062017281549, 1793261062042814269], [1793261062044221621, 1793261062066804054], [1793261062068179407, 1793261062090292962], [1793261062091568946, 1793261062113897005], [1793261062115022921, 1793261062137771026], [1793261062139241206, 1793261062164967667], [1793261062166209499, 1793261062187997131], [1793261062189354200, 1793261062212254855], [1793261062213574651, 1793261062233983174], [1793261062235408618, 1793261062259849752], [1793261062261161933, 1793261062283818094], [1793261062285025612, 1793261062306304676], [1793261062307603407, 1793261062331103348], [1793261062332511380, 1793261062357160386], [1793261062358255036, 1793261062377469877], [1793261062378814216, 1793261062401877741], [1793261062403768722, 1793261062428622208], [1793261062430536606, 1793261062452592370], [1793261062454445497, 1793261062479807225], [1793261062481539636, 1793261062504680493], [1793261062506410905, 1793261062529672174], [1793261062531635454, 1793261062559008305], [1793261062560894759, 1793261062582540324], [1793261062584367548, 1793261062610849070]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 1856662408, \"last_forward_tensor_bytes\": 1207730688, \"last_backward_tensor_bytes\": 3946628064, \"gin_bytes\": 0, \"notify_bytes\": 109456216, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 1856662408, \"last_forward_tensor_bytes\": 899915360, \"last_backward_tensor_bytes\": 3581276224, \"gin_bytes\": 0, \"notify_bytes\": 109456216, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-qwen122b/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "097c68602be4eaee068068d47dad84b283954e4f30674f6cd3a9e6f30c1e5a43",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-flash-8192-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "flash",
+        "--tokens",
+        "8192",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 8.962229013442993,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 8192,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "5a33366ebe7b392b57e64da6ecb187784c406e9c88489be94813fd23fba289f3",
+          "b6038e8ce91efca6710e3d4a101990dbcbf4952766388c2bcf74f839f9de1dd6"
+        ],
+        "per_rank_tokens": [
+          [
+            7771,
+            7571,
+            8351,
+            9297,
+            7552,
+            7762,
+            6979,
+            8916,
+            6998,
+            7498,
+            7927,
+            8474,
+            8032,
+            8124,
+            7428,
+            9038,
+            7557,
+            9238,
+            8354,
+            8279,
+            8251,
+            9908,
+            6466,
+            6643,
+            7241,
+            8709,
+            8348,
+            7453,
+            9393,
+            7148
+          ],
+          [
+            9138,
+            8669,
+            7738,
+            7636,
+            9091,
+            7272,
+            9411,
+            8368,
+            9413,
+            7883,
+            6584,
+            9198,
+            8806,
+            7828,
+            8062,
+            8138,
+            8915,
+            7357,
+            8584,
+            9068,
+            8719,
+            8895,
+            8442,
+            8162,
+            7644,
+            8095,
+            7290,
+            7489,
+            7746,
+            6477
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            8751,
+            8645,
+            7301,
+            9159,
+            6958,
+            7972,
+            8040,
+            6622,
+            8671,
+            8054
+          ],
+          [
+            8681,
+            7887,
+            8407,
+            8318,
+            8436,
+            9690,
+            8345,
+            7338,
+            8534,
+            6683
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            45292,
+            48881,
+            45752,
+            58091,
+            47563,
+            45319,
+            47125,
+            57213,
+            48645,
+            46272,
+            46082,
+            51468,
+            44073,
+            47162,
+            48400,
+            43022,
+            51064,
+            41099,
+            54365,
+            56792,
+            52873,
+            55006,
+            42465,
+            43102,
+            48009,
+            47440,
+            46886,
+            43194,
+            51193,
+            34680
+          ],
+          [
+            56162,
+            48559,
+            50782,
+            43507,
+            52295,
+            44885,
+            51215,
+            46491,
+            49821,
+            46014,
+            40984,
+            54564,
+            56955,
+            48550,
+            44540,
+            60034,
+            47768,
+            58471,
+            47263,
+            47290,
+            48947,
+            57812,
+            46983,
+            45728,
+            41301,
+            53384,
+            46942,
+            46458,
+            51641,
+            47070
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          2,
+          1,
+          1,
+          5,
+          0,
+          1,
+          6,
+          0,
+          5,
+          2,
+          2,
+          4,
+          2,
+          3,
+          5,
+          3,
+          0,
+          1,
+          2,
+          2,
+          5,
+          1,
+          0,
+          3,
+          4,
+          1,
+          0,
+          1,
+          4,
+          3
+        ],
+        "expert_rows_max_per_step": [
+          2975,
+          4696,
+          3853,
+          3553,
+          2490,
+          2547,
+          2878,
+          3083,
+          3200,
+          2686,
+          2482,
+          3850,
+          3803,
+          2039,
+          2833,
+          3852,
+          3101,
+          3385,
+          2834,
+          2907,
+          3243,
+          3877,
+          1840,
+          4030,
+          2122,
+          3006,
+          3540,
+          2892,
+          2953,
+          1711
+        ],
+        "actual_tokens_min": 6466,
+        "actual_tokens_max": 9908,
+        "actual_tokens_mean": 8113.733333333334,
+        "actual_tokens_std": 814.5260967103646,
+        "max_tokens_capacity": 9908,
+        "max_rows_capacity": 79900,
+        "input_tokens_per_second": 914549.1550079155,
+        "experts": 256,
+        "top_k": 6,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 17401.091999999997,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 474.39750000000004,
+        "backward_slowest_rank_p50_us": 16935.252,
+        "wall_slowest_rank_samples_us": [
+          18635.442,
+          17259.747,
+          17361.643,
+          19345.1,
+          17828.247,
+          15984.219,
+          17407.813,
+          18989.386,
+          17077.458,
+          17237.551,
+          16127.205,
+          18627.25,
+          18967.316,
+          17261.497,
+          16799.601,
+          20052.35,
+          17394.371,
+          19174.767,
+          18352.212,
+          19005.686,
+          18300.277,
+          19296.771,
+          16834.795,
+          16041.947,
+          16705.143,
+          18480.237,
+          16587.843,
+          16427.235,
+          17849.621,
+          16897.641
+        ],
+        "per_rank_wall_us": [
+          [
+            18624.018,
+            17257.241,
+            17361.643,
+            19345.1,
+            17823.417,
+            15984.219,
+            17405.082,
+            18979.977,
+            17077.458,
+            17192.807,
+            16120.76,
+            18624.841,
+            18967.316,
+            17261.497,
+            16783.229,
+            19961.101,
+            17394.371,
+            19170.603,
+            18347.251,
+            19003.567,
+            18295.847,
+            19292.889,
+            16834.795,
+            16039.876,
+            16701.072,
+            18478.389,
+            16576.566,
+            16419.961,
+            17844.856,
+            16895.422
+          ],
+          [
+            18635.442,
+            17259.747,
+            17358.897,
+            19343.404,
+            17828.247,
+            15976.982,
+            17407.813,
+            18989.386,
+            17049.791,
+            17237.551,
+            16127.205,
+            18627.25,
+            18964.255,
+            17259.833,
+            16799.601,
+            20052.35,
+            17393.036,
+            19174.767,
+            18352.212,
+            19005.686,
+            18300.277,
+            19296.771,
+            16833.199,
+            16041.947,
+            16705.143,
+            18480.237,
+            16587.843,
+            16427.235,
+            17849.621,
+            16897.641
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261072871232129,
+              1793261072889860779
+            ],
+            [
+              1793261072890434378,
+              1793261072907695660
+            ],
+            [
+              1793261072908352875,
+              1793261072925717330
+            ],
+            [
+              1793261072926428538,
+              1793261072945776372
+            ],
+            [
+              1793261072946396578,
+              1793261072964222835
+            ],
+            [
+              1793261072964794072,
+              1793261072980780501
+            ],
+            [
+              1793261072981339480,
+              1793261072998747183
+            ],
+            [
+              1793261072999435860,
+              1793261073018417982
+            ],
+            [
+              1793261073018948928,
+              1793261073036043191
+            ],
+            [
+              1793261073037468798,
+              1793261073054664049
+            ],
+            [
+              1793261073055282186,
+              1793261073071405262
+            ],
+            [
+              1793261073072047011,
+              1793261073090674286
+            ],
+            [
+              1793261073091262866,
+              1793261073110232197
+            ],
+            [
+              1793261073110846188,
+              1793261073128109897
+            ],
+            [
+              1793261073128697329,
+              1793261073145482995
+            ],
+            [
+              1793261073148183522,
+              1793261073168146995
+            ],
+            [
+              1793261073168715468,
+              1793261073186112524
+            ],
+            [
+              1793261073186803496,
+              1793261073205976445
+            ],
+            [
+              1793261073206645659,
+              1793261073224995175
+            ],
+            [
+              1793261073225636992,
+              1793261073244642634
+            ],
+            [
+              1793261073245276623,
+              1793261073263574767
+            ],
+            [
+              1793261073264309320,
+              1793261073283604750
+            ],
+            [
+              1793261073284146310,
+              1793261073300983141
+            ],
+            [
+              1793261073301513000,
+              1793261073317554873
+            ],
+            [
+              1793261073318094838,
+              1793261073334798712
+            ],
+            [
+              1793261073335429063,
+              1793261073353909656
+            ],
+            [
+              1793261073354547252,
+              1793261073371126271
+            ],
+            [
+              1793261073371703952,
+              1793261073388125940
+            ],
+            [
+              1793261073388809597,
+              1793261073406656503
+            ],
+            [
+              1793261073407215637,
+              1793261073424112999
+            ]
+          ],
+          [
+            [
+              1793261072871225937,
+              1793261072889865679
+            ],
+            [
+              1793261072890429793,
+              1793261072907693984
+            ],
+            [
+              1793261072908353673,
+              1793261072925715571
+            ],
+            [
+              1793261072926428885,
+              1793261072945774171
+            ],
+            [
+              1793261072946389411,
+              1793261072964220443
+            ],
+            [
+              1793261072964795720,
+              1793261072980774804
+            ],
+            [
+              1793261072981335538,
+              1793261072998745878
+            ],
+            [
+              1793261072999433691,
+              1793261073018425618
+            ],
+            [
+              1793261073018947748,
+              1793261073036000714
+            ],
+            [
+              1793261073037417972,
+              1793261073054661947
+            ],
+            [
+              1793261073055278922,
+              1793261073071408273
+            ],
+            [
+              1793261073072047046,
+              1793261073090676361
+            ],
+            [
+              1793261073091262267,
+              1793261073110228277
+            ],
+            [
+              1793261073110842581,
+              1793261073128104097
+            ],
+            [
+              1793261073128692576,
+              1793261073145504095
+            ],
+            [
+              1793261073148090630,
+              1793261073168145169
+            ],
+            [
+              1793261073168716144,
+              1793261073186111826
+            ],
+            [
+              1793261073186799300,
+              1793261073205976245
+            ],
+            [
+              1793261073206642199,
+              1793261073224996425
+            ],
+            [
+              1793261073225635226,
+              1793261073244642767
+            ],
+            [
+              1793261073245274278,
+              1793261073263576847
+            ],
+            [
+              1793261073264306789,
+              1793261073283605969
+            ],
+            [
+              1793261073284144252,
+              1793261073300979650
+            ],
+            [
+              1793261073301515473,
+              1793261073317559334
+            ],
+            [
+              1793261073318093721,
+              1793261073334801766
+            ],
+            [
+              1793261073335426020,
+              1793261073353908486
+            ],
+            [
+              1793261073354539907,
+              1793261073371129887
+            ],
+            [
+              1793261073371702700,
+              1793261073388132016
+            ],
+            [
+              1793261073388805617,
+              1793261073406657075
+            ],
+            [
+              1793261073407212172,
+              1793261073424111894
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 924391304,
+            "last_forward_tensor_bytes": 389886880,
+            "last_backward_tensor_bytes": 7144300832,
+            "gin_bytes": 0,
+            "notify_bytes": 32635120,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 924391304,
+            "last_forward_tensor_bytes": 494437608,
+            "last_backward_tensor_bytes": 7280768056,
+            "gin_bytes": 0,
+            "notify_bytes": 32635120,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:04:27.739000 263018 torch/distributed/run.py:803] \nW1029 08:04:27.739000 263018 torch/distributed/run.py:803] *****************************************\nW1029 08:04:27.739000 263018 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:04:27.739000 263018 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 8192, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"5a33366ebe7b392b57e64da6ecb187784c406e9c88489be94813fd23fba289f3\", \"b6038e8ce91efca6710e3d4a101990dbcbf4952766388c2bcf74f839f9de1dd6\"], \"per_rank_tokens\": [[7771, 7571, 8351, 9297, 7552, 7762, 6979, 8916, 6998, 7498, 7927, 8474, 8032, 8124, 7428, 9038, 7557, 9238, 8354, 8279, 8251, 9908, 6466, 6643, 7241, 8709, 8348, 7453, 9393, 7148], [9138, 8669, 7738, 7636, 9091, 7272, 9411, 8368, 9413, 7883, 6584, 9198, 8806, 7828, 8062, 8138, 8915, 7357, 8584, 9068, 8719, 8895, 8442, 8162, 7644, 8095, 7290, 7489, 7746, 6477]], \"per_rank_warmup_tokens\": [[8751, 8645, 7301, 9159, 6958, 7972, 8040, 6622, 8671, 8054], [8681, 7887, 8407, 8318, 8436, 9690, 8345, 7338, 8534, 6683]], \"per_rank_received_rows\": [[45292, 48881, 45752, 58091, 47563, 45319, 47125, 57213, 48645, 46272, 46082, 51468, 44073, 47162, 48400, 43022, 51064, 41099, 54365, 56792, 52873, 55006, 42465, 43102, 48009, 47440, 46886, 43194, 51193, 34680], [56162, 48559, 50782, 43507, 52295, 44885, 51215, 46491, 49821, 46014, 40984, 54564, 56955, 48550, 44540, 60034, 47768, 58471, 47263, 47290, 48947, 57812, 46983, 45728, 41301, 53384, 46942, 46458, 51641, 47070]], \"expert_rows_min_per_step\": [2, 1, 1, 5, 0, 1, 6, 0, 5, 2, 2, 4, 2, 3, 5, 3, 0, 1, 2, 2, 5, 1, 0, 3, 4, 1, 0, 1, 4, 3], \"expert_rows_max_per_step\": [2975, 4696, 3853, 3553, 2490, 2547, 2878, 3083, 3200, 2686, 2482, 3850, 3803, 2039, 2833, 3852, 3101, 3385, 2834, 2907, 3243, 3877, 1840, 4030, 2122, 3006, 3540, 2892, 2953, 1711], \"actual_tokens_min\": 6466, \"actual_tokens_max\": 9908, \"actual_tokens_mean\": 8113.733333333334, \"actual_tokens_std\": 814.5260967103646, \"max_tokens_capacity\": 9908, \"max_rows_capacity\": 79900, \"input_tokens_per_second\": 914549.1550079155, \"experts\": 256, \"top_k\": 6, \"hidden\": 4096, \"intermediate\": 2048, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 17401.091999999997, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 474.39750000000004, \"backward_slowest_rank_p50_us\": 16935.252, \"wall_slowest_rank_samples_us\": [18635.442, 17259.747, 17361.643, 19345.1, 17828.247, 15984.219, 17407.813, 18989.386, 17077.458, 17237.551, 16127.205, 18627.25, 18967.316, 17261.497, 16799.601, 20052.35, 17394.371, 19174.767, 18352.212, 19005.686, 18300.277, 19296.771, 16834.795, 16041.947, 16705.143, 18480.237, 16587.843, 16427.235, 17849.621, 16897.641], \"per_rank_wall_us\": [[18624.018, 17257.241, 17361.643, 19345.1, 17823.417, 15984.219, 17405.082, 18979.977, 17077.458, 17192.807, 16120.76, 18624.841, 18967.316, 17261.497, 16783.229, 19961.101, 17394.371, 19170.603, 18347.251, 19003.567, 18295.847, 19292.889, 16834.795, 16039.876, 16701.072, 18478.389, 16576.566, 16419.961, 17844.856, 16895.422], [18635.442, 17259.747, 17358.897, 19343.404, 17828.247, 15976.982, 17407.813, 18989.386, 17049.791, 17237.551, 16127.205, 18627.25, 18964.255, 17259.833, 16799.601, 20052.35, 17393.036, 19174.767, 18352.212, 19005.686, 18300.277, 19296.771, 16833.199, 16041.947, 16705.143, 18480.237, 16587.843, 16427.235, 17849.621, 16897.641]], \"measurement_intervals_ns_per_rank\": [[[1793261072871232129, 1793261072889860779], [1793261072890434378, 1793261072907695660], [1793261072908352875, 1793261072925717330], [1793261072926428538, 1793261072945776372], [1793261072946396578, 1793261072964222835], [1793261072964794072, 1793261072980780501], [1793261072981339480, 1793261072998747183], [1793261072999435860, 1793261073018417982], [1793261073018948928, 1793261073036043191], [1793261073037468798, 1793261073054664049], [1793261073055282186, 1793261073071405262], [1793261073072047011, 1793261073090674286], [1793261073091262866, 1793261073110232197], [1793261073110846188, 1793261073128109897], [1793261073128697329, 1793261073145482995], [1793261073148183522, 1793261073168146995], [1793261073168715468, 1793261073186112524], [1793261073186803496, 1793261073205976445], [1793261073206645659, 1793261073224995175], [1793261073225636992, 1793261073244642634], [1793261073245276623, 1793261073263574767], [1793261073264309320, 1793261073283604750], [1793261073284146310, 1793261073300983141], [1793261073301513000, 1793261073317554873], [1793261073318094838, 1793261073334798712], [1793261073335429063, 1793261073353909656], [1793261073354547252, 1793261073371126271], [1793261073371703952, 1793261073388125940], [1793261073388809597, 1793261073406656503], [1793261073407215637, 1793261073424112999]], [[1793261072871225937, 1793261072889865679], [1793261072890429793, 1793261072907693984], [1793261072908353673, 1793261072925715571], [1793261072926428885, 1793261072945774171], [1793261072946389411, 1793261072964220443], [1793261072964795720, 1793261072980774804], [1793261072981335538, 1793261072998745878], [1793261072999433691, 1793261073018425618], [1793261073018947748, 1793261073036000714], [1793261073037417972, 1793261073054661947], [1793261073055278922, 1793261073071408273], [1793261073072047046, 1793261073090676361], [1793261073091262267, 1793261073110228277], [1793261073110842581, 1793261073128104097], [1793261073128692576, 1793261073145504095], [1793261073148090630, 1793261073168145169], [1793261073168716144, 1793261073186111826], [1793261073186799300, 1793261073205976245], [1793261073206642199, 1793261073224996425], [1793261073225635226, 1793261073244642767], [1793261073245274278, 1793261073263576847], [1793261073264306789, 1793261073283605969], [1793261073284144252, 1793261073300979650], [1793261073301515473, 1793261073317559334], [1793261073318093721, 1793261073334801766], [1793261073335426020, 1793261073353908486], [1793261073354539907, 1793261073371129887], [1793261073371702700, 1793261073388132016], [1793261073388805617, 1793261073406657075], [1793261073407212172, 1793261073424111894]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 924391304, \"last_forward_tensor_bytes\": 389886880, \"last_backward_tensor_bytes\": 7144300832, \"gin_bytes\": 0, \"notify_bytes\": 32635120, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 924391304, \"last_forward_tensor_bytes\": 494437608, \"last_backward_tensor_bytes\": 7280768056, \"gin_bytes\": 0, \"notify_bytes\": 32635120, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "9b532818b1c725bbbd5477db5911496c7539863f744a71bb31058f8e9173ddd2",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    },
+    {
+      "label": "fp8-dual-weight-flash-20480-total",
+      "kind": "training_benchmark",
+      "command": [
+        "torchrun",
+        "--standalone",
+        "--nproc-per-node=2",
+        "benchmarks/torchrun_training.py",
+        "--backend",
+        "pf",
+        "--model",
+        "flash",
+        "--tokens",
+        "20480",
+        "--warmups",
+        "10",
+        "--samples",
+        "30",
+        "--stream-ordered",
+        "--fp8",
+        "--weight-grad-dtype",
+        "bf16"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "WEFTMOE_TENSOR_EXTENSION": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "status": 0,
+      "elapsed_s": 10.23252820968628,
+      "result": {
+        "schema_version": 3,
+        "workload": "variable_tokens_random_routes",
+        "route_trace": null,
+        "backend": "pf",
+        "world": 2,
+        "nominal_tokens_per_rank": 20480,
+        "seed": 123,
+        "token_std_fraction": 0.1,
+        "token_truncation_std": 3,
+        "route_bias_std": 0.5,
+        "route_distribution": "random",
+        "workload_sha256_per_rank": [
+          "89733bff50f5eca9808e72ee3283d600dd2b4c1f24a8719b317b09ef097a9dd8",
+          "953f1f31c91b0258720d5d02b3c96b2a2195d3d5ae823eb981badd569672b5e6"
+        ],
+        "per_rank_tokens": [
+          [
+            22702,
+            23424,
+            24179,
+            18004,
+            20834,
+            22222,
+            18797,
+            21482,
+            21274,
+            19417,
+            17066,
+            22795,
+            18753,
+            20964,
+            20142,
+            22088,
+            19946,
+            18905,
+            19884,
+            21974,
+            16538,
+            20792,
+            20737,
+            20779,
+            20307,
+            18455,
+            18757,
+            21520,
+            20206,
+            19479
+          ],
+          [
+            22495,
+            17983,
+            20896,
+            18155,
+            22184,
+            18667,
+            23365,
+            18017,
+            18521,
+            21704,
+            21165,
+            19360,
+            20733,
+            19655,
+            15462,
+            22786,
+            20399,
+            19137,
+            21618,
+            17683,
+            17724,
+            19012,
+            19301,
+            17100,
+            24025,
+            20205,
+            21746,
+            22381,
+            16990,
+            22474
+          ]
+        ],
+        "per_rank_warmup_tokens": [
+          [
+            18938,
+            20452,
+            17829,
+            22325,
+            22973,
+            18593,
+            19138,
+            19475,
+            19803,
+            21898
+          ],
+          [
+            16737,
+            20798,
+            21164,
+            21908,
+            22021,
+            18594,
+            19396,
+            22736,
+            17484,
+            25019
+          ]
+        ],
+        "per_rank_received_rows": [
+          [
+            124049,
+            117267,
+            141018,
+            109698,
+            121215,
+            101114,
+            143060,
+            126277,
+            117382,
+            123495,
+            100634,
+            107459,
+            117038,
+            126326,
+            112955,
+            135417,
+            126522,
+            117987,
+            116827,
+            100376,
+            101013,
+            128614,
+            99908,
+            105458,
+            142377,
+            129695,
+            130049,
+            107811,
+            120539,
+            150577
+          ],
+          [
+            147133,
+            131175,
+            129432,
+            107256,
+            136893,
+            144220,
+            109912,
+            110717,
+            121388,
+            123231,
+            128752,
+            145471,
+            119878,
+            117388,
+            100669,
+            133827,
+            115548,
+            110265,
+            132185,
+            137566,
+            104559,
+            110210,
+            140320,
+            121816,
+            123615,
+            102265,
+            112969,
+            155595,
+            102637,
+            101141
+          ]
+        ],
+        "expert_rows_min_per_step": [
+          4,
+          6,
+          6,
+          7,
+          21,
+          31,
+          3,
+          3,
+          12,
+          3,
+          17,
+          4,
+          1,
+          5,
+          3,
+          6,
+          7,
+          5,
+          2,
+          6,
+          4,
+          21,
+          9,
+          19,
+          4,
+          2,
+          4,
+          0,
+          8,
+          4
+        ],
+        "expert_rows_max_per_step": [
+          8007,
+          14106,
+          8226,
+          6980,
+          6302,
+          8836,
+          10919,
+          9228,
+          7909,
+          10386,
+          7018,
+          15646,
+          5569,
+          6272,
+          8361,
+          8294,
+          8540,
+          7173,
+          7869,
+          7352,
+          9507,
+          8451,
+          7074,
+          6149,
+          6685,
+          11515,
+          10989,
+          7638,
+          6805,
+          8967
+        ],
+        "actual_tokens_min": 15462,
+        "actual_tokens_max": 24179,
+        "actual_tokens_mean": 20222.75,
+        "actual_tokens_std": 1974.0109897110501,
+        "max_tokens_capacity": 25019,
+        "max_rows_capacity": 171979,
+        "input_tokens_per_second": 1053754.4115112992,
+        "experts": 256,
+        "top_k": 6,
+        "hidden": 4096,
+        "intermediate": 2048,
+        "warmups": 10,
+        "priming_steps": 0,
+        "compiled_graphs_during_measurement": null,
+        "forward_only": false,
+        "backward_only": false,
+        "compute_dtype": "fp8_e4m3fn",
+        "weight_grad_dtype": "bf16",
+        "weights_prepared_once": true,
+        "weight_preparation_in_timing": false,
+        "fp8_weight_preparation": "fused_quantize_transpose",
+        "stream_ordered": true,
+        "accumulate_main_grad": false,
+        "samples": 30,
+        "sample_pause_ms": 0,
+        "wall_slowest_rank_p50_us": 38194.603,
+        "forward_ready_slowest_rank_p50_us": null,
+        "per_rank_forward_ready_us": [
+          [],
+          []
+        ],
+        "backward_ready_slowest_rank_p50_us": null,
+        "per_rank_backward_ready_us": [
+          [],
+          []
+        ],
+        "per_rank_stage_profiles": null,
+        "window_padding": null,
+        "communication": null,
+        "per_rank_allocator_delta": null,
+        "per_rank_stage_kernel_us": null,
+        "forward_ready_timing_scope": null,
+        "backward_ready_timing_scope": null,
+        "forward_slowest_rank_p50_us": 645.951,
+        "backward_slowest_rank_p50_us": 37565.83900000001,
+        "wall_slowest_rank_samples_us": [
+          42310.523,
+          38535.535,
+          40805.455,
+          32945.119,
+          39994.727,
+          41009.504,
+          42091.737,
+          37209.421,
+          36022.443,
+          36922.082,
+          37775.797,
+          41978.661,
+          35496.575,
+          36616.15,
+          33662.962,
+          39634.184,
+          37235.2,
+          34656.422,
+          38526.975,
+          40171.403,
+          31407.019,
+          37563.613,
+          41300.209,
+          36062.275,
+          41119.273,
+          38911.588,
+          37862.231,
+          44313.186,
+          35457.966,
+          43870.254
+        ],
+        "per_rank_wall_us": [
+          [
+            42310.523,
+            38530.05,
+            40805.455,
+            32943.422,
+            39994.727,
+            41009.504,
+            42086.949,
+            37209.421,
+            36022.443,
+            36779.5,
+            37774.204,
+            41971.017,
+            35496.575,
+            36616.15,
+            33655.916,
+            39575.13,
+            37235.2,
+            34656.422,
+            38526.445,
+            40165.411,
+            31407.019,
+            37513.219,
+            41300.209,
+            36062.275,
+            41089.586,
+            38907.679,
+            37857.014,
+            44313.186,
+            35457.966,
+            43869.428
+          ],
+          [
+            42305.49,
+            38535.535,
+            40801.09,
+            32945.119,
+            39983.592,
+            41006.619,
+            42091.737,
+            37197.585,
+            35950.288,
+            36922.082,
+            37775.797,
+            41978.661,
+            35492.687,
+            36604.588,
+            33662.962,
+            39634.184,
+            37216.383,
+            34654.899,
+            38526.975,
+            40171.403,
+            31404.045,
+            37563.613,
+            41267.822,
+            36026.902,
+            41119.273,
+            38911.588,
+            37862.231,
+            44200.947,
+            35457.624,
+            43870.254
+          ]
+        ],
+        "measurement_intervals_ns_per_rank": [
+          [
+            [
+              1793261081758213890,
+              1793261081800529768
+            ],
+            [
+              1793261081802082007,
+              1793261081840616301
+            ],
+            [
+              1793261081842221594,
+              1793261081883029952
+            ],
+            [
+              1793261081884305964,
+              1793261081917251995
+            ],
+            [
+              1793261081918739211,
+              1793261081958737451
+            ],
+            [
+              1793261081960213371,
+              1793261082001225459
+            ],
+            [
+              1793261082002756628,
+              1793261082044846034
+            ],
+            [
+              1793261082046299440,
+              1793261082083511176
+            ],
+            [
+              1793261082084955919,
+              1793261082121018009
+            ],
+            [
+              1793261082122603223,
+              1793261082159385372
+            ],
+            [
+              1793261082160781416,
+              1793261082198558316
+            ],
+            [
+              1793261082200111543,
+              1793261082242085611
+            ],
+            [
+              1793261082243515117,
+              1793261082279014272
+            ],
+            [
+              1793261082280427885,
+              1793261082317046703
+            ],
+            [
+              1793261082318400492,
+              1793261082352058930
+            ],
+            [
+              1793261082353593639,
+              1793261082393171120
+            ],
+            [
+              1793261082394715210,
+              1793261082431953394
+            ],
+            [
+              1793261082433270547,
+              1793261082467929372
+            ],
+            [
+              1793261082469396172,
+              1793261082507927192
+            ],
+            [
+              1793261082509531355,
+              1793261082549699200
+            ],
+            [
+              1793261082550890359,
+              1793261082582299956
+            ],
+            [
+              1793261082583696603,
+              1793261082621212087
+            ],
+            [
+              1793261082622791238,
+              1793261082664093962
+            ],
+            [
+              1793261082665504718,
+              1793261082701575161
+            ],
+            [
+              1793261082703288834,
+              1793261082744381867
+            ],
+            [
+              1793261082745859329,
+              1793261082784769628
+            ],
+            [
+              1793261082786386036,
+              1793261082824245776
+            ],
+            [
+              1793261082825871105,
+              1793261082870186754
+            ],
+            [
+              1793261082871712424,
+              1793261082907172857
+            ],
+            [
+              1793261082908802352,
+              1793261082952674146
+            ]
+          ],
+          [
+            [
+              1793261081758214939,
+              1793261081800525306
+            ],
+            [
+              1793261081802080410,
+              1793261081840620852
+            ],
+            [
+              1793261081842222574,
+              1793261081883026974
+            ],
+            [
+              1793261081884305356,
+              1793261081917253237
+            ],
+            [
+              1793261081918742201,
+              1793261081958728780
+            ],
+            [
+              1793261081960212931,
+              1793261082001222044
+            ],
+            [
+              1793261082002756696,
+              1793261082044865852
+            ],
+            [
+              1793261082046307843,
+              1793261082083508234
+            ],
+            [
+              1793261082084958010,
+              1793261082120921702
+            ],
+            [
+              1793261082122454309,
+              1793261082159378932
+            ],
+            [
+              1793261082160782074,
+              1793261082198560536
+            ],
+            [
+              1793261082200111564,
+              1793261082242093144
+            ],
+            [
+              1793261082243515393,
+              1793261082279010474
+            ],
+            [
+              1793261082280427494,
+              1793261082317034675
+            ],
+            [
+              1793261082318397358,
+              1793261082352063133
+            ],
+            [
+              1793261082353593197,
+              1793261082393232583
+            ],
+            [
+              1793261082394740933,
+              1793261082431960636
+            ],
+            [
+              1793261082433270456,
+              1793261082467928104
+            ],
+            [
+              1793261082469394913,
+              1793261082507924142
+            ],
+            [
+              1793261082509526986,
+              1793261082549700783
+            ],
+            [
+              1793261082550890191,
+              1793261082582296850
+            ],
+            [
+              1793261082583692310,
+              1793261082621264620
+            ],
+            [
+              1793261082622824230,
+              1793261082664094611
+            ],
+            [
+              1793261082665502011,
+              1793261082701531352
+            ],
+            [
+              1793261082703257749,
+              1793261082744380659
+            ],
+            [
+              1793261082745858714,
+              1793261082784772984
+            ],
+            [
+              1793261082786385796,
+              1793261082824251147
+            ],
+            [
+              1793261082825977952,
+              1793261082870181480
+            ],
+            [
+              1793261082871712528,
+              1793261082907172651
+            ],
+            [
+              1793261082908800912,
+              1793261082952673548
+            ]
+          ]
+        ],
+        "measurement_scope": "eager forward+backward+release+device synchronize; input preparation excluded",
+        "forward_timing_scope": "host API boundary (not synchronized CUDA phase timing)",
+        "checkpoint": "row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward",
+        "implementation": {},
+        "gpu": "NVIDIA L20X",
+        "per_rank_workspace": [
+          {
+            "compute_bytes": 1894742152,
+            "last_forward_tensor_bytes": 1478027020,
+            "last_backward_tensor_bytes": 8467993896,
+            "gin_bytes": 0,
+            "notify_bytes": 82227920,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          },
+          {
+            "compute_bytes": 1894742152,
+            "last_forward_tensor_bytes": 1079125180,
+            "last_backward_tensor_bytes": 7965245936,
+            "gin_bytes": 0,
+            "notify_bytes": 82227920,
+            "notify_slots_in_use": 1,
+            "separate_forward_notify": true
+          }
+        ],
+        "extension": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so"
+      },
+      "stdout": "W1029 08:04:36.783000 263219 torch/distributed/run.py:803] \nW1029 08:04:36.783000 263219 torch/distributed/run.py:803] *****************************************\nW1029 08:04:36.783000 263219 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. \nW1029 08:04:36.783000 263219 torch/distributed/run.py:803] *****************************************\nNCCL version 2.31.2+cuda12.9\n/opt/.venv/lib/python3.12/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.\n  warnings.warn(  # warn only once\nTRAINING_CYCLE_JSON {\"schema_version\": 3, \"workload\": \"variable_tokens_random_routes\", \"route_trace\": null, \"backend\": \"pf\", \"world\": 2, \"nominal_tokens_per_rank\": 20480, \"seed\": 123, \"token_std_fraction\": 0.1, \"token_truncation_std\": 3, \"route_bias_std\": 0.5, \"route_distribution\": \"random\", \"workload_sha256_per_rank\": [\"89733bff50f5eca9808e72ee3283d600dd2b4c1f24a8719b317b09ef097a9dd8\", \"953f1f31c91b0258720d5d02b3c96b2a2195d3d5ae823eb981badd569672b5e6\"], \"per_rank_tokens\": [[22702, 23424, 24179, 18004, 20834, 22222, 18797, 21482, 21274, 19417, 17066, 22795, 18753, 20964, 20142, 22088, 19946, 18905, 19884, 21974, 16538, 20792, 20737, 20779, 20307, 18455, 18757, 21520, 20206, 19479], [22495, 17983, 20896, 18155, 22184, 18667, 23365, 18017, 18521, 21704, 21165, 19360, 20733, 19655, 15462, 22786, 20399, 19137, 21618, 17683, 17724, 19012, 19301, 17100, 24025, 20205, 21746, 22381, 16990, 22474]], \"per_rank_warmup_tokens\": [[18938, 20452, 17829, 22325, 22973, 18593, 19138, 19475, 19803, 21898], [16737, 20798, 21164, 21908, 22021, 18594, 19396, 22736, 17484, 25019]], \"per_rank_received_rows\": [[124049, 117267, 141018, 109698, 121215, 101114, 143060, 126277, 117382, 123495, 100634, 107459, 117038, 126326, 112955, 135417, 126522, 117987, 116827, 100376, 101013, 128614, 99908, 105458, 142377, 129695, 130049, 107811, 120539, 150577], [147133, 131175, 129432, 107256, 136893, 144220, 109912, 110717, 121388, 123231, 128752, 145471, 119878, 117388, 100669, 133827, 115548, 110265, 132185, 137566, 104559, 110210, 140320, 121816, 123615, 102265, 112969, 155595, 102637, 101141]], \"expert_rows_min_per_step\": [4, 6, 6, 7, 21, 31, 3, 3, 12, 3, 17, 4, 1, 5, 3, 6, 7, 5, 2, 6, 4, 21, 9, 19, 4, 2, 4, 0, 8, 4], \"expert_rows_max_per_step\": [8007, 14106, 8226, 6980, 6302, 8836, 10919, 9228, 7909, 10386, 7018, 15646, 5569, 6272, 8361, 8294, 8540, 7173, 7869, 7352, 9507, 8451, 7074, 6149, 6685, 11515, 10989, 7638, 6805, 8967], \"actual_tokens_min\": 15462, \"actual_tokens_max\": 24179, \"actual_tokens_mean\": 20222.75, \"actual_tokens_std\": 1974.0109897110501, \"max_tokens_capacity\": 25019, \"max_rows_capacity\": 171979, \"input_tokens_per_second\": 1053754.4115112992, \"experts\": 256, \"top_k\": 6, \"hidden\": 4096, \"intermediate\": 2048, \"warmups\": 10, \"priming_steps\": 0, \"compiled_graphs_during_measurement\": null, \"forward_only\": false, \"backward_only\": false, \"compute_dtype\": \"fp8_e4m3fn\", \"weight_grad_dtype\": \"bf16\", \"weights_prepared_once\": true, \"weight_preparation_in_timing\": false, \"fp8_weight_preparation\": \"fused_quantize_transpose\", \"stream_ordered\": true, \"accumulate_main_grad\": false, \"samples\": 30, \"sample_pause_ms\": 0, \"wall_slowest_rank_p50_us\": 38194.603, \"forward_ready_slowest_rank_p50_us\": null, \"per_rank_forward_ready_us\": [[], []], \"backward_ready_slowest_rank_p50_us\": null, \"per_rank_backward_ready_us\": [[], []], \"per_rank_stage_profiles\": null, \"window_padding\": null, \"communication\": null, \"per_rank_allocator_delta\": null, \"per_rank_stage_kernel_us\": null, \"forward_ready_timing_scope\": null, \"backward_ready_timing_scope\": null, \"forward_slowest_rank_p50_us\": 645.951, \"backward_slowest_rank_p50_us\": 37565.83900000001, \"wall_slowest_rank_samples_us\": [42310.523, 38535.535, 40805.455, 32945.119, 39994.727, 41009.504, 42091.737, 37209.421, 36022.443, 36922.082, 37775.797, 41978.661, 35496.575, 36616.15, 33662.962, 39634.184, 37235.2, 34656.422, 38526.975, 40171.403, 31407.019, 37563.613, 41300.209, 36062.275, 41119.273, 38911.588, 37862.231, 44313.186, 35457.966, 43870.254], \"per_rank_wall_us\": [[42310.523, 38530.05, 40805.455, 32943.422, 39994.727, 41009.504, 42086.949, 37209.421, 36022.443, 36779.5, 37774.204, 41971.017, 35496.575, 36616.15, 33655.916, 39575.13, 37235.2, 34656.422, 38526.445, 40165.411, 31407.019, 37513.219, 41300.209, 36062.275, 41089.586, 38907.679, 37857.014, 44313.186, 35457.966, 43869.428], [42305.49, 38535.535, 40801.09, 32945.119, 39983.592, 41006.619, 42091.737, 37197.585, 35950.288, 36922.082, 37775.797, 41978.661, 35492.687, 36604.588, 33662.962, 39634.184, 37216.383, 34654.899, 38526.975, 40171.403, 31404.045, 37563.613, 41267.822, 36026.902, 41119.273, 38911.588, 37862.231, 44200.947, 35457.624, 43870.254]], \"measurement_intervals_ns_per_rank\": [[[1793261081758213890, 1793261081800529768], [1793261081802082007, 1793261081840616301], [1793261081842221594, 1793261081883029952], [1793261081884305964, 1793261081917251995], [1793261081918739211, 1793261081958737451], [1793261081960213371, 1793261082001225459], [1793261082002756628, 1793261082044846034], [1793261082046299440, 1793261082083511176], [1793261082084955919, 1793261082121018009], [1793261082122603223, 1793261082159385372], [1793261082160781416, 1793261082198558316], [1793261082200111543, 1793261082242085611], [1793261082243515117, 1793261082279014272], [1793261082280427885, 1793261082317046703], [1793261082318400492, 1793261082352058930], [1793261082353593639, 1793261082393171120], [1793261082394715210, 1793261082431953394], [1793261082433270547, 1793261082467929372], [1793261082469396172, 1793261082507927192], [1793261082509531355, 1793261082549699200], [1793261082550890359, 1793261082582299956], [1793261082583696603, 1793261082621212087], [1793261082622791238, 1793261082664093962], [1793261082665504718, 1793261082701575161], [1793261082703288834, 1793261082744381867], [1793261082745859329, 1793261082784769628], [1793261082786386036, 1793261082824245776], [1793261082825871105, 1793261082870186754], [1793261082871712424, 1793261082907172857], [1793261082908802352, 1793261082952674146]], [[1793261081758214939, 1793261081800525306], [1793261081802080410, 1793261081840620852], [1793261081842222574, 1793261081883026974], [1793261081884305356, 1793261081917253237], [1793261081918742201, 1793261081958728780], [1793261081960212931, 1793261082001222044], [1793261082002756696, 1793261082044865852], [1793261082046307843, 1793261082083508234], [1793261082084958010, 1793261082120921702], [1793261082122454309, 1793261082159378932], [1793261082160782074, 1793261082198560536], [1793261082200111564, 1793261082242093144], [1793261082243515393, 1793261082279010474], [1793261082280427494, 1793261082317034675], [1793261082318397358, 1793261082352063133], [1793261082353593197, 1793261082393232583], [1793261082394740933, 1793261082431960636], [1793261082433270456, 1793261082467928104], [1793261082469394913, 1793261082507924142], [1793261082509526986, 1793261082549700783], [1793261082550890191, 1793261082582296850], [1793261082583692310, 1793261082621264620], [1793261082622824230, 1793261082664094611], [1793261082665502011, 1793261082701531352], [1793261082703257749, 1793261082744380659], [1793261082745858714, 1793261082784772984], [1793261082786385796, 1793261082824251147], [1793261082825977952, 1793261082870181480], [1793261082871712528, 1793261082907172651], [1793261082908800912, 1793261082952673548]]], \"measurement_scope\": \"eager forward+backward+release+device synchronize; input preparation excluded\", \"forward_timing_scope\": \"host API boundary (not synchronized CUDA phase timing)\", \"checkpoint\": \"row FP8 X + row FP8 FC1 gate/up; BWD column conversion once; recompute gated SwiGLU in backward\", \"implementation\": {}, \"gpu\": \"NVIDIA L20X\", \"per_rank_workspace\": [{\"compute_bytes\": 1894742152, \"last_forward_tensor_bytes\": 1478027020, \"last_backward_tensor_bytes\": 8467993896, \"gin_bytes\": 0, \"notify_bytes\": 82227920, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}, {\"compute_bytes\": 1894742152, \"last_forward_tensor_bytes\": 1079125180, \"last_backward_tensor_bytes\": 7965245936, \"gin_bytes\": 0, \"notify_bytes\": 82227920, \"notify_slots_in_use\": 1, \"separate_forward_notify\": true}], \"extension\": \"/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/fp8-dual-weight-flash/_runtime.cpython-312-x86_64-linux-gnu.so\"}\n",
+      "native_sha256": "9b532818b1c725bbbd5477db5911496c7539863f744a71bb31058f8e9173ddd2",
+      "adapter_sha256": "2f4fc4430b5255137dc4e4474a4041d8a2fd853737a6cf1bfceda039b492227b"
+    }
+  ],
+  "unit_tests": {
+    "command": "CUDA_VISIBLE_DEVICES=0 WEFTMOE_TENSOR_EXTENSION=\"$PWD/build/fp8-dual-weight-qwen35b/_runtime.cpython-312-x86_64-linux-gnu.so\" /opt/.venv/bin/python -m pytest -q tests/test_fp8.py",
+    "stdout": "........................................................                 [100%]\n56 passed in 2.12s\n",
+    "status": 0
+  },
+  "scope": "FP8 weight preparation changed only; retain W and W.T. Training benchmark excludes weight quantization and transpose output, includes source activation quantization. Preparation diagnostic compares old two-kernel and new fused GPU paths, with preallocated storage; does not include Python validation/allocation.",
+  "source_sha256": {
+    "src/cuda/fp8/api.hpp": "eb219b97d0752877452f1bbf21ae3f19c674210808574ea1ced027fecfba4b08",
+    "src/cuda/fp8.cu": "ca31ba5250f77edaa50918a31cd7eb1d726193207400e2d258a1c89e183b649e",
+    "src/cuda/fp8/quantization.cuh": "2213451037d1618a9da404c2c2a68a808ad26815ebdd68a6938150cac565338b",
+    "src/python/fp8.hpp": "bedcb30f290be31e7323a125dcecf85e038e96f030c4aed0524a24c89c9c5b1d",
+    "weftmoe/fp8.py": "a75d0cccfd52c821468d94229459eaab4393177e899de7f7ac65e2d0337bde04",
+    "tests/test_fp8.py": "66a8f14e266c4cd447539d0ec39759dd39166041e0da8f67d64ba471021252b4",
+    "benchmarks/torchrun_training.py": "609f74c9ee7fc29e153ebd8c7212d20333c0b948b44b8c2eab10072dc5f481ef",
+    "benchmarks/torchrun_fp8_weight_preparation.py": "e331e2e58af6ccba9b964c92c00aa0ea8f642c5b07ccf90bcd5a6b1a8da5bbec"
+  },
+  "fused_kernel_resources": {
+    "source": "cuobjdump --dump-resource-usage build/fp8-dual-weight-qwen35b/libweftmoe.so",
+    "aligned_bf16_registers": 87,
+    "aligned_fp32_registers": 88,
+    "fallback_registers": 90,
+    "shared_bytes": 17444,
+    "stack_bytes": 0,
+    "local_bytes": 0
+  }
+}

@@ -96,6 +96,8 @@ struct ActivationTransportPoolConfig {
   // Select DT explicitly for single-node inference. False keeps the PF path;
   // a small pool never opts into DT. The complete capacity must fit one window.
   bool decode_only = false;
+  // Compact source packets and packed compute rings; single-node PF FP8 only.
+  bool fp8_workspace = false;
   // Eager training submits successive uses of a workspace on its execution
   // stream. Handles retain tensors independently until GPU completion.
   bool stream_ordered_training = false;
@@ -183,10 +185,14 @@ enum class ForwardKernelSpecialization : std::uint8_t {
 struct ForwardMegaKernelConfig {
   std::uint64_t hidden_size = 0;
   std::uint64_t intermediate_size = 0;
-  // Preserve the post-Dispatch canonical X and the exact BF16 A/B values
-  // consumed by Forward's SwiGLU. The pool must have been constructed with
-  // enable_backward_state=true.
+  // Preserve X and A/B for Backward (BF16 or row-scaled FP8). Forward
+  // consumes the same represented A/B values. Requires enable_backward_state.
   bool retain_backward_state = false;
+  // Internal preparation policy selected by the FP8 PF backend. X is retained
+  // as a row-scaled FP8 checkpoint; fc1_input is absent.
+  bool fp8_x_checkpoint = false;
+  // The FP8 checkpoint omits the BF16 fc1_output binding too.
+  bool fp8_ab_checkpoint = false;
   // Caller-owned storage is prepared before entering Forward. Allocation
   // exceptions propagate locally; recovery belongs to the application.
   // With no binding, the training-ring backend allocates the tape.
@@ -201,7 +207,17 @@ struct ForwardMegaKernelConfig {
   CudaTensorBuffer inference_routes{}; // INT32 [tokens, top_k]
   CudaTensorBuffer inference_gates{};  // FP32 [tokens, top_k]
   // Eager split planning knows the exact tape extent only inside run().
-  std::function<ForwardTensorStorage()> tensor_factory{};
+  std::function<ForwardTensorStorage(const ForwardMegaKernelConfig &)> tensor_factory{};
+};
+
+// Caller-prequantized E4M3FN weights. Logical W1=[E,2I,H], W2=[E,H,I].
+// Each FP32 scale multiplies a logical 128x128 block. Optional transposes
+// are required for Backward and contain the same quantized values, transposed.
+// Buffers are immutable while any Forward/Backward handle retains the lease.
+struct FP8WeightBuffers {
+  CudaTensorBuffer w1, s1, w2, s2;
+  CudaTensorBuffer w1_t, s1_t, w2_t, s2_t;
+  std::uint64_t version = 0;
 };
 
 class ForwardWeightLease {
@@ -359,6 +375,10 @@ public:
       std::uint32_t owned_experts, std::uint32_t global_expert_begin,
       std::uint64_t hidden_size, std::uint64_t intermediate_size,
       const CudaTensorBuffer &packed_w1) const;
+  ForwardWeightLease publish_fp8_weights(
+      const FP8WeightBuffers &, std::uint32_t owned_experts,
+      std::uint32_t global_expert_begin, std::uint64_t hidden_size,
+      std::uint64_t intermediate_size) const;
 
 private:
   struct State;

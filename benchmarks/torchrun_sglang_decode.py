@@ -185,6 +185,7 @@ def main():
     # synthetic weights below define the layer; no model is loaded here.
     server = ServerArgs(
         model_path="dummy",
+        device="cuda",
         tp_size=world,
         ep_size=world,
         dp_size=world if args.dp_attention else 1,
@@ -334,7 +335,10 @@ def main():
                 scores, ids = logits.topk(k, dim=-1)
                 global_topk.topk_ids.copy_(ids)
                 global_topk.topk_weights.copy_(scores.softmax(-1))
-                torch.manual_seed(args.seed + global_tokens + 9173 * (iteration + 1) + rank)
+                input_rank = rank if args.dp_attention else 0
+                torch.manual_seed(
+                    args.seed + global_tokens + 9173 * (iteration + 1) + input_rank
+                )
                 x.normal_(0, 0.03)
             workload.update(global_topk.topk_ids.cpu().numpy().tobytes())
             workload.update(global_topk.topk_weights.cpu().numpy().tobytes())
@@ -469,6 +473,10 @@ def main():
                     )
         graphs.clear()
         del graph, outputs
+        if runtime is not None:
+            # Different global buckets can share a local token count but use
+            # new staging addresses, so discard their captured native plans.
+            runtime.invalidate_inference_layer(0)
     if runtime is not None:
         runtime.close()
     adapter.suspend(SimpleNamespace(graph_runner=None))
