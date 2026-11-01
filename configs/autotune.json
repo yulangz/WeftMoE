@@ -165,7 +165,6 @@
   },
   "decode": {
     "axes": {
-      "v4.decode_math_m": [0, 16, 64],
       "v4.decode_stages": [2, 3],
       "v4.decode_cta_multiplier": [0, 1, 2, 3]
     }

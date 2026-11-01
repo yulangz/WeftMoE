@@ -97,7 +97,7 @@ __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
                                             std::uint64_t tid,
                                             std::uint64_t stride) {
   if (a.fp8_source_x)
-    return; // Source quantization already wrote the registered packet.
+    return; // Source quantization owns the packet; publication orders peer reads.
   auto *input = a.network_pull
                     ? peer_at<uint4>(a.gin_window_base, a.static_network.input)
                     : peer_at<uint4>(a.local_base, a.source_input_offset);

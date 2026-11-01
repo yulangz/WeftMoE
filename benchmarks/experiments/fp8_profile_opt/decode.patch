@@ -1,0 +1,58 @@
+--- a/src/cuda/fp8/column.cuh
++++ b/src/cuda/fp8/column.cuh
+@@ -7,6 +7,27 @@
+ #endif
+ 
+ namespace weftmoe::cuda::fp8 {
++
++// E4M3 finite values are normal in FP16 and have only three mantissa bits.
++// For normal-range pow2 scales, change the packed exponent directly rather
++// than converting through FP32. Exceptional ranges retain the original path.
++__device__ __forceinline__ unsigned decode_scaled_e4m3_pair(unsigned q, float scale) {
++  const unsigned sb = __float_as_uint(scale), exponent = sb >> 23U;
++  if ((sb & 0x807fffffU) == 0U && exponent >= 10U && exponent <= 245U &&
++      (q & 0x7fU) != 0x7fU && ((q >> 8U) & 0x7fU) != 0x7fU) {
++    const auto h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(q), __NV_E4M3);
++    const unsigned bits = unsigned(h.x) | (unsigned(h.y) << 16U);
++    const unsigned magnitude = bits & 0x7fff7fffU;
++    const unsigned offset = unsigned(int(exponent) - 15) * 128U & 0xffffU;
++    const unsigned result = __vadd2((magnitude >> 3U) & 0x0fff0fffU,
++                                    offset | (offset << 16U));
++    return (result & ~__vcmpeq2(magnitude, 0U)) | (bits & 0x80008000U);
++  }
++  __nv_fp8x2_e4m3 v; v.__x = q;
++  const auto decoded = static_cast<float2>(v);
++  const auto result = __float22bfloat162_rn(make_float2(decoded.x * scale, decoded.y * scale));
++  return reinterpret_cast<const unsigned &>(result);
++}
+ 
+ // BF16 magnitudes can be reduced as two packed unsigned integers. This
+ // avoids decoding all 128 values merely to find their column maxima.
+@@ -76,10 +97,7 @@
+     if (row < rows) {
+       __nv_fp8x2_e4m3 q;
+       q.__x = *reinterpret_cast<const unsigned short *>(tile + tile_offset(row, column));
+-      const auto decoded = static_cast<float2>(q);
+-      const auto scale = row_scales[row];
+-      const auto pair = __float22bfloat162_rn(make_float2(decoded.x * scale, decoded.y * scale));
+-      value = reinterpret_cast<const unsigned &>(pair);
++      value = decode_scaled_e4m3_pair(q.__x, row_scales[row]);
+     }
+     values[i] = value;
+   }
+--- a/src/cuda/weftmoe_pf/fp8_swiglu.cuh
++++ b/src/cuda/weftmoe_pf/fp8_swiglu.cuh
+@@ -69,11 +69,8 @@
+         const auto as = a.fp8_ab_scales[sf_offset];
+         const auto bs = a.fp8_ab_scales[sf_offset + a.saved_rows * (a.intermediate / 128U)];
+         const auto decode = [](unsigned q, float scale) {
+-          __nv_fp8x2_e4m3 lo, hi;
+-          lo.__x = q & 65535U; hi.__x = q >> 16U;
+-          const auto x = static_cast<float2>(lo), y = static_cast<float2>(hi);
+-          return make_uint2(float2_to_bf16x2_bits(x.x * scale, x.y * scale),
+-                            float2_to_bf16x2_bits(y.x * scale, y.y * scale));
++          return make_uint2(fp8::decode_scaled_e4m3_pair(q & 65535U, scale),
++                            fp8::decode_scaled_e4m3_pair(q >> 16U, scale));
+         };
+         av = decode(*reinterpret_cast<const unsigned *>(a.fp8_ab_data + offset), as);
+         bv = decode(*reinterpret_cast<const unsigned *>(a.fp8_ab_data + offset + a.saved_rows * a.intermediate), bs);

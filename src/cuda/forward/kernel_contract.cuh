@@ -22,6 +22,8 @@ struct ForwardKernelArgs {
   std::uint64_t max_routes_per_rank = 0;
   std::size_t source_input_offset = 0;
   bool fp8_source_x = false;
+  const std::uint8_t *prequantized_input = nullptr;
+  const float *prequantized_scales = nullptr;
   std::size_t fused_source_gates_offset = 0;
   bool fused_inference_routes = false;
   bool training_counts_ready = false;

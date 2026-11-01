@@ -1,0 +1,29 @@
+--- a/src/cuda/weftmoe_pf/fp8_swiglu.cuh
++++ b/src/cuda/weftmoe_pf/fp8_swiglu.cuh
+@@ -143,17 +143,16 @@
+   }
+   auto *sf = scratch + 1536U;
+   fp8::MathSync::sync();
+-  if (tid < 64U) {
++  // Three independent magnitude planes use six warps concurrently.
++  if (tid < 192U) {
++    const unsigned plane = tid / 64U, index = tid % 64U;
++    unsigned maximum = 0U;
+ #pragma unroll
+-    for (unsigned plane = 0; plane < 3U; ++plane) {
+-      unsigned maximum = 0U;
+-#pragma unroll
+-      for (unsigned w = 0; w < 8U; ++w)
+-        maximum = __vmaxu2(maximum, maxima[plane * 512U + w * 64U + tid]);
+-      const auto x = (maximum & 0xffffU) >= 0x7f80U ? nanf("") : fp8::block_scale(__uint_as_float(maximum << 16U));
+-      const auto y = (maximum >> 16U) >= 0x7f80U ? nanf("") : fp8::block_scale(__uint_as_float(maximum & 0xffff0000U));
+-      *reinterpret_cast<float2 *>(sf + plane * 128U + tid * 2U) = make_float2(x, y);
+-    }
++    for (unsigned w = 0; w < 8U; ++w)
++      maximum = __vmaxu2(maximum, maxima[plane * 512U + w * 64U + index]);
++    const auto x = (maximum & 0xffffU) >= 0x7f80U ? nanf("") : fp8::block_scale(__uint_as_float(maximum << 16U));
++    const auto y = (maximum >> 16U) >= 0x7f80U ? nanf("") : fp8::block_scale(__uint_as_float(maximum & 0xffff0000U));
++    *reinterpret_cast<float2 *>(sf + plane * 128U + index * 2U) = make_float2(x, y);
+   }
+   fp8::MathSync::sync();
+   const auto cast = [&](const unsigned (&values)[32], const float *scales,

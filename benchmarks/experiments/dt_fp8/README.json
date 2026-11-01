@@ -1,0 +1,48 @@
+{
+  "purpose": "DT single-kernel FP8 forward: source preparation concurrent with mini notify, FP8 dispatch/compute and BF16 return/combine.",
+  "scope": "Explicit decode_only=True, training=False; single node. BF16 remains the default path.",
+  "api": [
+    "weights = prepare_fp8_weights(w1, w2, version=optimizer_step, training=False)",
+    "runtime = TensorRuntime(..., training=False, decode_only=True, fp8_workspace=True)",
+    "y = runtime.inference_fp8(layer, x_or_rowwise_fp8_tensor, routes, gates, weights)"
+  ],
+  "capture": "Warm each layer/token bucket before outer capture. Keep input/data/scale/routes/gates addresses stable. Mutate contents in place. Discard outer graphs and invalidate_inference_layer before replacing weights or addresses.",
+  "reproduce_from_repository_root": [
+    "/opt/.venv/bin/python benchmarks/experiments/dt_fp8/build.py dt -Xptxas=-v",
+    "TEST_DT_ALLOW_KNOWN_ONE_TOKEN=1 /opt/.venv/bin/python benchmarks/experiments/dt_fp8/run.py dt check",
+    "RUN_SUFFIX=-random /opt/.venv/bin/python benchmarks/experiments/dt_fp8/run.py dt bench",
+    "BUILD_MODELS=qwen35b BENCH_PROFILE=1 BENCH_SIZES='1 64 512' BENCH_REPEATS=5 RUN_SUFFIX=-profile /opt/.venv/bin/python benchmarks/experiments/dt_fp8/run.py dt bench",
+    "/opt/.venv/bin/python benchmarks/experiments/dt_fp8/summarize.py dt"
+  ],
+  "timing": "EP8, three model dimensions, tokens/rank 1/16/32/64/128/256/512. Alternating variant order and slowest-rank graph-replay latency. Includes online source work; excludes weight preparation. Prequantized-input variant excludes prior quantization. Random routes are static during each timed graph. Profile runs are separate and excluded from the final performance comparison.",
+  "validation": {
+    "reference": "original BF16",
+    "metric": "sum((actual-reference)^2)/(sum(actual^2)+sum(reference^2))",
+    "limit": "diff < 5e-3; same for every model, M, token count, FWD and BWD",
+    "dprob": "record diff, require finite values, no numerical error limit",
+    "exact_checks": "quantized layout, source format and graph/eager equivalence remain exact",
+    "known_case_exception": "Performance experiments may explicitly enable TEST_DT_ALLOW_KNOWN_ONE_TOKEN=1: only Qwen35B rank7 replay-1-0-0, diff in [.005,.0051] and FP8-reference diff<5e-5. Default tests remain strict; reports record actual waivers."
+  },
+  "autotune": {
+    "command": "/opt/.venv/bin/python benchmarks/experiments/dt_fp8/autotune.py --output build/dt-fp8-autotune-m64 --allow-known-one-token --detach",
+    "candidates": 25,
+    "models": 3,
+    "new_candidates": "Fixed M64; search operand stages, boolean slice scheduling and CTA count only.",
+    "registers": "fixed 224/56; not tuned",
+    "eligibility": "All correctness tests and timed inputs must pass the common BF16 global diff policy. A failed default is excluded, not a reason to abort other candidates. Models with no passing candidate have no finalists. No production settings are changed automatically.",
+    "reuse": "Only identical native binaries; rerun all correctness checks and timings."
+  },
+  "profiling": {
+    "command": "/opt/.venv/bin/python benchmarks/experiments/dt_fp8/profile.py --output build/dt-fp8-profile-20261101 --models qwen35b --tokens 512 --groups basic",
+    "method": "EP8 rank2, one NCU pass only, no clock or cache control, check replay output exactly. 90-second process-group deadline. Failures are preserved in summary.json. Stall-counter group is opt-in because replay can hang on communicating kernels.",
+    "limitations": "Profiling changes rank arrival and barrier waits. Counter kernel time and throughput cannot substitute for unprofiled performance or isolate a single phase.",
+    "separate_latency_command": "/opt/.venv/bin/python benchmarks/experiments/dt_fp8/compare.py --output build/dt-fp8-compare-20261101",
+    "latency_eligibility": "Paired default/previous-winner diagnostic timings use the common diff metric, but do not replace the full mutation/tail correctness suite."
+  },
+  "implementation": {
+    "M64": "two math warpgroups each own N128; WGMMA FP32 block accumulation every K128; independent operand-stage release",
+    "AB": "row-swizzled BF16 scratch; existing FP8 quantize/dequantize boundary retained",
+    "defaults": "Fixed M64 for every BF16/FP8 shape, 3 TMA stages, slice scheduling, resident-cluster CTA clamp"
+  },
+  "latest_report": "docs/benchmarks/dt_m64_20261101.json"
+}

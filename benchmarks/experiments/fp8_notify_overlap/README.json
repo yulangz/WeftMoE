@@ -1,0 +1,48 @@
+{
+  "source_id": "weftmoe-fp8-notify-overlap-20261031",
+  "baseline": "Current fixed224/56 plus retained FC1 subgroup change; immutable build/fp8-profile-opt/subgroup-{model}.",
+  "scope": "Single-node source FP8 X/dY. Network path remains serial. No GEMM or quantization arithmetic changes.",
+  "design": {
+    "fwd": "Record caller prerequisites and fork existing transport stream. Submit Notify first on caller stream, then X quantization on transport stream. Join source completion and publish across ranks before CPU count download and Main.",
+    "bwd": "Record caller prerequisites; submit retained-tape planner first on transport stream, then quantize dY on caller stream after its producer event. Transport stream joins quantization, publishes across ranks, and runs Main.",
+    "resources": "Reuse backward_transport_stream and existing role/join events. No new stream/event/device allocation.",
+    "publication": "Notify can publish route metadata before quantization finishes. A local event alone is insufficient for peer reads; the extra rank barrier publishes all source packets after both streams join. Empty sources participate.",
+    "stress": "Delay first source CTA by20millionclockcycles; require full parity and async multi-tape tests to pass."
+  },
+  "hardware": "8xNVIDIAL20X SM90,EP8",
+  "shapes": {
+    "qwen35b": {
+      "hidden": 2048,
+      "intermediate": 512,
+      "experts": 256,
+      "top_k": 8
+    },
+    "qwen122b": {
+      "hidden": 3072,
+      "intermediate": 1024,
+      "experts": 256,
+      "top_k": 8
+    },
+    "flash": {
+      "hidden": 4096,
+      "intermediate": 2048,
+      "experts": 256,
+      "top_k": 6
+    }
+  },
+  "tokens": [
+    8192,
+    20480
+  ],
+  "measurement": "30 samples after10warmups and full trace priming, same input/routing hashes, slowest-rank cycle wall median. SourceFP8, BF16dW; weight preparation excluded. Profile separately with CUDA activities; no simultaneous compilation/disassembly/profiling during wall measurements.",
+  "followup": "early: enqueue the FWD quantization join/publication immediately after Notify, before finish_training_notify downloads counts and synchronizes the host. Same GPU dependencies; removes an avoidable host boundary before source publication.",
+  "ordered_followup": {
+    "ordered": "Notify/planner launch before quantization. Fork prerequisite still recorded before Notify; join and peer publication after both.",
+    "ordered_fwd": "Same Notify-first order in FWD; BWD serial.",
+    "ordered_half": "Same Notify-first order in both phases, with Notify/planner grid halved and rounded to the existing2CTAcluster. Main GEMM grid unchanged. Fixed choice across models.",
+    "ordered_delay": "Notify-first with firstquantCTA delayed20millioncycles, Q35only.",
+    "reason": "CUDA correlations show Notify API returned while quantization was still running, but Notify GPU execution began near quantization tail. Test ordering and scheduling capacity rather than attributing all delay to host overhead."
+  },
+  "production": "Retain Notify-first FWD+BWD overlap only for single-node FP8; original Notify CTA count, fixed224/56. Remove experimental flags and delay injection; use one quantization lambda per phase, preserve serial network path and caller input readiness. Rebuild and retest cleaned source.",
+  "result": "Retained uniform single-node Notify-first implementation. End-to-end gains are modest and Flash 8K is not a stable improvement; see decision and every raw run in the report."
+}

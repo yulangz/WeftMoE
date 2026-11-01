@@ -69,7 +69,8 @@ runtime.close()  # 所有 rank 在全部 backward 完成后共同关闭。
 推理创建 `training=False` 的 runtime，默认使用 PF；设置 `decode_only=True` 显式选择 DT。
 DT 要求单机、纯推理、编译形状匹配、EP world 不超过 32，整个 pool 容量可由单个 source
 window 容纳。Python 接口会将窗口设为 `max_tokens`，没有固定的 64-token 上限；各 EP rank
-必须使用一致配置。使用 `inference_eager(..., layer=layer_id)` 执行 eager 推理。
+必须使用一致配置。BF16 和 FP8 DT 的所有 token shape 固定使用 M64，
+不再提供 M16 路径、切换阈值或 M 维度调参。使用 `inference_eager(..., layer=layer_id)` 执行 eager 推理。
 CUDA Graph 接口为 `inference(layer_id, ...)`，
 先在 capture 外预热，并保持图使用的地址不变。设置 `layer` 会缓存重排后的权重：
 原地更新后调用 `refresh_inference_weights()`；更换权重地址时先丢弃外部图并
@@ -77,7 +78,8 @@ CUDA Graph 接口为 `inference(layer_id, ...)`，
 
 ## Block-wise FP8
 
-SM90 PF 路径支持 E4M3FN 前向、输入梯度和权重梯度。权重采用每个专家独立的
+SM90 PF 路径支持 E4M3FN 前向、输入梯度和权重梯度；单机 DT 支持 FP8 推理前向。
+权重采用每个专家独立的
 `128×128` block scale；激活和反向梯度在线采用 `1×128` scale。每个 K128
 片段的 FP8 WGMMA 结果乘对应 scale 后累加到 FP32。单机及多机 GIN 的 N256
 路径都在源端独立量化 X/dY，Dispatch 搬运 FP8 数据及 FP32 scale；Return、输出
@@ -86,6 +88,16 @@ SM90 PF 路径支持 E4M3FN 前向、输入梯度和权重梯度。权重采用�
 FP8 和 scale 重数量化为列向 FP8，Z/dAB 则在 SwiGLU 反向产生时直接从 BF16
 列量化。row→col 会重新选取 scale 并再次舍入，不能视为无损转置，也不等价于
 从原始 BF16 直接列量化。量化本身不求导，反向使用对应的 FP8 GEMM 近似梯度。
+
+FP8 相对原始 BF16 的验收采用全局指标
+`diff = sum((actual-reference)^2) / (sum(actual^2)+sum(reference^2))`，
+要求 `diff < 5e-3`，每个 rank 单独检查，dW 再逐 expert 检查；dprob 仅要求有限。
+不使用逐元素相对容差。布局、图回放、预量化输入等数学等价路径仍要求精确一致。
+训练 PF 与固定 M64 DT 的前向另设严格逐位回归：三个模型、普通及紧凑 FP8 workspace，
+3600 个 rank-case 全部一致，每份训练 tape 均实际执行反向。
+完整 DT 回归的 816 项中保留此前 Qwen35B 单 token 的已知误差豁免；该豁免不适用于
+训推逐位一致性测试。测试范围和成对性能数据见
+[固定 M64 验证报告](benchmarks/dt_m64_20261101.json)。
 
 构建方式与上面的 BF16 Tensor API 相同，无需安装 DeepGEMM。`H/I` 必须是 128
 的倍数，并匹配构建 profile。先在 forward/backward 外准备权重，再显式传给 `moe`：
@@ -125,22 +137,44 @@ W1 仍使用 `[gate, up]` 规范行序，禁止先交错 gate/up 再划量化块
 与训练主参数的对应关系由调用者保证。自行量化时使用当前 block amax，scale 向上取到
 2 的幂；全零块 scale 为 1，尾部补零且不跨专家。
 
+预量化激活使用 rowwise `FP8Tensor`：`data[tokens,H]` 为 E4M3FN，
+`scales[tokens,H/128]` 为 FP32 正有限 2 的幂，`block_rows=1`。
+PF/DT 的 `forward_fp8` 均接受此格式；FP8 tape 的 `backward` 和
+`backward_async` 也接受相同格式的 dY。源端直接复制数据和 scale 到通信 packet，
+跳过 amax 和重新量化；量化器及输入准备耗时由调用者决定是否计入端到端测量。
+
+```python
+from weftmoe.fp8 import quantize_fp8
+
+qx, qdy = quantize_fp8(x), quantize_fp8(dy)
+tape = runtime.forward_fp8(qx, routes, gates, prepared,
+                           weight_grad_dtype=torch.bfloat16)
+dx, dgates, dw1, dw2 = runtime.backward(tape, qdy)
+```
+
 纯推理使用 `training=False` 的 runtime 和
-`prepare_fp8_weights(..., training=False)`，调用
-`forward_fp8(..., retain_backward_state=False)`。本实现尚未接入 DT、完整 MoE
-CUDA Graph 或 Megatron/SGLang adapter 的自动选择。FP8 仅支持 PF N256
-及源端量化配置；原来的多机 BF16 通信 + 目的端 FP8 量化路径已删除。
+`prepare_fp8_weights(..., training=False)`。Eager 调用
+`forward_fp8(..., retain_backward_state=False)`；CUDA Graph 调用
+`inference_fp8(layer_id, x_or_fp8_tensor, routes, gates, prepared)`。
+每个 layer/token bucket 必须在外部 capture 前预热，保持 data、scale、routes、gates
+地址不变。更换权重或输入地址时，先丢弃外部图并 `invalidate_inference_layer()`，
+然后重新预热和 capture。Megatron/SGLang adapter 尚不自动选择 FP8。
+PF FP8 使用 N256 和源端量化配置；原来的多机 BF16 通信 + 目的端 FP8 量化路径已删除。
+DT 在同一个 kernel 中让 math warps 量化或复制源输入，control warps 执行 mini notify，
+现有跨 rank barrier 等待两者完成后发布数据。FP8 M64 使用两个 math warpgroup，
+各自计算 N128；每个 K128 块的四次 WGMMA 后做 scale 累加。
 
 PF N256 的 X 由独立 `prepare_source_x` kernel 按源 token 量化，结果跨 top-k
 路由和 N tile 复用。每行 packet 包含 `FP8[H] + FP32[H/128]`，pitch 向上对齐
 到 16 字节。`TensorRuntime(..., fp8_workspace=True)` 按此大小分配源输入区；
-默认 runtime 保留 BF16 容量以支持混用。Notify 不再拷贝 BF16 X；独立量化
-kernel 与 Notify、主 kernel 在同一 stream 上顺序执行，沿用 Notify 的跨 rank
-发布协议，不新增 peer ready 标记或跨 stream 事件。Pull 只搬运数据和 scale，
-并写入现有 ring 布局。源 packet 的复用仍受已有 Forward
+默认 runtime 保留 BF16 容量以支持混用。Notify 不再拷贝 BF16 X。
+单机 PF 的源端量化/复制与 planner 分别在两个 stream 执行；本地 event 汇合后，
+`source_ready_kernel` 通过跨 rank barrier 发布所有源 packet，再允许主 kernel Pull。
+多机 GIN 保持同一 transport/preparation stream 上的有序执行。
+Pull 只搬运数据和 scale，并写入现有 ring 布局。源 packet 的复用受已有 Forward
 跨 rank 完成协议保护；目的端 row FP8 X 随各自 tape 独立保留。原始 BF16 X 无需保存。
-反向 dY 也通过同一个独立源端量化 kernel 写入该输入区，随后在原有反向
-transport stream 上恢复路由计划并执行 BWD；反向 Pull 只搬运 FP8 + scale。
+反向对 dY 使用同样的量化或直接复制方案：单机源准备与路由计划恢复并行，汇合并发布后
+执行 BWD；多机 GIN 顺序恢复计划及准备源数据。反向 Pull 只搬运 FP8 + scale。
 Z/dAB 的量化仍在 SwiGLU epilogue 中。
 PF N256 路径在每个 M128 ring slot 内紧凑存放 `FP8[M128,C]` 与 `FP32 scale[C/128,M128]`。
 启用 `fp8_workspace=True` 时，slot 跨度为 `128 * align16(C + 4*C/128)` 字节，
@@ -151,7 +185,7 @@ X/dR 与 dAB 的通道数即使不同，写入也只覆盖当前 slot；不能�
 前向及 Dgrad 复用多级 producer/math 流水线，双 CTA cluster multicast
 共享激活；W1 的 5D TMA descriptor 直接
 描述规范 gate/up 权重，无需额外预打包权重副本。math 使用 N128 WGMMA 子块与
-N256 最终累加器，以控制寄存器用量；默认 math/control 配额为 216/72。
+N256 最终累加器，以控制寄存器用量；math/control 配额固定为 224/56，不按模型或 shape 调整。
 单机 N256 训练路径由指定 FC1 N tile 保存目的端 row FP8 X；GIN 由 Pull 在
 搬运时按专家的 canonical 行号保存，连同 gate 和反向索引一起写入独立 tape。BWD 中指定 dU
 N tile 异步读取对应 X 块，在 dU 计算后完成一次 row→column 重量化，写入

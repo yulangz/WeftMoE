@@ -1,0 +1,22 @@
+--- a/src/cuda/weftmoe_pf/backward_kernel.cuh
++++ b/src/cuda/weftmoe_pf/backward_kernel.cuh
+@@ -408,6 +408,11 @@
+         const auto offset = std::uint64_t(t.block) * kM * reduction + k * kM;
+         fp8::row_to_column(reinterpret_cast<const std::uint8_t *>(s.a[stage]),
+             scales, t.rows, a.fp8_wgrad_data + offset, a.fp8_wgrad_scales + offset / 128U);
++      }
++      // The dR conversion is the final reader of the operand stage. X uses
++      // the separate xraw/xscales arena, so let TMA refill while X converts.
++      backward_compute_detail::release_stage(s.empty[stage]);
++      if (cache_owner) {
+         if (a.fp8_x_row_data) {
+           asm volatile("cp.async.wait_group 0;" ::: "memory");
+           fp8::MathSync::sync();
+@@ -417,7 +422,6 @@
+           fp8::MathSync::sync();
+         }
+       }
+-      backward_compute_detail::release_stage(s.empty[stage]);
+       stage = (stage + 1U) % kStages;
+       phase ^= stage == 0U;
+     }

@@ -322,6 +322,15 @@ private:
   friend class ExternalCudaProducer;
 };
 
+// Caller-prequantized source activations/gradients: contiguous E4M3FN
+// [tokens, hidden] and FP32 dequantization scales [tokens, hidden / 128].
+// Scales must be finite positive powers of two, matching rowwise 1x128
+// quantization. Data/scales are copied verbatim to symmetric source packets.
+struct FP8SourceBuffers {
+  CudaTensorBuffer data;
+  CudaTensorBuffer scales;
+};
+
 // CUDA-specific zero-copy producer boundary. It records readiness on the
 // caller-owned producer stream, checks the typed allocation range/device, and
 // retains both allocation and stream owners through consumer completion.
@@ -359,6 +368,14 @@ public:
                            std::uint64_t capacity_elements,
                            std::uint64_t num_tokens, std::uint64_t hidden_size,
                            std::shared_ptr<const void> allocation_owner) const;
+  // These overloads retain both owners and producer readiness. The legacy
+  // lease type names are preserved; only FP8 forward/backward consumers accept them.
+  BFloat16ActivationLease publish_fp8_activations(
+      const FP8SourceBuffers &, std::uint64_t num_tokens,
+      std::uint64_t hidden_size) const;
+  BFloat16OutputGradientLease publish_fp8_output_gradients(
+      const FP8SourceBuffers &, std::uint64_t num_tokens,
+      std::uint64_t hidden_size) const;
   ForwardWeightLease publish_weights(
       const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
       std::shared_ptr<const void> w1_owner, const transport::BFloat16 *w2,

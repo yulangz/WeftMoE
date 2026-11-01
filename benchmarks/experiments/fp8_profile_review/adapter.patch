@@ -1,0 +1,13 @@
+--- a/src/python/runtime.cpp
++++ b/src/python/runtime.cpp
+@@ -508,7 +508,10 @@
+       backward.wait();
+     else
+       pending_training_.push_back({{}, std::move(backward)});
++    // Diagnostic adapter: retain the handle until the BWD trace is downloaded.
++#if !WEFTMOE_DEVICE_TIMELINE
+     tape->forward = {};
++#endif
+     tape->dispatch = {};
+     return py::make_tuple(dx, dg, dw1, dw2);
+   }

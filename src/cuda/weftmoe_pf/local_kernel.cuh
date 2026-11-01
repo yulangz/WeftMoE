@@ -157,8 +157,8 @@ __device__ __forceinline__ void pull_fp8(
   unsigned expert = 0, begin = 0, phase = 0, peer_rows = 0;
   SourceRowCursor cursor(a);
   auto *gates = peer_at<float>(a.local_base, a.canonical_gates_offset);
-  // Source quantization precedes Notify on the same stream. Notify's existing
-  // system release/acquire publication covers the packet as well as routes.
+  // Source-ready publication follows both planning and quantization. Its
+  // system release/acquire covers the packets before peer TMA reads.
   if constexpr (SourceQuantized)
     asm volatile("fence.proxy.async.global;" ::: "memory");
   for (unsigned linear = blockIdx.x * kPullWarps + warp;; linear += gridDim.x * kPullWarps) {

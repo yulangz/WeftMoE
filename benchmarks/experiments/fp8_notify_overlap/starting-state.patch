@@ -1,0 +1,87 @@
+diff --git a/src/cuda/fp8/tile.cuh b/src/cuda/fp8/tile.cuh
+index d9bee15..78a0048 100644
+--- a/src/cuda/fp8/tile.cuh
++++ b/src/cuda/fp8/tile.cuh
+@@ -6,12 +6,10 @@
+ 
+ namespace weftmoe::cuda::fp8 {
+ 
+-#ifndef WEFTMOE_FP8_MATH_REGISTERS
+-#define WEFTMOE_FP8_MATH_REGISTERS 216
+-#endif
+-inline constexpr unsigned kMathRegisters = WEFTMOE_FP8_MATH_REGISTERS;
++// One fixed partition for FP8 FWD and BWD across model profiles.
++inline constexpr unsigned kMathRegisters = 224U;
+ inline constexpr unsigned kControlRegisters = 504U - 2U * kMathRegisters;
+-static_assert(kMathRegisters >= 168U && kMathRegisters <= 240U && kMathRegisters % 8U == 0U);
++static_assert(kControlRegisters == 56U);
+ 
+ struct NoSync {
+   __device__ static void sync() {}
+diff --git a/src/cuda/weftmoe_pf/local_compute.cuh b/src/cuda/weftmoe_pf/local_compute.cuh
+index ae209d4..9b70cfb 100644
+--- a/src/cuda/weftmoe_pf/local_compute.cuh
++++ b/src/cuda/weftmoe_pf/local_compute.cuh
+@@ -12,11 +12,9 @@ __device__ __forceinline__ void store_fp8_swiglu(
+     const Args &a, const float *accum, transport::BFloat16 *output,
+     const float *gates, unsigned row, unsigned rows, unsigned column, unsigned block) {
+   const unsigned lane = threadIdx.x % 32U;
+-  const unsigned mask = 0xfU << (lane / 4U * 4U);
+   const unsigned row0 = threadIdx.x / 32U * 16U + lane / 4U;
+-  const auto store_eight = [](std::uint8_t *destination, const unsigned (&words)[4]) {
++  const auto store_eight = [](std::uint8_t *destination, const unsigned (&words)[4], unsigned mask) {
+     const unsigned lane = threadIdx.x % 4U;
+-    const unsigned mask = 0xfU << (threadIdx.x % 32U / 4U * 4U);
+     unsigned lo = words[0] | (words[1] << 16U);
+     unsigned hi = words[2] | (words[3] << 16U);
+     // A 4x4 halfword transpose: exchange packed pairs, then interleave
+@@ -34,6 +32,14 @@ __device__ __forceinline__ void store_fp8_swiglu(
+     const auto m = row0 + item * 8U;
+     if (m >= rows)
+       continue;
++    // All valid four-lane row groups participate with the same warp mask.
++    // Width-four shuffles keep rows independent without dynamic subgroup masks.
++    const unsigned valid = min(8U, rows - (threadIdx.x / 32U * 16U + item * 8U));
++    const unsigned mask = 0xffffffffU >> ((8U - valid) * 4U);
++    const auto row_max = [mask](unsigned x) {
++      x = max(x, __shfl_xor_sync(mask, x, 1, 4));
++      return max(x, __shfl_xor_sync(mask, x, 2, 4));
++    };
+     // Capture read-only row metadata before any output stores can alias it.
+     const float route_gate = gates[row + m];
+     const auto saved = a.fp8_ab_data ? a.checkpoint.rows[std::uint64_t(block) * kM + m] : 0U;
+@@ -52,8 +58,8 @@ __device__ __forceinline__ void store_fp8_swiglu(
+         max_b = max(max_b, max(__float_as_uint(g[4]) & 0x7fffffffU,
+                                __float_as_uint(g[5]) & 0x7fffffffU));
+       }
+-      max_a = __reduce_max_sync(mask, max_a);
+-      max_b = __reduce_max_sync(mask, max_b);
++      max_a = row_max(max_a);
++      max_b = row_max(max_b);
+       scale_a = fp8::block_scale(__bfloat162float(__float2bfloat16_rn(__uint_as_float(max_a))));
+       scale_b = fp8::block_scale(__bfloat162float(__float2bfloat16_rn(__uint_as_float(max_b))));
+       if (ab_row && !(lane % 4U)) {
+@@ -93,11 +99,11 @@ __device__ __forceinline__ void store_fp8_swiglu(
+       }
+       if (a.fp8_ab_quantized && ab_row) {
+         const auto offset = index * 8U + lane % 4U * 8U;
+-        store_eight(ab_row + offset, aq_words);
+-        store_eight(ab_row + ab_plane + offset, bq_words);
++        store_eight(ab_row + offset, aq_words, mask);
++        store_eight(ab_row + ab_plane + offset, bq_words, mask);
+       }
+     }
+-    maximum = __reduce_max_sync(mask, maximum);
++    maximum = row_max(maximum);
+     const auto scale = fp8::block_scale(__uint_as_float(maximum << 16U));
+     const auto inverse = isfinite(scale) ? __uint_as_float(0x7f000000U - __float_as_uint(scale)) : scale;
+     auto *buffer = reinterpret_cast<std::uint8_t *>(output);
+@@ -112,7 +118,7 @@ __device__ __forceinline__ void store_fp8_swiglu(
+         const auto v = bf16x2_bits_to_float2(values[index + j]);
+         words[j] = __nv_fp8x2_e4m3(make_float2(v.x * inverse, v.y * inverse)).__x;
+       }
+-      store_eight(base + column + index * 8U + lane % 4U * 8U, words);
++      store_eight(base + column + index * 8U + lane % 4U * 8U, words, mask);
+     }
+     if (!(lane % 4U)) {
+       auto *sf = Packed

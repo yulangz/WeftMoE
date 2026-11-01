@@ -35,6 +35,8 @@ from benchmarks.workload import make_workload
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
+    parser.add_argument("--prequantized-inputs", action="store_true",
+                        help="Supply rowwise FP8 X/dY; prepare before timing, include packet copy")
     parser.add_argument("--fp8", action="store_true",
                         help="PF block-wise FP8; quantize fixed weights and emit W/W.T outside timing")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"), default="flex",
@@ -96,6 +98,8 @@ def main():
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
     args = parser.parse_args()
     resolve_model(args)
+    if args.prequantized_inputs and not args.fp8:
+        parser.error("--prequantized-inputs requires --fp8")
     if args.weight_grad_dtype is not None and not args.fp8:
         parser.error("--weight-grad-dtype is an FP8 option; BF16 already returns BF16 dW")
     if args.fp8 and (args.backend != "pf" or args.prepared_weights or args.verify):
@@ -322,6 +326,9 @@ def main():
                     kernel_probe.start()
             routes, gates = cpu_routes.cuda(), cpu_gates.cuda()
             x, dy = rand(routes.shape[0], args.hidden), rand(routes.shape[0], args.hidden)
+            if args.prequantized_inputs:
+                from weftmoe.fp8 import quantize_fp8
+                x, dy = quantize_fp8(x), quantize_fp8(dy)
             dist.barrier()
             torch.cuda.synchronize()
             if args.backward_only:
@@ -490,6 +497,9 @@ def main():
                 intermediate=args.intermediate, warmups=args.warmups,
                 priming_steps=priming_steps, compiled_graphs_during_measurement=compile_graphs,
                 forward_only=args.forward_only, backward_only=args.backward_only,
+                input_dtype="fp8_e4m3fn" if args.prequantized_inputs else "bf16",
+                input_preparation_in_timing=not args.prequantized_inputs,
+                source_packet_copy_in_timing=args.prequantized_inputs,
                 compute_dtype="fp8_e4m3fn" if args.fp8 else "bf16",
                 weight_grad_dtype=(args.weight_grad_dtype or "float32") if args.fp8 else "bf16",
                 weights_prepared_once=args.prepared_weights or args.fp8,

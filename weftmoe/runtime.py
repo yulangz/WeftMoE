@@ -178,13 +178,36 @@ class TensorRuntime:
         self._check(x, routes, gates, w1, w2)
         return self.native.forward(x, routes, gates, w1, w2)
 
+    def _source_input(self, value):
+        from .fp8 import FP8Tensor
+
+        if isinstance(value, FP8Tensor):
+            if value.block_rows != 1 or len(value.shape) != 2:
+                raise ValueError("FP8 source requires rowwise 1x128 quantization")
+            data = value.data
+            if tuple(data.shape) != value.shape:
+                raise ValueError("FP8 source must have an unpadded hidden dimension")
+            buffers = (data, value.scales)
+        else:
+            if not isinstance(value, torch.Tensor) or value.dtype != torch.bfloat16:
+                raise ValueError("Source must be BF16 or FP8Tensor with explicit row scales")
+            data, buffers = value, (value,)
+        if (data.ndim != 2 or data.shape[1] != self.hidden
+                or data.shape[0] > self.max_tokens or not data.is_cuda
+                or not data.is_contiguous() or data.device != self.stream.device):
+            raise ValueError("Source shape/device/layout does not match runtime")
+        return data, buffers
+
     def forward_fp8(self, x, routes, gates, weights, *,
                     synchronize=True, retain_backward_state=True,
                     weight_grad_dtype=torch.float32):
-        """PF forward with prequantized weights and online activation casts.
+        """PF/DT forward with BF16 or prequantized rowwise FP8Tensor input.
 
         Prepare weights with weftmoe.fp8.prepare_fp8_weights before this call.
-        Backward consumes the returned tape through the usual backward API.
+        FP8Tensor inputs require block_rows=1 and finite positive power-of-two
+        FP32 scales. Data/scales are copied unchanged into source packets;
+        only BF16 inputs are quantized. Backward accepts either input format
+        through the usual backward API and still returns BF16 dX.
         """
         from .fp8 import PreparedFP8Weights
 
@@ -192,34 +215,30 @@ class TensorRuntime:
             raise ValueError("weight_grad_dtype must be torch.bfloat16 or torch.float32")
         if not isinstance(weights, PreparedFP8Weights):
             raise TypeError("weights must be PreparedFP8Weights")
-        if self.decode_only:
-            raise ValueError("FP8 currently requires a PF runtime")
         if self.training and torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Runtime must be invoked on its preparation stream")
-        if x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.max_tokens:
-            raise ValueError("Activation shape exceeds prepared capacity")
+        source, source_buffers = self._source_input(x)
         for value, dtype, shape in (
-            (x, torch.bfloat16, (x.shape[0], self.hidden)),
-            (routes, torch.int32, (x.shape[0], self.top_k)),
-            (gates, torch.float32, (x.shape[0], self.top_k)),
+            (routes, torch.int32, (source.shape[0], self.top_k)),
+            (gates, torch.float32, (source.shape[0], self.top_k)),
         ):
             if (value.shape != shape or value.dtype != dtype or not value.is_cuda
-                    or value.device != x.device or not value.is_contiguous()):
+                    or value.device != source.device or not value.is_contiguous()):
                 raise ValueError(f"Expected contiguous CUDA {dtype} of shape {shape}")
         if (weights.w1.shape != (self.experts // self.world, 2 * self.intermediate, self.hidden)
                 or weights.w2.shape != (self.experts // self.world, self.hidden, self.intermediate)
-                or weights.w1.data.device != x.device):
+                or weights.w1.data.device != source.device):
             raise ValueError("Prepared FP8 weights do not match runtime shape/device")
         # Native calls run on the preparation stream. Include preparation of
         # weights and caller-produced inputs in its dependency chain.
-        caller = torch.cuda.current_stream(x.device)
+        caller = torch.cuda.current_stream(source.device)
         if caller == self.stream:
             return self.native.forward_fp8(x, routes, gates, weights,
                                            synchronize, retain_backward_state,
                                            weight_grad_dtype == torch.float32)
         self.stream.wait_stream(caller)
         with torch.cuda.stream(self.stream):
-            for value in (x, routes, gates):
+            for value in (*source_buffers, routes, gates):
                 value.record_stream(self.stream)
             tape = self.native.forward_fp8(x, routes, gates, weights,
                                           synchronize, retain_backward_state,
@@ -228,9 +247,12 @@ class TensorRuntime:
         return tape
 
     def backward(self, tape, dy):
+        """Consume BF16 dY, or a rowwise FP8Tensor for an FP8 tape."""
         if torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Backward must use the preparation stream")
-        return self.native.backward(tape, dy.contiguous())
+        dy = dy.contiguous() if isinstance(dy, torch.Tensor) else dy
+        self._source_input(dy)
+        return self.native.backward(tape, dy)
 
     def forward_async(self, x, routes, gates, w1, w2, *, retain_backward_state=True):
         """Enqueue FWD, optionally omitting X/AB for checkpoint's no-grad pass."""
@@ -243,7 +265,9 @@ class TensorRuntime:
         """Return stream-ordered gradients; reclaim completed calls without waiting."""
         if torch.cuda.current_stream() != self.stream:
             raise RuntimeError("Backward must use the preparation stream")
-        return self.native.backward_async(tape, dy.contiguous())
+        dy = dy.contiguous() if isinstance(dy, torch.Tensor) else dy
+        self._source_input(dy)
+        return self.native.backward_async(tape, dy)
 
     def drain(self):
         """Finish the pending training call before inspecting or releasing leases."""
@@ -255,6 +279,36 @@ class TensorRuntime:
         return self.native.graph_forward(
             layer, x, routes, gates, w1, w2, torch.cuda.current_stream().cuda_stream
         )
+
+    def inference_fp8(self, layer, x, routes, gates, weights):
+        """Replay a prepared FP8 inference graph, with stable input/scale addresses.
+
+        Warm each layer/token bucket before outer capture. Replacing prepared
+        weights requires invalidate_inference_layer and recapture. X may be
+        BF16 or rowwise FP8Tensor; source preparation stays inside the DT kernel.
+        """
+        from .fp8 import PreparedFP8Weights
+        if self.training:
+            raise ValueError("inference_fp8 requires training=False")
+        source, _ = self._source_input(x)
+        if not isinstance(weights, PreparedFP8Weights):
+            raise TypeError("weights must be PreparedFP8Weights")
+        if (weights.w1.shape != (self.experts // self.world, 2 * self.intermediate, self.hidden)
+                or weights.w2.shape != (self.experts // self.world, self.hidden, self.intermediate)
+                or weights.w1.data.device != source.device):
+            raise ValueError("Prepared FP8 weights do not match runtime")
+        for value, dtype in ((routes, torch.int32), (gates, torch.float32)):
+            if (value.shape != (source.shape[0], self.top_k) or value.dtype != dtype
+                    or value.device != source.device or not value.is_contiguous()):
+                raise ValueError("Invalid inference routes/gates")
+        # A warmed native plan already owns completed weight preparation.
+        # Outer capture must not add a dependency on the preparation stream.
+        if torch.cuda.is_current_stream_capturing():
+            weights._validate_version()
+        else:
+            weights.wait(training=False)
+        return self.native.graph_forward(layer, x, routes, gates,
+            weights.w1.data, weights.w2.data, torch.cuda.current_stream().cuda_stream, weights)
 
     def inference_eager(self, x, routes, gates, w1, w2, *, layer=None):
         """Run changing inputs/routes; an optional layer caches immutable weights.

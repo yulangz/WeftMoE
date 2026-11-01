@@ -1,0 +1,50 @@
+--- a/src/cuda/weftmoe_pf/backward_weights.cuh
++++ b/src/cuda/weftmoe_pf/backward_weights.cuh
+@@ -49,6 +49,7 @@
+   std::uint32_t task_tile;
+   std::uint32_t task_count;
+   alignas(8) std::uint64_t cluster_join;
++  unsigned dw_expert_order[256];
+ };
+ 
+ #ifndef WEFTMOE_FP8_WGRAD_CLAIM_TILES
+--- a/src/cuda/weftmoe_pf/fp8_wgrad.cuh
++++ b/src/cuda/weftmoe_pf/fp8_wgrad.cuh
+@@ -34,6 +34,20 @@
+     }
+     cutlass::arch::fence_barrier_init();
+   }
++  const auto experts = a.dispatch.sizes.owned_expert_count;
++  if constexpr (Producer) {
++    if (experts <= 256U) {
++      for (unsigned expert = threadIdx.x - 256U; expert < experts; expert += 32U) {
++        const auto rows = a.dispatch.expert_row_count[expert];
++        unsigned position = 0U;
++        for (unsigned other = 0U; other < experts; ++other) {
++          const auto other_rows = a.dispatch.expert_row_count[other];
++          position += other_rows > rows || (other_rows == rows && other < expert);
++        }
++        state.dw_expert_order[position] = expert;
++      }
++    }
++  }
+   using Sync = UnifiedComputeSynchronization<true>;
+   Sync::cta_sync();
+   unsigned stage = 0U, phase = 0U;
+@@ -41,7 +55,6 @@
+   constexpr auto tiles1 = backward_pipeline_detail::kDw1TilesPerExpert;
+   constexpr auto chunks2 = (tiles2 + Claim - 1U) / Claim;
+   constexpr auto chunks1 = (tiles1 + Claim - 1U) / Claim;
+-  const auto experts = a.dispatch.sizes.owned_expert_count;
+   const auto layout = pipeline::backward::make_backward_scheduler_layout(
+       a.scheduler_mblock_capacity,
+       backward_tuning::kMainHidden / backward_tuning::kDxTileN / 2U,
+@@ -59,7 +72,7 @@
+     const bool first = index >= experts * chunks2;
+     const auto chunks = first ? chunks1 : chunks2;
+     const auto relative = first ? index - experts * chunks2 : index;
+-    const auto expert = relative / chunks;
++    const auto expert = experts <= 256U ? state.dw_expert_order[relative / chunks] : relative / chunks;
+     const auto rows = unsigned(a.dispatch.expert_row_count[expert]);
+     if (!rows) continue;
+     const auto begin = relative % chunks * Claim;

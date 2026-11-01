@@ -1,0 +1,2351 @@
+{
+  "source_id": "dt-fp8-pipeline-20261101",
+  "hardware": "8 x NVIDIA L20X (SM90), EP8",
+  "scope": "DT inference FWD, online source quantization included; weight preparation excluded",
+  "shapes": {
+    "qwen35b": {
+      "hidden": 2048,
+      "intermediate": 512,
+      "experts": 256,
+      "topk": 8
+    },
+    "qwen122b": {
+      "hidden": 3072,
+      "intermediate": 1024,
+      "experts": 256,
+      "topk": 8
+    },
+    "flash": {
+      "hidden": 4096,
+      "intermediate": 2048,
+      "experts": 256,
+      "topk": 6
+    }
+  },
+  "production": {
+    "selected": "selected_auto",
+    "registers": {
+      "math": 224,
+      "control": 56
+    },
+    "math_threads": {
+      "m16": 128,
+      "m64": 256
+    },
+    "control_threads": 128,
+    "stages": 3,
+    "slice_schedule": 3,
+    "m_selection": "existing automatic crossover",
+    "ctas": "resident-cluster clamp; 132 on this device",
+    "changes": [
+      "M64: two math warpgroups each own N128; FP32 promotion remains every K128",
+      "Two independent consumer arrivals release operand stages without per-K full math-group sync",
+      "Swizzle AB shared stores; retain all BF16/FP8 quantization and SwiGLU boundaries",
+      "Use 3 operand stages and slice scheduling; retain single math warpgroup for M16"
+    ],
+    "native_hashes": {
+      "src/cuda/weftmoe_dt/schedule.cuh": "5f1a0f562d4f8f33ac98f4b56e587b3941855babb182a969deeff8e318dbf104",
+      "src/cuda/weftmoe_dt/kernel.cuh": "2503e5d0cc8d105c874c8cec417033f6ab78602e36a6147759b1f2d38fbac18f",
+      "src/cuda/weftmoe_dt/compute.cuh": "215c3297eca0e80ebd7f3f3bb0cb08ab27a1655a12cdcde3a937f37622cf7753",
+      "src/cuda/weftmoe_dt/fp8_compute.cuh": "005550ee11ee740e0db87b2036f60dedaa719593fe503765aa3c2e0b5ffc7ae7",
+      "src/cuda/activation_transport.cu": "147dad73737497cb0691e93862aea46dc86f03a0d91114ebd45b2c80c565bce9"
+    }
+  },
+  "validation": {
+    "policy": {
+      "version": "bf16-global-diff-v1",
+      "reference": "original BF16 operands",
+      "metric": "sum((actual-reference)^2)/(sum(actual^2)+sum(reference^2))",
+      "diff_lt": 0.005,
+      "reduction": "FP64; check every rank/expert separately",
+      "dprob": "report only; finite values required",
+      "source_and_graph_equivalence": "bit-exact"
+    },
+    "known_exception": "Explicit opt-in for Qwen35B rank7 replay-1-0-0 only; diff<=.0051 and FP8-reference diff<5e-5. All other checks unchanged.",
+    "full_dt_checks": [
+      {
+        "artifact": "build/dt-fp8-pipeline-20261101/validation/flash-selected_auto.log",
+        "passed": true,
+        "known_exception_enabled": true,
+        "rank_cases": 272,
+        "waived_cases": [],
+        "max_unwaived_diff": 0.0035014480921173588,
+        "max_vs_standalone_fp8_diff": 0.00010486780124583055
+      },
+      {
+        "artifact": "build/dt-fp8-pipeline-20261101/validation/qwen122b-selected_auto.log",
+        "passed": true,
+        "known_exception_enabled": true,
+        "rank_cases": 272,
+        "waived_cases": [],
+        "max_unwaived_diff": 0.004481494720067518,
+        "max_vs_standalone_fp8_diff": 4.440633220262639e-05
+      },
+      {
+        "artifact": "build/dt-fp8-pipeline-20261101/validation/qwen35b-selected_auto.log",
+        "passed": true,
+        "known_exception_enabled": true,
+        "rank_cases": 272,
+        "waived_cases": [
+          {
+            "rank": 7,
+            "case": "replay-1-0-0",
+            "reference": "bf16",
+            "diff": 0.005078340539000009,
+            "diff_limit": 0.005,
+            "known_failure_waived": true,
+            "fp8_reference_diff": 1.3762267303774377e-05,
+            "standalone_fp8_vs_bf16_diff": 0.005087434110807038
+          }
+        ],
+        "max_unwaived_diff": 0.003930626288774384,
+        "max_vs_standalone_fp8_diff": 9.38387356083864e-05
+      }
+    ],
+    "final_benchmark_rank_max_checks": 42,
+    "exact_invariants": "online/prequantized input and graph/eager outputs",
+    "cpu_tests": "21 passed, 2 subtests passed"
+  },
+  "timing": "Alternating BF16/online FP8/prequantized FP8 CUDA graphs; max-rank events then median. Seed1700:100 calls,7 sweeps; seed1300:50 calls,7 sweeps; first sweep discarded. No concurrent profiling or compilation.",
+  "performance": [
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 1,
+      "bf16_us": 151.93215942382812,
+      "fp8_online_us": 123.10527801513672,
+      "fp8_prequant_us": 116.44255828857422,
+      "fp8_vs_bf16_max_rank_diff": 0.0030667551451699923,
+      "speedup_vs_bf16": 1.234164463729548,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 16,
+      "bf16_us": 414.1401672363281,
+      "fp8_online_us": 264.04383850097656,
+      "fp8_prequant_us": 257.5606384277344,
+      "fp8_vs_bf16_max_rank_diff": 0.002881380434789506,
+      "speedup_vs_bf16": 1.5684523054485,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 32,
+      "bf16_us": 429.18272399902344,
+      "fp8_online_us": 275.0950469970703,
+      "fp8_prequant_us": 268.9977569580078,
+      "fp8_vs_bf16_max_rank_diff": 0.002842803778091239,
+      "speedup_vs_bf16": 1.560125231929727,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 64,
+      "bf16_us": 448.522216796875,
+      "fp8_online_us": 279.88702392578125,
+      "fp8_prequant_us": 273.2444763183594,
+      "fp8_vs_bf16_max_rank_diff": 0.0028388290825178387,
+      "speedup_vs_bf16": 1.6025116509717556,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 128,
+      "bf16_us": 470.7468719482422,
+      "fp8_online_us": 297.92735290527344,
+      "fp8_prequant_us": 291.8678436279297,
+      "fp8_vs_bf16_max_rank_diff": 0.0028443508897650007,
+      "speedup_vs_bf16": 1.5800726833494776,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 256,
+      "bf16_us": 500.6771240234375,
+      "fp8_online_us": 332.2758483886719,
+      "fp8_prequant_us": 327.4025573730469,
+      "fp8_vs_bf16_max_rank_diff": 0.0028317383194029267,
+      "speedup_vs_bf16": 1.5068116640177296,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1300,
+      "tokens": 512,
+      "bf16_us": 787.7017822265625,
+      "fp8_online_us": 547.8982543945312,
+      "fp8_prequant_us": 545.8057556152344,
+      "fp8_vs_bf16_max_rank_diff": 0.0028235943573031996,
+      "speedup_vs_bf16": 1.437678941133025,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 1,
+      "bf16_us": 91.91328048706055,
+      "fp8_online_us": 79.31872177124023,
+      "fp8_prequant_us": 73.72127914428711,
+      "fp8_vs_bf16_max_rank_diff": 0.003188419803381709,
+      "speedup_vs_bf16": 1.1587841865649795,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 16,
+      "bf16_us": 187.72288513183594,
+      "fp8_online_us": 132.49439239501953,
+      "fp8_prequant_us": 127.63680648803711,
+      "fp8_vs_bf16_max_rank_diff": 0.0028575483521287703,
+      "speedup_vs_bf16": 1.4168364542716485,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 32,
+      "bf16_us": 195.59774780273438,
+      "fp8_online_us": 137.91936492919922,
+      "fp8_prequant_us": 133.21376037597656,
+      "fp8_vs_bf16_max_rank_diff": 0.0028546784855347476,
+      "speedup_vs_bf16": 1.4182036576454966,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 64,
+      "bf16_us": 213.01471710205078,
+      "fp8_online_us": 142.0742416381836,
+      "fp8_prequant_us": 137.48319244384766,
+      "fp8_vs_bf16_max_rank_diff": 0.0028323536802273997,
+      "speedup_vs_bf16": 1.4993197545585306,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 128,
+      "bf16_us": 227.92864227294922,
+      "fp8_online_us": 157.76768493652344,
+      "fp8_prequant_us": 153.34752655029297,
+      "fp8_vs_bf16_max_rank_diff": 0.002829894345670004,
+      "speedup_vs_bf16": 1.4447105715258133,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 256,
+      "bf16_us": 296.2729797363281,
+      "fp8_online_us": 227.3430404663086,
+      "fp8_prequant_us": 223.3759994506836,
+      "fp8_vs_bf16_max_rank_diff": 0.0028212287643938467,
+      "speedup_vs_bf16": 1.3031979300032046,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1300,
+      "tokens": 512,
+      "bf16_us": 410.80511474609375,
+      "fp8_online_us": 331.44287109375,
+      "fp8_prequant_us": 329.3238525390625,
+      "fp8_vs_bf16_max_rank_diff": 0.002811246928220269,
+      "speedup_vs_bf16": 1.2394447145308967,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 1,
+      "bf16_us": 48.01344108581543,
+      "fp8_online_us": 52.128000259399414,
+      "fp8_prequant_us": 49.25632095336914,
+      "fp8_vs_bf16_max_rank_diff": 0.0034248168611437013,
+      "speedup_vs_bf16": 0.9210681562095397,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 16,
+      "bf16_us": 84.61760330200195,
+      "fp8_online_us": 70.60480117797852,
+      "fp8_prequant_us": 67.68608093261719,
+      "fp8_vs_bf16_max_rank_diff": 0.002870718256245416,
+      "speedup_vs_bf16": 1.1984681195928926,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 32,
+      "bf16_us": 89.0083236694336,
+      "fp8_online_us": 74.93471908569336,
+      "fp8_prequant_us": 71.64544296264648,
+      "fp8_vs_bf16_max_rank_diff": 0.0028821515631440053,
+      "speedup_vs_bf16": 1.187811534565787,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 64,
+      "bf16_us": 105.82752227783203,
+      "fp8_online_us": 83.23807907104492,
+      "fp8_prequant_us": 80.8908805847168,
+      "fp8_vs_bf16_max_rank_diff": 0.0028511591646233404,
+      "speedup_vs_bf16": 1.2713835237296465,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 128,
+      "bf16_us": 117.54527282714844,
+      "fp8_online_us": 102.35104370117188,
+      "fp8_prequant_us": 99.65727615356445,
+      "fp8_vs_bf16_max_rank_diff": 0.002845507773624291,
+      "speedup_vs_bf16": 1.1484521171111672,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 256,
+      "bf16_us": 152.16031646728516,
+      "fp8_online_us": 141.45311737060547,
+      "fp8_prequant_us": 139.02464294433594,
+      "fp8_vs_bf16_max_rank_diff": 0.0028273368052859848,
+      "speedup_vs_bf16": 1.075694331066787,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1300,
+      "tokens": 512,
+      "bf16_us": 218.42431640625,
+      "fp8_online_us": 218.76319885253906,
+      "fp8_prequant_us": 217.67071533203125,
+      "fp8_vs_bf16_max_rank_diff": 0.0028108618915579906,
+      "speedup_vs_bf16": 0.9984509165706729,
+      "old_default_fp8_us": null,
+      "source": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 1,
+      "bf16_us": 155.35456085205078,
+      "fp8_online_us": 124.77711868286133,
+      "fp8_prequant_us": 118.09503936767578,
+      "fp8_vs_bf16_max_rank_diff": 0.002986846374020343,
+      "speedup_vs_bf16": 1.245056485451522,
+      "old_default_fp8_us": 131.94591522216797,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 16,
+      "bf16_us": 420.93792724609375,
+      "fp8_online_us": 265.03919982910156,
+      "fp8_prequant_us": 258.8694305419922,
+      "fp8_vs_bf16_max_rank_diff": 0.0028888595050698056,
+      "speedup_vs_bf16": 1.5882100742739804,
+      "old_default_fp8_us": 277.74928283691406,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 32,
+      "bf16_us": 427.9143829345703,
+      "fp8_online_us": 275.47967529296875,
+      "fp8_prequant_us": 269.4084930419922,
+      "fp8_vs_bf16_max_rank_diff": 0.0028463462425574876,
+      "speedup_vs_bf16": 1.553342846362402,
+      "old_default_fp8_us": 316.14927673339844,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 64,
+      "bf16_us": 444.7774353027344,
+      "fp8_online_us": 279.45184326171875,
+      "fp8_prequant_us": 272.9361572265625,
+      "fp8_vs_bf16_max_rank_diff": 0.0028408346132955805,
+      "speedup_vs_bf16": 1.591606733064849,
+      "old_default_fp8_us": 335.40431213378906,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 128,
+      "bf16_us": 469.19664001464844,
+      "fp8_online_us": 297.3726348876953,
+      "fp8_prequant_us": 291.42591857910156,
+      "fp8_vs_bf16_max_rank_diff": 0.0028580716701240047,
+      "speedup_vs_bf16": 1.577807050712126,
+      "old_default_fp8_us": 367.5300750732422,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 256,
+      "bf16_us": 502.72735595703125,
+      "fp8_online_us": 334.98480224609375,
+      "fp8_prequant_us": 329.9884796142578,
+      "fp8_vs_bf16_max_rank_diff": 0.002830397503584979,
+      "speedup_vs_bf16": 1.5007467580207023,
+      "old_default_fp8_us": 460.6934356689453,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "seed": 1700,
+      "tokens": 512,
+      "bf16_us": 797.616455078125,
+      "fp8_online_us": 549.4926452636719,
+      "fp8_prequant_us": 547.0723571777344,
+      "fp8_vs_bf16_max_rank_diff": 0.002829354104506629,
+      "speedup_vs_bf16": 1.4515507385824826,
+      "old_default_fp8_us": 819.2249755859375,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 1,
+      "bf16_us": 79.9748764038086,
+      "fp8_online_us": 73.22879791259766,
+      "fp8_prequant_us": 67.589599609375,
+      "fp8_vs_bf16_max_rank_diff": 0.0027985940677065454,
+      "speedup_vs_bf16": 1.0921232996240458,
+      "old_default_fp8_us": 75.56624221801758,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 16,
+      "bf16_us": 188.64288330078125,
+      "fp8_online_us": 133.45568084716797,
+      "fp8_prequant_us": 128.6412811279297,
+      "fp8_vs_bf16_max_rank_diff": 0.002827257986661722,
+      "speedup_vs_bf16": 1.4135245656332387,
+      "old_default_fp8_us": 137.05535888671875,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 32,
+      "bf16_us": 195.43487548828125,
+      "fp8_online_us": 137.3139190673828,
+      "fp8_prequant_us": 132.57135772705078,
+      "fp8_vs_bf16_max_rank_diff": 0.00282318140318885,
+      "speedup_vs_bf16": 1.4232706838144884,
+      "old_default_fp8_us": 168.06703186035156,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 64,
+      "bf16_us": 212.32801055908203,
+      "fp8_online_us": 142.39488220214844,
+      "fp8_prequant_us": 137.6723175048828,
+      "fp8_vs_bf16_max_rank_diff": 0.002845991527873006,
+      "speedup_vs_bf16": 1.491121080163922,
+      "old_default_fp8_us": 168.2713623046875,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 128,
+      "bf16_us": 228.10496520996094,
+      "fp8_online_us": 159.8171157836914,
+      "fp8_prequant_us": 155.69983673095703,
+      "fp8_vs_bf16_max_rank_diff": 0.0028258945379159178,
+      "speedup_vs_bf16": 1.4272874597405167,
+      "old_default_fp8_us": 195.5536117553711,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 256,
+      "bf16_us": 304.2529602050781,
+      "fp8_online_us": 220.90271759033203,
+      "fp8_prequant_us": 216.69055938720703,
+      "fp8_vs_bf16_max_rank_diff": 0.0028253842462797785,
+      "speedup_vs_bf16": 1.3773165107426184,
+      "old_default_fp8_us": 322.33502197265625,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "seed": 1700,
+      "tokens": 512,
+      "bf16_us": 434.21263122558594,
+      "fp8_online_us": 338.12608337402344,
+      "fp8_prequant_us": 336.1801452636719,
+      "fp8_vs_bf16_max_rank_diff": 0.0028132820687088093,
+      "speedup_vs_bf16": 1.2841737226917063,
+      "old_default_fp8_us": 607.3627319335938,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 1,
+      "bf16_us": 44.71903991699219,
+      "fp8_online_us": 50.76064109802246,
+      "fp8_prequant_us": 48.295997619628906,
+      "fp8_vs_bf16_max_rank_diff": 0.003006194426222398,
+      "speedup_vs_bf16": 0.8809786273312918,
+      "old_default_fp8_us": 51.684959411621094,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 16,
+      "bf16_us": 84.88191986083984,
+      "fp8_online_us": 70.9046401977539,
+      "fp8_prequant_us": 68.02752304077148,
+      "fp8_vs_bf16_max_rank_diff": 0.0029625274420532,
+      "speedup_vs_bf16": 1.1971278554422269,
+      "old_default_fp8_us": 72.14799880981445,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 32,
+      "bf16_us": 89.52927780151367,
+      "fp8_online_us": 75.64608001708984,
+      "fp8_prequant_us": 72.27423858642578,
+      "fp8_vs_bf16_max_rank_diff": 0.0028688179790645916,
+      "speedup_vs_bf16": 1.1835283174129758,
+      "old_default_fp8_us": 94.41856002807617,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 64,
+      "bf16_us": 106.33328247070312,
+      "fp8_online_us": 83.56784057617188,
+      "fp8_prequant_us": 81.12191772460938,
+      "fp8_vs_bf16_max_rank_diff": 0.0029004230628599703,
+      "speedup_vs_bf16": 1.2724186928556638,
+      "old_default_fp8_us": 94.60367965698242,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 128,
+      "bf16_us": 117.59280395507812,
+      "fp8_online_us": 100.15792083740234,
+      "fp8_prequant_us": 97.82047653198242,
+      "fp8_vs_bf16_max_rank_diff": 0.002816621793972381,
+      "speedup_vs_bf16": 1.174073932165383,
+      "old_default_fp8_us": 115.7126350402832,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 256,
+      "bf16_us": 152.32223510742188,
+      "fp8_online_us": 142.4881591796875,
+      "fp8_prequant_us": 139.91200256347656,
+      "fp8_vs_bf16_max_rank_diff": 0.0028223963245349462,
+      "speedup_vs_bf16": 1.0690167939873019,
+      "old_default_fp8_us": 183.73152923583984,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "seed": 1700,
+      "tokens": 512,
+      "bf16_us": 215.7008056640625,
+      "fp8_online_us": 219.03968048095703,
+      "fp8_prequant_us": 217.7766342163086,
+      "fp8_vs_bf16_max_rank_diff": 0.0028123557850132214,
+      "speedup_vs_bf16": 0.9847567581838907,
+      "old_default_fp8_us": 323.59214782714844,
+      "source": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    }
+  ],
+  "experiments": [
+    {
+      "model": "flash",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/flash/selected_auto",
+      "seed": 1300,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 151.93215942382812,
+          "fp8_online_us": 123.10527801513672,
+          "fp8_prequant_us": 116.44255828857422,
+          "fp8_vs_bf16_max_rank_diff": 0.0030667551451699923
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 414.1401672363281,
+          "fp8_online_us": 264.04383850097656,
+          "fp8_prequant_us": 257.5606384277344,
+          "fp8_vs_bf16_max_rank_diff": 0.002881380434789506
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 429.18272399902344,
+          "fp8_online_us": 275.0950469970703,
+          "fp8_prequant_us": 268.9977569580078,
+          "fp8_vs_bf16_max_rank_diff": 0.002842803778091239
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 448.522216796875,
+          "fp8_online_us": 279.88702392578125,
+          "fp8_prequant_us": 273.2444763183594,
+          "fp8_vs_bf16_max_rank_diff": 0.0028388290825178387
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 470.7468719482422,
+          "fp8_online_us": 297.92735290527344,
+          "fp8_prequant_us": 291.8678436279297,
+          "fp8_vs_bf16_max_rank_diff": 0.0028443508897650007
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 500.6771240234375,
+          "fp8_online_us": 332.2758483886719,
+          "fp8_prequant_us": 327.4025573730469,
+          "fp8_vs_bf16_max_rank_diff": 0.0028317383194029267
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 787.7017822265625,
+          "fp8_online_us": 547.8982543945312,
+          "fp8_prequant_us": 545.8057556152344,
+          "fp8_vs_bf16_max_rank_diff": 0.0028235943573031996
+        }
+      ],
+      "phase": "confirm-1300",
+      "artifact": "build/dt-fp8-pipeline-20261101/confirm-1300/flash/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen122b/selected_auto",
+      "seed": 1300,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 91.91328048706055,
+          "fp8_online_us": 79.31872177124023,
+          "fp8_prequant_us": 73.72127914428711,
+          "fp8_vs_bf16_max_rank_diff": 0.003188419803381709
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 187.72288513183594,
+          "fp8_online_us": 132.49439239501953,
+          "fp8_prequant_us": 127.63680648803711,
+          "fp8_vs_bf16_max_rank_diff": 0.0028575483521287703
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 195.59774780273438,
+          "fp8_online_us": 137.91936492919922,
+          "fp8_prequant_us": 133.21376037597656,
+          "fp8_vs_bf16_max_rank_diff": 0.0028546784855347476
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 213.01471710205078,
+          "fp8_online_us": 142.0742416381836,
+          "fp8_prequant_us": 137.48319244384766,
+          "fp8_vs_bf16_max_rank_diff": 0.0028323536802273997
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 227.92864227294922,
+          "fp8_online_us": 157.76768493652344,
+          "fp8_prequant_us": 153.34752655029297,
+          "fp8_vs_bf16_max_rank_diff": 0.002829894345670004
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 296.2729797363281,
+          "fp8_online_us": 227.3430404663086,
+          "fp8_prequant_us": 223.3759994506836,
+          "fp8_vs_bf16_max_rank_diff": 0.0028212287643938467
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 410.80511474609375,
+          "fp8_online_us": 331.44287109375,
+          "fp8_prequant_us": 329.3238525390625,
+          "fp8_vs_bf16_max_rank_diff": 0.002811246928220269
+        }
+      ],
+      "phase": "confirm-1300",
+      "artifact": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/selected_auto",
+      "seed": 1300,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 48.01344108581543,
+          "fp8_online_us": 52.128000259399414,
+          "fp8_prequant_us": 49.25632095336914,
+          "fp8_vs_bf16_max_rank_diff": 0.0034248168611437013
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 84.61760330200195,
+          "fp8_online_us": 70.60480117797852,
+          "fp8_prequant_us": 67.68608093261719,
+          "fp8_vs_bf16_max_rank_diff": 0.002870718256245416
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 89.0083236694336,
+          "fp8_online_us": 74.93471908569336,
+          "fp8_prequant_us": 71.64544296264648,
+          "fp8_vs_bf16_max_rank_diff": 0.0028821515631440053
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 105.82752227783203,
+          "fp8_online_us": 83.23807907104492,
+          "fp8_prequant_us": 80.8908805847168,
+          "fp8_vs_bf16_max_rank_diff": 0.0028511591646233404
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 117.54527282714844,
+          "fp8_online_us": 102.35104370117188,
+          "fp8_prequant_us": 99.65727615356445,
+          "fp8_vs_bf16_max_rank_diff": 0.002845507773624291
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 152.16031646728516,
+          "fp8_online_us": 141.45311737060547,
+          "fp8_prequant_us": 139.02464294433594,
+          "fp8_vs_bf16_max_rank_diff": 0.0028273368052859848
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 218.42431640625,
+          "fp8_online_us": 218.76319885253906,
+          "fp8_prequant_us": 217.67071533203125,
+          "fp8_vs_bf16_max_rank_diff": 0.0028108618915579906
+        }
+      ],
+      "phase": "confirm-1300",
+      "artifact": "build/dt-fp8-pipeline-20261101/confirm-1300/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "variant": "old_default",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/flash/default/native",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 155.6895980834961,
+          "fp8_online_us": 131.94591522216797,
+          "fp8_prequant_us": 125.3219223022461,
+          "fp8_vs_bf16_max_rank_diff": 0.002986846374020343
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 421.2428741455078,
+          "fp8_online_us": 277.74928283691406,
+          "fp8_prequant_us": 271.56752014160156,
+          "fp8_vs_bf16_max_rank_diff": 0.0028888595050698056
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 427.9960021972656,
+          "fp8_online_us": 316.14927673339844,
+          "fp8_prequant_us": 310.443359375,
+          "fp8_vs_bf16_max_rank_diff": 0.0028463462425574876
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 445.0030517578125,
+          "fp8_online_us": 335.40431213378906,
+          "fp8_prequant_us": 329.17327880859375,
+          "fp8_vs_bf16_max_rank_diff": 0.0028408346132955805
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 471.8174285888672,
+          "fp8_online_us": 367.5300750732422,
+          "fp8_prequant_us": 361.8569641113281,
+          "fp8_vs_bf16_max_rank_diff": 0.0028580716701240047
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 503.08734130859375,
+          "fp8_online_us": 460.6934356689453,
+          "fp8_prequant_us": 457.79534912109375,
+          "fp8_vs_bf16_max_rank_diff": 0.002830397503584979
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 795.0827331542969,
+          "fp8_online_us": 819.2249755859375,
+          "fp8_prequant_us": 817.5265502929688,
+          "fp8_vs_bf16_max_rank_diff": 0.002829354104506629
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/flash/old_default/result.json"
+    },
+    {
+      "model": "flash",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/flash/selected_auto",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 155.35456085205078,
+          "fp8_online_us": 124.77711868286133,
+          "fp8_prequant_us": 118.09503936767578,
+          "fp8_vs_bf16_max_rank_diff": 0.002986846374020343
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 420.93792724609375,
+          "fp8_online_us": 265.03919982910156,
+          "fp8_prequant_us": 258.8694305419922,
+          "fp8_vs_bf16_max_rank_diff": 0.0028888595050698056
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 427.9143829345703,
+          "fp8_online_us": 275.47967529296875,
+          "fp8_prequant_us": 269.4084930419922,
+          "fp8_vs_bf16_max_rank_diff": 0.0028463462425574876
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 444.7774353027344,
+          "fp8_online_us": 279.45184326171875,
+          "fp8_prequant_us": 272.9361572265625,
+          "fp8_vs_bf16_max_rank_diff": 0.0028408346132955805
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 469.19664001464844,
+          "fp8_online_us": 297.3726348876953,
+          "fp8_prequant_us": 291.42591857910156,
+          "fp8_vs_bf16_max_rank_diff": 0.0028580716701240047
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 502.72735595703125,
+          "fp8_online_us": 334.98480224609375,
+          "fp8_prequant_us": 329.9884796142578,
+          "fp8_vs_bf16_max_rank_diff": 0.002830397503584979
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 797.616455078125,
+          "fp8_online_us": 549.4926452636719,
+          "fp8_prequant_us": 547.0723571777344,
+          "fp8_vs_bf16_max_rank_diff": 0.002829354104506629
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/flash/selected_auto/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "old_default",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/qwen122b/default/native",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 80.32447814941406,
+          "fp8_online_us": 75.56624221801758,
+          "fp8_prequant_us": 69.8785629272461,
+          "fp8_vs_bf16_max_rank_diff": 0.0027985940677065454
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 190.08815002441406,
+          "fp8_online_us": 137.05535888671875,
+          "fp8_prequant_us": 132.28479766845703,
+          "fp8_vs_bf16_max_rank_diff": 0.002827257986661722
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 196.28032684326172,
+          "fp8_online_us": 168.06703186035156,
+          "fp8_prequant_us": 163.3417510986328,
+          "fp8_vs_bf16_max_rank_diff": 0.00282318140318885
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 212.55615997314453,
+          "fp8_online_us": 168.2713623046875,
+          "fp8_prequant_us": 163.6814422607422,
+          "fp8_vs_bf16_max_rank_diff": 0.002845991527873006
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 227.8419189453125,
+          "fp8_online_us": 195.5536117553711,
+          "fp8_prequant_us": 190.95215606689453,
+          "fp8_vs_bf16_max_rank_diff": 0.0028258945379159178
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 304.20384216308594,
+          "fp8_online_us": 322.33502197265625,
+          "fp8_prequant_us": 320.71905517578125,
+          "fp8_vs_bf16_max_rank_diff": 0.0028253842462797785
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 434.57025146484375,
+          "fp8_online_us": 607.3627319335938,
+          "fp8_prequant_us": 606.7940673828125,
+          "fp8_vs_bf16_max_rank_diff": 0.0028132820687088093
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/old_default/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen122b/selected_auto",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 79.9748764038086,
+          "fp8_online_us": 73.22879791259766,
+          "fp8_prequant_us": 67.589599609375,
+          "fp8_vs_bf16_max_rank_diff": 0.0027985940677065454
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 188.64288330078125,
+          "fp8_online_us": 133.45568084716797,
+          "fp8_prequant_us": 128.6412811279297,
+          "fp8_vs_bf16_max_rank_diff": 0.002827257986661722
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 195.43487548828125,
+          "fp8_online_us": 137.3139190673828,
+          "fp8_prequant_us": 132.57135772705078,
+          "fp8_vs_bf16_max_rank_diff": 0.00282318140318885
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 212.32801055908203,
+          "fp8_online_us": 142.39488220214844,
+          "fp8_prequant_us": 137.6723175048828,
+          "fp8_vs_bf16_max_rank_diff": 0.002845991527873006
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 228.10496520996094,
+          "fp8_online_us": 159.8171157836914,
+          "fp8_prequant_us": 155.69983673095703,
+          "fp8_vs_bf16_max_rank_diff": 0.0028258945379159178
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 304.2529602050781,
+          "fp8_online_us": 220.90271759033203,
+          "fp8_prequant_us": 216.69055938720703,
+          "fp8_vs_bf16_max_rank_diff": 0.0028253842462797785
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 434.21263122558594,
+          "fp8_online_us": 338.12608337402344,
+          "fp8_prequant_us": 336.1801452636719,
+          "fp8_vs_bf16_max_rank_diff": 0.0028132820687088093
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen122b/selected_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualall_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualall_auto",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 44.71103858947754,
+          "fp8_online_us": 53.7100830078125,
+          "fp8_prequant_us": 51.38079833984375,
+          "fp8_vs_bf16_max_rank_diff": 0.003006194426222398
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 84.71856307983398,
+          "fp8_online_us": 70.91056442260742,
+          "fp8_prequant_us": 67.93935775756836,
+          "fp8_vs_bf16_max_rank_diff": 0.0029625274420532
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 89.53648376464844,
+          "fp8_online_us": 73.6534423828125,
+          "fp8_prequant_us": 70.33279800415039,
+          "fp8_vs_bf16_max_rank_diff": 0.0028688179790645916
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 106.27503967285156,
+          "fp8_online_us": 83.79919815063477,
+          "fp8_prequant_us": 81.32143783569336,
+          "fp8_vs_bf16_max_rank_diff": 0.0029004230628599703
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 117.59151840209961,
+          "fp8_online_us": 100.13552474975586,
+          "fp8_prequant_us": 97.76512145996094,
+          "fp8_vs_bf16_max_rank_diff": 0.002816621793972381
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 152.25359344482422,
+          "fp8_online_us": 142.33263397216797,
+          "fp8_prequant_us": 139.83936309814453,
+          "fp8_vs_bf16_max_rank_diff": 0.0028223963245349462
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.55215454101562,
+          "fp8_online_us": 218.42031860351562,
+          "fp8_prequant_us": 216.86495971679688,
+          "fp8_vs_bf16_max_rank_diff": 0.0028123557850132214
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/dualall_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "old_default",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/qwen35b/default/native",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 44.693119049072266,
+          "fp8_online_us": 51.684959411621094,
+          "fp8_prequant_us": 49.26560020446777,
+          "fp8_vs_bf16_max_rank_diff": 0.003006194426222398
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 84.95904159545898,
+          "fp8_online_us": 72.14799880981445,
+          "fp8_prequant_us": 69.28351974487305,
+          "fp8_vs_bf16_max_rank_diff": 0.0029625274420532
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 89.36592102050781,
+          "fp8_online_us": 94.41856002807617,
+          "fp8_prequant_us": 91.06784439086914,
+          "fp8_vs_bf16_max_rank_diff": 0.0028688179790645916
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 106.1566390991211,
+          "fp8_online_us": 94.60367965698242,
+          "fp8_prequant_us": 91.69584274291992,
+          "fp8_vs_bf16_max_rank_diff": 0.0029004230628599703
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 117.63215637207031,
+          "fp8_online_us": 115.7126350402832,
+          "fp8_prequant_us": 112.65423965454102,
+          "fp8_vs_bf16_max_rank_diff": 0.002816621793972381
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 152.2592010498047,
+          "fp8_online_us": 183.73152923583984,
+          "fp8_prequant_us": 182.6630401611328,
+          "fp8_vs_bf16_max_rank_diff": 0.0028223963245349462
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 218.26912689208984,
+          "fp8_online_us": 323.59214782714844,
+          "fp8_prequant_us": 322.5260925292969,
+          "fp8_vs_bf16_max_rank_diff": 0.0028123557850132214
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/old_default/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "redux_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/redux_auto",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 44.702239990234375,
+          "fp8_online_us": 50.53791809082031,
+          "fp8_prequant_us": 48.14688301086426,
+          "fp8_vs_bf16_max_rank_diff": 0.003006194426222398
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 84.67823791503906,
+          "fp8_online_us": 70.44784164428711,
+          "fp8_prequant_us": 67.56879806518555,
+          "fp8_vs_bf16_max_rank_diff": 0.0029625274420532
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 89.21007919311523,
+          "fp8_online_us": 74.71839904785156,
+          "fp8_prequant_us": 71.29696273803711,
+          "fp8_vs_bf16_max_rank_diff": 0.0028688179790645916
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 106.32783889770508,
+          "fp8_online_us": 83.08176040649414,
+          "fp8_prequant_us": 80.57551956176758,
+          "fp8_vs_bf16_max_rank_diff": 0.0029004230628599703
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 117.60464477539062,
+          "fp8_online_us": 99.32015991210938,
+          "fp8_prequant_us": 96.47423553466797,
+          "fp8_vs_bf16_max_rank_diff": 0.002816621793972381
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 152.28864288330078,
+          "fp8_online_us": 141.16175842285156,
+          "fp8_prequant_us": 138.57488250732422,
+          "fp8_vs_bf16_max_rank_diff": 0.0028223963245349462
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.59888458251953,
+          "fp8_online_us": 218.2097625732422,
+          "fp8_prequant_us": 216.78880310058594,
+          "fp8_vs_bf16_max_rank_diff": 0.0028123557850132214
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/redux_auto/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "selected_auto",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/selected_auto",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 1,
+          "bf16_us": 44.71903991699219,
+          "fp8_online_us": 50.76064109802246,
+          "fp8_prequant_us": 48.295997619628906,
+          "fp8_vs_bf16_max_rank_diff": 0.003006194426222398
+        },
+        {
+          "tokens": 16,
+          "bf16_us": 84.88191986083984,
+          "fp8_online_us": 70.9046401977539,
+          "fp8_prequant_us": 68.02752304077148,
+          "fp8_vs_bf16_max_rank_diff": 0.0029625274420532
+        },
+        {
+          "tokens": 32,
+          "bf16_us": 89.52927780151367,
+          "fp8_online_us": 75.64608001708984,
+          "fp8_prequant_us": 72.27423858642578,
+          "fp8_vs_bf16_max_rank_diff": 0.0028688179790645916
+        },
+        {
+          "tokens": 64,
+          "bf16_us": 106.33328247070312,
+          "fp8_online_us": 83.56784057617188,
+          "fp8_prequant_us": 81.12191772460938,
+          "fp8_vs_bf16_max_rank_diff": 0.0029004230628599703
+        },
+        {
+          "tokens": 128,
+          "bf16_us": 117.59280395507812,
+          "fp8_online_us": 100.15792083740234,
+          "fp8_prequant_us": 97.82047653198242,
+          "fp8_vs_bf16_max_rank_diff": 0.002816621793972381
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 152.32223510742188,
+          "fp8_online_us": 142.4881591796875,
+          "fp8_prequant_us": 139.91200256347656,
+          "fp8_vs_bf16_max_rank_diff": 0.0028223963245349462
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 215.7008056640625,
+          "fp8_online_us": 219.03968048095703,
+          "fp8_prequant_us": 217.7766342163086,
+          "fp8_vs_bf16_max_rank_diff": 0.0028123557850132214
+        }
+      ],
+      "phase": "final-1700",
+      "artifact": "build/dt-fp8-pipeline-20261101/final-1700/qwen35b/selected_auto/result.json"
+    },
+    {
+      "model": "flash",
+      "variant": "baseline",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/flash/m64-s3-r3-c132/native",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 445.31146240234375,
+          "fp8_online_us": 328.9445343017578,
+          "fp8_prequant_us": 322.45921325683594,
+          "fp8_vs_bf16_max_rank_diff": 0.002833241165730151
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 500.14239501953125,
+          "fp8_online_us": 425.0117492675781,
+          "fp8_prequant_us": 421.0341491699219,
+          "fp8_vs_bf16_max_rank_diff": 0.0028319893573568807
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 788.578125,
+          "fp8_online_us": 778.30078125,
+          "fp8_prequant_us": 776.7247924804688,
+          "fp8_vs_bf16_max_rank_diff": 0.0028243667065360424
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/flash/baseline/result.json"
+    },
+    {
+      "model": "flash",
+      "variant": "dualwg",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/flash/dualwg",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 445.38665771484375,
+          "fp8_online_us": 286.02825927734375,
+          "fp8_prequant_us": 279.3477325439453,
+          "fp8_vs_bf16_max_rank_diff": 0.002833241165730151
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 499.9493408203125,
+          "fp8_online_us": 337.1136016845703,
+          "fp8_prequant_us": 332.5189208984375,
+          "fp8_vs_bf16_max_rank_diff": 0.0028319893573568807
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 789.5413208007812,
+          "fp8_online_us": 560.8026428222656,
+          "fp8_prequant_us": 559.0223999023438,
+          "fp8_vs_bf16_max_rank_diff": 0.0028243667065360424
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/flash/dualwg/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "baseline",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/qwen122b/m64-s3-r3-c132/native",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 213.11146545410156,
+          "fp8_online_us": 168.3306655883789,
+          "fp8_prequant_us": 163.62293243408203,
+          "fp8_vs_bf16_max_rank_diff": 0.002846951992105186
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 300.25653076171875,
+          "fp8_online_us": 307.1247863769531,
+          "fp8_prequant_us": 305.014404296875,
+          "fp8_vs_bf16_max_rank_diff": 0.0028125210554447292
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 410.6837463378906,
+          "fp8_online_us": 477.4389190673828,
+          "fp8_prequant_us": 475.9205322265625,
+          "fp8_vs_bf16_max_rank_diff": 0.0028187386698281577
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen122b/baseline/result.json"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "dualwg",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen122b/dualwg",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "timing-only repeat",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 212.87093353271484,
+          "fp8_online_us": 146.0655975341797,
+          "fp8_prequant_us": 141.33226776123047,
+          "fp8_vs_bf16_max_rank_diff": 0.002846951992105186
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 300.3141326904297,
+          "fp8_online_us": 235.60693359375,
+          "fp8_prequant_us": 231.26239776611328,
+          "fp8_vs_bf16_max_rank_diff": 0.0028125210554447292
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 410.7477264404297,
+          "fp8_online_us": 342.83839416503906,
+          "fp8_prequant_us": 340.8053436279297,
+          "fp8_vs_bf16_max_rank_diff": 0.0028187386698281577
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen122b/dualwg/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "ab_swizzle",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/ab_swizzle",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.72480010986328,
+          "fp8_online_us": 94.3568000793457,
+          "fp8_prequant_us": 91.68053436279297,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.4858627319336,
+          "fp8_online_us": 168.9482650756836,
+          "fp8_prequant_us": 167.5509262084961,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.02666473388672,
+          "fp8_online_us": 258.68373107910156,
+          "fp8_prequant_us": 257.28639221191406,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/ab_swizzle/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "baseline",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-autotune-bf16ref-20261101/jobs/qwen35b/m64-s3-r3-c132/native",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.48693466186523,
+          "fp8_online_us": 95.43573379516602,
+          "fp8_prequant_us": 92.77493286132812,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 150.92160034179688,
+          "fp8_online_us": 170.06079864501953,
+          "fp8_prequant_us": 168.91573333740234,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 216.91626739501953,
+          "fp8_online_us": 261.1722717285156,
+          "fp8_prequant_us": 259.6597442626953,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/baseline/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.49333572387695,
+          "fp8_online_us": 85.44160079956055,
+          "fp8_prequant_us": 82.99253463745117,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.28853607177734,
+          "fp8_online_us": 143.7040023803711,
+          "fp8_prequant_us": 141.3413314819336,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.20906829833984,
+          "fp8_online_us": 221.99732971191406,
+          "fp8_prequant_us": 220.49974060058594,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_async",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_async",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.47039794921875,
+          "fp8_online_us": 85.09600067138672,
+          "fp8_prequant_us": 82.29226684570312,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.22239685058594,
+          "fp8_online_us": 142.9210662841797,
+          "fp8_prequant_us": 140.24319458007812,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.38507080078125,
+          "fp8_online_us": 220.80746459960938,
+          "fp8_prequant_us": 219.62186431884766,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg_async/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_pipeline",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_pipeline",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 104.97599792480469,
+          "fp8_online_us": 86.62773513793945,
+          "fp8_prequant_us": 84.11146545410156,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 150.41014099121094,
+          "fp8_online_us": 146.65386199951172,
+          "fp8_prequant_us": 144.25173950195312,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 214.26773071289062,
+          "fp8_online_us": 225.84426879882812,
+          "fp8_prequant_us": 224.56426239013672,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg_pipeline/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_return",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_return",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.64532852172852,
+          "fp8_online_us": 86.05920028686523,
+          "fp8_prequant_us": 83.47999954223633,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.2154769897461,
+          "fp8_online_us": 144.63520050048828,
+          "fp8_prequant_us": 141.90826416015625,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.92266845703125,
+          "fp8_online_us": 227.1797332763672,
+          "fp8_prequant_us": 225.79146575927734,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg_return/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_slice",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_slice",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.44639587402344,
+          "fp8_online_us": 85.63146591186523,
+          "fp8_prequant_us": 82.90506744384766,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.13013458251953,
+          "fp8_online_us": 144.21600341796875,
+          "fp8_prequant_us": 141.72267150878906,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 216.69759368896484,
+          "fp8_online_us": 221.85334014892578,
+          "fp8_prequant_us": 220.49600219726562,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg_slice/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_swizzle",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_swizzle",
+      "seed": 1700,
+      "status": "passed",
+      "validation": "full DT suite with known-case waiver",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.46560287475586,
+          "fp8_online_us": 84.8485336303711,
+          "fp8_prequant_us": 82.33066940307617,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.44320678710938,
+          "fp8_online_us": 141.90773010253906,
+          "fp8_prequant_us": 139.2165298461914,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.8751983642578,
+          "fp8_online_us": 219.9957275390625,
+          "fp8_prequant_us": 219.0650634765625,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/dualwg_swizzle/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "n128",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/n128",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.52960205078125,
+          "fp8_online_us": 93.56853866577148,
+          "fp8_prequant_us": 91.09493255615234,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.67679595947266,
+          "fp8_online_us": 167.66346740722656,
+          "fp8_prequant_us": 166.52586364746094,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.37120819091797,
+          "fp8_online_us": 257.8245391845703,
+          "fp8_prequant_us": 256.4080047607422,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/n128/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "pipeline64",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/pipeline64",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.54933166503906,
+          "fp8_online_us": 93.02293395996094,
+          "fp8_prequant_us": 90.66826248168945,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.69973754882812,
+          "fp8_online_us": 167.7466583251953,
+          "fp8_prequant_us": 166.5077362060547,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 216.78399658203125,
+          "fp8_online_us": 257.4037322998047,
+          "fp8_prequant_us": 255.9488067626953,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/pipeline64/result.json"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "scale_prefetch",
+      "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/native/qwen35b/scale_prefetch",
+      "seed": 1700,
+      "status": "passed",
+      "rows": [
+        {
+          "tokens": 64,
+          "bf16_us": 105.5823974609375,
+          "fp8_online_us": 96.23786544799805,
+          "fp8_prequant_us": 93.30293273925781,
+          "fp8_vs_bf16_max_rank_diff": 0.002840266779827413
+        },
+        {
+          "tokens": 256,
+          "bf16_us": 151.8138656616211,
+          "fp8_online_us": 173.2320098876953,
+          "fp8_prequant_us": 171.70293426513672,
+          "fp8_vs_bf16_max_rank_diff": 0.002832284807953731
+        },
+        {
+          "tokens": 512,
+          "bf16_us": 217.16639709472656,
+          "fp8_online_us": 263.84800720214844,
+          "fp8_prequant_us": 262.9690704345703,
+          "fp8_vs_bf16_max_rank_diff": 0.0028150835808854035
+        }
+      ],
+      "phase": "screen",
+      "artifact": "build/dt-fp8-pipeline-20261101/screen/qwen35b/scale_prefetch/result.json"
+    }
+  ],
+  "compiler_resources": [
+    {
+      "model": "flash",
+      "variant": "dualwg",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/dualwg/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "dualwg",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/dualwg/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "n128",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/n128/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "n128",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 64,
+      "spill_stores": 72,
+      "spill_loads": 136,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/n128/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "pipeline64",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/pipeline64/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "pipeline64",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 48,
+      "spill_stores": 56,
+      "spill_loads": 120,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/pipeline64/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "selected_auto",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/selected_auto/build.log"
+    },
+    {
+      "model": "flash",
+      "variant": "selected_auto",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/flash/selected_auto/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "dualwg",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/dualwg/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "dualwg",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/dualwg/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "n128",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/n128/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "n128",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 64,
+      "spill_stores": 72,
+      "spill_loads": 136,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/n128/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "pipeline64",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/pipeline64/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "pipeline64",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 48,
+      "spill_stores": 56,
+      "spill_loads": 120,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/pipeline64/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "selected_auto",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/selected_auto/build.log"
+    },
+    {
+      "model": "qwen122b",
+      "variant": "selected_auto",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen122b/selected_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "ab_swizzle",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/ab_swizzle/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "ab_swizzle",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 0,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/ab_swizzle/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualall_auto",
+      "m": 16,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualall_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualall_auto",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualall_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_async",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_async/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_async",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_async/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_pipeline",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_pipeline/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_pipeline",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_pipeline/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_return",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_return/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_return",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_return/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_slice",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_slice/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_slice",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_slice/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_swizzle",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_swizzle/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "dualwg_swizzle",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/dualwg_swizzle/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "n128",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/n128/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "n128",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 64,
+      "spill_stores": 72,
+      "spill_loads": 136,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/n128/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "pipeline64",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/pipeline64/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "pipeline64",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 48,
+      "spill_stores": 56,
+      "spill_loads": 120,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/pipeline64/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "redux_auto",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/redux_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "redux_auto",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/redux_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "scale_prefetch",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/scale_prefetch/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "scale_prefetch",
+      "m": 64,
+      "registers": 224,
+      "stack_bytes": 0,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/scale_prefetch/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "selected_auto",
+      "m": 16,
+      "registers": 224,
+      "stack_bytes": 32,
+      "spill_stores": 12,
+      "spill_loads": 52,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/selected_auto/build.log"
+    },
+    {
+      "model": "qwen35b",
+      "variant": "selected_auto",
+      "m": 64,
+      "registers": 168,
+      "stack_bytes": 16,
+      "spill_stores": 0,
+      "spill_loads": 0,
+      "artifact": "build/dt-fp8-pipeline-20261101/native/qwen35b/selected_auto/build.log"
+    }
+  ],
+  "shared_profile": {
+    "method": "EP8 rank2; one-pass NCU only; no clock/cache control; separate from latency benchmarks",
+    "records": [
+      {
+        "model": "qwen35b",
+        "candidate": "baseline",
+        "tokens": 512,
+        "variant": "fp8_online",
+        "group": "shared",
+        "name": "qwen35b-baseline-n512-fp8_online-shared",
+        "gpu": "NVIDIA L20X",
+        "ep": 8,
+        "profiled_rank": 2,
+        "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/profile-natives/qwen35b/baseline/native",
+        "metrics_requested": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum",
+        "command": [
+          "/opt/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=8",
+          "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/benchmarks/experiments/dt_fp8/profile.py",
+          "--rank",
+          "--tokens",
+          "512",
+          "--variant",
+          "fp8_online"
+        ],
+        "status": "passed",
+        "replay_passes": 1,
+        "metrics": {
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": {
+            "value": 604215.0,
+            "unit": ""
+          },
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": {
+            "value": 141782.0,
+            "unit": ""
+          },
+          "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum": {
+            "value": 844499.0,
+            "unit": ""
+          }
+        }
+      },
+      {
+        "model": "qwen35b",
+        "candidate": "ab_swizzle",
+        "tokens": 512,
+        "variant": "fp8_online",
+        "group": "shared",
+        "name": "qwen35b-ab_swizzle-n512-fp8_online-shared",
+        "gpu": "NVIDIA L20X",
+        "ep": 8,
+        "profiled_rank": 2,
+        "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/profile-natives/qwen35b/ab_swizzle/native",
+        "metrics_requested": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum",
+        "command": [
+          "/opt/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=8",
+          "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/benchmarks/experiments/dt_fp8/profile.py",
+          "--rank",
+          "--tokens",
+          "512",
+          "--variant",
+          "fp8_online"
+        ],
+        "status": "passed",
+        "replay_passes": 1,
+        "metrics": {
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": {
+            "value": 34555.0,
+            "unit": ""
+          },
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": {
+            "value": 142631.0,
+            "unit": ""
+          },
+          "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum": {
+            "value": 274839.0,
+            "unit": ""
+          }
+        }
+      },
+      {
+        "model": "qwen35b",
+        "candidate": "dualwg",
+        "tokens": 512,
+        "variant": "fp8_online",
+        "group": "shared",
+        "name": "qwen35b-dualwg-n512-fp8_online-shared",
+        "gpu": "NVIDIA L20X",
+        "ep": 8,
+        "profiled_rank": 2,
+        "native": "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/build/dt-fp8-pipeline-20261101/profile-natives/qwen35b/dualwg/native",
+        "metrics_requested": "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum",
+        "command": [
+          "/opt/.venv/bin/python",
+          "-m",
+          "torch.distributed.run",
+          "--standalone",
+          "--nproc-per-node=8",
+          "/storage/openpsi/codes/wanghaitao.wht/project/ops/WeftMoE/benchmarks/experiments/dt_fp8/profile.py",
+          "--rank",
+          "--tokens",
+          "512",
+          "--variant",
+          "fp8_online"
+        ],
+        "status": "passed",
+        "replay_passes": 1,
+        "metrics": {
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum": {
+            "value": 641383.0,
+            "unit": ""
+          },
+          "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum": {
+            "value": 172972.0,
+            "unit": ""
+          },
+          "l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum": {
+            "value": 881667.0,
+            "unit": ""
+          }
+        }
+      }
+    ]
+  },
+  "limitations": [
+    "NCU captures rank2 once, single pass only; counter durations are not latency benchmarks",
+    "Qwen35B 1 token remains slower than BF16; 512 tokens is near parity, not a guaranteed speedup",
+    "Static routes within timed graphs; both routing seeds tested; single node only"
+  ],
+  "rejected": [
+    "Single-warpgroup N128 or double-partial pipeline introduced spills and only 1-3% gains",
+    "Fine-grained S-ready counters, full-column return and dual-warpgroup N64 pipeline did not improve the tested baseline",
+    "M16 with 8 math warps removed spills but regressed the 1-token case",
+    "Integer hardware amax reduction improved the tested Qwen35B cases by less than 2%; left as an experiment"
+  ],
+  "autotune": {
+    "output": "build/dt-fp8-autotune-dualwg-20261101",
+    "candidates": 50,
+    "models": 3,
+    "status_file": "build/dt-fp8-autotune-dualwg-20261101/status.json",
+    "known_case_waiver": true,
+    "installs_results_automatically": false
+  },
+  "method_reference": ".agents/skills/KernelWiki/wiki/patterns/pipeline-stalls.md"
+}

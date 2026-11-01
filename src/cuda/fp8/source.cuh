@@ -12,6 +12,26 @@ __host__ __device__ constexpr unsigned source_pitch(unsigned hidden) {
   return (hidden + hidden / 128U * sizeof(float) + 15U) & ~15U;
 }
 
+// Preserve caller quantization exactly: no amax, scale arithmetic or cast.
+// Each warp copies one row into the packet layout used by local/GIN Pull.
+template <unsigned Hidden>
+__global__ __launch_bounds__(128) void copy_source_x(
+    const std::uint8_t *input, const float *input_scales,
+    std::uint8_t *output, std::uint64_t tokens) {
+  constexpr unsigned Pitch = source_pitch(Hidden);
+  const auto warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+  for (auto row = std::uint64_t(blockIdx.x) * 4U + warp; row < tokens;
+       row += std::uint64_t(gridDim.x) * 4U) {
+    auto *packet = output + row * Pitch;
+    for (unsigned col = lane * 16U; col < Hidden; col += 512U)
+      *reinterpret_cast<uint4 *>(packet + col) =
+          *reinterpret_cast<const uint4 *>(input + row * Hidden + col);
+    auto *scales = reinterpret_cast<float *>(packet + Hidden);
+    for (unsigned col = lane; col < Hidden / 128U; col += 32U)
+      scales[col] = input_scales[row * (Hidden / 128U) + col];
+  }
+}
+
 template <unsigned Hidden>
 __global__ __launch_bounds__(128) void prepare_source_x(
     const __nv_bfloat16 *input, std::uint8_t *output, std::uint64_t tokens) {

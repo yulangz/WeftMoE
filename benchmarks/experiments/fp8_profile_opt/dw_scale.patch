@@ -1,0 +1,26 @@
+--- a/src/cuda/fp8/tile.cuh
++++ b/src/cuda/fp8/tile.cuh
+@@ -73,6 +73,14 @@
+ #pragma unroll
+   for (unsigned segment = 0U; segment < N / AtomN; ++segment) {
+     float factors[4];
++    float column_scales[AtomN / 2U];
++    if constexpr (!BlockWeight) {
++#pragma unroll
++      for (unsigned j = 0U; j < AtomN / 2U; ++j) {
++        column_scales[j] = sb[segment * AtomN + c + j / 2U * 8U + j % 2U];
++        asm volatile("" :: "f"(column_scales[j]) : "memory");
++      }
++    }
+     if constexpr (BlockWeight) {
+       // A canonical N128 weight block has one scale. The packed gate/up
+       // layout alternates two such blocks every eight output columns.
+@@ -104,7 +112,7 @@
+       for (unsigned e = 0U; e < 4U; ++e) {
+         const auto index = segment * Mma::kNumAccum + j * 4U + e;
+         const auto scale = BlockWeight ? factors[(j % 2U) * 2U + e / 2U]
+-            : sa[r + e / 2U * 8U] * sb[segment * AtomN + c + j * 8U + e % 2U];
++            : sa[r + e / 2U * 8U] * column_scales[j * 2U + e % 2U];
+         total[index] = fmaf(partial[j * 4U + e], scale, total[index]);
+       }
+     }

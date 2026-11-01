@@ -1,4 +1,4 @@
-"""Real SM90 FP8 instructions against independently dequantized references.
+"""SM90 FP8: BF16 global-diff acceptance and exact quantization layouts.
 
 Run with WEFTMOE_TENSOR_EXTENSION pointing at a freshly built tensor adapter.
 """
@@ -6,6 +6,7 @@ import os
 
 import pytest
 import torch
+from benchmarks.fp8_validation import assert_diff
 
 from weftmoe.fp8 import (FP8Tensor, fp8_gemm, prepare_fp8_weights,
                          quantize_fp8, transpose_fp8_weight, _quantize_fp8_weight_pair)
@@ -154,20 +155,15 @@ def test_gemm(m, n, k, b_block_rows):
     aq, bq = quantize_fp8(a), quantize_fp8(b, block_rows=b_block_rows)
     expected = aq.dequantize().double() @ bq.dequantize().double().T
     actual = fp8_gemm(aq, bq, dtype=torch.float32)
-    # Hopper's FP8 Tensor Core partial accumulator has lower precision than
-    # CUDA FP32. Promotion every K128 bounds this error; compare against FP64
-    # both globally and per-element, including cancellation near zero.
-    def check_accumulation(value, target):
-        if not value.numel():
-            return
-        error = (value.double() - target).abs()
-        sum_abs = aq.dequantize().double().abs() @ bq.dequantize().double().abs().T
-        assert torch.all(error <= sum_abs * 2e-4 + 1e-6)
-        assert error.norm() <= target.norm() * 4e-4 + 1e-6
-    check_accumulation(actual, expected)
+    # Global FP64 diff only; quantized-math and original BF16-operand references
+    # both use the shared acceptance threshold, including cancellation cases.
+    original = a.double() @ b.double().T
+    assert_diff(actual, original, 'gemm')
+    assert_diff(actual, expected, 'quantized_gemm')
     out = torch.full((m, n), 0.5, device="cuda", dtype=torch.float32)
     fp8_gemm(aq, bq, dtype=torch.float32, out=out, accumulate=True)
-    check_accumulation(out, expected + 0.5)
+    assert_diff(out, original + 0.5, 'gemm_accumulate')
+    assert_diff(out, expected + 0.5, 'quantized_gemm_accumulate')
     bf16 = fp8_gemm(aq, bq)
     torch.testing.assert_close(bf16, actual.bfloat16(), rtol=0, atol=0)
 

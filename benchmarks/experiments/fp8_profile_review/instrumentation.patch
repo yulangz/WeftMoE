@@ -1,0 +1,121 @@
+--- a/src/cuda/profiling/device_timeline_types.hpp
++++ b/src/cuda/profiling/device_timeline_types.hpp
+@@ -126,6 +126,12 @@
+   TxCreditWaitNs = 120,
+   ReturnWorkerBytes = 121,
+   ReturnNicWaitNs = 122,
++  Fc1EpilogueReady = 123,
++  BwdDuBegin = 124, BwdDuEnd = 125,
++  BwdDxBegin = 126, BwdDxEnd = 127,
++  BwdSwiBegin = 128, BwdSwiEnd = 129,
++  BwdRowColNs = 130,
++  BwdDwBegin = 131, BwdDwEnd = 132,
+ };
+ 
+ // Fixed-width, pointer-free host/device trace record. Timestamps are only
+--- a/src/cuda/weftmoe_pf/local_compute.cuh
++++ b/src/cuda/weftmoe_pf/local_compute.cuh
+@@ -554,6 +554,8 @@
+       while (ring::acquire(slot.fc2_done) <
+              std::uint64_t(t.generation - 1U) * kFc2Tiles) {
+       }
++      WEFTMOE_TIMELINE_RECORD(a.timeline, Fc1EpilogueReady, Compute, t.column,
++                              t.block, 0U);
+       if (a.saved_ab)
+         static_v4_save_fc1_tile<kN>(a, accum, t.rows, t.column * kN / 2U,
+                                     t.block);
+--- a/src/cuda/weftmoe_pf/backward_kernel.cuh
++++ b/src/cuda/weftmoe_pf/backward_kernel.cuh
+@@ -380,6 +380,9 @@
+     const ForwardKernelArgs &f, const BackwardKernelArgs &a, Shared &s,
+     const Task &t, float *accum, unsigned &stage, unsigned &phase) {
+   {
++#if WEFTMOE_DEVICE_TIMELINE
++    std::uint64_t column_ns = 0U;
++#endif
+     constexpr unsigned reduction = Dx ? 2U * backward_tuning::kMainIntermediate : backward_tuning::kMainHidden;
+     for (unsigned k = 0; k < reduction; k += 128U) {
+       s.full[stage].wait(phase);
+@@ -405,6 +408,9 @@
+         fp8::multiply_tile<N, fp8::NoSync, true, true>(reinterpret_cast<std::uint8_t *>(s.a[stage]),
+             reinterpret_cast<std::uint8_t *>(s.b[stage]), scales, scales + kM, accum);
+       if (cache_owner) {
++#if WEFTMOE_DEVICE_TIMELINE
++        const auto column_begin = threadIdx.x == 0U ? device_globaltimer_ns() : 0U;
++#endif
+         const auto offset = std::uint64_t(t.block) * kM * reduction + k * kM;
+         fp8::row_to_column(reinterpret_cast<const std::uint8_t *>(s.a[stage]),
+             scales, t.rows, a.fp8_wgrad_data + offset, a.fp8_wgrad_scales + offset / 128U);
+@@ -416,11 +422,16 @@
+               a.fp8_x_scales + xoffset / 128U);
+           fp8::MathSync::sync();
+         }
++#if WEFTMOE_DEVICE_TIMELINE
++        if (!threadIdx.x) column_ns += device_globaltimer_ns() - column_begin;
++#endif
+       }
+       backward_compute_detail::release_stage(s.empty[stage]);
+       stage = (stage + 1U) % kStages;
+       phase ^= stage == 0U;
+     }
++    if constexpr (!Dx)
++      WEFTMOE_TIMELINE_RECORD(f.timeline, BwdRowColNs, Compute, t.column, column_ns, t.block);
+     return;
+   }
+ 
+@@ -433,6 +444,11 @@
+ #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+   const auto task_begin = device_globaltimer_ns();
+ #endif
++  if constexpr (Dx) {
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDxBegin, Compute, t.column, t.block, 0U);
++  } else {
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDuBegin, Compute, t.column, t.block, 0U);
++  }
+   constexpr auto MajorA = hopper::Major::K, MajorB = hopper::Major::MN;
+   using Mma =
+       typename hopper::BF16MMASelector<N, MajorA, MajorB, kK, 128U>::type;
+@@ -534,6 +550,11 @@
+   }
+   backward_weights::UnifiedComputeSynchronization<
+       true>::math_sync(256U, 0U);
++  if constexpr (Dx) {
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDxEnd, Compute, t.column, t.block, 0U);
++  } else {
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDuEnd, Compute, t.column, t.block, 0U);
++  }
+   if (!threadIdx.x) {
+ #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+     auto *status =
+@@ -575,6 +596,7 @@
+       using Sync =
+           backward_weights::UnifiedComputeSynchronization<true>;
+       Sync::math_sync(256U, 0U);
++      WEFTMOE_TIMELINE_RECORD(f.timeline, BwdSwiBegin, Compute, t.column, t.block, 0U);
+       if constexpr (FP8) {
+ #if defined(WEFTMOE_PF_BWD_TASK_TIMING)
+           const auto task_begin = device_globaltimer_ns();
+@@ -635,6 +657,7 @@
+                   device_globaltimer_ns());
+       }
+       }
++      WEFTMOE_TIMELINE_RECORD(f.timeline, BwdSwiEnd, Compute, t.column, t.block, 0U);
+     }
+   }
+ }
+@@ -754,6 +777,7 @@
+ #else
+     compute<Network, FP8>(f, a, s);
+     begin_weights<Network, FP8>(f, a, storage, state);
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDwBegin, Compute, 0U, 0U, 0U);
+     if constexpr (FP8) {
+       backward_weights::run_fp8_weights_pipeline<false>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
+     } else {
+@@ -763,6 +787,7 @@
+         a, dr_mn_map, u_mn_map, dab_mn_map, x_mn_map, dw2_store_map, dw1_store_map,
+         geometry, storage, state, sync);
+     }
++    WEFTMOE_TIMELINE_RECORD(f.timeline, BwdDwEnd, Compute, 0U, 0U, 0U);
+ #endif
+     finish();
+   } else {

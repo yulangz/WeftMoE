@@ -1,0 +1,231 @@
+--- a/src/cuda/activation_transport.cu
++++ b/src/cuda/activation_transport.cu
+@@ -1,3 +1,9 @@
++#ifndef WEFTMOE_FP8_NOTIFY_OVERLAP_FWD
++#define WEFTMOE_FP8_NOTIFY_OVERLAP_FWD 0
++#endif
++#ifndef WEFTMOE_FP8_NOTIFY_OVERLAP_BWD
++#define WEFTMOE_FP8_NOTIFY_OVERLAP_BWD 0
++#endif
+ #include "cuda/activation_transport_internal.hpp"
+ #include "cuda/communication/chunk_ring.cuh"
+ #include "cuda/communication/local_notification.cuh"
+@@ -4714,9 +4720,13 @@
+   // lifetime to the Forward handle and its normal completion protocol.
+   struct SourcePreparationGuard {
+     cudaStream_t stream = nullptr;
++    cudaStream_t planner_stream = nullptr;
+     ~SourcePreparationGuard() {
+-      if (stream)
++      if (stream) {
+         (void)cudaStreamSynchronize(stream);
++        if (planner_stream && planner_stream != stream)
++          (void)cudaStreamSynchronize(planner_stream);
++      }
+     }
+   } source_preparation_guard;
+   const auto &layout = state->layout;
+@@ -5256,22 +5266,33 @@
+                         " resident CTAs",
+                     std::to_string(max_active_clusters) + " resident clusters");
+   if (standalone_notify) {
++    const bool overlap_source = WEFTMOE_FP8_NOTIFY_OVERLAP_FWD && source_fp8 && !network_prefill;
++    const auto source_stream = overlap_source ? slot.backward_transport_stream : exec->stream;
++    const auto source_check = [&](cudaError_t error, const char *what) {
++      internal::throw_cuda("fp8-source-overlap", error, id.calling_rank, id.world_size,
++          backend->session.session().identity(), id.generation, ExchangeKind::ExpertCounts, what);
++    };
+     if (source_fp8) {
+-      source_preparation_guard.stream = exec->stream;
+-      // A separate source kernel replaces BF16 staging. Notify follows on this
+-      // stream and its existing peer publication also publishes the FP8 packet.
+-      // The auxiliary-stream experiment added host overhead without useful
+-      // overlap for these short kernels; no cross-stream events are needed.
++      source_preparation_guard.stream = source_stream;
++      source_preparation_guard.planner_stream = exec->stream;
++      if (overlap_source) {
++        source_check(cudaEventRecord(slot.backward_roles_ready, exec->stream), "record source prerequisites");
++        source_check(cudaStreamWaitEvent(source_stream, slot.backward_roles_ready), "fork source quantization");
++      }
++      if (!overlap_source) {
+       if (id.num_tokens) {
+         const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+             (id.num_tokens + 3U) / 4U, 4U * sms));
+-        fp8::prepare_source_x<forward_tuning::kMainHidden><<<blocks, 128, 0, exec->stream>>>(
++        fp8::prepare_source_x<forward_tuning::kMainHidden><<<blocks, 128, 0, source_stream>>>(
+             reinterpret_cast<const __nv_bfloat16 *>(activation.pointer),
+             network_prefill ? at<std::uint8_t>(slot.gin_window, args.static_network.input)
+                             : at<std::uint8_t>(slot.device, layout.input), id.num_tokens);
+         internal::throw_cuda("fp8-source", cudaGetLastError(), id.calling_rank, id.world_size,
+             backend->session.session().identity(), id.generation,
+             ExchangeKind::ExpertCounts, "launch source quantization");
++      }
++      if (overlap_source)
++        source_check(cudaEventRecord(slot.backward_join_transport, source_stream), "record source quantization complete");
+       }
+     }
+     args.training_counts_ready = !split_notify;
+@@ -5292,6 +5313,9 @@
+                          id.generation, ExchangeKind::ExpertCounts,
+                          "prepare standalone resident planner");
+     auto notify_launch = launch;
++    if (overlap_source)
++      notify_launch.gridDim.x = std::max(forward_tuning::kClusterSize,
++          forward_main_compute_ctas / (2U * forward_tuning::kClusterSize) * forward_tuning::kClusterSize);
+     notify_launch.blockDim = dim3(threads);
+     notify_launch.dynamicSmemBytes = notify_smem;
+     internal::throw_cuda(
+@@ -5299,6 +5323,27 @@
+         id.calling_rank, id.world_size, backend->session.session().identity(),
+         id.generation, ExchangeKind::ExpertCounts,
+         "launch standalone PF planner");
++    if (overlap_source) {
++      if (id.num_tokens) {
++        const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
++            (id.num_tokens + 3U) / 4U, 4U * sms));
++        fp8::prepare_source_x<forward_tuning::kMainHidden><<<blocks, 128, 0, source_stream>>>(
++            reinterpret_cast<const __nv_bfloat16 *>(activation.pointer),
++            network_prefill ? at<std::uint8_t>(slot.gin_window, args.static_network.input)
++                            : at<std::uint8_t>(slot.device, layout.input), id.num_tokens);
++        internal::throw_cuda("fp8-source", cudaGetLastError(), id.calling_rank, id.world_size,
++            backend->session.session().identity(), id.generation,
++            ExchangeKind::ExpertCounts, "launch source quantization");
++      }
++      if (overlap_source)
++        source_check(cudaEventRecord(slot.backward_join_transport, source_stream), "record source quantization complete");
++    }
++    if (overlap_source) {
++      source_check(cudaStreamWaitEvent(exec->stream, slot.backward_join_transport), "join source quantization");
++      // Local stream readiness alone does not publish packets to peer ranks.
++      weftmoe_pf::source_ready_kernel<<<1, 128, 0, exec->stream>>>(args);
++      source_check(cudaGetLastError(), "publish source packets after notify and quantization");
++    }
+     if (split_notify) {
+       ActivationTransportBridge::finish_training_notify(dispatch, consumer);
+       view.sizes = args.dispatch.sizes = dispatch.sizes();
+@@ -6522,26 +6567,38 @@
+       cudaStreamWaitEvent(transport_stream, slot.backward_roles_ready),
+       identity.rank, identity.world, "backward", identity.generation,
+       ExchangeKind::ExpertCounts, "wait Backward caller-stream dependency");
++  const bool overlap_source = WEFTMOE_FP8_NOTIFY_OVERLAP_BWD && pf_args.fp8_source_x && !use_gin;
++  const auto source_stream = overlap_source ? exec->stream : transport_stream;
+   internal::throw_cuda(
+       "backward-run",
+-      internal::wait_input_ready(transport_stream, gradient.allocation->ready,
++      internal::wait_input_ready(source_stream, gradient.allocation->ready,
+                                  gradient.allocation->ready_capture_id),
+       identity.rank, identity.world, "backward", identity.generation,
+       ExchangeKind::ExpertCounts, "wait dY producer");
+   // Keep dY alive on host-side launch failures, as for source X preparation.
+   struct SourcePreparationGuard {
+     cudaStream_t stream = nullptr;
++    cudaStream_t planner_stream = nullptr;
+     ~SourcePreparationGuard() {
+-      if (stream)
++      if (stream) {
+         (void)cudaStreamSynchronize(stream);
++        if (planner_stream && planner_stream != stream)
++          (void)cudaStreamSynchronize(planner_stream);
++      }
+     }
+   } source_preparation_guard;
++  const auto source_check = [&](cudaError_t error, const char *what) {
++    internal::throw_cuda("fp8-dy-overlap", error, identity.rank, identity.world,
++        "backward", identity.generation, ExchangeKind::ExpertCounts, what);
++  };
++  if (!overlap_source) {
+   if (pf_args.fp8_source_x && identity.tokens) {
+-    source_preparation_guard.stream = transport_stream;
++    source_preparation_guard.stream = source_stream;
++    source_preparation_guard.planner_stream = transport_stream;
+     const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+         (identity.tokens + 3U) / 4U, 4U * sm_count));
+     fp8::prepare_source_x<backward_tuning::kMainHidden>
+-        <<<blocks, 128, 0, transport_stream>>>(
++        <<<blocks, 128, 0, source_stream>>>(
+             reinterpret_cast<const __nv_bfloat16 *>(gradient.pointer),
+             use_gin ? at<std::uint8_t>(slot.gin_window, pf_args.static_network.input)
+                     : at<std::uint8_t>(slot.device, layout.input), identity.tokens);
+@@ -6549,6 +6606,7 @@
+                          identity.world, "backward", identity.generation,
+                          ExchangeKind::ExpertCounts,
+                          "launch source dY quantization");
++  }
+   }
+   // Only count/route metadata belongs to the tape. The physical PF plan
+   // belongs to the shared execution workspace and may contain a later layer.
+@@ -6571,7 +6629,7 @@
+   planner_cluster.id = cudaLaunchAttributeClusterDimension;
+   planner_cluster.val.clusterDim = {2U, 1U, 1U};
+   cudaLaunchConfig_t planner_launch{};
+-  planner_launch.gridDim = dim3(compute_ctas);
++  planner_launch.gridDim = dim3(overlap_source ? std::max(2U, (compute_ctas / 2U) & ~1U) : compute_ctas);
+   planner_launch.blockDim = dim3(384U);
+   planner_launch.dynamicSmemBytes = planner_smem;
+   planner_launch.stream = transport_stream;
+@@ -6581,6 +6639,30 @@
+       "backward-plan", cudaLaunchKernelEx(&planner_launch, planner, pf_args),
+       identity.rank, identity.world, "backward", identity.generation,
+       ExchangeKind::ExpertCounts, "restore current tape PF plan and stage dY");
++  if (overlap_source) {
++  if (pf_args.fp8_source_x && identity.tokens) {
++    source_preparation_guard.stream = source_stream;
++    source_preparation_guard.planner_stream = transport_stream;
++    const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
++        (identity.tokens + 3U) / 4U, 4U * sm_count));
++    fp8::prepare_source_x<backward_tuning::kMainHidden>
++        <<<blocks, 128, 0, source_stream>>>(
++            reinterpret_cast<const __nv_bfloat16 *>(gradient.pointer),
++            use_gin ? at<std::uint8_t>(slot.gin_window, pf_args.static_network.input)
++                    : at<std::uint8_t>(slot.device, layout.input), identity.tokens);
++    internal::throw_cuda("fp8-source-dy", cudaGetLastError(), identity.rank,
++                         identity.world, "backward", identity.generation,
++                         ExchangeKind::ExpertCounts,
++                         "launch source dY quantization");
++  }
++  if (overlap_source)
++    source_check(cudaEventRecord(slot.backward_join_compute, source_stream), "record dY quantization complete");
++  }
++  if (overlap_source) {
++    source_check(cudaStreamWaitEvent(transport_stream, slot.backward_join_compute), "join dY quantization");
++    weftmoe_pf::source_ready_kernel<<<1, 128, 0, transport_stream>>>(pf_args);
++    source_check(cudaGetLastError(), "publish dY after planner and quantization");
++  }
+   if (use_gin) {
+     backward_build_row_directory_kernel<<<1, 256, 0, transport_stream>>>(
+         args);
+--- a/src/cuda/weftmoe_pf/split_notify.cuh
++++ b/src/cuda/weftmoe_pf/split_notify.cuh
+@@ -167,4 +167,13 @@
+ #endif
+ }
+ 
++// One CTA joins ranks after both local preparation streams. The reusable
++// rank phase is shared with Notify, but its resident-grid counter is untouched.
++__global__ __launch_bounds__(128) void source_ready_kernel(
++    const __grid_constant__ ForwardKernelArgs a) {
++#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
++  rank_barrier<0U, 128U, false, false>(a);
++#endif
++}
++
+ } // namespace weftmoe_pf
+--- a/src/cuda/fp8/source.cuh
++++ b/src/cuda/fp8/source.cuh
+@@ -15,6 +15,16 @@
+ template <unsigned Hidden>
+ __global__ __launch_bounds__(128) void prepare_source_x(
+     const __nv_bfloat16 *input, std::uint8_t *output, std::uint64_t tokens) {
++#if defined(WEFTMOE_FP8_SOURCE_DELAY_CYCLES)
++  // Experiment-only stress: let Notify finish well before one source CTA.
++  if (!blockIdx.x) {
++    if (!threadIdx.x) {
++      const auto begin = clock64();
++      while (clock64() - begin < WEFTMOE_FP8_SOURCE_DELAY_CYCLES) {}
++    }
++    __syncthreads();
++  }
++#endif
+   constexpr unsigned Pitch = source_pitch(Hidden);
+   const auto warp = threadIdx.x / 32U, lane = threadIdx.x % 32U;
+   for (auto row = std::uint64_t(blockIdx.x) * 4U + warp; row < tokens;

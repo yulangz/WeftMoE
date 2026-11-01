@@ -1,0 +1,36 @@
+--- a/src/cuda/weftmoe_pf/local_kernel.cuh
++++ b/src/cuda/weftmoe_pf/local_kernel.cuh
+@@ -206,26 +206,13 @@
+       constexpr auto Pitch = fp8::source_pitch(Hidden);
+       const auto *packet = peer_at<const char>(a.peer_bases[source], a.source_input_offset) +
+           std::uint64_t(token) * Pitch;
+-      for (unsigned offset = 0; offset < Pitch; offset += 4096U) {
+-        const auto bytes = min(4096U, Pitch - offset);
+-        if (!lane) {
+-          cute::SM90_BULK_COPY_G2S::copy(packet + offset,
+-              reinterpret_cast<std::uint64_t *>(&s.pull_full[warp]), s.pull[warp], bytes);
+-          s.pull_full[warp].arrive_and_expect_tx(bytes);
+-          s.pull_full[warp].wait(phase);
+-          phase ^= 1U;
+-        }
+-        __syncwarp();
+-        for (unsigned index = lane * 16U; index < bytes && offset + index < Hidden; index += 512U)
+-          *reinterpret_cast<uint4 *>(output + offset + index) =
+-              *reinterpret_cast<const uint4 *>(s.pull[warp] + index);
+-        const auto sf_begin = max(offset, unsigned(Hidden));
+-        const auto sf_end = min(offset + bytes, unsigned(Hidden + Hidden / 128U * 4U));
+-        for (unsigned address = sf_begin + lane * 4U; address < sf_end; address += 128U)
+-          scales[(address - Hidden) / 4U * 128U] =
+-              *reinterpret_cast<const float *>(s.pull[warp] + address - offset);
+-        __syncwarp();
+-      }
++      // Load each already-quantized source row directly into the writing warp.
++      // The existing row publication fence remains after all payload/scale stores.
++      for (unsigned index = lane * 16U; index < Hidden; index += 512U)
++        *reinterpret_cast<uint4 *>(output + index) =
++            *reinterpret_cast<const uint4 *>(packet + index);
++      for (unsigned column = lane; column < Hidden / 128U; column += 32U)
++        scales[column * 128U] = reinterpret_cast<const float *>(packet + Hidden)[column];
+     } else {
+     for (unsigned offset = 0; offset < a.hidden * 2U; offset += 4096U) {
+       const auto bytes = min(4096U, unsigned(a.hidden * 2U) - offset);

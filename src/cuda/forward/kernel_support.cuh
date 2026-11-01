@@ -138,7 +138,7 @@ CUtensorMap make_fp8_tma_map(void *base, std::uint64_t inner,
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
                     field, 0, "nonzero uint32 dimensions and valid base",
                     "invalid");
-  if (packed_ring && (inner % 128U || outer % 128U || box_outer != 128U ||
+  if (packed_ring && (inner % 128U || outer % 128U || (box_outer != 16U && box_outer != 64U && box_outer != 128U) ||
                       row_stride_bytes < inner + inner / 32U))
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
                     field, 0, "M128 slots with room for FP8 data and scales", "invalid");
@@ -1569,8 +1569,9 @@ struct PoolSlot {
   CUtensorMap forward_x_map{};
   CUtensorMap forward_fp8_x_map{}, forward_fp8_s_map{};
   CUtensorMap forward_s_map{};
-  CUtensorMap decode_x_map[2]{};
-  CUtensorMap decode_s_map[2]{};
+  CUtensorMap decode_fp8_x_map{}, decode_fp8_s_map{};
+  CUtensorMap decode_x_map{};
+  CUtensorMap decode_s_map{};
   CUtensorMap forward_output_store_map{};
   CUtensorMap forward_training_output_store_map{};
   CUtensorMap forward_staging_store_map{};

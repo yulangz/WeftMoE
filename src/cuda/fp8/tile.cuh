@@ -6,12 +6,10 @@
 
 namespace weftmoe::cuda::fp8 {
 
-#ifndef WEFTMOE_FP8_MATH_REGISTERS
-#define WEFTMOE_FP8_MATH_REGISTERS 216
-#endif
-inline constexpr unsigned kMathRegisters = WEFTMOE_FP8_MATH_REGISTERS;
+// One fixed partition for FP8 FWD and BWD across model profiles.
+inline constexpr unsigned kMathRegisters = 224U;
 inline constexpr unsigned kControlRegisters = 504U - 2U * kMathRegisters;
-static_assert(kMathRegisters >= 168U && kMathRegisters <= 240U && kMathRegisters % 8U == 0U);
+static_assert(kControlRegisters == 56U);
 
 struct NoSync {
   __device__ static void sync() {}

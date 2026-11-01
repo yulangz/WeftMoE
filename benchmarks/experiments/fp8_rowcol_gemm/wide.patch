@@ -1,0 +1,370 @@
+--- a/src/cuda/fp8/api.hpp
++++ b/src/cuda/fp8/api.hpp
+@@ -11,6 +11,9 @@
+ #endif
+ #ifndef WEFTMOE_FP8_SOURCE_DY
+ #define WEFTMOE_FP8_SOURCE_DY 1
++#endif
++#ifndef WEFTMOE_FP8_WGRAD_ROWCOL_FUSION
++#define WEFTMOE_FP8_WGRAD_ROWCOL_FUSION 0
+ #endif
+ 
+ struct CUstream_st;
+--- a/src/cuda/fp8/column.cuh
++++ b/src/cuda/fp8/column.cuh
+@@ -7,6 +7,65 @@
+ #endif
+ 
+ namespace weftmoe::cuda::fp8 {
++
++// Convert a row-scaled operand directly into the next WGMMA shared stage.
++// Each warp owns eight channels, using eight lanes per channel pair.
++// Sixteen packed BF16 values balance instruction count and register pressure.
++__device__ __forceinline__ void row_to_column_shared(
++    const std::uint8_t *tile, const float *row_scales, unsigned rows,
++    std::uint8_t *output, float *scales, unsigned begin, unsigned columns) {
++  const unsigned lane = threadIdx.x % 32U;
++  const unsigned warp = threadIdx.x / 32U;
++#pragma unroll 1
++  for (unsigned stripe = 0U; stripe < columns; stripe += 64U) {
++    const unsigned column = begin + stripe + warp * 8U + lane % 4U * 2U;
++    unsigned values[16], maximum = 0U;
++#pragma unroll
++    for (unsigned i = 0U; i < 16U; ++i) {
++      const unsigned row = lane / 4U + i * 8U;
++      unsigned bits = 0U;
++      if (row < rows) {
++        __nv_fp8x2_e4m3 q;
++        q.__x = *reinterpret_cast<const unsigned short *>(tile + tile_offset(row, column));
++        const auto decoded = static_cast<float2>(q);
++        const float scale = row_scales[row];
++        const auto pair = __float22bfloat162_rn(make_float2(decoded.x * scale, decoded.y * scale));
++        bits = reinterpret_cast<const unsigned &>(pair);
++      }
++      values[i] = bits;
++      maximum = __vmaxu2(maximum, bits & 0x7fff7fffU);
++    }
++#pragma unroll
++    for (unsigned delta = 4U; delta <= 16U; delta *= 2U)
++      maximum = __vmaxu2(maximum, __shfl_xor_sync(0xffffffffU, maximum, delta));
++    const unsigned am = maximum & 0xffffU;
++    const unsigned bm = maximum >> 16U;
++    const float sa = am >= 0x7f80U ? nanf("") : block_scale(__uint_as_float(am << 16U));
++    const float sb = bm >= 0x7f80U ? nanf("") : block_scale(__uint_as_float(bm << 16U));
++    const float ia = am >= 0x7f80U ? sa : __uint_as_float(0x7f000000U - __float_as_uint(sa));
++    const float ib = bm >= 0x7f80U ? sb : __uint_as_float(0x7f000000U - __float_as_uint(sb));
++    if (lane < 4U) {
++      scales[column] = sa;
++      scales[column + 1U] = sb;
++    }
++#pragma unroll
++    for (unsigned i = 0U; i < 16U; ++i) {
++      const auto bits = values[i];
++      const unsigned q = __nv_fp8x2_e4m3(make_float2(
++          __uint_as_float(bits << 16U) * ia,
++          __uint_as_float(bits & 0xffff0000U) * ib)).__x;
++      const auto next = __shfl_xor_sync(0xffffffffU, q, 4U);
++      const unsigned lo = q | (next << 16U);
++      const auto hi = __shfl_xor_sync(0xffffffffU, lo, 8U);
++      if (!(lane / 4U % 4U)) {
++        *reinterpret_cast<unsigned *>(output + tile_offset(column, lane / 4U + i * 8U)) =
++            __byte_perm(lo, hi, 0x6420U);
++        *reinterpret_cast<unsigned *>(output + tile_offset(column + 1U, lane / 4U + i * 8U)) =
++            __byte_perm(lo, hi, 0x7531U);
++      }
++    }
++  }
++}
+ 
+ // BF16 magnitudes can be reduced as two packed unsigned integers. This
+ // avoids decoding all 128 values merely to find their column maxima.
+--- a/src/cuda/fp8/tile.cuh
++++ b/src/cuda/fp8/tile.cuh
+@@ -13,6 +13,10 @@
+ 
+ struct NoSync {
+   __device__ static void sync() {}
++};
++
++struct NoOverlap {
++  __device__ __forceinline__ void operator()(unsigned) const {}
+ };
+ 
+ struct MathSync {
+@@ -46,10 +50,10 @@
+ };
+ 
+ template <unsigned N, class Sync = MathSync, bool BlockWeight = false,
+-          bool AsyncOperands = false>
++          bool AsyncOperands = false, class Overlap = NoOverlap>
+ __device__ __forceinline__ void multiply_tile(
+     std::uint8_t *qa, std::uint8_t *qb, const float *sa, const float *sb,
+-    float *total) {
++    float *total, Overlap overlap = {}) {
+   // Keep only one N128 partial live alongside the final N-column result.
+   // A native N256 partial plus the final accumulator exceeds the persistent
+   // worker's register allocation and makes ptxas serialize/spill WGMMA.
+@@ -94,6 +98,7 @@
+       Mma::wgmma(da, db, partial, k != 0U);
+     }
+     cute::warpgroup_commit_batch();
++    overlap(segment);
+     cute::warpgroup_wait<0>();
+ #pragma unroll
+     for (auto &v : partial)
+--- a/src/cuda/weftmoe_pf/backward_kernel.cuh
++++ b/src/cuda/weftmoe_pf/backward_kernel.cuh
+@@ -58,6 +58,10 @@
+     ? backward_weights::kFP8PipelineBytes : sizeof(Shared) + kFP8ScaleBytes;
+ constexpr auto kFP8SharedBytes = kFP8BaseSharedBytes +
+     (WEFTMOE_FP8_STREAMED_WGRAD ? 128U * 132U : 0U);
++// The local row-to-column candidate uses a single raw operand staging tile.
++constexpr auto kFP8RowColSharedBytes = backward_weights::kFP8PipelineBytes + backward_tuning::kDwTileN * 132U;
++constexpr auto kFP8LocalSharedBytes = WEFTMOE_FP8_WGRAD_ROWCOL_FUSION && kFP8RowColSharedBytes > kFP8SharedBytes
++    ? kFP8RowColSharedBytes : kFP8SharedBytes;
+ __device__ __forceinline__ float *fp8_scales(Shared &s, unsigned stage) {
+   return reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(&s) + sizeof(Shared)) + stage * (kM + kN);
+ }
+@@ -391,7 +395,7 @@
+       auto *xraw = reinterpret_cast<std::uint8_t *>(&s) + kFP8BaseSharedBytes;
+       auto *xscales = reinterpret_cast<float *>(xraw + kM * 128U);
+       const auto xoffset = std::uint64_t(t.block) * kM * reduction + k * kM;
+-      if (cache_owner && a.fp8_x_row_data) {
++      if (cache_owner && a.fp8_x_row_data && !(!Network && WEFTMOE_FP8_WGRAD_ROWCOL_FUSION)) {
+         for (unsigned v = threadIdx.x * 16U; v < kM * 128U; v += 256U * 16U) {
+           const auto dest = unsigned(__cvta_generic_to_shared(xraw + v));
+           asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
+@@ -406,6 +410,14 @@
+             reinterpret_cast<std::uint8_t *>(s.b[stage]), scales, scales + kM, accum);
+       if (cache_owner) {
+         const auto offset = std::uint64_t(t.block) * kM * reduction + k * kM;
++        if constexpr (!Network && WEFTMOE_FP8_WGRAD_ROWCOL_FUSION) {
++          // Keep dY row-scaled; dW converts each operand in its shared pipeline.
++          for (unsigned v = threadIdx.x * 16U; v < kM * 128U; v += 256U * 16U)
++            *reinterpret_cast<uint4 *>(a.fp8_wgrad_data + offset + v) =
++                *reinterpret_cast<const uint4 *>(reinterpret_cast<const std::uint8_t *>(s.a[stage]) + v);
++          if (threadIdx.x < kM)
++            a.fp8_wgrad_scales[offset / 128U + threadIdx.x] = scales[threadIdx.x];
++        } else {
+         fp8::row_to_column(reinterpret_cast<const std::uint8_t *>(s.a[stage]),
+             scales, t.rows, a.fp8_wgrad_data + offset, a.fp8_wgrad_scales + offset / 128U);
+         if (a.fp8_x_row_data) {
+@@ -415,6 +427,7 @@
+               a.fp8_x_data + xoffset,
+               a.fp8_x_scales + xoffset / 128U);
+           fp8::MathSync::sync();
++        }
+         }
+       }
+       backward_compute_detail::release_stage(s.empty[stage]);
+@@ -755,7 +768,7 @@
+     compute<Network, FP8>(f, a, s);
+     begin_weights<Network, FP8>(f, a, storage, state);
+     if constexpr (FP8) {
+-      backward_weights::run_fp8_weights_pipeline<false>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
++      backward_weights::run_fp8_weights_pipeline<false, !Network && WEFTMOE_FP8_WGRAD_ROWCOL_FUSION>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
+     } else {
+     backward_weights::UnifiedComputeSynchronization<true> sync{
+         state};
+@@ -776,7 +789,7 @@
+       produce<Network, FP8>(f, a, s, dy_map, dab_map, w2_map, w1_map);
+       begin_weights<Network, FP8>(f, a, storage, state);
+       if constexpr (FP8)
+-        backward_weights::run_fp8_weights_pipeline<true>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
++        backward_weights::run_fp8_weights_pipeline<true, !Network && WEFTMOE_FP8_WGRAD_ROWCOL_FUSION>(a, geometry, storage, state, dw1_store_map, dw2_store_map);
+       if constexpr (!FP8) {
+       backward_weights::UnifiedComputeSynchronization<false>
+           sync{state};
+--- a/src/cuda/weftmoe_pf/fp8_wgrad.cuh
++++ b/src/cuda/weftmoe_pf/fp8_wgrad.cuh
+@@ -7,7 +7,7 @@
+ // Keep the existing producer warp active during Wgrad. Operand slots have
+ // independent full/empty barriers, so the two math warpgroups need no CTA
+ // rendezvous for every K128 promotion. Output storage never aliases operands.
+-template <bool Producer>
++template <bool Producer, bool Fused = false>
+ __device__ __forceinline__ void run_fp8_weights_pipeline(
+     const BackwardKernelArgs &a, const RowGeometry &geometry,
+     unsigned char *storage, SharedState &state,
+@@ -27,16 +27,24 @@
+   using Barrier = cutlass::arch::ClusterTransactionBarrier;
+   auto *full = reinterpret_cast<Barrier *>(storage + Stages * StageBytes);
+   auto *empty = full + Stages;
++  auto *raw_empty = empty + Stages;
++  static_assert(Stages * StageBytes + (2U * Stages + 1U) * sizeof(Barrier) <= StoreOffset);
++  auto *raw = storage + kFP8PipelineBytes;
++  auto *raw_scales = reinterpret_cast<float *>(raw + N * 128U);
++  static_assert(N >= 128U && N % 128U == 0U);
++  if constexpr (Fused && Producer)
++    asm volatile("fence.proxy.async.global;" ::: "memory");
+   if (threadIdx.x == 256U) {
+     for (unsigned s = 0; s < Stages; ++s) {
+       full[s].init(1U);
+       empty[s].init(8U);
+     }
++    if constexpr (Fused) raw_empty->init(8U);
+     cutlass::arch::fence_barrier_init();
+   }
+   using Sync = UnifiedComputeSynchronization<true>;
+   Sync::cta_sync();
+-  unsigned stage = 0U, phase = 0U;
++  unsigned stage = 0U, phase = 0U, raw_phase = 0U;
+   constexpr auto tiles2 = backward_pipeline_detail::kDw2TilesPerExpert;
+   constexpr auto tiles1 = backward_pipeline_detail::kDw1TilesPerExpert;
+   constexpr auto chunks2 = (tiles2 + Claim - 1U) / Claim;
+@@ -84,6 +92,7 @@
+         if constexpr (Producer) {
+           for (unsigned k = 0; k < rows; k += 128U) {
+             empty[stage].wait(phase ^ 1U);
++            if constexpr (Fused) raw_empty->wait(raw_phase ^ 1U);
+             if (threadIdx.x == 256U) {
+               const auto lo = std::uint64_t(lp) * a.fp8_wgrad_rows +
+                   (padded + k) * m + left_column * 128U;
+@@ -91,21 +100,57 @@
+                   (padded + k) * n + right_column * 128U;
+               auto *barrier = reinterpret_cast<std::uint64_t *>(full + stage);
+               cute::SM90_BULK_COPY_G2S::copy(a.fp8_wgrad_data + lo, barrier,
+-                  qa + stage * 128U * 128U, 128U * 128U);
++                  Fused && !first ? raw : qa + stage * 128U * 128U, 128U * 128U);
+               cute::SM90_BULK_COPY_G2S::copy(right_data + ro, barrier,
+-                  qb + stage * N * 128U, N * 128U);
++                  Fused && first ? raw : qb + stage * N * 128U, N * 128U);
+               cute::SM90_BULK_COPY_G2S::copy(a.fp8_wgrad_scales + lo / 128U, barrier,
+-                  sa + stage * (128U + N), 128U * sizeof(float));
++                  Fused && !first ? raw_scales : sa + stage * (128U + N), 128U * sizeof(float));
+               cute::SM90_BULK_COPY_G2S::copy(right_scales + ro / 128U, barrier,
+-                  sb + stage * (128U + N), N * sizeof(float));
++                  Fused && first ? raw_scales : sb + stage * (128U + N), N * sizeof(float));
+               full[stage].arrive_and_expect_tx(StageBytes);
+             }
++            if constexpr (Fused) raw_phase ^= 1U;
+             stage = (stage + 1U) % Stages;
+             phase ^= stage == 0U;
+           }
+         } else {
+           float accum[N / 2U] = {};
+           for (unsigned k = 0; k < rows; k += 128U) {
++            if constexpr (Fused) {
++              // Only the first K block is synchronous. Later blocks are
++              // converted while the previous block's MMA is in flight.
++              if (!k) {
++                full[stage].wait(phase);
++                for (unsigned part = 0U; part < (first ? N / 128U : 1U); ++part)
++                  fp8::row_to_column_shared(raw + part * 128U * 128U,
++                      raw_scales + part * 128U, min(128U, rows),
++                      first ? qb + stage * N * 128U + part * 128U * 128U : qa + stage * 128U * 128U,
++                      (first ? sb : sa) + stage * (128U + N) + part * 128U, 0U, 128U);
++                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                fp8::MathSync::sync();
++                if (threadIdx.x % 32U == 0U) raw_empty->arrive();
++              }
++              const auto overlap = [&](unsigned segment) {
++                if (k + 128U >= rows) return;
++                const auto next = (stage + 1U) % Stages;
++                if (!segment) full[next].wait(phase ^ unsigned(next == 0U));
++                constexpr unsigned Segments = N / 128U;
++                const auto part = first ? segment : 0U;
++                fp8::row_to_column_shared(raw + part * 128U * 128U,
++                    raw_scales + part * 128U, min(128U, rows - k - 128U),
++                    first ? qb + next * N * 128U + part * 128U * 128U : qa + next * 128U * 128U,
++                    (first ? sb : sa) + next * (128U + N) + part * 128U,
++                    first ? 0U : segment * (128U / Segments), first ? 128U : 128U / Segments);
++                if (segment + 1U == Segments) {
++                  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++                  fp8::MathSync::sync();
++                  if (threadIdx.x % 32U == 0U) raw_empty->arrive();
++                }
++              };
++              fp8::multiply_tile<N, fp8::NoSync, false, true>(
++                  qa + stage * 128U * 128U, qb + stage * N * 128U,
++                  sa + stage * (128U + N), sb + stage * (128U + N), accum, overlap);
++            } else {
+             full[stage].wait(phase);
+             if constexpr (N == 256U && WEFTMOE_FP8_WGRAD_PIPELINED_PROMOTION)
+               fp8::multiply_tile_pipelined_256<fp8::NoSync>(
+@@ -115,6 +160,7 @@
+               fp8::multiply_tile<N, fp8::NoSync, false, true>(
+                   qa + stage * 128U * 128U, qb + stage * N * 128U,
+                   sa + stage * (128U + N), sb + stage * (128U + N), accum);
++            }
+             if (threadIdx.x % 32U == 0U) empty[stage].arrive();
+             stage = (stage + 1U) % Stages;
+             phase ^= stage == 0U;
+@@ -164,5 +210,7 @@
+       Barrier::invalidate(reinterpret_cast<std::uint64_t *>(full + i));
+       Barrier::invalidate(reinterpret_cast<std::uint64_t *>(empty + i));
+     }
++  if constexpr (Fused)
++    if (threadIdx.x == 256U) Barrier::invalidate(reinterpret_cast<std::uint64_t *>(raw_empty));
+   Sync::cta_sync();
+ }
+--- a/src/cuda/activation_transport.cu
++++ b/src/cuda/activation_transport.cu
+@@ -6636,7 +6636,7 @@
+                  : weftmoe_pf::backward_stream::kernel<false, false>);
+   const auto smem = use_gin ? (args.fp8 ? weftmoe_pf::backward_stream::kFP8NetworkSharedBytes
+                                              : weftmoe_pf::backward_stream::kNetworkSharedBytes)
+-      : args.fp8 ? weftmoe_pf::backward_stream::kFP8SharedBytes
++      : args.fp8 ? weftmoe_pf::backward_stream::kFP8LocalSharedBytes
+                  : weftmoe_pf::backward_stream::kSharedBytes;
+   const auto entry = reinterpret_cast<const void *>(kernel);
+   int clusters = 0;
+@@ -6689,7 +6689,7 @@
+                        "launch unified Backward workers");
+   // First use converts each complete block in place. Later uses of this tape
+   // reuse its column layout; stream joins below order them after this launch.
+-  if (args.fp8_x_row_data)
++  if (args.fp8_x_row_data && (use_gin || !WEFTMOE_FP8_WGRAD_ROWCOL_FUSION))
+     saved.fp8_x_columns_queued = true;
+   for (auto event : {slot.backward_transport_done,
+                      record ? record->computed : slot.backward_compute_done,
+--- a/tests/cuda/fp8_column.cu
++++ b/tests/cuda/fp8_column.cu
+@@ -8,6 +8,7 @@
+ #include <stdexcept>
+ #include <vector>
+ 
++template <unsigned SharedParts>
+ __global__ void convert(const unsigned char *input, const float *scales,
+                         unsigned rows, unsigned char *output, float *out_scales) {
+   __shared__ unsigned char tile[128 * 128];
+@@ -17,7 +18,19 @@
+   if (threadIdx.x < 128)
+     sf[threadIdx.x] = scales[threadIdx.x];
+   __syncthreads();
+-  weftmoe::cuda::fp8::row_to_column(tile, sf, rows, output, out_scales);
++  if constexpr (SharedParts) {
++    __shared__ unsigned char column[128 * 128];
++    __shared__ float column_sf[128];
++    for (unsigned part = 0; part < SharedParts; ++part)
++      weftmoe::cuda::fp8::row_to_column_shared(tile, sf, rows, column,
++          column_sf, part * (128 / SharedParts), 128 / SharedParts);
++    __syncthreads();
++    for (unsigned i = threadIdx.x; i < 128 * 128; i += blockDim.x)
++      output[i] = column[i];
++    if (threadIdx.x < 128) out_scales[threadIdx.x] = column_sf[threadIdx.x];
++  } else {
++    weftmoe::cuda::fp8::row_to_column(tile, sf, rows, output, out_scales);
++  }
+ }
+ 
+ void check(cudaError_t result) {
+@@ -36,6 +49,7 @@
+   check(cudaMalloc(&sf, 128 * sizeof(float)));
+   check(cudaMalloc(&out_sf, 128 * sizeof(float)));
+   unsigned cases = 0;
++  for (unsigned parts : {0, 1, 2})
+   for (unsigned pattern = 0; pattern < 6; ++pattern)
+     for (unsigned rows : {0, 1, 31, 65, 127, 128}) {
+       std::vector<unsigned char> q(128 * 128, 0x7f), actual(q.size());
+@@ -68,7 +82,9 @@
+       }
+       check(cudaMemcpy(input, q.data(), q.size(), cudaMemcpyHostToDevice));
+       check(cudaMemcpy(sf, scales.data(), 128 * sizeof(float), cudaMemcpyHostToDevice));
+-      convert<<<1, 256>>>(input, sf, rows, output, out_sf);
++      if (parts == 0) convert<0><<<1, 256>>>(input, sf, rows, output, out_sf);
++      if (parts == 1) convert<1><<<1, 256>>>(input, sf, rows, output, out_sf);
++      if (parts == 2) convert<2><<<1, 256>>>(input, sf, rows, output, out_sf);
+       check(cudaGetLastError());
+       check(cudaMemcpy(actual.data(), output, actual.size(), cudaMemcpyDeviceToHost));
+       check(cudaMemcpy(actual_sf.data(), out_sf, 128 * sizeof(float), cudaMemcpyDeviceToHost));

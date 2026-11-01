@@ -4,10 +4,8 @@ from autotune_common import require
 import unified_tuning
 
 
-DEFAULTS = dict(decode_math_m=0, decode_stages=3, decode_cta_multiplier=0,
+DEFAULTS = dict(decode_stages=3, decode_cta_multiplier=0,
                 decode_slice_schedule=0,
-                decode_m64_min_rows=16,
-                decode_narrow_cta_multiplier=0,
                 cta_count=0, network_lanes=2, packet_rows=32,
                 return_packet_rows=32, network_min_depth=8,
                 network_max_workers=32, source_group=0,
@@ -45,10 +43,7 @@ MACROS = {
     "local_compact_return_max_tokens": "WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS",
     "local_prefill_streaming": "WEFTMOE_FWD_LOCAL_PREFILL_STREAMING",
     "local_prefill_fast_math": "WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH",
-    "decode_math_m": "WEFTMOE_FWD_LOCAL_DECODE_M",
     "decode_slice_schedule": "WEFTMOE_DT_SLICE_SCHEDULE",
-    "decode_m64_min_rows": "WEFTMOE_FWD_LOCAL_DECODE_M64_MIN_ROWS",
-    "decode_narrow_cta_multiplier": "WEFTMOE_FWD_LOCAL_DECODE_NARROW_CTA_MULTIPLIER",
     "decode_stages": "WEFTMOE_FWD_LOCAL_DECODE_STAGES",
     "decode_cta_multiplier": "WEFTMOE_FWD_LOCAL_DECODE_CTA_MULTIPLIER",
     "cta_count": "WEFTMOE_FWD_STATIC_V4_CTA_COUNT",
@@ -83,17 +78,15 @@ def validate(config):
                    backward_return_pending=(1, 2, 4, 8),
                    backward_return_spans=(0, 1), backward_striped_signals=(0, 1),
                    network_private_dr=(0, 1), network_vector_pull=(0, 1),
-                   decode_math_m=(0, 16, 64), decode_stages=(2, 3),
-                   decode_slice_schedule=(0, 1, 2, 3),
+                   decode_stages=(2, 3),
+                   decode_slice_schedule=(0, 1),
                    decode_cta_multiplier=(0, 1, 2, 3),
-                   decode_narrow_cta_multiplier=(0, 1, 2, 3),
                    packet_rows=(8, 16, 32, 64, 128),
                    return_packet_rows=(16, 32, 64, 128),
                    network_max_workers=(1, 2, 4, 8, 16, 32),
                    source_group=(0, 1, 2, 4, 8, 16))
     for key, allowed in choices.items():
         require(v[key] in allowed, f"V4 {key} must be one of {allowed}")
-    require(v["decode_m64_min_rows"] > 0, "decode M64 row threshold must be positive")
     require(v["network_lanes"] > 0 and v["network_min_depth"] > 0,
             "network lanes and ring depth must be positive")
     require(0 < v["network_get_workers"] < v["network_workers"],

@@ -1,107 +1,55 @@
-"""PF FP8 forward, Dgrad and Wgrad against six standalone FP8 GEMMs.
-
-Uses real EP dispatch/combine, including unequal token counts and empty
-experts. Run using torchrun --standalone --nproc-per-node=2.
-For GIN set TEST_FP8_CANONICAL=1 to model the window-ordered training tape.
-"""
+"""PF FP8 FWD/BWD against original BF16 math with one global diff policy."""
 import os
 
 import torch
 import torch.distributed as dist
 
-from weftmoe.fp8 import FP8Tensor, fp8_gemm, prepare_fp8_weights, quantize_fp8
+from weftmoe.fp8 import FP8Tensor, prepare_fp8_weights, quantize_fp8
 from weftmoe.runtime import TensorRuntime, moe
+from benchmarks.fp8_validation import global_diff, passes, limit_for
 
 
 @torch.no_grad()
-def reference(x, routes, gates, weights, dy, lengths):
-    canonical = os.environ.get("TEST_FP8_CANONICAL", "0") == "1"
+def reference(x, routes, gates, w1, w2, dy, lengths):
+    # Unquantized BF16 inputs/weights/dY, independent Torch expert math.
+    # No row/column FP8 conversion or WGMMA result is used as the oracle.
     y = torch.zeros_like(x, dtype=torch.float32)
     dx = torch.zeros_like(y)
     dg = torch.zeros_like(gates)
-    dw1 = torch.zeros(weights.w1.shape, device=x.device, dtype=torch.float32)
-    dw2 = torch.zeros(weights.w2.shape, device=x.device, dtype=torch.float32)
-    for expert in range(weights.w1.shape[0]):
+    dw1, dw2 = torch.zeros_like(w1), torch.zeros_like(w2)
+    for expert in range(w1.shape[0]):
         rows, slots = torch.where(routes == expert)
         if not rows.numel():
             continue
-        # Independent model of the persistent ring: round-robin over source
-        # ranks, preserving source-local route order and skipping exhausted ranks.
-        sources, begin = [], 0
-        for length in lengths:
-            sources.append(torch.where((rows >= begin) & (rows < begin + length))[0].tolist())
-            begin += length
-        permutation = torch.tensor([source[i] for i in range(max(map(len, sources)))
-                                    for source in sources if i < len(source)], device=x.device)
-        if canonical:
-            # GIN visits token windows, then source groups starting with the
-            # destination's node. Within a group it concatenates source spans.
-            local_world = int(os.environ["LOCAL_WORLD_SIZE"])
-            group_size = int(os.environ.get("TEST_FP8_SOURCE_GROUP", local_world))
-            groups = len(lengths) // group_size
-            owner = expert // (weights.w1.shape[0] // len(lengths))
-            first_group = (owner // local_world) * local_world // group_size
-            window = int(os.environ.get("WEFTMOE_STATIC_RING_TOKENS", "4096"))
-            order = []
-            row_ids = rows.tolist()
-            starts = [sum(lengths[:rank]) for rank in range(len(lengths))]
-            for token_begin in range(0, max(lengths), window):
-                for offset in range(groups):
-                    group = (first_group + offset) % groups
-                    for rank in range(group * group_size, (group + 1) * group_size):
-                        order.extend(index for index in sources[rank]
-                                     if token_begin <= row_ids[index] - starts[rank] < token_begin + window)
-            assert len(order) == rows.numel()
-            permutation = torch.tensor(order, device=x.device)
-        rows, slots = rows[permutation], slots[permutation]
-        xe, de = x[rows].contiguous(), dy[rows].contiguous()
-        g = gates[rows, slots, None]
-        qx, qd = quantize_fp8(xe), quantize_fp8(de)
-        ab = fp8_gemm(qx, weights.w1.matrix(expert))
-        if os.environ.get("TEST_FP8_AB", "1") == "1":
-            ab = quantize_fp8(ab).dequantize()
-        a, b = ab.float().chunk(2, -1)
-        sig = torch.sigmoid(a)
-        u = (a * sig) * b
-        z = (u * g).bfloat16()
-        ye = fp8_gemm(quantize_fp8(z), weights.w2.matrix(expert))
-        y.index_add_(0, rows, ye.float())
-        dz = fp8_gemm(qd, weights.w2_t.matrix(expert)).float()
-        dg[rows, slots] = (u * dz).sum(-1)
-        du = g * dz
-        dab = torch.cat((du * b * (sig * (1 + a * (1 - sig))), du * (a * sig)), -1).bfloat16()
-        dxe = fp8_gemm(quantize_fp8(dab), weights.w1_t.matrix(expert))
-        dx.index_add_(0, rows, dxe.float())
-        source_cache = os.environ.get("TEST_FP8_SOURCE_CACHE", "1") == "1"
-        column_x = qx.dequantize().contiguous() if source_cache else xe
-        column_dy = qd.dequantize().contiguous() if source_cache else de
-        dw1[expert] = fp8_gemm(quantize_fp8(dab, transpose=True),
-                              quantize_fp8(column_x, transpose=True), dtype=torch.float32)
-        dw2[expert] = fp8_gemm(quantize_fp8(column_dy, transpose=True),
-                              quantize_fp8(z, transpose=True), dtype=torch.float32)
+        with torch.enable_grad():
+            inputs = [v.detach().requires_grad_() for v in
+                      (x[rows], gates[rows, slots, None], w1[expert], w2[expert])]
+            ex, eg, first, second = inputs
+            a, b = torch.nn.functional.linear(ex, first).float().chunk(2, -1)
+            h = (torch.nn.functional.silu(a) * b * eg).bfloat16()
+            ye = torch.nn.functional.linear(h, second)
+            gx, gg, g1, g2 = torch.autograd.grad(ye, inputs, dy[rows])
+        y.index_add_(0, rows, ye.detach().float())
+        dx.index_add_(0, rows, gx.float())
+        dg[rows, slots] = gg.flatten()
+        dw1[expert], dw2[expert] = g1, g2
     return y.bfloat16(), dx.bfloat16(), dg, dw1, dw2
 
 
 def compare(name, actual, expected, rank):
-    assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
-    if not actual.numel():
-        return
-    expected = expected.to(actual.dtype)
-    actual, expected = actual.float(), expected.float()
-    delta = actual - expected
-    relative = delta.norm() / expected.norm().clamp_min(1e-20)
-    print(rank, name, "relative_l2", relative.item(), "max_abs", delta.abs().max().item(), flush=True)
-    # The standalone N64 and persistent N128/N256 WGMMA paths share K128
-    # scaling. SwiGLU uses CUDA exp/rcp versus Torch sigmoid, so allow BF16
-    # boundary changes, while catching wrong scales, permutations and routing.
-    assert relative < 0.01, (name, relative.item())
-    assert torch.isfinite(actual).all()
-    if not expected.any():
-        assert not actual.any(), name
+    # Check dW expert-by-expert, so empty/large experts cannot hide another's error.
+    pairs = zip(actual.unbind(), expected.unbind()) if name.endswith(('dw1', 'dw2')) else [(actual, expected)]
+    values = [global_diff(a, b) for a, b in pairs]
+    valid = all(passes(value, name) for value in values)
+    print(rank, name, 'diffs', values, 'limit', limit_for(name), flush=True)
+    agreed = torch.tensor(int(valid), device=actual.device)
+    dist.all_reduce(agreed, op=dist.ReduceOp.MIN)
+    assert agreed.item(), (name, values, 'at least one rank failed BF16 global diff')
 
 
 def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     h = int(os.environ.get("TEST_HIDDEN", 2048))
@@ -168,7 +116,7 @@ def main():
         print(rank, "FP8_FORWARD_DONE", flush=True)
         y.backward(dy)
         print(rank, "FP8_BACKWARD_DONE", flush=True)
-        expected = reference(all_x, route, all_gates, weights, all_dy, lengths)
+        expected = reference(all_x, route, all_gates, all_w1, all_w2, all_dy, lengths)
         actual = y, x.grad, gates.grad, w1.grad, w2.grad
         for name, value, target in zip(("y", "dx", "dg", "dw1", "dw2"), actual, expected):
             target = (target.chunk(world)[rank] if name.startswith("dw")
@@ -182,12 +130,46 @@ def main():
                 torch.testing.assert_close(before, after, rtol=0, atol=0)
             print(rank, "MIXED_BF16_FP8_POOL_PASS", flush=True)
             del probe, bf16_before, bf16_after
+        # Prequantized X/dY must reproduce the same source packets. Exercise
+        # mixed input formats across ranks, empty sources and reverse BWD order.
+        qx, qdy = quantize_fp8(x.detach()), quantize_fp8(dy)
+        baseline = runtime.forward_fp8(x.detach(), local_routes, gates.detach(),
+                                       local_weights, weight_grad_dtype=torch.bfloat16)
+        baseline_values = (baseline.output, *runtime.backward(baseline, dy))
+        pending = []
+        for mode in ("x", "dy", "both"):
+            source = qx if mode != "dy" else x.detach()
+            tape = runtime.forward_fp8(source, local_routes, gates.detach(), local_weights,
+                                       synchronize=False, weight_grad_dtype=torch.bfloat16)
+            pending.append((tape, mode))
+        for tape, mode in reversed(pending):
+            grads = runtime.backward_async(tape, qdy if mode != "x" else dy)
+            for value, expected_value in zip((tape.output, *grads), baseline_values):
+                torch.testing.assert_close(value, expected_value, rtol=0, atol=0)
+        runtime.drain()
+        # Fresh temporary sources leave ownership entirely to native leases.
+        tape = runtime.forward_fp8(quantize_fp8(x.detach()) if rank % 2 else x.detach(),
+                                   local_routes, gates.detach(), local_weights,
+                                   synchronize=False, weight_grad_dtype=torch.bfloat16)
+        grads = runtime.backward_async(tape, quantize_fp8(dy) if rank % 2 == 0 else dy)
+        for value, expected_value in zip((tape.output, *grads), baseline_values):
+            torch.testing.assert_close(value, expected_value, rtol=0, atol=0)
+        runtime.drain()
+        # Reject ambiguous bare FP8 and the weight block layout before launch.
+        for invalid in (qx.data, quantize_fp8(x.detach(), block_rows=128)):
+            try:
+                runtime.forward_fp8(invalid, local_routes, gates.detach(), local_weights)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid prequantized source was accepted")
+        del pending, tape, baseline, baseline_values, grads, qx, qdy
+        print(rank, "FP8_PREQUANT_INPUT_PASS", "skew", skew, flush=True)
         print(rank, "FP8_PARITY_PASS", "skew", skew, runtime.native.usage(), flush=True)
     # Retain independent versions and output dtypes, then run reverse async
     # backward. BF16 and FP32 tapes must not share a mutable dtype decision.
     tapes = []
     for version, factor in enumerate((0.9, 1.1, 0.7), 1):
-        global_version = prepare_fp8_weights(all_w1 * factor, all_w2, version=version)
         local_version = prepare_fp8_weights(w1.detach() * factor, w2, version=version)
         grad_dtype = torch.bfloat16 if version == 3 else torch.float32
         tape = runtime.forward_fp8(x.detach(), local_routes, gates.detach(), local_version,
@@ -198,11 +180,11 @@ def main():
         # checkpoint on the GIN path (compact FP8 pools still allocate scales).
         assert tape.tensor_bytes > 0 or lengths[rank] == 0
         assert runtime.native.usage()["last_forward_tensor_bytes"] == tape.tensor_bytes
-        tapes.append((tape, global_version, grad_dtype))
-    for tape, version_weights, grad_dtype in reversed(tapes):
+        tapes.append((tape, all_w1 * factor, all_w2, grad_dtype))
+    for tape, reference_w1, reference_w2, grad_dtype in reversed(tapes):
         gradients = runtime.backward_async(tape, dy)
         assert gradients[2].dtype == gradients[3].dtype == grad_dtype
-        expected = reference(all_x, route, all_gates, version_weights, all_dy, lengths)
+        expected = reference(all_x, route, all_gates, reference_w1, reference_w2, all_dy, lengths)
         actual = (tape.output, *gradients)
         for name, value, target in zip(("y", "dx", "dg", "dw1", "dw2"), actual, expected):
             target = (target.chunk(world)[rank] if name.startswith("dw")
@@ -234,7 +216,10 @@ def main():
                                           imported(weights.w2, 0.875, True))
     tape = runtime.forward_fp8(x.detach(), local_routes, gates.detach(), local_checkpoint)
     actual = (tape.output, *runtime.backward(tape, dy))
-    expected = reference(all_x, route, all_gates, checkpoint, all_dy, lengths)
+    # Imported-only checkpoints have no pre-quantization BF16 weights. Use
+    # their represented values as BF16 weights for this import-specific test.
+    expected = reference(all_x, route, all_gates, checkpoint.w1.dequantize().bfloat16(),
+                         checkpoint.w2.dequantize().bfloat16(), all_dy, lengths)
     for name, value, target in zip(("y", "dx", "dg", "dw1", "dw2"), actual, expected):
         target = (target.chunk(world)[rank] if name.startswith("dw")
                   else target[start:start + lengths[rank]])
@@ -272,8 +257,14 @@ def main():
     result = inference.forward_fp8(x.detach(), local_routes, gates.detach(), inference_weights,
                                     retain_backward_state=False)
     compare("inference", result.output,
-            reference(all_x, route, all_gates, weights, all_dy, lengths)[0][start:start + lengths[rank]], rank)
+            reference(all_x, route, all_gates, all_w1, all_w2, all_dy, lengths)[0][start:start + lengths[rank]], rank)
+    inference_expected = result.output.clone()
     del result
+    prequantized_result = inference.forward_fp8(quantize_fp8(x.detach()), local_routes,
+                                                gates.detach(), inference_weights,
+                                                retain_backward_state=False)
+    torch.testing.assert_close(prequantized_result.output, inference_expected, rtol=0, atol=0)
+    del inference_expected, prequantized_result
     inference.close()
     print(rank, "FP8_INFERENCE_PASS", flush=True)
     dist.destroy_process_group()

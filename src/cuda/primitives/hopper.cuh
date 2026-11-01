@@ -4,11 +4,9 @@
 // Instructions are provided by CuTe/CUTLASS.
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90.hpp>
-#include <cute/arch/copy_sm75.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/arch/mma_sm90_desc.hpp>
 #include <cute/arch/mma_sm90_gmma.hpp>
-#include <cute/arch/mma_sm80.hpp>
 #include <cutlass/arch/barrier.h>
 
 // This primitive header can precede either phase's tuning header in a TU.

@@ -170,11 +170,14 @@ class PreparedFP8Weights:
         return tuple(t for w in (self.w1, self.w2, self.w1_t, self.w2_t)
                      if w is not None for t in (w.data, w.scales))
 
-    def wait(self, *, training: bool = False):
+    def _validate_version(self, *, training: bool = False):
         if tuple(t._version for t in self._tensors()) != self._tensor_versions:
             raise RuntimeError("Prepared FP8 weights were modified; prepare a new weight version")
         if training and (self.w1_t is None or self.w2_t is None):
             raise ValueError("Backward requires weights prepared with training=True")
+
+    def wait(self, *, training: bool = False):
+        self._validate_version(training=training)
         with torch.cuda.device(self.w1.data.device):
             stream = torch.cuda.current_stream()
             stream.wait_event(self._ready)

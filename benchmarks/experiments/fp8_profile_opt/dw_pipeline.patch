@@ -1,0 +1,18 @@
+--- a/src/cuda/weftmoe_pf/backward_kernel.cuh
++++ b/src/cuda/weftmoe_pf/backward_kernel.cuh
+@@ -54,10 +54,12 @@
+ constexpr auto kFP8ScaleBytes = kStages * (kM + kN) * sizeof(float);
+ // FP8 Wgrad has its own smaller pipeline; reserving the BF16 arena here
+ // wastes enough SMEM to prevent the concurrent GIN workers from launching.
+-constexpr auto kFP8BaseSharedBytes = backward_weights::kFP8PipelineBytes > sizeof(Shared) + kFP8ScaleBytes
+-    ? backward_weights::kFP8PipelineBytes : sizeof(Shared) + kFP8ScaleBytes;
+-constexpr auto kFP8SharedBytes = kFP8BaseSharedBytes +
++// Activation conversion scratch is dead before the dW pipeline starts.
++constexpr auto kFP8BaseSharedBytes = sizeof(Shared) + kFP8ScaleBytes;
++constexpr auto kFP8ActivationBytes = kFP8BaseSharedBytes +
+     (WEFTMOE_FP8_STREAMED_WGRAD ? 128U * 132U : 0U);
++constexpr auto kFP8SharedBytes = backward_weights::kFP8PipelineBytes > kFP8ActivationBytes
++    ? backward_weights::kFP8PipelineBytes : kFP8ActivationBytes;
+ __device__ __forceinline__ float *fp8_scales(Shared &s, unsigned stage) {
+   return reinterpret_cast<float *>(reinterpret_cast<unsigned char *>(&s) + sizeof(Shared)) + stage * (kM + kN);
+ }
