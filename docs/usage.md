@@ -94,11 +94,11 @@ FP8 相对原始 BF16 的验收采用全局指标
 要求 `diff < 5e-3`，每个 rank 单独检查，dW 再逐 expert 检查；dprob 仅要求有限。
 GEMM 对反量化后精确参考的算术检查单独使用 `diff < 1e-6`，不包含 FP8 量化误差。
 不使用逐元素相对容差。布局、图回放、预量化输入等数学等价路径仍要求精确一致。
-训练 PF 与固定 M64 DT 的前向另设严格逐位回归：三个模型、普通及紧凑 FP8 workspace，
-3600 个 rank-case 全部一致，每份训练 tape 均实际执行反向。
-完整 DT 回归的 816 项中保留此前 Qwen35B 单 token 的已知误差豁免；该豁免不适用于
-训推逐位一致性测试。测试范围和成对性能数据见
-[固定 M64 验证报告](benchmarks/dt_m64_20261101.json)。
+训练 PF 与固定 M64 DT 的前向另设严格逐位回归，入口为 `tests/torchrun_pf_dt.py`，
+每份训练 tape 均实际执行反向。`tests/torchrun_dt_fp8.py` 的
+`TEST_DT_ALLOW_KNOWN_ONE_TOKEN=1` 只允许 Qwen35B 单 token 的已知误差豁免；
+该豁免不适用于训推逐位一致性测试。本轮性能测量使用 64/512 tokens，没有使用该豁免。
+当前测量范围、计时口径与结果见 [Benchmark](benchmarks.md)。
 
 构建方式与上面的 BF16 Tensor API 相同，无需安装 DeepGEMM。`H/I` 必须是 128
 的倍数，并匹配构建 profile。先在 forward/backward 外准备权重，再显式传给 `moe`：

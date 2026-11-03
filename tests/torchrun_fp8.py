@@ -247,6 +247,9 @@ def main():
             raise AssertionError("optimizer update must invalidate the old FP8 cache")
     print(rank, "FP8_OPTIMIZER_PASS", flush=True)
     runtime.close()
+    # NCCL allocates outside PyTorch; return unused training allocations before
+    # constructing the inference communicator (not part of benchmark timing).
+    torch.cuda.empty_cache()
 
     # The same prepared forward layout is usable without training tape storage.
     inference = TensorRuntime(group=dist.group.WORLD, experts=experts, top_k=top_k,
