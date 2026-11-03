@@ -37,6 +37,7 @@ def test_unbound_data_updates_do_not_reuse_quantized_weights(monkeypatch):
     parameters = [parameter, parameter]
     forward = lambda: manager.forward_experts(layer, None, None, None, parameters)
     first = forward()
+    assert first._cache_key == 0
     version = parameter._version
     parameter.data.add_(1)
     assert parameter._version == version
@@ -44,6 +45,7 @@ def test_unbound_data_updates_do_not_reuse_quantized_weights(monkeypatch):
     optimizer = torch.optim.AdamW([parameter], lr=0.5)
     manager.bind_optimizer(optimizer)
     cached = forward()
+    assert cached._cache_key == id(layer)
     assert forward() is cached
     hook = manager._optimizer_hook
     # Wrappers must not be silently unwrapped or remove a working binding.
@@ -100,17 +102,21 @@ def test_master_publish_waits_for_all_writer_streams(monkeypatch):
     master.device = device
     master.offloaded = False
     master.writer_streams = {}
+    master.dirty = False
     master.bindings = {id(p): (layer, i, 0, p) for i, p in enumerate(parameters)}
     master.weights = {
         layer: tuple(_storage((1, 128, 128), 128, device) for _ in range(4))
     }
-    master.adapter = SimpleNamespace(weight_version=1, _parameters=lambda _: parameters)
+    master.adapter = SimpleNamespace(fp8=True, weight_version=1, _parameters=lambda _: parameters)
+    master.publish()
+    old = master.adapter.fp8_weights[layer][1]
 
     def quantize(source, row, scale, col, col_scale, stream):
-        row.copy_(source)
-        col.copy_(source.T)
-        scale.fill_(1)
-        col_scale.fill_(1)
+        # Emulate a raw CUDA write: no automatic PyTorch version increment.
+        row.data.copy_(source)
+        col.data.copy_(source.T)
+        scale.data.fill_(1)
+        col_scale.data.fill_(1)
 
     monkeypatch.setattr(
         module, "_extension", lambda: SimpleNamespace(fp8_quantize_weight=quantize)
@@ -122,7 +128,14 @@ def test_master_publish_waits_for_all_writer_streams(monkeypatch):
             torch.cuda._sleep(20_000_000)
             source = torch.full((128, 128), i + 1.0, device=device)
             master.write(parameter, source)
+    assert master.dirty and master.adapter.weight_version == 2
+    with pytest.raises(RuntimeError, match="modified"):
+        old._validate_version()
+    from weftmoe.megatron import _Routed
+    with pytest.raises(RuntimeError, match="changed before FP8 backward"):
+        _Routed.backward(SimpleNamespace(manager=master.adapter, weight_version=1), None)
     master.publish()
+    assert not master.dirty
     prepared = master.adapter.fp8_weights[layer][1]
     with torch.cuda.stream(torch.cuda.Stream()):
         prepared.wait(training=True)
@@ -154,7 +167,7 @@ def test_sglang_offload_preserves_or_requires_full_update(
     for w in row:
         w.data.fill_(2)
         w.scales.fill_(1)
-    weights = _seal_weights((*row, None, None), 0, cache_key=123)
+    weights = _seal_weights((*row, None, None), 7, cache_key=123)
     for name, value in dict(
         _fp8_weights={0: weights},
         _fp8_devices={0: device},
@@ -189,7 +202,23 @@ def test_sglang_offload_preserves_or_requires_full_update(
     prepared = adapter._prepare_fp8_layer(SimpleNamespace(layer_id=0))
     prepared.wait()
     assert prepared._cache_key == 123
+    assert prepared.version == (1 if discard else 7)
     assert torch.equal(
         prepared.w1.data.float(),
         torch.full((1, 128, 128), 3.0 if discard else 2.0, device=device),
     )
+
+
+def test_master_dirty_blocks_forward_until_publication():
+    manager = MegatronAdapter.__new__(MegatronAdapter)
+    manager.master_weights = SimpleNamespace(dirty=True)
+    manager.weight_version = 4
+    manager.get_runtime = lambda _: pytest.fail("must reject before touching runtime")
+    with pytest.raises(RuntimeError, match="Publish"):
+        manager.forward_experts(None, None, None, None, [])
+    def publish():
+        manager.master_weights.dirty = False
+    manager.master_weights.publish = publish
+    manager.weights_updated()
+    assert manager.weight_version == 4  # write already invalidated this generation
+    assert not manager.master_weights.dirty

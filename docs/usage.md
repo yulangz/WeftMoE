@@ -139,7 +139,10 @@ W1 仍使用 `[gate, up]` 规范行序，禁止先交错 gate/up 再划量化块
 2 的幂；全零块 scale 为 1，尾部补零且不跨专家。
 
 预量化激活使用 rowwise `FP8Tensor`：`data[tokens,H]` 为 E4M3FN，
-`scales[tokens,H/128]` 为 FP32 正有限 2 的幂，`block_rows=1`。
+`scales[tokens,H/128]` 为 FP32 正有限 2 的幂，`block_rows=1`，data 指针须 16 字节对齐。
+布局和对齐会在入口检查；scale 内容是外部生产者的契约，热路径不做需要设备同步的
+逐值检查。违反该契约可能产生非有限输出或反向列转换的额外舍入误差。
+推荐使用 `quantize_fp8` 生成正常有限输入的表示；非有限输入通过 NaN scale 传播。
 PF/DT 的 `forward_fp8` 均接受此格式；FP8 tape 的 `backward` 和
 `backward_async` 也接受相同格式的 dY。源端直接复制数据和 scale 到通信 packet，
 跳过 amax 和重新量化；量化器及输入准备耗时由调用者决定是否计入端到端测量。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import functools
 import logging
+import time
 from dataclasses import replace
 
 import torch
@@ -70,6 +71,7 @@ def _prepare_fp8_layer(layer):
 
 @torch.no_grad()
 def resume_fp8_weights(*, for_update=False):
+    from .fp8 import _seal_weights
     global _fp8_offloaded
     if _fp8_needs_update and not for_update:
         raise RuntimeError("Complete the FP8 weight update before inference")
@@ -79,9 +81,11 @@ def resume_fp8_weights(*, for_update=False):
         for tensor in weights._tensors():
             tensor.data = (torch.empty_like(tensor, device=_fp8_devices[key])
                            if _fp8_needs_update else tensor.to(device=_fp8_devices[key]))
+        if not _fp8_needs_update:
+            _fp8_weights[key] = _seal_weights(
+                (weights.w1, weights.w2, None, None), weights.version,
+                cache_key=weights._cache_key)
     _fp8_offloaded = False
-    if not _fp8_needs_update:
-        commit_fp8_weights(0)
 
 
 def commit_fp8_weights(version):
@@ -157,11 +161,9 @@ def participate_idle_layers(model):
 
 
 @torch.no_grad()
-def _prepare_bf16_memory_budget(model):
-    """Make persistent BF16 allocations visible to SGLang's KV profiler."""
+def _prepare_memory_budget(model):
+    """Prepare compute weights and PF/DT storage before SGLang sizes KV."""
     global _decode_batch, _eager_pending
-    if _use_fp8():
-        return
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -188,12 +190,25 @@ def _prepare_bf16_memory_budget(model):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         logging.getLogger(__name__).info(
-            "Prepared BF16 WeftMoE before KV sizing: %d layers; "
+            "Prepared %s WeftMoE before KV sizing: %d layers; "
             "PF/DT workspaces included in available-memory measurement",
-            len(layers),
+            "FP8" if _use_fp8() else "BF16", len(layers),
         )
     finally:
         _decode_batch = previous_decode
+
+
+def _check_fp8_tms_compatibility(impl):
+    """Guard only the allocation-pool workaround that uses private APIs."""
+    memory = torch.cuda.memory
+    required = ("_cuda_endAllocateToPool", "_cuda_releasePool",
+                "_cuda_beginAllocateCurrentThreadToPool")
+    if (torch.__version__.split(".")[:2] != ["2", "9"]
+            or any(not callable(getattr(memory, name, None)) for name in required)
+            or getattr(impl, "_primary_mem_pool", None) is None):
+        raise RuntimeError(
+            "WeftMoE FP8 with TMS requires the validated PyTorch 2.9 allocation-pool "
+            "interfaces; revalidate the TMS lifecycle before upgrading")
 
 
 def install():
@@ -220,7 +235,7 @@ def install():
 
     @functools.wraps(original_init_memory_pool)
     def init_memory_pool(self, *args, **kwargs):
-        _prepare_bf16_memory_budget(self.model)
+        _prepare_memory_budget(self.model)
         return original_init_memory_pool(self, *args, **kwargs)
 
     ModelRunnerKVCacheMixin.init_memory_pool = init_memory_pool
@@ -234,6 +249,7 @@ def install():
             from sglang.srt.utils.torch_memory_saver_adapter import _memory_saver
             impl = getattr(_memory_saver, "_impl", None)
             if impl is not None and impl._binary_wrapper.cdll.tms_get_interesting_region():
+                _check_fp8_tms_compatibility(impl)
                 # These initial BF16 tensors are discarded after quantization.
                 # A persistent TMS pool would retain/remap their freed blocks.
                 # Keep the ordinary pool until the outer loader region exits;
@@ -643,7 +659,7 @@ def _release_prefill():
 
 
 def suspend(model_runner, *, discard_fp8=False):
-    """Keep decode graphs, unless the low-memory policy is set."""
+    """FP8 releases weight addresses; BF16 can retain its decode graphs."""
     global _recapture
     if _use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
         # Prepared FP8 versions are immutable. Rebuild plans after AWEX rather
@@ -660,10 +676,14 @@ def resume(model_runner):
     if _recapture:
         from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
+        started = time.perf_counter()
         with torch.no_grad(), model_capture_mode():
             _reset_decode_inputs(model_runner.graph_runner)
             model_runner.graph_runner.capture()
         _recapture = False
+        logging.getLogger(__name__).info(
+            "WeftMoE decode graph recapture wall time: %.3f s (outside weight transfer)",
+            time.perf_counter() - started)
     # AWEX has completed the update at the same addresses. BF16 graphs read
     # the original weights directly, so no weight refresh or recapture is needed.
 

@@ -2887,6 +2887,9 @@ BFloat16ActivationLease ExternalCudaProducer::publish_fp8_activations(
   const auto &producer = *state_->backend;
   const auto elements =
       checked_mul(num_tokens, hidden_size, "external activation elements");
+  if (reinterpret_cast<std::uintptr_t>(buffers.data.data) % 16U)
+    transport_error(NotifyErrorCode::InvalidHandle, "external-activation-publish",
+                    "FP8 source alignment", 0, "16-byte aligned", "misaligned");
   validate_external_cuda_range(buffers.data.data, elements, buffers.data.bytes,
                                1U, state_->backend->device, "FP8 source data");
   validate_external_cuda_range(buffers.scales.data, elements / 128U,
@@ -2938,6 +2941,9 @@ BFloat16OutputGradientLease ExternalCudaProducer::publish_fp8_output_gradients(
                     0, "valid and nonzero", "empty");
   const auto elements =
       checked_mul(num_tokens, hidden_size, "external output gradient elements");
+  if (reinterpret_cast<std::uintptr_t>(buffers.data.data) % 16U)
+    transport_error(NotifyErrorCode::InvalidHandle, "external-output-gradient-publish",
+                    "FP8 source alignment", 0, "16-byte aligned", "misaligned");
   validate_external_cuda_range(buffers.data.data, elements, buffers.data.bytes,
                                1U, state_->backend->device, "FP8 source data");
   validate_external_cuda_range(buffers.scales.data, elements / 128U,

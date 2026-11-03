@@ -163,6 +163,31 @@ def main():
                 pass
             else:
                 raise AssertionError("invalid prequantized source was accepted")
+        # A contiguous view can still violate the vector-load alignment.
+        def misaligned(value):
+            storage = torch.empty(value.data.numel() + 1, dtype=torch.float8_e4m3fn,
+                                  device=value.data.device)
+            data = storage[1:].view(value.shape)
+            return FP8Tensor(data, value.scales, value.shape)
+        bad_x, bad_dy = misaligned(qx), misaligned(qdy)
+        for entry in (runtime, runtime.native):
+            try:
+                entry.forward_fp8(bad_x, local_routes, gates.detach(), local_weights)
+            except (ValueError, RuntimeError) as error:
+                assert "align" in str(error), error
+            else:
+                raise AssertionError("misaligned FP8 X was accepted")
+        alignment_tape = runtime.forward_fp8(qx, local_routes, gates.detach(), local_weights)
+        for entry in (runtime, runtime.native):
+            try:
+                entry.backward(alignment_tape, bad_dy)
+            except (ValueError, RuntimeError) as error:
+                assert "align" in str(error), error
+            else:
+                raise AssertionError("misaligned FP8 dY was accepted")
+        runtime.backward(alignment_tape, qdy)
+        torch.cuda.synchronize()  # invalid views must not poison the context
+        del bad_x, bad_dy, alignment_tape
         del pending, tape, baseline, baseline_values, grads, qx, qdy
         print(rank, "FP8_PREQUANT_INPUT_PASS", "skew", skew, flush=True)
         print(rank, "FP8_PARITY_PASS", "skew", skew, runtime.native.usage(), flush=True)

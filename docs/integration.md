@@ -28,7 +28,7 @@ adapter.prepare()
 设置 `WEFTMOE_FP8=1`（或 `MegatronAdapter(..., fp8=True)`）启用 routed experts 的
 blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。
 未绑定 master 时，默认每次 forward 从参数重新量化，避免 `.data` 更新绕过 Tensor version
-后静默使用旧权重。BF16/FP32 参数现量化不做主机有限性检查，不在每层或重算时读取 GPU
+后静默使用旧权重。未绑定时原生缓存只保留一个槽位，活跃 tape 单独保留所需版本。BF16/FP32 参数现量化不做主机有限性检查，不在每层或重算时读取 GPU
 标量；非有限块通过 NaN scale 传播。导入的 FP8 权重仍检查字节和 scale，并同步一次。
 当前优化器接入范围是 AdamW 和下述 AReaL GPU-staged Muon。
 `adapter.bind_optimizer(optimizer)` 只接受具有 step post hook 的 `torch.optim.AdamW`，
@@ -43,7 +43,9 @@ AReaL 的 GPU-staged Muon 在初始化后调用 `adapter.bind_fp32_masters(optim
 当前支持 expert DP=1、ETP=1：routed expert 的 BF16 GPU storage 释放，不保留 CPU BF16 副本；
 Parameter 对象、DDP hooks 和 FP32 梯度 buffer 保留。每次更新直接在 Muon compute stream
 将 FP32 master 量化为 W/Wᵀ，跳过 BF16 写回，所有 micro-batch 和重算复用。
-引擎在完整 optimizer step 后调用 `adapter.weights_updated()`；发布会等待所有量化 writer
+第一次 master 写入立即使旧版本和旧 tape 失效，未发布期间禁止新计算；原生写入也显式更新
+Tensor version，直接持有旧 `PreparedFP8Weights` 的调用者同样会报错。更新必须发生在全部
+反向完成后，不支持与旧版本计算并发覆写。引擎在完整 optimizer step 后调用 `adapter.weights_updated()`；发布会等待所有量化 writer
 stream，再记录消费者等待的 ready event。`close()` 从 master 恢复普通 BF16 参数后解除绑定，
 因此退出 adapter 后仍可读取模型 checkpoint。
 `suspend()` 释放 FP8 缓存，不保留 CPU FP8 W/Wᵀ 备份；`release_bf16_weights()` 从
@@ -82,21 +84,24 @@ BF16 的 PF/DT 通过 5D TMA 直接读取原始 FC1 权重，在共享内存形�
 缓冲区仍按形状复用。SGLang 在计算 KV/Mamba 容量之前预热 PF/DT workspace，
 使其计入实际可用显存。否则按原始模型权重估算的 KV pool 会过大，
 后续长 prefill 的 attention 临时张量可能 OOM。`mem_fraction_static` 无需因此手动调低；
-可容纳的 KV token 数会按新增持久内存相应减少。FP8 保持原来的准备路径。
+可容纳的 KV token 数会按持久内存相应调整。FP8 同样在 KV 预算前完成量化、释放 BF16
+专家 storage，并预热 PF/DT workspace，避免预算仍按 BF16 权重或遗漏 workspace 计算。
 
 FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
 FP8 权重字节（uint8 view）和 FP32 block scale，不恢复 BF16，不重新量化。
 AWEX 确定下一次完整覆盖权重时调用 `suspend(..., discard_fp8=True)`，只保留张量元数据，
 不拷贝旧 FP8 到 CPU；接收时分配 GPU 空间，`commit_fp8_weights()` 后才允许推理。
-普通 suspend/resume 需要继续使用旧权重，默认仍保存 CPU 副本。
+普通 suspend/resume 需要继续使用旧权重，默认仍保存 CPU 副本，恢复时保留原版本号。
 启用 TMS 时，初始专家 BF16 分配使用临时普通 CUDA pool，避免其释放后仍由 TMS 持久池
 保留并在 onload 时重新占用显存。此兼容路径使用 PyTorch 2.9 / 当前 TMS 的内部接口，
+只在触发该 pool 兼容路径时检查 PyTorch 2.9.x 和所需接口；其它版本会明确报错。
 升级依赖时需重跑包含 TMS、权重更新和图重捕获的 8 卡生命周期测试。
 重新捕获前重置 decode 的 dummy request、KV 和 Mamba 输入，避免使用上一批请求的索引。
 
 `WEFTMOE_FP8=1` 可从 BF16 模型权重准备 FP8 专家缓存，prefill PF 和 decode DT 都使用
-FP8。权重卸载时销毁图、将 FP8 缓存搬到 CPU；接收前恢复并重新绑定地址，传输全部完成后
-发布新版本，再捕获 decode 图。该模式暂不保留跨权重版本的图。
+FP8。suspend 会释放权重和 workspace 地址，因此即使 KV-only 恢复也必须重新捕获图；
+完整更新走上面的 discard 路径，普通恢复保留原权重。日志单独输出
+`WeftMoE decode graph recapture wall time`，不把它混入权重传输耗时。
 AWEX 包和协议不变，兼容代码位于 AReaL 的 adapter 层。
 
 - Prefill 使用 PF，decode/CUDA Graph 使用 DT；按集体执行阶段选择，不按各 rank 的局部 token 数独立切换。
@@ -108,7 +113,7 @@ DT 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 �
 不能只设置 `AREAL_USE_WEFTMOE=1` 就让原版 `python -m sglang.launch_server` 自动安装 hook；
 可使用下面已接入的 AReaL worker，或在自己的 worker 入口显式调用 `install()`。
 
-共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图，
+BF16 共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图，
 释放 prefill runtime；原地址的 BF16 权重更新完成后可直接回放，无需刷新权重副本或重新 capture。
 显存紧张可设 `WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS=0`，代价是释放后需要重新准备图。
 模型权重地址改变时不能继续回放旧图。最终退出使用 `close(model_runner)`。

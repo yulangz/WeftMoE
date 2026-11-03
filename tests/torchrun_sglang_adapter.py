@@ -143,27 +143,31 @@ def main():
 
     expected = reference()
     adapter.install()
-    if not adapter._use_fp8():
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
-        def resolve_pool(pre_model_load_memory):
-            assert adapter._runtime is not None and adapter._decode_runtime is not None
-            assert adapter._eager_pending is None
-            assert all(rt.native.usage()["compute_bytes"] > 0
-                       for rt in (adapter._runtime, adapter._decode_runtime))
-            return "profiled_after_weftmoe"
-        runner = SimpleNamespace(
-            model=layer, spec_algorithm=SimpleNamespace(is_none=lambda: True),
-            is_draft_worker=False, _resolve_memory_pool_config=resolve_pool,
-            _apply_memory_pool_config=lambda config: None, device="cuda", gpu_id=local_rank,
-        )
-        ModelRunnerKVCacheMixin.init_memory_pool(runner, 0)
-        assert runner.memory_pool_config == "profiled_after_weftmoe"
-        print(rank, "SGLANG_BF16_MEMORY_BUDGET_PASS", flush=True)
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
+    def resolve_pool(pre_model_load_memory):
+        assert adapter._runtime is not None and adapter._decode_runtime is not None
+        assert adapter._eager_pending is None
+        assert all(rt.native.usage()["compute_bytes"] > 0
+                   for rt in (adapter._runtime, adapter._decode_runtime))
+        return "profiled_after_weftmoe"
+    runner = SimpleNamespace(
+        model=layer, spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        is_draft_worker=False, _resolve_memory_pool_config=resolve_pool,
+        _apply_memory_pool_config=lambda config: None, device="cuda", gpu_id=local_rank,
+    )
+    ModelRunnerKVCacheMixin.init_memory_pool(runner, 0)
+    assert runner.memory_pool_config == "profiled_after_weftmoe"
+    print(rank, "SGLANG_MEMORY_BUDGET_PASS", flush=True)
+    if adapter._use_fp8():
+        assert all(p.untyped_storage().nbytes() == 0
+                   for p in (layer.w13_weight, layer.w2_weight))
+        print(rank, "SGLANG_FP8_MEMORY_BUDGET_PASS", flush=True)
+    else:
         # Another layer must only add descriptors, not a full FC1 weight copy.
         # Workspaces were warmed above; the reference layer is already allocated.
         before = torch.cuda.memory_allocated()
         reference_layer.layer_id = 1
-        adapter._prepare_bf16_memory_budget(reference_layer)
+        adapter._prepare_memory_budget(reference_layer)
         growth = torch.cuda.memory_allocated() - before
         assert growth < layer.w13_weight.numel() * layer.w13_weight.element_size(), growth
         print(rank, "SGLANG_BF16_NO_WEIGHT_COPY_PASS", growth, flush=True)
@@ -207,7 +211,17 @@ def main():
             raise AssertionError(("graph_vs_eager", rank, iteration, str(error))) from error
     # Keep the existing BF16 graph while AWEX updates weights in place.
     # Both PF and DT must observe the new original weights without refreshing.
-    model_runner = SimpleNamespace(graph_runner=None, memory_saver_adapter=memory_saver)
+    # Exercise resume's recapture callback, not just a manual capture afterwards.
+    runner = SimpleNamespace(
+        graphs={0: graph}, output_buffers={0: captured}, seq_len_fill_value=1,
+        buffers=SimpleNamespace(seq_lens=torch.ones(1, device="cuda", dtype=torch.int32),
+                                seq_lens_cpu=torch.ones(1, dtype=torch.int32)))
+    def recapture():
+        nonlocal graph, captured
+        graph, captured = capture()
+        runner.graphs[0], runner.output_buffers[0] = graph, captured
+    runner.capture = recapture
+    model_runner = SimpleNamespace(graph_runner=runner, memory_saver_adapter=memory_saver)
     discard_graphs = adapter._use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0"
     if discard_graphs:
         del graph, captured
@@ -226,8 +240,6 @@ def main():
     update_weights()
     expected = reference()
     adapter.resume(model_runner)
-    if discard_graphs:
-        graph, captured = capture()
     if not adapter._use_fp8():
         resumed_eager = layer(x, topk)
         if not dp_attention:
@@ -238,6 +250,18 @@ def main():
     if not dp_attention:
         dist.all_reduce(actual)
     check_output(actual, expected)
+    if adapter._use_fp8():
+        version = adapter._fp8_weights[layer.layer_id].version
+        del graph, captured
+        adapter.suspend(model_runner)  # KV-only: restore the same weights/version.
+        adapter.resume(model_runner)
+        assert adapter._fp8_weights[layer.layer_id].version == version
+        graph.replay()
+        actual = captured.clone()
+        if not dp_attention:
+            dist.all_reduce(actual)
+        check_output(actual, expected)
+        print(rank, "SGLANG_FP8_KV_ONLY_VERSION_PASS", flush=True)
     del graph, captured
     adapter.close(model_runner, keep_fp8=adapter._use_fp8())
     assert adapter._runtime is None

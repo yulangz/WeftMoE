@@ -153,13 +153,16 @@ class MegatronAdapter:
 
     def weights_updated(self):
         """Invalidate after optimizer/checkpoint writes, including .data copies."""
-        self.weight_version += 1
+        if self.master_weights is None or not self.master_weights.dirty:
+            self.weight_version += 1
         if self.master_weights is not None:
             self.master_weights.publish()
         else:
             self.fp8_weights.clear()
 
     def forward_experts(self, layer, x, routes, gates, parameters, *, retain=True):
+        if self.master_weights is not None and self.master_weights.dirty:
+            raise RuntimeError("Publish FP32-master FP8 weights before compute")
         runtime = self.get_runtime(layer)
         if not self.fp8:
             return runtime.forward_async(x, routes, gates, *self.pack(parameters),
@@ -174,7 +177,8 @@ class MegatronAdapter:
                 raise RuntimeError("FP32-master FP8 weights are not ready for compute")
             weights = prepare_fp8_weights(*self.pack(parameters), training=True,
                                           version=self.weight_version)
-            weights = replace(weights, _cache_key=id(layer))
+            if cacheable:
+                weights = replace(weights, _cache_key=id(layer))
             entry = (versions, weights)
             if cacheable:
                 self.fp8_weights[layer] = entry

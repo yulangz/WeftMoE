@@ -128,7 +128,10 @@ def transpose_fp8_weight(weight: FP8Tensor) -> FP8Tensor:
 
 def fp8_gemm(a: FP8Tensor, b: FP8Tensor, *, dtype=torch.bfloat16,
              out: torch.Tensor | None = None, accumulate: bool = False) -> torch.Tensor:
-    """Compute A @ B.T using FP8 WGMMA and scaled K128 FP32 partial sums."""
+    """Reference/diagnostic A @ B.T using FP8 WGMMA and K128 FP32 sums.
+
+    This standalone kernel is not pipelined; use PF/DT for production MoE.
+    """
     if (len(a.shape) != 2 or len(b.shape) != 2 or a.shape[1] != b.shape[1]
             or a.data.device != b.data.device):
         raise ValueError("FP8 GEMM requires [M,K], [N,K] on the same device")
@@ -156,6 +159,8 @@ class PreparedFP8Weights:
 
     Refresh by constructing another object after optimizer.step(). Existing
     tapes retain the old object. Mutating any data/scale tensor is an error.
+    The FP32-master adapter explicitly invalidates old versions before reusing
+    their storage; those objects and tapes can no longer be used for compute.
     """
     w1: FP8Tensor
     w2: FP8Tensor

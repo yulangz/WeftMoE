@@ -25,6 +25,7 @@ class MasterWeights:
         self.masters = {}
         self.weights = {}
         self.writer_streams = {}
+        self.dirty = False
         self.device = next(iter(adapter._parameters(adapter.layers[0]))).device
         self.offloaded = False
         self.materialized = False
@@ -96,6 +97,12 @@ class MasterWeights:
         layer, kind, expert, _ = self.bindings[id(parameter)]
         row = self.weights[layer][kind].matrix(expert)
         col = self.weights[layer][kind + 2].matrix(expert)
+        if not self.dirty:
+            self.adapter.weight_version += 1
+            self.dirty = True
+        # Native writes bypass PyTorch's version counter. Invalidate retained
+        # PreparedFP8Weights too, even when a caller bypasses the adapter.
+        torch.autograd.graph.increment_version((row.data, row.scales, col.data, col.scales))
         stream = torch.cuda.current_stream(self.device)
         _extension().fp8_quantize_weight(master, row.data, row.scales,
                                          col.data, col.scales, stream.cuda_stream)
@@ -114,6 +121,7 @@ class MasterWeights:
                     _seal_weights(weights, self.adapter.weight_version, cache_key=id(layer)))
             for layer, weights in self.weights.items()
         }
+        self.dirty = False
 
     @torch.no_grad()
     def offload(self):
@@ -168,8 +176,7 @@ class MasterWeights:
             self.resume()
         else:
             self._rebuild()
-        self.adapter.weight_version += 1
-        self.publish()
+            self.publish()
 
     @torch.no_grad()
     def discard_materialized(self):

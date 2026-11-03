@@ -47,3 +47,17 @@ def test_recapture_restores_sglang_constructor_inputs():
             if actual_tensor is not None:
                 assert torch.equal(actual_tensor, expected_tensor), field.name
                 assert addresses[id(actual_tensor)] == actual_tensor.data_ptr()
+
+
+def test_tms_private_api_guard(monkeypatch):
+    from weftmoe.sglang import _check_fp8_tms_compatibility
+    impl = SimpleNamespace(_primary_mem_pool=object())
+    monkeypatch.setattr(torch, "__version__", "2.9.1+cu129")
+    _check_fp8_tms_compatibility(impl)
+    monkeypatch.setattr(torch, "__version__", "2.10.0")
+    with pytest.raises(RuntimeError, match="revalidate"):
+        _check_fp8_tms_compatibility(impl)
+    monkeypatch.setattr(torch, "__version__", "2.9.1")
+    monkeypatch.setattr(torch.cuda.memory, "_cuda_releasePool", None)
+    with pytest.raises(RuntimeError, match="allocation-pool"):
+        _check_fp8_tms_compatibility(impl)

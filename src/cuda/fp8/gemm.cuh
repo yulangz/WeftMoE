@@ -92,6 +92,8 @@ __global__ __launch_bounds__(128) void gemm_kernel(Matrix a, Matrix b,
       }
     }
   }
+#else
+  __trap();
 #endif
 }
 

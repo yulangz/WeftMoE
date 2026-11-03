@@ -185,6 +185,8 @@ class TensorRuntime:
             if value.block_rows != 1 or len(value.shape) != 2:
                 raise ValueError("FP8 source requires rowwise 1x128 quantization")
             data = value.data
+            if data.data_ptr() % 16:
+                raise ValueError("FP8 source data must be 16-byte aligned")
             if tuple(data.shape) != value.shape:
                 raise ValueError("FP8 source must have an unpadded hidden dimension")
             buffers = (data, value.scales)
@@ -205,8 +207,11 @@ class TensorRuntime:
 
         Prepare weights with weftmoe.fp8.prepare_fp8_weights before this call.
         FP8Tensor inputs require block_rows=1 and finite positive power-of-two
-        FP32 scales. Data/scales are copied unchanged into source packets;
-        only BF16 inputs are quantized. Backward accepts either input format
+        FP32 scales and 16-byte-aligned data. Data/scales are copied unchanged
+        into source packets. External scale values are a caller contract, not checked on the hot
+        path (which would require device synchronization). Invalid scales can
+        produce nonfinite outputs or additional rounding error in backward.
+        Only BF16 inputs are quantized. Backward accepts either input format
         through the usual backward API and still returns BF16 dX.
         """
         from .fp8 import PreparedFP8Weights
