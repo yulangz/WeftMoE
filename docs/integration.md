@@ -28,9 +28,15 @@ adapter.prepare()
 设置 `WEFTMOE_FP8=1`（或 `MegatronAdapter(..., fp8=True)`）启用 routed experts 的
 blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。
 未绑定 master 时，默认每次 forward 从参数重新量化，避免 `.data` 更新绕过 Tensor version
-后静默使用旧权重。支持 PyTorch step post hook 的优化器可调用 `adapter.bind_optimizer(optimizer)`，
+后静默使用旧权重。BF16/FP32 参数现量化不做主机有限性检查，不在每层或重算时读取 GPU
+标量；非有限块通过 NaN scale 传播。导入的 FP8 权重仍检查字节和 scale，并同步一次。
+当前优化器接入范围是 AdamW 和下述 AReaL GPU-staged Muon。
+`adapter.bind_optimizer(optimizer)` 只接受具有 step post hook 的 `torch.optim.AdamW`，
 由 hook 自动失效缓存，从而在 micro-batch 和重算之间复用；checkpoint load 等 step 之外的
-直接写入仍需调用 `adapter.weights_updated()`。不支持该 hook 的优化器保持默认行为。
+直接写入仍需调用 `adapter.weights_updated()`。
+Megatron 的 `MegatronOptimizer` / `ChainedOptimizer` 包装器不支持此绑定，会明确抛出
+`TypeError`；不会递归绑定其内部 optimizer，以免在完整 step 结束前发布部分权重。
+使用这些包装器的 AdamW 用户应不调用 `bind_optimizer()`，保持每次 forward 异步现量化。
 router/shared experts 保持原实现。
 
 AReaL 的 GPU-staged Muon 在初始化后调用 `adapter.bind_fp32_masters(optimizer)`。

@@ -221,6 +221,8 @@ def prepare_fp8_weights(w1: torch.Tensor | FP8Tensor,
     Training quantization emits W and W.T together, using the same FP8 bytes
     and block scales. Prequantized inputs are copied and transposed without
     changing quantization values.
+    BF16/FP32 inputs stay asynchronous: nonfinite source blocks produce NaN
+    scales. Imported FP8 bytes/scales are validated with one host synchronization.
     W1 uses canonical [gate, up] rows; internal packing must preserve their
     separate logical block scales. Scale values need not be powers of two.
     """
@@ -254,17 +256,16 @@ def prepare_fp8_weights(w1: torch.Tensor | FP8Tensor,
             or a.shape[2] % 128 or b.shape[2] % 128):
         raise ValueError("Expected W1 [E,2I,H], W2 [E,H,I], H/I multiples of 128")
     with torch.cuda.device(a.data.device):
-        # Preparation is explicitly outside capture/hot paths. Reject corrupt
-        # checkpoint scales before they can enter a distributed computation.
+        # Only imported checkpoints require host validation. Our quantizer
+        # propagates nonfinite source blocks through NaN scales without a
+        # blocking scalar read on the ordinary BF16/FP32 forward path.
         valid = []
         for source, w in zip((w1, w2), prepared):
-            valid.append((torch.isfinite(w.scales) & (w.scales > 0)).all())
-            # Our quantizer records every nonfinite source block as a NaN
-            # scale. Imported E4M3FN bytes additionally need a NaN-bit check;
-            # E4M3FN has no infinity encoding. Never expand weights to FP32.
             if isinstance(source, FP8Tensor):
+                valid.append((torch.isfinite(w.scales) & (w.scales > 0)).all())
+                # E4M3FN has no infinity encoding; check NaN without FP32 copies.
                 valid.append(((w.data.view(torch.uint8) & 0x7f) != 0x7f).all())
-        if not torch.stack(valid).all().item():
+        if valid and not torch.stack(valid).all().item():
             raise ValueError("FP8 weights must be finite and scales finite and positive")
         at, bt = ((qt if qt is not None else transpose_fp8_weight(q)) if training else None
                   for q, qt in zip(prepared, transposed))

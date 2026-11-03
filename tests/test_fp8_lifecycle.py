@@ -41,13 +41,23 @@ def test_unbound_data_updates_do_not_reuse_quantized_weights(monkeypatch):
     parameter.data.add_(1)
     assert parameter._version == version
     assert torch.equal(forward().value, first.value + 1)
-    optimizer = torch.optim.SGD([parameter], lr=0.5)
+    optimizer = torch.optim.AdamW([parameter], lr=0.5)
     manager.bind_optimizer(optimizer)
     cached = forward()
     assert forward() is cached
+    hook = manager._optimizer_hook
+    # Wrappers must not be silently unwrapped or remove a working binding.
+    for unsupported in (SimpleNamespace(optimizer=optimizer),
+                        torch.optim.SGD([parameter], lr=0.5)):
+        with pytest.raises(TypeError, match='torch.optim.AdamW.*MegatronOptimizer'):
+            manager.bind_optimizer(unsupported)
+        assert manager._optimizer_hook is hook
+        assert forward() is cached
     parameter.grad = torch.ones_like(parameter)
     optimizer.step()
-    assert torch.equal(forward().value, cached.value - 0.5)
+    updated = forward()
+    assert not torch.equal(updated.value, cached.value)
+    assert torch.equal(updated.value, parameter.unsqueeze(0))
     manager._optimizer_hook.remove()
 
 

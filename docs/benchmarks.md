@@ -97,6 +97,30 @@ RL 的采样长度不同，以上不是完整训练吞吐对照，也不承诺�
 当前可复用入口为 `benchmarks/torchrun_training.py`、`benchmarks/torchrun_sglang_decode.py`
 和 `tools/autotune_dt_fp8.py`。
 
+PF 训练历史结果（完整 FWD+BWD cycle，单位 ms；名义 tokens 为每 rank，权重量化在计时外）：
+
+| EP | 规模 | tokens | BF16 | FP8 | FP8 延迟变化 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 8 | qwen35b | 8192 | 6.575 | 6.653 | +1.2% |
+| 8 | qwen35b | 20480 | 15.516 | 15.559 | +0.3% |
+| 8 | qwen122b | 8192 | 12.266 | 12.067 | -1.6% |
+| 8 | qwen122b | 20480 | 36.954 | 28.463 | -23.0% |
+| 8 | flash | 8192 | 19.037 | 17.581 | -7.6% |
+| 8 | flash | 20480 | 45.816 | 42.394 | -7.5% |
+| 16 | qwen35b | 8192 | 13.416 | 18.161 | +35.4% |
+| 16 | qwen35b | 20480 | 31.426 | 42.928 | +36.6% |
+| 16 | qwen122b | 8192 | 24.316 | 25.314 | +4.1% |
+| 16 | qwen122b | 20480 | 56.896 | 60.130 | +5.7% |
+| 16 | flash | 8192 | 29.297 | 30.439 | +3.9% |
+| 16 | flash | 20480 | 72.383 | 71.090 | -1.8% |
+
+**训练结论：EP8 的 Q35 未超过 BF16；EP16 六组中五组更慢，只有 Flash 20K 约快 1.8%。**
+这些历史数据不支持“所有规模 FP8 训练均优于 BF16”的结论，也不能用后面的 DT decode 收益替代。
+EP8 来自 [2026-10-31 final-cycle 报告](https://github.com/yulangz/WeftMoE/blob/f40a921ea75cbd0ac6b99a2fb3c0d1b0c05015e1/docs/benchmarks/fp8_profile_opt_20261031.json)，
+EP16 来自 [2026-10-29 源端 FP8 通信报告](https://github.com/yulangz/WeftMoE/blob/f40a921ea75cbd0ac6b99a2fb3c0d1b0c05015e1/docs/benchmarks/fp8_network_source_20261029.json)。
+两表均为逐样本最慢 rank 的墙钟时间中位数；EP16 已使用 FP8 X/dY 通信和 FP8 X/AB 缓存。
+报告归档在 `f40a921`，实际实验源码与二进制身份见各报告；这些不是本次修复后的重新测量。
+
 固定 M64 的 DT 历史回放结果（EP8、256 experts、静态路由、单位 µs；实现提交 `6a2f213`）：
 
 | 规模 | 每 rank tokens | BF16 | FP8 在线量化 | 预量化 FP8 输入 |

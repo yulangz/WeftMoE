@@ -99,16 +99,25 @@ class MegatronAdapter:
             self.master_weights = MasterWeights(self, optimizer)
 
     def bind_optimizer(self, optimizer):
-        """Enable non-master cache reuse through a PyTorch optimizer step hook.
+        """Enable non-master cache reuse for a torch.optim.AdamW instance.
 
-        Optimizers without post-step hooks use fresh quantization per forward.
+        Megatron optimizer wrappers are not unwrapped; use the unbound path
+        or bind_fp32_masters() for the supported AReaL GPU-staged Muon path.
         Direct parameter writes outside optimizer.step still require
         weights_updated(), including checkpoint loads.
         """
+        register = getattr(optimizer, "register_step_post_hook", None)
+        if not isinstance(optimizer, torch.optim.AdamW) or not callable(register):
+            raise TypeError(
+                "bind_optimizer requires torch.optim.AdamW with register_step_post_hook; "
+                "MegatronOptimizer/ChainedOptimizer wrappers are not supported. "
+                "Leave the adapter unbound for per-forward quantization, or use "
+                "bind_fp32_masters() for AReaL GPU-staged Muon.")
+        hook = register(
+            lambda *_: self.weights_updated())
         if self._optimizer_hook is not None:
             self._optimizer_hook.remove()
-        self._optimizer_hook = optimizer.register_step_post_hook(
-            lambda *_: self.weights_updated())
+        self._optimizer_hook = hook
         self.weights_updated()
 
     def pack(self, parameters):

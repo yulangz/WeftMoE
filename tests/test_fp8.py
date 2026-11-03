@@ -237,8 +237,38 @@ def test_imported_nan_weight_is_rejected(nan_byte):
 
 
 @pytest.mark.parametrize('bad', [float('inf'), float('nan')])
-def test_nonfinite_source_weight_is_rejected(bad):
+def test_nonfinite_source_weight_propagates_nan_scale(bad):
     x = torch.ones(1, 256, 128, device='cuda', dtype=torch.bfloat16)
     x[0, 0, 0] = bad
-    with pytest.raises(ValueError, match='finite'):
-        prepare_fp8_weights(x, x[:, :128].contiguous())
+    weights = prepare_fp8_weights(x, x[:, :128].contiguous())
+    for w in (weights.w1, weights.w2, weights.w1_t, weights.w2_t):
+        assert w.scales[0, 0, 0].isnan()
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('training', [False, True])
+def test_source_weight_preparation_has_no_host_sync(dtype, training):
+    w1 = torch.ones(1, 256, 128, device='cuda', dtype=dtype)
+    w2 = torch.ones(1, 128, 128, device='cuda', dtype=dtype)
+    previous = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode('error')
+        weights = prepare_fp8_weights(w1, w2, training=training)
+        weights.wait(training=training)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.testing.assert_close(weights.w1.dequantize(), w1.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('bad_scale', [0., -1., float('inf'), float('nan')])
+@pytest.mark.parametrize('import_first', [False, True])
+def test_mixed_source_and_imported_weights_validate_imported_scales(bad_scale, import_first):
+    w1 = torch.ones(1, 256, 128, device='cuda', dtype=torch.bfloat16)
+    w2 = torch.ones(1, 128, 128, device='cuda', dtype=torch.bfloat16)
+    source = [w1, w2]
+    index = 0 if import_first else 1
+    imported = quantize_fp8(source[index], block_rows=128)
+    imported.scales[0, 0, 0] = bad_scale
+    source[index] = imported
+    with pytest.raises(ValueError, match='finite and positive'):
+        prepare_fp8_weights(*source)

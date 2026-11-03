@@ -157,7 +157,7 @@ def main():
         if os.environ.get("TEST_FP32_MASTER_CHECKPOINT") == "1":
             optimizer.bind_managed_checkpoint_process_group(dist.new_group(backend="gloo"))
     else:
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
         adapter.bind_optimizer(optimizer)
     primary = os.environ.get("TEST_FP32_MASTER") == "1"
     if primary:
@@ -241,10 +241,12 @@ def main():
         if ddp is not None and not use_muon:
             for p in model.parameters():
                 p.grad = p.main_grad.to(p.dtype)
+        weight_version = adapter.weight_version
         update = optimizer.step()
         if use_muon:
             assert update[0] and torch.isfinite(torch.as_tensor(update[1])), update
-        adapter.weights_updated()
+            adapter.weights_updated()
+        assert adapter.weight_version == weight_version + 1
         if primary:
             from weftmoe.fp8 import _quantize_fp8_weight_pair
             optimizer.drain()
