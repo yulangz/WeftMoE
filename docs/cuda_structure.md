@@ -14,6 +14,8 @@
 这三个 `.cuh` 是私有实现片段，各自只由对应的 `.cu` 包含一次，位于
 `weftmoe::cuda` namespace 内。它们依赖所属 `.cu` 前面定义的状态和 kernel，
 不作为独立头文件或独立编译单元使用。共享状态保持原有可见性，公开 C++ API 不变。
+所属 `.cu` 只在 include 区间定义实现宏，片段检查该宏，误包含会在编译期报错。
+片段不使用 `#pragma once`，重复包含也不会被静默忽略。
 
 `activation_transport.cu` 在完成资源与后端定义后包含 execution 和 validation；
 `device_notify.cu` 在定义 workspace 和 notify operation 后包含 dispatch。

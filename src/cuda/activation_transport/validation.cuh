@@ -1,4 +1,6 @@
-#pragma once
+#ifndef WEFTMOE_ACTIVATION_TRANSPORT_IMPL
+#error "Private implementation fragment: include only from activation_transport.cu"
+#endif
 
 // Implementation fragment included only by activation_transport.cu, inside
 // weftmoe::cuda, after its shared state and kernel definitions. Keeping the

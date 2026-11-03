@@ -3130,8 +3130,10 @@ GinRdmaForwardMegaKernel::run(const DeviceDispatchHandle &dispatch,
 }
 
 // Keep execution and validation separate from resource/backend preparation.
+#define WEFTMOE_ACTIVATION_TRANSPORT_IMPL
 #include "cuda/activation_transport/execution.cuh"
 #include "cuda/activation_transport/validation.cuh"
+#undef WEFTMOE_ACTIVATION_TRANSPORT_IMPL
 
 ActivationTransportCapability
 probe_activation_transport_capability(std::uint32_t world_size) {

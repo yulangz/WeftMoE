@@ -1,4 +1,6 @@
-#pragma once
+#ifndef WEFTMOE_DEVICE_NOTIFY_IMPL
+#error "Private implementation fragment: include only from device_notify.cu"
+#endif
 
 // Implementation fragment included only by device_notify.cu, inside
 // weftmoe::cuda, after the workspace, input, operation, and kernel definitions.

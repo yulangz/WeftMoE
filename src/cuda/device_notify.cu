@@ -3371,6 +3371,8 @@ void CudaNotifyOperation::cancel() {
   impl_->terminal = true;
 }
 
+#define WEFTMOE_DEVICE_NOTIFY_IMPL
 #include "cuda/notify/dispatch.cuh"
+#undef WEFTMOE_DEVICE_NOTIFY_IMPL
 
 } // namespace weftmoe::cuda
