@@ -190,12 +190,7 @@ __device__ __noinline__ void prepare_canonical(const ForwardKernelArgs &a,
                      geometry.expert_row<false>(0U, source, ordinal)] =
             unsigned(physical);
         if constexpr (Training) {
-          const auto saved =
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
-              tape_begin + row;
-#else
-              source_metadata(a, source, a.checkpoint.source_rows)[route];
-#endif
+          const auto saved = tape_begin + row;
           a.checkpoint.rows[physical] = saved;
           if (a.checkpoint.gates) {
             a.checkpoint.gates[saved] = gate;

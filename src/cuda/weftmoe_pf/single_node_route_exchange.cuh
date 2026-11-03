@@ -30,9 +30,10 @@ __device__ __noinline__ void route_exchange(const ForwardKernelArgs &a,
     auto *source_input =
         peer_at<transport::BFloat16>(a.local_base, a.source_input_offset);
     const auto input_vectors = a.dispatch.identity.num_tokens * a.hidden / 8ULL;
-    for (auto vector = tid; vector < input_vectors; vector += stride)
-      reinterpret_cast<uint4 *>(source_input)[vector] =
-          reinterpret_cast<const uint4 *>(a.input)[vector];
+    if (!a.fp8_source_x)
+      for (auto vector = tid; vector < input_vectors; vector += stride)
+        reinterpret_cast<uint4 *>(source_input)[vector] =
+            reinterpret_cast<const uint4 *>(a.input)[vector];
 
     // The fixed reduction order depends only on source routes, so the idle
     // math role can build it while control publishes the route table.

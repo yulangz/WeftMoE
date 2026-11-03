@@ -167,4 +167,13 @@ __global__ __launch_bounds__(384U, 1) void notify_kernel(
 #endif
 }
 
+// One CTA joins ranks after both local preparation streams. The reusable
+// rank phase is shared with Notify, but its resident-grid counter is untouched.
+__global__ __launch_bounds__(128) void source_ready_kernel(
+    const __grid_constant__ ForwardKernelArgs a) {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED) && __has_include(<nccl_device.h>)
+  rank_barrier<0U, 128U, false, false>(a);
+#endif
+}
+
 } // namespace weftmoe_pf

@@ -144,6 +144,13 @@ CudaTensorBuffer binding(const std::shared_ptr<Allocation> &value) {
 struct ForwardTensorStorage::Impl {
   std::shared_ptr<tensor_storage_detail::Allocation> output, x, ab, gates,
       headers;
+  std::shared_ptr<tensor_storage_detail::Allocation> fp8_x;
+  CudaTensorAllocator allocator;
+  std::size_t fp8_sf_offset = 0, fp8_ab_sf_offset = 0;
+  bool fp8_ab_checkpoint = false;
+  // Enqueue order on the owning execution stream makes the layout transition
+  // visible before any later Backward. The opaque tape owns the column cache.
+  mutable bool fp8_x_columns_queued = false;
   tensor_storage_detail::Completion completion;
   std::uint64_t tokens, rows, hidden, intermediate;
   bool training;
@@ -157,6 +164,10 @@ struct BackwardTensorStorage::Impl {
   std::uint64_t tokens, hidden, intermediate, rows, padded_rows;
   std::size_t u_offset, dab_offset, dgate_rows_offset, dr_offset = 0;
   bool private_dr = false;
+  bool fp32_weight_gradients = false;
+  bool fp8_compute = false;
+  bool streamed_fp8_wgrad = false;
+  std::size_t fp8_wgrad_offset = 0, fp8_scales_offset = 0, fp8_ready_offset = 0;
   unsigned pf_depth = 0;
   std::size_t pf_dab_offset = 0;
   CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{};
@@ -165,7 +176,8 @@ struct BackwardTensorStorage::Impl {
   static std::shared_ptr<Impl>
   make(const DeviceDispatchHandle &, const CudaExecution &,
        const BackwardMegaKernelConfig &, const BackwardTensorBuffers &,
-       const CudaTensorAllocator &, unsigned pf_depth, bool private_dr);
+       const CudaTensorAllocator &, unsigned pf_depth, bool private_dr, bool fp8_compute,
+       bool streamed_fp8_wgrad);
 };
 
 ForwardTensorStorage prepare_forward_tensors(
@@ -179,11 +191,13 @@ ForwardTensorStorage prepare_forward_tensors(
         "prepare Forward tensors requires Notify and a model shape");
   ForwardTensorStorage result;
   auto state = std::make_shared<ForwardTensorStorage::Impl>(execution);
+  state->allocator = allocator;
   state->tokens = dispatch.identity().num_tokens;
   state->rows = dispatch.received_row_capacity();
   state->hidden = config.hidden_size;
   state->intermediate = config.intermediate_size;
   state->training = config.retain_backward_state;
+  state->fp8_ab_checkpoint = config.fp8_ab_checkpoint;
   const auto device = execution.device_ordinal();
   const auto make = [&](std::uint64_t bytes,
                         const CudaTensorBuffer &binding = CudaTensorBuffer{}) {
@@ -200,14 +214,27 @@ ForwardTensorStorage prepare_forward_tensors(
                   2ULL, "output bytes"),
       bindings.output);
   if (state->training) {
-    state->x = make(
-        checked_mul(checked_mul(state->rows, state->hidden, "saved X elements"),
-                    2ULL, "saved X bytes"),
-        bindings.fc1_input);
-    state->ab = make(checked_mul(checked_mul(state->rows, state->intermediate,
+    if (config.fp8_x_checkpoint && (bindings.fc1_input.data || bindings.fc1_input.bytes || bindings.fc1_input.owner))
+      throw std::runtime_error("source FP8 Forward does not write a BF16 X checkpoint");
+    if (!config.fp8_x_checkpoint)
+      state->x = make(
+          checked_mul(checked_mul(state->rows, state->hidden, "saved X elements"),
+                      2ULL, "saved X bytes"),
+          bindings.fc1_input);
+    if (config.fp8_ab_checkpoint) {
+      if (bindings.fc1_output.data || bindings.fc1_output.bytes || bindings.fc1_output.owner)
+        throw std::invalid_argument("FP8 AB checkpoint does not accept a BF16 fc1_output binding");
+      std::size_t cursor = 0;
+      const auto elements = checked_mul(state->rows, 2ULL * state->intermediate, "FP8 AB elements");
+      append(cursor, elements, 1U, "FP8 AB");
+      state->fp8_ab_sf_offset = append(cursor, elements / 128U, 4U, "FP8 AB scales");
+      state->ab = make(cursor);
+    } else {
+      state->ab = make(checked_mul(checked_mul(state->rows, state->intermediate,
                                              "saved AB elements"),
                                  4ULL, "saved AB bytes"),
                      bindings.fc1_output);
+    }
     state->gates = make(checked_mul(state->rows, sizeof(float), "saved gates"));
     state->headers = make(
         checked_mul(state->rows, sizeof(LocalP2pRouteHeader), "saved routing"));
@@ -225,7 +252,7 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
     const DeviceDispatchHandle &dispatch, const CudaExecution &execution,
     const BackwardMegaKernelConfig &config,
     const BackwardTensorBuffers &bindings, const CudaTensorAllocator &allocator,
-    unsigned pf_depth, bool private_dr) {
+    unsigned pf_depth, bool private_dr, bool fp8_compute, bool streamed_fp8_wgrad) {
   using namespace tensor_storage_detail;
   if (!dispatch || !execution || !config.hidden_size ||
       !config.intermediate_size)
@@ -234,6 +261,9 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   auto state = std::make_shared<BackwardTensorStorage::Impl>(execution);
   state->pf_depth = pf_depth;
   state->private_dr = private_dr;
+  state->fp32_weight_gradients = config.fp32_weight_gradients;
+  state->fp8_compute = fp8_compute;
+  state->streamed_fp8_wgrad = streamed_fp8_wgrad;
   state->tokens = dispatch.identity().num_tokens;
   state->top_k = dispatch.identity().top_k;
   state->experts = dispatch.sizes().owned_expert_count;
@@ -267,42 +297,58 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
       checked_mul(checked_mul(state->tokens, state->top_k, "dGate elements"),
                   sizeof(float), "dGate bytes"),
       bindings.dgate);
-  state->dw1 = make(checked_mul(weight, 4ULL, "dW1 bytes"), bindings.dw1);
-  state->dw2 = make(checked_mul(weight, 2ULL, "dW2 bytes"), bindings.dw2);
+  const auto weight_element_bytes = config.fp32_weight_gradients ? 4ULL : 2ULL;
+  state->dw1 = make(checked_mul(weight, 2ULL * weight_element_bytes, "dW1 bytes"), bindings.dw1);
+  state->dw2 = make(checked_mul(weight, weight_element_bytes, "dW2 bytes"), bindings.dw2);
   // Notify already carries exact R/P. Local IPC dR belongs to the execution
   // slot. Network PF can keep dR private: only this GPU forwards into it.
   std::size_t cursor = 0;
   const auto intermediate_elements = checked_mul(
       state->padded_rows, state->intermediate, "Backward workspace elements");
-  state->u_offset = append(cursor, intermediate_elements, 2U, "Backward U");
-  state->dab_offset = append(cursor, intermediate_elements, 4U, "Backward dAB");
+  const auto du_elements = streamed_fp8_wgrad
+      ? std::uint64_t(pf_depth) * backward_tuning::kTileM * state->intermediate
+      : intermediate_elements;
+  state->u_offset = append(cursor, du_elements, 2U, "Backward dU");
+  state->dab_offset = streamed_fp8_wgrad
+      ? append(cursor, du_elements / 128U, sizeof(float), "FP8 SwiGLU dGate partials")
+      : append(cursor, intermediate_elements, 4U, "Backward dAB");
   state->dgate_rows_offset =
       append(cursor, state->padded_rows, sizeof(float), "Backward dGate rows");
   if (private_dr)
     state->dr_offset =
         append(cursor,
-               checked_mul(std::max(state->rows, std::uint64_t{1}),
-                           state->hidden, "private Backward dR elements"),
-               2U, "private Backward dR");
+               streamed_fp8_wgrad ? std::max<std::uint64_t>(128U, state->padded_rows) : std::max(state->rows, std::uint64_t{1}),
+               streamed_fp8_wgrad ? fp8::source_pitch(unsigned(state->hidden)) : 2U * state->hidden,
+               "private Backward dR");
   if (pf_depth && 2U * state->intermediate > state->hidden)
     state->pf_dab_offset = append(
         cursor, std::uint64_t(pf_depth) * backward_tuning::kTileM *
                     state->intermediate,
         4U, "PF Backward dAB ring");
+  if (fp8_compute) {
+    const auto elements = checked_mul(state->padded_rows,
+        (streamed_fp8_wgrad ? state->hidden : 2U * state->hidden) +
+            3U * state->intermediate, "FP8 Wgrad elements");
+    state->fp8_ready_offset = append(cursor, 1U, 8U, "FP8 Wgrad readiness");
+    state->fp8_wgrad_offset = append(cursor, elements, 1U, "FP8 Wgrad operands");
+    state->fp8_scales_offset = append(cursor, elements / 128U, 4U, "FP8 Wgrad scales");
+  }
   state->workspace = make(cursor);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
   auto *base = state->workspace->data;
-  if (pf_depth && 2U * state->intermediate > state->hidden)
+  if (!streamed_fp8_wgrad && pf_depth && 2U * state->intermediate > state->hidden)
     state->dab_map = make_bf16_tma_map(
         at<void>(base, state->pf_dab_offset), 2ULL * state->intermediate,
         std::uint64_t(pf_depth) * backward_tuning::kTileM,
         backward_tuning::kTileM, "PF Backward dAB ring", 64U);
-  state->u_mn_map =
+  if (!streamed_fp8_wgrad) {
+    state->u_mn_map =
       make_bf16_tma_map_mn(at<void>(base, state->u_offset), state->intermediate,
                            state->padded_rows, "Backward dW2 U MN-major");
-  state->dab_mn_map = make_bf16_tma_map_mn(
+    state->dab_mn_map = make_bf16_tma_map_mn(
       at<void>(base, state->dab_offset), 2ULL * state->intermediate,
       state->padded_rows, "Backward dW1 dAB MN-major");
+  }
 #endif
   validate_disjoint(
       {state->dx, state->dgate, state->dw1, state->dw2, state->workspace});
@@ -317,8 +363,8 @@ std::uint64_t ForwardTensorStorage::row_capacity() const {
 std::uint64_t ForwardTensorStorage::bytes() const {
   if (!impl_)
     return 0;
-  return impl_->output->bytes +
-         (impl_->training ? impl_->x->bytes + impl_->ab->bytes +
+  return impl_->output->bytes + (impl_->fp8_x ? impl_->fp8_x->bytes : 0U) +
+         (impl_->training ? (impl_->x ? impl_->x->bytes : 0U) + impl_->ab->bytes +
                                 impl_->gates->bytes + impl_->headers->bytes
                           : 0);
 }
@@ -333,7 +379,8 @@ ForwardTensorBuffers ForwardTensorStorage::buffers() const {
   if (!impl_)
     return {};
   using tensor_storage_detail::binding;
-  return {binding(impl_->output), binding(impl_->x), binding(impl_->ab)};
+  return {binding(impl_->output), binding(impl_->x),
+          impl_->fp8_ab_checkpoint ? CudaTensorBuffer{} : binding(impl_->ab)};
 }
 BackwardTensorBuffers BackwardTensorStorage::buffers() const {
   if (!impl_)

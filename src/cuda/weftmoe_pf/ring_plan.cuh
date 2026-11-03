@@ -96,6 +96,8 @@ __device__ __forceinline__ void build_pull_packet(const ForwardKernelArgs &a,
 __device__ __forceinline__ void stage_input(const ForwardKernelArgs &a,
                                             std::uint64_t tid,
                                             std::uint64_t stride) {
+  if (a.fp8_source_x)
+    return; // Source quantization owns the packet; publication orders peer reads.
   auto *input = a.network_pull
                     ? peer_at<uint4>(a.gin_window_base, a.static_network.input)
                     : peer_at<uint4>(a.local_base, a.source_input_offset);
@@ -197,13 +199,9 @@ template <bool Network, bool Training = false, unsigned Threads = 384U,
 __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
                                      unsigned char *scratch) {
   constexpr unsigned Math = 256U, SourceThreads = Threads - Math;
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
   // Forward and Backward must use the same source order within a window;
   // otherwise identical physical row numbers describe different routes.
   constexpr bool Canonical = Training;
-#else
-  constexpr bool Canonical = Training && (!Network || Backward);
-#endif
   const auto &r = a.ring;
   const auto &p = r.source;
   const auto owned = a.dispatch.sizes.owned_expert_count;
@@ -489,14 +487,12 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
     build_blocks(a, w, expert, tid, Threads);
     if constexpr (Network)
       collective_scope_sync<Threads, kCollectiveScopeBarrier>();
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
     std::uint64_t tape_begin = 0U;
     if constexpr (Network && Training) {
       tape_begin = a.dispatch.expert_row_prefix[expert];
       for (std::uint64_t previous = 0U; previous < w; ++previous)
         tape_begin += r.expert_rows[previous * owned + expert];
     }
-#endif
     // Freeze reverse identity and gate before payload starts. Each warp reads
     // a contiguous source-expert route list; pull does no peer count/ordinal
     // search, and Return never depends on the lifetime of an X slot.
@@ -529,13 +525,9 @@ __device__ __noinline__ void prepare(const ForwardKernelArgs &a,
             static_cast<unsigned>(route), source, gate,
             static_cast<unsigned>(route / p.shape.top_k), output};
         if constexpr (Training) {
-          const auto tape_row =
-#if defined(WEFTMOE_PF_WINDOW_ORDERED_TAPE) && WEFTMOE_PF_WINDOW_ORDERED_TAPE
-              Network
-                  ? tape_begin + row
-                  :
-#endif
-                  source_metadata(a, source, a.checkpoint.source_rows)[route];
+          const auto tape_row = Network
+              ? tape_begin + row
+              : source_metadata(a, source, a.checkpoint.source_rows)[route];
           a.checkpoint
               .rows[(r.window_prefix[w] + prefix[expert]) * p.shape.tile_m +
                     row] = tape_row;

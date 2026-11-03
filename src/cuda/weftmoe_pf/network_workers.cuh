@@ -21,7 +21,7 @@ __device__ __noinline__ void dispatch(const ForwardKernelArgs &a,
   if (threadIdx.x % 32U)
     return;
   Endpoint endpoint(a, worker);
-  const auto row_bytes = a.hidden * sizeof(weftmoe::transport::BFloat16);
+  const auto row_bytes = a.fp8_source_x ? fp8::source_pitch(unsigned(a.hidden)) : a.hidden * 2U;
   const auto peers = endpoint.layout().nodes - 1U;
   unsigned issued = 0U, completed = 0U;
   std::uint64_t bytes = 0U, packets = 0U;
@@ -163,7 +163,7 @@ __device__ __forceinline__ void pull_rows(const ForwardKernelArgs &a,
   const auto lane = threadIdx.x % 32U;
   const auto &r = a.ring;
   const auto owned = a.dispatch.sizes.owned_expert_count;
-  const auto bytes = unsigned(a.hidden * 2U);
+  const auto bytes = a.fp8_source_x ? fp8::source_pitch(unsigned(a.hidden)) : unsigned(a.hidden * 2U);
   for (std::uint64_t window = 0; window < r.state->windows; ++window) {
     if constexpr (WindowAdmission)
       while (ring::acquire(r.state->admitted_windows) < window + 1U) {
@@ -240,7 +240,55 @@ __device__ __forceinline__ void pull_rows(const ForwardKernelArgs &a,
   }
 }
 
-template <class Storage>
+// Packet rows are contiguous on the wire. Keep the payload on the bulk-copy
+// path even when BF16's optional vector-copy experiment is enabled. The smaller
+// profiles retain row-major source scales and copy the entire packet at once;
+// their producer gathers K-block scales. Wider profiles retain column-major
+// scales for TMA reuse across more GEMM tiles.
+__device__ __forceinline__ void copy_fp8_row(
+    Copy &copy, const char *input, std::uint8_t *output, unsigned row, unsigned hidden,
+    unsigned pitch) {
+  const unsigned lane = threadIdx.x % 32U;
+  auto *q = fp8::ring_row(output, row, hidden, pitch);
+  if constexpr (!local::kFP8NetworkRowScales) {
+    if (!lane)
+      copy(input, reinterpret_cast<char *>(q), hidden);
+    __syncwarp();
+    auto *s = fp8::ring_scales(output, row, hidden, pitch);
+    for (unsigned c = lane; c < hidden / 128U; c += 32U)
+      s[c * 128U] = reinterpret_cast<const float *>(input + hidden)[c];
+    __threadfence();
+    __syncwarp();
+    return;
+  }
+  auto *s = reinterpret_cast<float *>(fp8::ring_row(output, row / 128U * 128U,
+      hidden, pitch) + 128U * hidden) + row % 128U * (hidden / 128U);
+  const unsigned scale_bytes = hidden / 128U * sizeof(float);
+  if (hidden + scale_bytes <= local::kPullBufferBytes && scale_bytes % 16U == 0U) {
+    if (!lane) {
+      asm volatile("fence.proxy.async.global;" ::: "memory");
+      cute::SM90_BULK_COPY_G2S::copy(input,
+          reinterpret_cast<std::uint64_t *>(&copy.full), copy.buffer, hidden + scale_bytes);
+      copy.full.arrive_and_expect_tx(hidden + scale_bytes);
+      copy.full.wait(copy.phase);
+      copy.phase ^= 1U;
+      cute::SM90_BULK_COPY_S2G::copy(copy.buffer, q, hidden);
+      cute::SM90_BULK_COPY_S2G::copy(copy.buffer + hidden, s, scale_bytes);
+      cute::tma_store_arrive();
+      asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+  } else {
+    if (!lane)
+      copy(input, reinterpret_cast<char *>(q), hidden);
+    __syncwarp();
+    for (unsigned c = lane; c < hidden / 128U; c += 32U)
+      s[c] = reinterpret_cast<const float *>(input + hidden)[c];
+    __threadfence();
+  }
+  __syncwarp();
+}
+
+template <bool FP8, class Storage>
 __device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
                                   unsigned warp, unsigned worker,
                                   unsigned workers) {
@@ -253,7 +301,11 @@ __device__ __noinline__ void pull(const ForwardKernelArgs &a, Storage &s,
       a, worker, workers,
       [&](std::uint64_t block, unsigned m, float gate, const char *input) {
         const auto row = ring::row(a, block) + m;
-        copy.warp_copy(input, output + row * bytes, bytes);
+        if constexpr (FP8) {
+          copy_fp8_row(copy, input, reinterpret_cast<std::uint8_t *>(output),
+                       unsigned(row), unsigned(a.hidden), unsigned(a.fp8_x_pitch));
+        } else
+          copy.warp_copy(input, output + row * bytes, bytes);
         if (!lane) {
           gates[row] = gate;
           const auto valid = a.ring.blocks[block].tile.rows;

@@ -52,11 +52,11 @@ __global__ void backward_setup_local_kernel(BackwardKernelArgs a) {
 
 #include "cuda/backward/swiglu.cuh"
 
-template <bool Stage = false>
+template <bool Stage = false, bool FP8 = false>
 __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
     const BackwardKernelArgs &a, std::uint64_t padded_row,
     std::uint64_t compact_row, bool row_is_valid, std::uint32_t lane,
-    transport::BFloat16 *staging = nullptr) {
+    transport::BFloat16 *staging = nullptr, float *staging_scales = nullptr) {
   auto *u = a.recomputed_u;
   const auto *ab = a.saved_ab;
   const auto *gates = a.saved_gates;
@@ -98,7 +98,12 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
         db;
     *reinterpret_cast<uint4 *>(u + padded_row * a.intermediate + column) =
         activation;
-    if constexpr (Stage) {
+    if constexpr (Stage && FP8) {
+      fp8::store_fp8_eight(da, reinterpret_cast<std::uint8_t *>(staging),
+          unsigned(2U * a.intermediate), unsigned(column), staging_scales, staging_scales ? 128U : 1U);
+      fp8::store_fp8_eight(db, reinterpret_cast<std::uint8_t *>(staging),
+          unsigned(2U * a.intermediate), unsigned(a.intermediate + column), staging_scales, staging_scales ? 128U : 1U);
+    } else if constexpr (Stage) {
       *reinterpret_cast<uint4 *>(staging + column) = da;
       *reinterpret_cast<uint4 *>(staging + a.intermediate + column) = db;
     }

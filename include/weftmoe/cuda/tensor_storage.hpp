@@ -58,6 +58,8 @@ public:
   void run(const std::function<void()> &prepare) const;
   // Agree only whether peer pointers changed. Preparation exceptions propagate
   // locally; unlike run(), this hot path does not coordinate allocation errors.
+  // The agreement follows prior work on the execution stream so it cannot
+  // overtake a resident multi-rank kernel still using the peer workspace.
   bool run_with_change(const std::function<bool()> &prepare) const;
 
 private:
@@ -67,15 +69,16 @@ private:
 
 struct ForwardTensorBuffers {
   CudaTensorBuffer output;     // BF16 [tokens, hidden]
-  CudaTensorBuffer fc1_input;  // BF16 [received_rows, hidden], training only
+  CudaTensorBuffer fc1_input;  // BF16 [received_rows, hidden]; empty for source-FP8 tape
   CudaTensorBuffer fc1_output; // BF16 [2, received_rows, intermediate]
 };
 
 struct BackwardTensorBuffers {
   CudaTensorBuffer dx;    // BF16 [tokens, hidden]
   CudaTensorBuffer dgate; // FP32 [tokens, top_k]
-  CudaTensorBuffer dw1;   // BF16 [local_experts, 2 * intermediate, hidden]
-  CudaTensorBuffer dw2;   // BF16 [local_experts, hidden, intermediate]
+  CudaTensorBuffer dw1;   // BF16, or FP32 with fp32_weight_gradients
+                         // [local_experts, 2 * intermediate, hidden]
+  CudaTensorBuffer dw2;   // Same dtype, [local_experts, hidden, intermediate]
 };
 
 // These objects own per-call tensors, rank-private Backward intermediates,

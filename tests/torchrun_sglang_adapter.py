@@ -2,7 +2,7 @@
 
 import os
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import SimpleNamespace, MethodType
 
 import torch
 import torch.distributed as dist
@@ -16,6 +16,16 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 import weftmoe.sglang as adapter
 
 
+def check_output(actual, expected):
+    if os.environ.get("WEFTMOE_FP8") == "1":
+        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        diff = ((actual.double() - expected.double()).square().sum()
+                / (actual.double().square().sum() + expected.double().square().sum()).clamp_min(1e-30))
+        assert diff < 5e-3, diff.item()
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
+
+
 @torch.no_grad()
 def main():
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -25,11 +35,15 @@ def main():
     tokens = int(os.environ.get("TEST_TOKENS", 17))
     hidden = int(os.environ.get("TEST_HIDDEN", 2048))
     intermediate = int(os.environ.get("TEST_INTERMEDIATE", 512))
+    dp_attention = os.environ.get("TEST_DP_ATTENTION") == "1"
     torch.cuda.set_device(local_rank)
     args = ServerArgs(
         model_path="dummy",
+        device="cuda",
         tp_size=world,
         ep_size=world,
+        dp_size=world if dp_attention else 1,
+        enable_dp_attention=dp_attention,
         moe_runner_backend="triton",
         moe_a2a_backend="none",
         chunked_prefill_size=max(512 * world, tokens),
@@ -40,11 +54,19 @@ def main():
     initialize_moe_config(args)
     init_distributed_environment(world, rank, local_rank=local_rank)
     initialize_model_parallel(
-        tensor_model_parallel_size=world, expert_model_parallel_size=world
+        tensor_model_parallel_size=world, expert_model_parallel_size=world,
+        attention_data_parallel_size=world if dp_attention else 1,
     )
+    if dp_attention:
+        from sglang.srt.layers.dp_attention import initialize_dp_attention, set_dp_buffer_len
+
+        initialize_dp_attention(args, SimpleNamespace(hidden_size=hidden, dtype=torch.bfloat16))
+        set_dp_buffer_len(0, 0, True)
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
+    original_forward = FusedMoE.forward
+    adapter.install()
 
     memory_saver = None
     if os.environ.get("TEST_TMS") == "1":
@@ -52,31 +74,110 @@ def main():
 
         memory_saver = TorchMemorySaver()
         memory_saver.hook_mode = "torch"
+        from sglang.srt.utils import torch_memory_saver_adapter
+        torch_memory_saver_adapter._memory_saver = memory_saver
     with (
         memory_saver.region(tag="weights", enable_cpu_backup=True)
         if memory_saver else nullcontext()
-    ):
+    ), torch.device("cuda"):
         layer = FusedMoE(
             experts, hidden, intermediate, layer_id=0, top_k=top_k,
             params_dtype=torch.bfloat16, inplace=False,
         ).cuda()
+    if memory_saver is not None and adapter._use_fp8():
+        segments = memory_saver._impl._primary_mem_pool.snapshot()
+        for p in (layer.w13_weight, layer.w2_weight):
+            assert not any(s["address"] <= p.data_ptr() < s["address"] + s["total_size"]
+                           for s in segments), "Temporary BF16 weight retained by TMS pool"
     torch.manual_seed(37 + rank)
     layer.w13_weight.normal_(0, 0.03)
     layer.w2_weight.normal_(0, 0.03)
-    torch.manual_seed(100)
+    reference_layer = FusedMoE(
+        experts, hidden, intermediate, layer_id=0, top_k=top_k,
+        params_dtype=torch.bfloat16, inplace=False,
+    ).cuda()
+    reference_layer.w13_weight.copy_(layer.w13_weight)
+    reference_layer.w2_weight.copy_(layer.w2_weight)
+    torch.manual_seed(100 + (rank if dp_attention else 0))
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.03
     ids = (
         torch.arange(tokens * top_k, device="cuda").reshape(tokens, top_k) % experts
     ).int()
     gates = torch.full((tokens, top_k), 1 / top_k, device="cuda")
     topk = StandardTopKOutput(gates, ids, torch.empty(tokens, experts, device="cuda"))
-    baseline = layer.forward
-    expected = baseline(x, topk)
-    dist.all_reduce(expected)
+    baseline = MethodType(original_forward, reference_layer)
+
+    def update_weights():
+        reference_layer.w13_weight.mul_(0.75)
+        reference_layer.w2_weight.mul_(0.875)
+        if adapter._use_fp8():
+            from weftmoe.fp8 import prepare_fp8_weights
+            prepared = prepare_fp8_weights(reference_layer.w13_weight,
+                                            reference_layer.w2_weight, training=False)
+            targets = adapter.fp8_parameter_map(layer)
+            for p, source in ((layer.w13_weight, prepared.w1), (layer.w2_weight, prepared.w2)):
+                data, scales = targets[id(p)]
+                data.copy_(source.data.view(torch.uint8))
+                scales.copy_(source.scales)
+                assert torch.equal(data, source.data.view(torch.uint8))
+                assert torch.equal(scales, source.scales)
+                assert p.untyped_storage().nbytes() == 0
+            adapter.commit_fp8_weights(1)
+        else:
+            layer.w13_weight.copy_(reference_layer.w13_weight)
+            layer.w2_weight.copy_(reference_layer.w2_weight)
+
+    def reference():
+        if not dp_attention:
+            out = baseline(x, topk)
+            dist.all_reduce(out)
+            return out
+        def gather(tensor):
+            out = torch.empty((world * tensor.shape[0], *tensor.shape[1:]),
+                              device=tensor.device, dtype=tensor.dtype)
+            dist.all_gather_into_tensor(out, tensor.contiguous())
+            return out
+        out = baseline(gather(x), StandardTopKOutput(gather(gates), gather(ids), None))
+        dist.all_reduce(out)
+        return out.chunk(world)[rank]
+
+    expected = reference()
     adapter.install()
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
+    def resolve_pool(pre_model_load_memory):
+        assert adapter._runtime is not None and adapter._decode_runtime is not None
+        assert adapter._eager_pending is None
+        assert all(rt.native.usage()["compute_bytes"] > 0
+                   for rt in (adapter._runtime, adapter._decode_runtime))
+        return "profiled_after_weftmoe"
+    runner = SimpleNamespace(
+        model=layer, spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        is_draft_worker=False, _resolve_memory_pool_config=resolve_pool,
+        _apply_memory_pool_config=lambda config: None, device="cuda", gpu_id=local_rank,
+    )
+    ModelRunnerKVCacheMixin.init_memory_pool(runner, 0)
+    assert runner.memory_pool_config == "profiled_after_weftmoe"
+    print(rank, "SGLANG_MEMORY_BUDGET_PASS", flush=True)
+    if adapter._use_fp8():
+        assert all(p.untyped_storage().nbytes() == 0
+                   for p in (layer.w13_weight, layer.w2_weight))
+        print(rank, "SGLANG_FP8_MEMORY_BUDGET_PASS", flush=True)
+    else:
+        # Another layer must only add descriptors, not a full FC1 weight copy.
+        # Workspaces were warmed above; the reference layer is already allocated.
+        before = torch.cuda.memory_allocated()
+        reference_layer.layer_id = 1
+        adapter._prepare_memory_budget(reference_layer)
+        growth = torch.cuda.memory_allocated() - before
+        assert growth < layer.w13_weight.numel() * layer.w13_weight.element_size(), growth
+        print(rank, "SGLANG_BF16_NO_WEIGHT_COPY_PASS", growth, flush=True)
     actual = layer(x, topk)
-    dist.all_reduce(actual)
-    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
+    if adapter._use_fp8():
+        assert layer.w13_weight.untyped_storage().nbytes() == 0
+        assert layer.w2_weight.untyped_storage().nbytes() == 0
+    if not dp_attention:
+        dist.all_reduce(actual)
+    check_output(actual, expected)
     def capture():
         with model_capture_mode():
             layer(x, topk)
@@ -97,16 +198,37 @@ def main():
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
         if iteration == 2:
+            ids[-1] = torch.arange(top_k, device='cuda')
+            ids[-1, 0] = top_k - 1
             ids[-1, -1] = -1  # SGLang's masked route must stage as zero gate.
         gates.mul_(0.95)
         eager = layer(x, topk)
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(captured, eager, rtol=0.02, atol=0.00002)
-    # Keep the existing graph while AWEX updates weights in place. In particular
-    # FC1 must refresh its packed copy rather than replaying stale parameters.
-    model_runner = SimpleNamespace(graph_runner=None)
-    adapter.suspend(model_runner)
+        try:
+            check_output(captured, eager)
+        except AssertionError as error:
+            raise AssertionError(("graph_vs_eager", rank, iteration, str(error))) from error
+    # Keep the existing BF16 graph while AWEX updates weights in place.
+    # Both PF and DT must observe the new original weights without refreshing.
+    # Exercise resume's recapture callback, not just a manual capture afterwards.
+    runner = SimpleNamespace(
+        graphs={0: graph}, output_buffers={0: captured}, seq_len_fill_value=1,
+        buffers=SimpleNamespace(seq_lens=torch.ones(1, device="cuda", dtype=torch.int32),
+                                seq_lens_cpu=torch.ones(1, dtype=torch.int32)))
+    def recapture():
+        nonlocal graph, captured
+        graph, captured = capture()
+        runner.graphs[0], runner.output_buffers[0] = graph, captured
+    runner.capture = recapture
+    model_runner = SimpleNamespace(graph_runner=runner, memory_saver_adapter=memory_saver)
+    discard_graphs = adapter._use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0"
+    if discard_graphs:
+        del graph, captured
+    adapter.suspend(model_runner, discard_fp8=adapter._use_fp8())
+    if adapter._use_fp8():
+        assert all(t.untyped_storage().nbytes() == 0
+                   for weights in adapter._fp8_weights.values() for t in weights._tensors())
     if memory_saver:
         memory_saver.pause("weights")
         scratch = torch.empty_like(layer.w13_weight)
@@ -115,36 +237,51 @@ def main():
         del scratch
         memory_saver.resume("weights")
     ids.add_(1).remainder_(experts)
-    layer.w13_weight.mul_(0.75)
-    layer.w2_weight.mul_(0.875)
+    update_weights()
+    expected = reference()
     adapter.resume(model_runner)
-    expected = baseline(x, topk)
-    dist.all_reduce(expected)
+    if not adapter._use_fp8():
+        resumed_eager = layer(x, topk)
+        if not dp_attention:
+            dist.all_reduce(resumed_eager)
+        check_output(resumed_eager, expected)
     graph.replay()
     actual = captured.clone()
-    dist.all_reduce(actual)
-    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
+    if not dp_attention:
+        dist.all_reduce(actual)
+    check_output(actual, expected)
+    if adapter._use_fp8():
+        version = adapter._fp8_weights[layer.layer_id].version
+        del graph, captured
+        adapter.suspend(model_runner)  # KV-only: restore the same weights/version.
+        adapter.resume(model_runner)
+        assert adapter._fp8_weights[layer.layer_id].version == version
+        graph.replay()
+        actual = captured.clone()
+        if not dp_attention:
+            dist.all_reduce(actual)
+        check_output(actual, expected)
+        print(rank, "SGLANG_FP8_KV_ONLY_VERSION_PASS", flush=True)
     del graph, captured
-    adapter.close(model_runner)
+    adapter.close(model_runner, keep_fp8=adapter._use_fp8())
     assert adapter._runtime is None
     assert adapter._decode_runtime is None
     assert not adapter._graph_inputs
     # Baseline parity below uses valid routes; the masked-ID check above uses
     # the adapter's existing eager sanitization as its reference.
     ids.add_(1).remainder_(experts)
-    layer.w13_weight.mul_(0.75)
-    layer.w2_weight.mul_(0.875)
-    expected = baseline(x, topk)
-    dist.all_reduce(expected)
+    update_weights()
+    expected = reference()
     restored = layer(x, topk)
     actual = restored.clone()
-    dist.all_reduce(actual)
-    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.00002)
+    if not dp_attention:
+        dist.all_reduce(actual)
+    check_output(actual, expected)
     graph, captured = capture()
     graph.replay()
     torch.cuda.synchronize()
     # Eager prefill uses PF; decode uses DT with a different GEMM reduction.
-    torch.testing.assert_close(captured, restored, rtol=0.02, atol=0.00002)
+    check_output(captured, restored)
     previous = captured.clone()
     graph.replay()
     torch.cuda.synchronize()
@@ -153,6 +290,16 @@ def main():
     adapter.close(model_runner)
     print(rank, "SGLANG_PARITY_GRAPH_RESTART_PASS", flush=True)
     dist.destroy_process_group()
+    if memory_saver is not None:
+        # This test owns a local TMS instance. Destroy its private MemPool
+        # while HookUtil's pluggable allocator is still alive, after tensor
+        # owners are gone; the default attribute teardown order does the reverse.
+        del baseline, reference_layer, layer, model_runner
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()
+        with memory_saver._impl._with_region_config(tag="weights", enable_cpu_backup=True):
+            del memory_saver._impl._primary_mem_pool
 
 
 if __name__ == "__main__":

@@ -212,7 +212,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
 
 def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
     if config["static_v4_prefill_min_tokens"]:
-        # Both M16/M64 DT variants are compiled; account for the larger one.
+        # DT uses a fixed M64 tile.
         stages = config.get("v4", {}).get("decode_stages", 3)
         payload = 3 * 1024 + stages * (64 + 128) * 64 * 2 + 64 * 128 * 2 + 3 * 4096
         size = (payload + (2 * stages + 3) * 8 + 1023) // 1024 * 1024

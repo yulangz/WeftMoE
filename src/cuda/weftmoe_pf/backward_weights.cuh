@@ -51,6 +51,19 @@ struct alignas(16) SharedState {
   alignas(8) std::uint64_t cluster_join;
 };
 
+#ifndef WEFTMOE_FP8_WGRAD_CLAIM_TILES
+#define WEFTMOE_FP8_WGRAD_CLAIM_TILES 4
+#endif
+#ifndef WEFTMOE_FP8_WGRAD_PIPELINE_STAGES
+#define WEFTMOE_FP8_WGRAD_PIPELINE_STAGES 2
+#endif
+
+inline constexpr unsigned kFP8StageBytes = (128U + backward_tuning::kDwTileN) * 132U;
+inline constexpr unsigned kFP8StoreOffset =
+    (WEFTMOE_FP8_WGRAD_PIPELINE_STAGES * (kFP8StageBytes + 16U) + 1023U) & ~1023U;
+inline constexpr unsigned kFP8PipelineBytes =
+    kFP8StoreOffset + 128U * backward_tuning::kDwTileN * 2U;
+
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
 template <bool MathRole> struct UnifiedComputeSynchronization {
   static constexpr bool kMathEnabled = MathRole;
@@ -120,10 +133,11 @@ template <bool MathRole> struct UnifiedComputeSynchronization {
 // join. The caller subsequently partitions registers for entire warpgroups,
 // then calls run_compute only for threadIdx.x < kComputeThreads. The caller
 // must also load RowGeometry before splitting roles.
-template <std::uint32_t StorageTileN>
+template <std::uint32_t StorageTileN, bool FP8 = false>
 __device__ __forceinline__ void initialize_compute(unsigned char *storage,
                                                    SharedState &state) {
-  backward_compute_detail::initialize_k_mn_barriers<StorageTileN>(storage);
+  if constexpr (!FP8)
+    backward_compute_detail::initialize_k_mn_barriers<StorageTileN>(storage);
   if (threadIdx.x == 0U) {
     state.task_kind = ~0U;
     state.task_owner = 0U;
@@ -136,7 +150,9 @@ __device__ __forceinline__ void initialize_compute(unsigned char *storage,
   }
 }
 
-template <std::uint32_t DwTileN, class Synchronization>
+#include "cuda/weftmoe_pf/fp8_wgrad.cuh"
+
+template <std::uint32_t DwTileN, bool FP8, class Synchronization>
 __device__ __forceinline__ void
 run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
             const CUtensorMap &u_mn_map, const CUtensorMap &dab_mn_map,
@@ -146,6 +162,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
             Synchronization &synchronization) {
   using namespace backward_pipeline_detail;
   static_assert(DwTileN == backward_tuning::kDwTileN);
+  static_assert(!FP8, "FP8 uses the prepared-operand Wgrad pipeline");
   constexpr auto kDxTiles =
       backward_tuning::kMainHidden / backward_tuning::kDxTileN / 2U;
   constexpr std::uint32_t kDwStoreIssuers =
@@ -208,6 +225,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
           static_cast<std::uint32_t>(words[layout.dw_reduction_rows + owner]);
       const auto compact_reduction_start =
           static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[owner]);
+      {
       backward_compute_detail::run_mn_mn_chunk<
           backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization>(
           dr_mn_map, u_mn_map, dw2_store_map, task_tile_shared,
@@ -215,6 +233,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
           static_cast<std::uint32_t>(padded_offsets[owner]), reduction_rows,
           static_cast<std::uint32_t>(a.intermediate),
           owner * static_cast<std::uint32_t>(a.hidden), storage, dw_pipeline);
+      }
       const auto last = pipeline::backward::cluster_tile(
           task_tile_shared + task_count_shared - 1U, cluster_rank, kDw2MTiles,
           kDw2NTiles);
@@ -241,6 +260,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
           static_cast<std::uint32_t>(words[layout.dw_reduction_rows + owner]);
       const auto compact_reduction_start =
           static_cast<std::uint32_t>(a.dispatch.expert_row_prefix[owner]);
+      {
       backward_compute_detail::run_mn_mn_chunk<
           backward_tuning::kDwTileM, DwTileN, kStorageTileN, Synchronization>(
           dab_mn_map, x_mn_map, dw1_store_map, task_tile_shared,
@@ -250,6 +270,7 @@ run_compute(const BackwardKernelArgs &a, const CUtensorMap &dr_mn_map,
           static_cast<std::uint32_t>(a.hidden),
           owner * static_cast<std::uint32_t>(2ULL * a.intermediate), storage,
           dw_pipeline);
+      }
       const auto last = pipeline::backward::cluster_tile(
           task_tile_shared + task_count_shared - 1U, cluster_rank, kDw1MTiles,
           kDw1NTiles);

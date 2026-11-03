@@ -8,7 +8,7 @@ namespace weftmoe_pf::network {
 
 constexpr std::size_t kSharedBytes = sizeof(local::Shared);
 
-template <class Storage>
+template <bool FP8, class Storage>
 __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
                                         Storage &s) {
   const auto warp = (threadIdx.x - 288U) / 32U;
@@ -28,10 +28,11 @@ __device__ __forceinline__ void workers(const ForwardKernelArgs &a,
     const auto worker = blockIdx.x < kNetworkOwners
                             ? 2U * blockIdx.x + warp - 1U
                             : 3U * blockIdx.x - kNetworkOwners + warp;
-    pull(a, s, warp, worker, gridDim.x * 3U - kNetworkOwners);
+    pull<FP8>(a, s, warp, worker, gridDim.x * 3U - kNetworkOwners);
   }
 }
 
+template <bool FP8 = false>
 __global__ __launch_bounds__(kThreads, 1) void kernel(
     const __grid_constant__ ForwardKernelArgs a,
     const __grid_constant__ CUtensorMap x_map,
@@ -58,18 +59,18 @@ __global__ __launch_bounds__(kThreads, 1) void kernel(
   }
   if (threadIdx.x >= 256U)
     cutlass::arch::warpgroup_reg_dealloc<
-        Resources::kUnifiedProducerRegisters>();
+        FP8 ? fp8::kControlRegisters : Resources::kUnifiedProducerRegisters>();
   __syncthreads();
   cute::cluster_sync();
   if (!a.dispatch.runtime->error) {
     if (threadIdx.x < 256U) {
-      cutlass::arch::warpgroup_reg_alloc<Resources::kUnifiedMathRegisters>();
-      local::compute<Schedule, true, Mma, forward_tuning::kWgmmaWaitGroup>(
+      cutlass::arch::warpgroup_reg_alloc<FP8 ? fp8::kMathRegisters : Resources::kUnifiedMathRegisters>();
+      local::compute<FP8, Schedule, true, Mma, forward_tuning::kWgmmaWaitGroup>(
           a, s, output_map);
     } else if (threadIdx.x < 288U) {
-      local::produce<Schedule, true>(a, s, x_map, s_map, w1_map, w2_map);
+      local::produce<FP8, Schedule, true>(a, s, x_map, s_map, w1_map, w2_map);
     } else {
-      workers(a, s);
+      workers<FP8>(a, s);
     }
   }
   // Return RX is source-local, but local experts can still be writing this

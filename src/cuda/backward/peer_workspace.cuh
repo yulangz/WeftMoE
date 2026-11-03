@@ -15,6 +15,7 @@ struct BackwardPeerWorkspace {
     std::uint64_t row_capacity = 0, route_capacity = 0, hidden = 0;
     std::size_t table = 0;
     CUtensorMap dr_map{}, dr_mn_map{};
+    bool need_dr = true;
   };
 
   CollectiveTensorPreparation preparation;
@@ -73,14 +74,16 @@ struct BackwardPeerWorkspace {
   }
 
   std::shared_ptr<Buffer> allocate(std::uint64_t rows, std::uint64_t routes,
-                                  std::uint64_t hidden) {
+                                  std::uint64_t hidden, bool need_dr) {
     auto result = std::make_shared<Buffer>();
     result->row_capacity = rows;
     result->route_capacity = routes;
     result->hidden = hidden;
+    result->need_dr = need_dr;
     std::size_t cursor = 0;
     // Empty destinations still need a valid, nonzero TMA descriptor.
-    append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
+    if (need_dr)
+      append(cursor, checked_mul(std::max(rows, std::uint64_t{1}), hidden,
                                 "Backward dR elements"),
             sizeof(transport::BFloat16), "Backward compact dR");
     result->descriptor.dgate =
@@ -97,15 +100,15 @@ struct BackwardPeerWorkspace {
   }
 
   void prepare(std::uint64_t next_generation, std::uint64_t rows,
-                std::uint64_t routes, std::uint64_t hidden) {
+                std::uint64_t routes, std::uint64_t hidden, bool need_dr) {
     // A retained Notify plan is immutable. Repeating that Backward needs no
     // allocation, address exchange or host collective.
-    if (buffer && generation == next_generation)
+    if (buffer && generation == next_generation && buffer->need_dr == need_dr)
       return;
     generation = 0;
     std::shared_ptr<Buffer> next;
     const bool bindings_changed = preparation.run_with_change([&] {
-      if (buffer && buffer->hidden == hidden &&
+      if (buffer && buffer->hidden == hidden && buffer->need_dr == need_dr &&
           rows <= buffer->row_capacity &&
           routes <= buffer->route_capacity) {
         next = buffer;
@@ -117,17 +120,19 @@ struct BackwardPeerWorkspace {
                                              "Backward grown row capacity"))
             : initial_rows;
         next = allocate(std::max(rows, reserved),
-                        std::max(routes, max_routes), hidden);
+                        std::max(routes, max_routes), hidden, need_dr);
       }
       // Preserve the logical TMA bounds, including zero fill of tail tiles.
       // The descriptor may change without replacing or remapping the storage.
-      next->dr_map = make_bf16_tma_map(
-          next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
-          backward_tuning::kActivationTileM, "actual Backward dR",
-          backward_tuning::kTileK);
-      next->dr_mn_map = make_bf16_tma_map_mn(
-          next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
-          "actual Backward dR MN");
+      if (need_dr) {
+        next->dr_map = make_bf16_tma_map(
+            next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
+            backward_tuning::kActivationTileM, "actual Backward dR",
+            backward_tuning::kTileK);
+        next->dr_mn_map = make_bf16_tma_map_mn(
+            next->allocation->data, hidden, std::max(rows, std::uint64_t{1}),
+            "actual Backward dR MN");
+      }
       return next != buffer;
     });
     // Logical rows and call generations do not change peer addresses. The

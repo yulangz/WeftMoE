@@ -153,7 +153,7 @@ def main():
             expected_second = reference(first, routes, gates, all_w1, all_w2)
             check(second, expected_second, f"shared-workspace-{iteration}")
         del graph
-        # Every warmed bucket of the updated layer must release its packed W1.
+        # Discard every warmed bucket and its retained weight descriptors.
         # All four layers share these weights; their outer graph is gone above.
         for layer in range(4):
             runtime.invalidate_inference_layer(layer)

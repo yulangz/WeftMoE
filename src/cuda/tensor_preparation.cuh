@@ -100,19 +100,26 @@ void CollectiveTensorPreparation::run(
 bool CollectiveTensorPreparation::run_with_change(
     const std::function<bool()> &prepare) const {
   auto &state = *impl_;
+  // Peer rebinding is part of the serialized execution workspace lifecycle.
+  // A previous asynchronous MoE may still occupy the resident grid. Launching
+  // this NCCL collective on the independent setup stream can overtake it on
+  // some ranks and prevent the peer grids it is waiting for from launching.
+  // Order the agreement after prior execution, including its transport join.
+  // Keep run()'s allocation-failure agreement on its separate setup stream.
+  const auto stream = internal::checked_execution_state(state.execution)->stream;
   // Only changing an exported pointer requires every peer to remap. Do not
   // turn a per-call allocation exception into a recoverable collective error.
   state.host[0] = prepare() ? 1U : 0U;
   auto *device = static_cast<std::uint32_t *>(state.status->data);
   Impl::check(cudaMemcpyAsync(device, state.host, sizeof(*device),
-                             cudaMemcpyHostToDevice, state.stream));
+                             cudaMemcpyHostToDevice, stream));
   const auto error = ncclAllReduce(device, device + 1U, 1U, ncclUint32,
-                                   ncclMax, state.nccl->comm, state.stream);
+                                   ncclMax, state.nccl->comm, stream);
   if (error != ncclSuccess)
     throw std::runtime_error(std::string("peer binding agreement: ") +
                              ncclGetErrorString(error));
   Impl::check(cudaMemcpyAsync(state.host + 1U, device + 1U, sizeof(*device),
-                             cudaMemcpyDeviceToHost, state.stream));
-  Impl::check(cudaStreamSynchronize(state.stream));
+                             cudaMemcpyDeviceToHost, stream));
+  Impl::check(cudaStreamSynchronize(stream));
   return state.host[1] != 0U;
 }

@@ -22,7 +22,7 @@ HOST_SOURCES = (
 )
 CUDA_SOURCES = (
     'src/cuda/device_notify.cu', 'src/cuda/activation_transport.cu',
-    'src/transport/nccl_count_exchange.cu',
+    'src/transport/nccl_count_exchange.cu', 'src/cuda/fp8.cu',
 )
 TEST_SOURCE = 'tests/test_cuda_notify.cpp'
 PUBLIC_HEADERS = tuple(str(p.relative_to(ROOT)) for p in sorted((ROOT / 'include').rglob('*.hpp'))
