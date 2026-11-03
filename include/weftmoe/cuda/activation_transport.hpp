@@ -382,16 +382,6 @@ public:
       std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
       std::uint32_t owned_experts, std::uint32_t global_expert_begin,
       std::uint64_t hidden_size, std::uint64_t intermediate_size) const;
-  // Legacy caller-owned packing scratch is validated and retained by the lease
-  // for compatibility. Forward's TMA maps now read W1 directly and form the
-  // gate/up layout in shared memory; no packed weight values are cached.
-  ForwardWeightLease publish_weights(
-      const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
-      std::shared_ptr<const void> w1_owner, const transport::BFloat16 *w2,
-      std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
-      std::uint32_t owned_experts, std::uint32_t global_expert_begin,
-      std::uint64_t hidden_size, std::uint64_t intermediate_size,
-      const CudaTensorBuffer &packed_w1) const;
   ForwardWeightLease publish_fp8_weights(
       const FP8WeightBuffers &, std::uint32_t owned_experts,
       std::uint32_t global_expert_begin, std::uint64_t hidden_size,

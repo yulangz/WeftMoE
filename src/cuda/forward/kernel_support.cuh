@@ -166,7 +166,7 @@ CUtensorMap make_fp8_tma_map(void *base, std::uint64_t inner,
 
 // Describe original [expert, gate/up, channel, hidden] storage in the order
 // consumed by GMMA: [expert, channel/8, gate/up, channel%8, hidden].
-CUtensorMap make_packed_w1_tma_map(void *base, std::uint64_t hidden,
+CUtensorMap make_gate_up_w1_tma_map(void *base, std::uint64_t hidden,
                                   std::uint64_t intermediate,
                                   std::uint32_t experts, std::uint32_t tile_n,
                                   std::uint32_t tile_k, const char *field, bool fp8 = false) {
@@ -174,7 +174,7 @@ CUtensorMap make_packed_w1_tma_map(void *base, std::uint64_t hidden,
       hidden > UINT32_MAX || intermediate > UINT32_MAX ||
       intermediate % 8U || tile_n % 16U)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig, "forward-tma-map",
-                    field, 0, "valid packed gate/up dimensions", "invalid");
+                    field, 0, "valid gate/up dimensions", "invalid");
   CUtensorMap map{};
   const auto row_bytes = checked_mul(hidden, fp8 ? 1ULL : 2ULL, field);
   const auto projection_bytes = checked_mul(intermediate, row_bytes, field);

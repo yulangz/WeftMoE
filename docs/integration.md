@@ -18,16 +18,39 @@ adapter.prepare()
 ```
 
 替换范围是 `MoELayer` 的 routed experts。router 和 shared experts 仍由 Megatron 执行，
-返回普通 parameter gradients，沿用 DDP hooks。多层共享固定权重重排 workspace 和通信 runtime。
+返回普通 parameter gradients，沿用 DDP hooks。多层共享固定的 expert 参数拼接缓冲区和通信 runtime。
 `max_tokens` 应是 TP/CP 切分后本 rank 实际进入 MoE 的最大行数，不是全局序列总长。
 
 要求 ETP=1、BF16、无 bias 的 SwiGLU；关闭 `overlap_param_gather` 和 shared-expert overlap。
 当前 adapter 不支持 latent MoE、input-probability placement、激活 clamp/offset 或部分 MoE 重算。
 支持整层 checkpoint：首次 `no_grad` FWD 不保存 X/GU，BWD 中重算 FWD 时才保存。
 
+设置 `WEFTMOE_FP8=1`（或 `MegatronAdapter(..., fp8=True)`）启用 routed experts 的
+blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。每层权重量化结果在
+micro-batch 和重算之间复用。引擎必须在每次 optimizer step 和 checkpoint load 后调用
+`adapter.weights_updated()`；仅检查 Tensor version 无法检测优化器的 `.data` 写入。
+未绑定 master 的独立 adapter 在 offload 后重新准备缓存。router/shared experts 保持原实现。
+
+AReaL 的 GPU-staged Muon 在初始化后调用 `adapter.bind_fp32_masters(optimizer)`。
+当前支持 expert DP=1、ETP=1：routed expert 的 BF16 GPU storage 释放，不保留 CPU BF16 副本；
+Parameter 对象、DDP hooks 和 FP32 梯度 buffer 保留。每次更新直接在 Muon compute stream
+将 FP32 master 量化为 W/Wᵀ，跳过 BF16 写回，所有 micro-batch 和重算复用。
+`suspend()` 释放 FP8 缓存，不保留 CPU FP8 W/Wᵀ 备份；`release_bf16_weights()` 从
+已有 CPU FP32 master 重建 GPU FP8 缓存。重建仅在恢复计算/传权阶段发生，micro-batch 间复用。
+checkpoint 按需从 FP32 master 生成临时 BF16 参数。FP32 直接量化不承诺与经过 BF16
+中间舍入的版本逐位相同；训练与 rollout 通过 AWEX 复用同一份 FP8 字节和 scale。
+量化、搬运、传权与 runtime/graph 重建均计入端到端耗时。
+
+BF16 Muon 共卡 offload 也会实际释放没有 DDP `param_data` 的参数。完整且独占 storage 的
+本地专家直接释放 BF16 storage，以 CPU FP32 master 为权威来源，不做搬运和逐位比较，
+也不保留 CPU BF16 备份。onload 保留原 Parameter/Storage identity，并从 master 恢复。
+共享存储或没有完整本地 master 的参数使用原字节备份。释放前等待 optimizer 完成，
+恢复前检查 master 身份和版本；checkpoint lease 先恢复权重，再允许修改 master。
+
 正常热路径不逐层 CPU drain，也不 collective 确认每次分配成功。
 notify 返回实际行数后申请训练缓存的同步边界仍然保留，并非全流程没有 CPU 等待。
-`suspend()` 在共卡边界等待完成、检查不存在 live tape，但保留通信池；`close()` 才释放。
+`suspend()` 在共卡边界等待完成、检查不存在 live tape，并释放训练 workspace 和 expert 参数拼接缓冲区，
+只保留 NCCL session；下一次训练按需重建 workspace。重建开销计入端到端运行时间。
 分配异常向上传播；不能捕获后继续复用已中断的通信状态。
 
 ## SGLang
@@ -39,9 +62,28 @@ from weftmoe.sglang import install
 install()
 ```
 
-只在启动父进程调用不足以覆盖 spawn 出来的 worker。当前接入的是 BF16 `FusedMoE`，
-要求 `ep_size == tp_size`、expert TP=1，不支持量化专家。
+只在启动父进程调用不足以覆盖 spawn 出来的 worker。当前接入的是 BF16 权重的 `FusedMoE`，
+要求 `ep_size == tp_size`、expert TP=1，不直接接收 SGLang 的量化 checkpoint。
 这里的 `tp_size` 是 SGLang 的进程组大小；开启 DP attention 后可形成 DP=EP 的布局。
+
+BF16 的 PF/DT 通过 5D TMA 直接读取原始 FC1 权重，在共享内存形成 gate/up 排列，
+不保存额外的显存重排副本。训练侧同样直接读取原始布局；Megatron 的跨 expert 参数拼接
+缓冲区仍按形状复用。SGLang 在计算 KV/Mamba 容量之前预热 PF/DT workspace，
+使其计入实际可用显存。否则按原始模型权重估算的 KV pool 会过大，
+后续长 prefill 的 attention 临时张量可能 OOM。`mem_fraction_static` 无需因此手动调低；
+可容纳的 KV token 数会按新增持久内存相应减少。FP8 保持原来的准备路径。
+
+FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
+FP8 权重字节（uint8 view）和 FP32 block scale，不恢复 BF16，不重新量化。
+启用 TMS 时，初始专家 BF16 分配使用临时普通 CUDA pool，避免其释放后仍由 TMS 持久池
+保留并在 onload 时重新占用显存。此兼容路径使用 PyTorch 2.9 / 当前 TMS 的内部接口，
+升级依赖时需重跑包含 TMS、权重更新和图重捕获的 8 卡生命周期测试。
+重新捕获前重置 decode 的 dummy request、KV 和 Mamba 输入，避免使用上一批请求的索引。
+
+`WEFTMOE_FP8=1` 可从 BF16 模型权重准备 FP8 专家缓存，prefill PF 和 decode DT 都使用
+FP8。权重卸载时销毁图、将 FP8 缓存搬到 CPU；接收前恢复并重新绑定地址，传输全部完成后
+发布新版本，再捕获 decode 图。该模式暂不保留跨权重版本的图。
+AWEX 包和协议不变，兼容代码位于 AReaL 的 adapter 层。
 
 - Prefill 使用 PF，decode/CUDA Graph 使用 DT；按集体执行阶段选择，不按各 rank 的局部 token 数独立切换。
 - TP attention 输入先按行分片，结果按模型原有 TP 布局合并。
@@ -52,14 +94,15 @@ DT 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 �
 不能只设置 `AREAL_USE_WEFTMOE=1` 就让原版 `python -m sglang.launch_server` 自动安装 hook；
 可使用下面已接入的 AReaL worker，或在自己的 worker 入口显式调用 `install()`。
 
-共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图与重排权重，
-释放 prefill runtime；恢复权重后刷新 packed weights，避免每轮重新 capture。
+共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图，
+释放 prefill runtime；原地址的 BF16 权重更新完成后可直接回放，无需刷新权重副本或重新 capture。
 显存紧张可设 `WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS=0`，代价是释放后需要重新准备图。
 模型权重地址改变时不能继续回放旧图。最终退出使用 `close(model_runner)`。
 
 ## AReaL
 
-本轮验证对应 AReaL `dev@d7023ba9`；不是任意上游版本均已内置接入。
+配套 AReaL 提交为 `6cb3fff5`（`feat/weftmoe-fp8-residency`），包含 FP8 AWEX 和权重
+生命周期改动；不是任意上游版本均已内置接入。
 关键位置：
 
 | AReaL 位置 | 职责 |

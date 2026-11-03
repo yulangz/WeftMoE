@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import MethodType
+import os
 
 import torch
 
@@ -12,14 +13,14 @@ from .runtime import TensorRuntime
 class _Routed(torch.autograd.Function):
     @staticmethod
     def forward(ctx, manager, layer, x, routes, gates, *parameters):
-        packed = manager.pack(parameters)
         runtime = manager.get_runtime(layer)
         ctx.manager = manager
+        ctx.weight_version = manager.weight_version
         # Retain the original tensors and let autograd detect a premature
         # optimizer update before backward repacks their values.
         ctx.save_for_backward(*parameters)
         ctx.runtime = runtime
-        ctx.tape = runtime.forward_async(x, routes, gates, *packed)
+        ctx.tape = manager.forward_experts(layer, x, routes, gates, parameters)
         return ctx.tape.output
 
     @staticmethod
@@ -27,7 +28,11 @@ class _Routed(torch.autograd.Function):
         # A single fixed weight workspace serves all layers. Forward is
         # complete before reuse; restore this layer's weights before backward
         # consumes the retained lease. Optimizer steps happen after all tapes.
-        ctx.manager.pack(ctx.saved_tensors)
+        if ctx.manager.fp8 and ctx.weight_version != ctx.manager.weight_version:
+            raise RuntimeError("Expert weights changed before FP8 backward")
+        parameters = ctx.saved_tensors
+        if not ctx.manager.fp8:
+            ctx.manager.pack(parameters)
         dx, dg, dw1, dw2 = ctx.runtime.backward_async(ctx.tape, dy)
         ctx.tape = None
         ctx.runtime = None
@@ -37,17 +42,22 @@ class _Routed(torch.autograd.Function):
 
 
 class MegatronAdapter:
-    def __init__(self, models, *, max_tokens):
+    def __init__(self, models, *, max_tokens, fp8=None):
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         self.max_tokens = max_tokens
+        self.fp8 = os.environ.get("WEFTMOE_FP8", "0") == "1" if fp8 is None else fp8
+        self.fp8_weights = {}
+        self.master_weights = None
+        self._models = tuple(models)
+        self.weight_version = 0
         self.runtime = None
-        # Communication workspaces survive train/rollout residency switches,
-        # like Megatron's DeepEP buffer. close() releases them at engine teardown.
+        # Keep the NCCL session across residency switches; rebuild the larger
+        # compute/communication workspaces when training next needs them.
         self.session = None
         self.packed = {}
         self.layers = []
-        for model in models:
+        for model in self._models:
             if getattr(
                 getattr(model, "ddp_config", None), "overlap_param_gather", False
             ):
@@ -81,6 +91,11 @@ class MegatronAdapter:
         """Validate and allocate the communication context before rollout starts."""
         self.get_runtime(self.layers[0])
 
+    def bind_fp32_masters(self, optimizer):
+        if self.fp8:
+            from ._master_weights import MasterWeights
+            self.master_weights = MasterWeights(self, optimizer)
+
     def pack(self, parameters):
         count = len(parameters) // 2
         key = (count, parameters[0].shape, parameters[count].shape)
@@ -94,6 +109,51 @@ class MegatronAdapter:
         torch.stack(parameters[:count], out=packed[0])
         torch.stack(parameters[count:], out=packed[1])
         return packed
+
+    def release_bf16_weights(self):
+        """Restore FP8 compute storage; BF16 experts remain metadata only."""
+        if self.master_weights is not None:
+            self.master_weights.discard_materialized()
+            self.master_weights.resume()
+
+    def restore_bf16_weights(self):
+        """Materialize checkpoint BF16 weights on demand from FP32 masters."""
+        if self.master_weights is not None:
+            self.master_weights.materialize()
+
+    @staticmethod
+    def _parameters(layer):
+        return [getattr(linear, f"weight{i}")
+                for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2)
+                for i in range(layer.num_local_experts)]
+
+    def weights_updated(self):
+        """Invalidate after optimizer/checkpoint writes, including .data copies."""
+        self.weight_version += 1
+        if self.master_weights is not None:
+            self.master_weights.publish()
+        else:
+            self.fp8_weights.clear()
+
+    def forward_experts(self, layer, x, routes, gates, parameters, *, retain=True):
+        runtime = self.get_runtime(layer)
+        if not self.fp8:
+            return runtime.forward_async(x, routes, gates, *self.pack(parameters),
+                                         retain_backward_state=retain)
+        from .fp8 import prepare_fp8_weights
+
+        versions = tuple(p._version for p in parameters)
+        entry = self.fp8_weights.get(layer)
+        if entry is None or entry[0] != versions:
+            if self.master_weights is not None:
+                raise RuntimeError("FP32-master FP8 weights are not ready for compute")
+            weights = prepare_fp8_weights(*self.pack(parameters), training=True,
+                                          version=self.weight_version)
+            entry = (versions, weights)
+            self.fp8_weights[layer] = entry
+        return runtime.forward_fp8(x, routes, gates, entry[1], synchronize=False,
+                                   retain_backward_state=retain,
+                                   weight_grad_dtype=torch.bfloat16)
 
     def get_runtime(self, layer):
         if self.runtime is None:
@@ -110,6 +170,7 @@ class MegatronAdapter:
                 training=True,
                 max_saved=len(self.layers) + 8,
                 session=self.session,
+                fp8_workspace=self.fp8,
             )
             self.session = self.runtime.native.session()
         return self.runtime
@@ -127,14 +188,7 @@ class MegatronAdapter:
             shared = layer.shared_experts_compute(hidden_states)
             probabilities, _ = layer.route(hidden_states, padding_mask)
             gates, routes = probabilities.topk(layer.config.moe_router_topk, dim=-1)
-            parameters = [
-                getattr(layer.experts.linear_fc1, f"weight{i}")
-                for i in range(layer.num_local_experts)
-            ]
-            parameters += [
-                getattr(layer.experts.linear_fc2, f"weight{i}")
-                for i in range(layer.num_local_experts)
-            ]
+            parameters = manager._parameters(layer)
             inputs = (
                 hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous(),
                 routes.int().contiguous(),
@@ -146,10 +200,8 @@ class MegatronAdapter:
             if torch.is_grad_enabled():
                 output = _Routed.apply(manager, layer, *inputs, *parameters)
             else:
-                packed = manager.pack(parameters)
-                output = manager.get_runtime(layer).forward_async(
-                    *inputs, *packed, retain_backward_state=False
-                ).output
+                output = manager.forward_experts(layer, *inputs, parameters,
+                                                 retain=False).output
             output = output.view_as(hidden_states)
             if shared is not None:
                 output = output + shared
@@ -158,15 +210,22 @@ class MegatronAdapter:
         return forward
 
     def suspend(self):
-        """Finish training uses before offload, retaining communication buffers."""
-        if self.runtime is None:
-            return
-        torch.cuda.synchronize()
-        self.runtime.drain()
-        if self.runtime.native.usage()["notify_slots_in_use"]:
-            raise RuntimeError(
-                "Cannot offload WeftMoE while autograd still owns saved X/AB"
-            )
+        """Release idle training workspaces while rollout owns the GPUs."""
+        if self.runtime is not None:
+            torch.cuda.synchronize()
+            self.runtime.drain()
+            if self.runtime.native.usage()["notify_slots_in_use"]:
+                raise RuntimeError(
+                    "Cannot offload WeftMoE while autograd still owns saved X/AB"
+                )
+            self.runtime.close()
+            self.runtime = None
+        if self.master_weights is not None:
+            self.master_weights.discard_materialized()
+            self.master_weights.offload()
+        else:
+            self.weights_updated()
+        self.packed.clear()
 
     def close(self):
         """Release buffers and the session when the training engine is destroyed."""
@@ -175,5 +234,11 @@ class MegatronAdapter:
             self.runtime.close()
             self.runtime = None
         self.packed.clear()
+        self.fp8_weights.clear()
         self.session = None
+        if self.master_weights is not None:
+            for _, _, _, parameter in self.master_weights.bindings.values():
+                del parameter._weftmoe_fp8_writer
+                del parameter._weftmoe_fp8_storage
+            self.master_weights = None
         torch.cuda.empty_cache()

@@ -1,0 +1,15 @@
+{
+  "purpose": "Matched AReaL baseline, BF16 WeftMoE and FP8 WeftMoE RL trials",
+  "model": "Qwen3.5 MoE BF16 checkpoint supplied by --model-path",
+  "dataset": "DAPO-Math-17k",
+  "actor": "TP2 DP4 EP8, BF16 dW, FP32 Muon CPU-staged master state, full-layer recompute; FP8 mode releases routed BF16 storage",
+  "rollout": "TP8 process group, DP attention DP8/EP8, FP8 PF and DT",
+  "batch": "32 prompts x 16 samples",
+  "context": 16384,
+  "steps": 20,
+  "precision": "E4M3 blockwise expert GEMM; BF16 dW; attention/router/shared expert unchanged",
+  "weight_refresh": "FP32 master writes FP8 W/Wt once per optimizer step; AWEX sends W bytes and scales, never Wt. SGLang rebinds receive buffers, publishes the received version, then recaptures decode graphs.",
+  "command": "python benchmarks/experiments/areal_fp8/run.py fp8 --dp-attention --model-path /models/Qwen3.5-MoE --data-path /datasets/DAPO-Math-17k --extension /build/_runtime.so --output-root /results/moe --experiment moe-fp8 --wandb-project moe --wandb-entity team --netrc /private/netrc",
+  "comparison_limit": "Sampled sequence lengths can differ. Quantization and graph rebuilding contribute to end-to-end runtime; update_weights excludes decode graph recapture. Compare matched configurations and report token counts.",
+  "environment": "Use the AReaL Python environment; optional --areal-path and --deps-path select source/dependency checkouts. Network settings in run.py target the original eight-GPU host and must match the target cluster."
+}

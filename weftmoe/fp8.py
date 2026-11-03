@@ -200,6 +200,16 @@ class PreparedFP8Weights:
                 raise RuntimeError("FP8 cache is stale after a parameter update; prepare new weights")
 
 
+def _seal_weights(weights, version, sources=()):
+    """Publish an already-written weight version without copying its tensors."""
+    with torch.cuda.device(weights[0].data.device):
+        event = torch.cuda.Event()
+        event.record()
+    tensors = tuple(t for w in weights if w is not None for t in (w.data, w.scales))
+    return PreparedFP8Weights(*weights, version, event,
+                              tuple(t._version for t in tensors), tuple(sources))
+
+
 @torch.inference_mode(False)
 @torch.no_grad()
 def prepare_fp8_weights(w1: torch.Tensor | FP8Tensor,
@@ -252,8 +262,4 @@ def prepare_fp8_weights(w1: torch.Tensor | FP8Tensor,
                 raise ValueError("FP8 weights must be finite")
         at, bt = ((qt if qt is not None else transpose_fp8_weight(q)) if training else None
                   for q, qt in zip(prepared, transposed))
-        event = torch.cuda.Event()
-        event.record()
-    tensors = tuple(t for w in (a, b, at, bt) if w is not None for t in (w.data, w.scales))
-    return PreparedFP8Weights(a, b, at, bt, version, event,
-                              tuple(t._version for t in tensors), tuple(sources))
+    return _seal_weights((a, b, at, bt), version, sources)

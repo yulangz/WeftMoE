@@ -1,15 +1,16 @@
-"""SGLang BF16 expert adapter with warmed CUDA child graphs and no X/AB retention."""
+"""SGLang expert adapter with warmed CUDA child graphs and no X/AB retention."""
 
 from __future__ import annotations
 
 import os
 import functools
+import logging
 
 import torch
 import torch.distributed as dist
 import triton
 
-from ._sglang_kernels import scatter_output, stage_inputs
+from ._sglang_kernels import sanitize_routes, scatter_output, stage_inputs
 from .runtime import TensorRuntime
 
 _runtime = None
@@ -24,6 +25,75 @@ _rows_are_dp_sharded = False
 _eager_pending = None
 _decode_batch = False
 _graph_inputs = {}
+_fp8_weights = {}
+_fp8_devices = {}
+_fp8_offloaded = False
+_fp8_initial_pool = None
+
+
+def _use_fp8():
+    return os.environ.get("WEFTMOE_FP8", "0") == "1"
+
+
+def _prepare_fp8_layer(layer):
+    from .fp8 import prepare_fp8_weights
+    global _fp8_initial_pool
+
+    if layer.layer_id not in _fp8_weights:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm FP8 expert weights before graph capture")
+        # End the temporary allocation pool after the loader's outer TMS
+        # region has exited. PyTorch cannot destroy nested pools inside another
+        # active use_mem_pool scope. Live BF16 allocations remain valid until
+        # their tensors are released below; freed blocks can now be reclaimed.
+        _fp8_initial_pool = None
+        parameters = (layer.w13_weight, layer.w2_weight)
+        # SGLang FusedMoE owns its two complete allocations. Fail before
+        # releasing an unexpectedly shared flat buffer belonging to other layers.
+        if any(p.storage_offset() != 0 or p.numel() * p.element_size()
+               != p.untyped_storage().nbytes() for p in parameters):
+            raise ValueError("FP8 SGLang residency requires whole expert weight allocations")
+        _fp8_weights[layer.layer_id] = prepare_fp8_weights(
+            layer.w13_weight, layer.w2_weight, training=False)
+        _fp8_devices[layer.layer_id] = layer.w13_weight.device
+        torch.cuda.synchronize(layer.w13_weight.device)
+        for p in parameters:
+            p.untyped_storage().resize_(0)
+        torch.cuda.empty_cache()
+    return _fp8_weights[layer.layer_id]
+
+
+@torch.no_grad()
+def resume_fp8_weights():
+    global _fp8_offloaded
+    if not _fp8_offloaded:
+        return
+    for key, weights in _fp8_weights.items():
+        for tensor in weights._tensors():
+            tensor.data = tensor.to(device=_fp8_devices[key])
+    _fp8_offloaded = False
+    commit_fp8_weights(0)
+
+
+def commit_fp8_weights(version):
+    from .fp8 import _seal_weights
+    for key, weights in list(_fp8_weights.items()):
+        _fp8_weights[key] = _seal_weights((weights.w1, weights.w2, None, None), version)
+
+
+def fp8_parameter_map(model):
+    """AWEX binds these views directly; BF16 expert Parameters are metadata only."""
+    if not _use_fp8():
+        return {}
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    resume_fp8_weights()
+    result = {}
+    for layer in model.modules():
+        if isinstance(layer, FusedMoE):
+            weights = _prepare_fp8_layer(layer)
+            for parameter, weight in ((layer.w13_weight, weights.w1), (layer.w2_weight, weights.w2)):
+                result[id(parameter)] = (weight.data.view(torch.uint8), weight.scales)
+    return result
 
 
 def _prepare_runtime(layer, group, top_k, max_tokens, *, decode_only=False):
@@ -41,6 +111,7 @@ def _prepare_runtime(layer, group, top_k, max_tokens, *, decode_only=False):
         training=False,
         stream=_stream,
         decode_only=decode_only,
+        fp8_workspace=_use_fp8(),
     )
 
 
@@ -70,6 +141,47 @@ def participate_idle_layers(model):
         # Call the installed adapter forward (bound to this layer).
         experts.forward(x, topk)
 
+
+@torch.no_grad()
+def _prepare_bf16_memory_budget(model):
+    """Make persistent BF16 allocations visible to SGLang's KV profiler."""
+    global _decode_batch, _eager_pending
+    if _use_fp8():
+        return
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    layers = [layer for layer in model.modules() if isinstance(layer, FusedMoE)]
+    if not layers:
+        return
+    previous_decode = _decode_batch
+    try:
+        # Allocate both transport workspaces before KV/Mamba capacity is
+        # chosen. A one-token zero-gate warmup uses
+        # the same preparation path as real prefill/decode, without attention
+        # state or an extra estimate that can drift from native allocations.
+        for decode in (False, True):
+            _decode_batch = decode
+            for layer in layers:
+                device = layer.w13_weight.device
+                x = torch.zeros((1, layer.hidden_size), dtype=torch.bfloat16, device=device)
+                ids = torch.arange(layer.top_k, dtype=torch.int32, device=device).view(1, -1)
+                gates = torch.zeros((1, layer.top_k), dtype=torch.float32, device=device)
+                layer(x, StandardTopKOutput(gates, ids, None))
+        if _eager_pending is not None:
+            _eager_pending.native.drain_eager_inference()
+            _eager_pending = None
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        logging.getLogger(__name__).info(
+            "Prepared BF16 WeftMoE before KV sizing: %d layers; "
+            "PF/DT workspaces included in available-memory measurement",
+            len(layers),
+        )
+    finally:
+        _decode_batch = previous_decode
+
+
 def install():
     # Keep graph allocations outside TMS: their native child-graph addresses
     # stay resident, or are explicitly destroyed by the low-memory policy.
@@ -88,6 +200,52 @@ def install():
         _dp_layout_patched = True
     if getattr(FusedMoE, "_weftmoe_installed", False):
         return
+
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
+    original_init_memory_pool = ModelRunnerKVCacheMixin.init_memory_pool
+
+    @functools.wraps(original_init_memory_pool)
+    def init_memory_pool(self, *args, **kwargs):
+        _prepare_bf16_memory_budget(self.model)
+        return original_init_memory_pool(self, *args, **kwargs)
+
+    ModelRunnerKVCacheMixin.init_memory_pool = init_memory_pool
+
+    original_moe_init = FusedMoE.__init__
+
+    @functools.wraps(original_moe_init)
+    def moe_init(self, *args, **kwargs):
+        global _fp8_initial_pool
+        if _use_fp8():
+            from sglang.srt.utils.torch_memory_saver_adapter import _memory_saver
+            impl = getattr(_memory_saver, "_impl", None)
+            if impl is not None and impl._binary_wrapper.cdll.tms_get_interesting_region():
+                # These initial BF16 tensors are discarded after quantization.
+                # A persistent TMS pool would retain/remap their freed blocks.
+                # Keep the ordinary pool until the outer loader region exits;
+                # TMS.disable() destroys its nested pool too early on torch2.9.
+                # torch2.9's allocation filters select the outer pool first;
+                # suspend its filter while entering our ordinary pool. Balance
+                # begin/end/release exactly as use_mem_pool does, then restore
+                # the loader's filter before its context manager resumes.
+                memory = torch.cuda.memory
+                device = torch.cuda.current_device()
+                outer_id = impl._primary_mem_pool.id
+                memory._cuda_endAllocateToPool(device, outer_id)
+                memory._cuda_releasePool(device, outer_id)
+                impl._binary_wrapper.cdll.tms_set_interesting_region(False)
+                try:
+                    if _fp8_initial_pool is None:
+                        _fp8_initial_pool = torch.cuda.MemPool()
+                    with torch.cuda.use_mem_pool(_fp8_initial_pool):
+                        original_moe_init(self, *args, **kwargs)
+                finally:
+                    impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+                    memory._cuda_beginAllocateCurrentThreadToPool(device, outer_id)
+                return
+        original_moe_init(self, *args, **kwargs)
+
+    FusedMoE.__init__ = moe_init
 
     # Graph-buffer IPC mappings live for the all-reduce communicator's entire
     # lifetime. Use the existing TMS staging path so graph allocations are never
@@ -206,14 +364,9 @@ def install():
                 start, valid_tokens, hidden, k,
                 triton.next_power_of_2(hidden), triton.next_power_of_2(k),
             )
-        # In the DP-sharded layout every row is a real SGLang row and the
-        # standard top-k path already returns exactly the int32/float32,
-        # contiguous tensors consumed by TensorRuntime.  Rebuilding them used
-        # to allocate two tensors and launch arange/clone/compare/where/copy
-        # kernels in every MoE layer.  Besides being pure overhead in prefill,
-        # those kernels sat outside the warmed child graph.  Keep the padded
-        # construction only for the replicated-input compatibility layout,
-        # where this rank may own fewer than ``local_tokens`` real rows.
+        # DP rows need no X copy. Masked top-k entries still need sanitization:
+        # raw -1 expert IDs cannot enter the native dispatch planner. Match the
+        # graph staging kernel in one launch without copying activations.
         elif (
             not sharded_rows
             and valid_tokens == local_tokens
@@ -222,8 +375,10 @@ def install():
             and ids.is_contiguous()
             and weights.is_contiguous()
         ):
-            routes = ids
-            gates = weights
+            routes = torch.empty_like(ids)
+            gates = torch.empty_like(weights)
+            sanitize_routes[(local_tokens,)](
+                ids, weights, routes, gates, k, triton.next_power_of_2(k))
         else:
             routes = (
                 torch.arange(k, dtype=torch.int32, device=x.device)
@@ -260,7 +415,19 @@ def install():
                     layer, group, k, capacity, decode_only=True
                 )
             runtime = _decode_runtime
-        if capturing:
+        if _use_fp8():
+            prepared = _prepare_fp8_layer(layer)
+            if _eager_pending is not None:
+                _eager_pending.native.drain_eager_inference()
+                _eager_pending = None
+            if capturing:
+                output = runtime.inference_fp8(layer.layer_id, x, routes, gates, prepared)
+            else:
+                output = runtime.forward_fp8(
+                    x, routes, gates, prepared, synchronize=False,
+                    retain_backward_state=False).output
+                _eager_pending = runtime
+        elif capturing:
             if _eager_pending is not None:
                 _eager_pending.native.drain_eager_inference()
                 _eager_pending = None
@@ -466,33 +633,67 @@ def _release_prefill():
 
 
 def suspend(model_runner):
-    """Keep decode graphs/packed weights, unless the low-memory policy is set."""
+    """Keep decode graphs, unless the low-memory policy is set."""
     global _recapture
-    if os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
+    if _use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
+        # Prepared FP8 versions are immutable. Rebuild plans after AWEX rather
+        # than leaving captured graphs pointing at the previous weight version.
         _recapture = getattr(model_runner, "graph_runner", None) is not None
-        close(model_runner)
+        close(model_runner, keep_fp8=_use_fp8())
     else:
         _release_prefill()
 
 
 def resume(model_runner):
     global _recapture
+    resume_fp8_weights()
     if _recapture:
         from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 
         with torch.no_grad(), model_capture_mode():
+            _reset_decode_inputs(model_runner.graph_runner)
             model_runner.graph_runner.capture()
         _recapture = False
-        return
-    # AWEX has restored the same weight addresses and copied the new version.
-    # Refresh the packed FC1 copy in place; child/outer graphs need no recapture.
-    if _decode_runtime is not None:
-        _decode_runtime.refresh_inference_weights()
+    # AWEX has completed the update at the same addresses. BF16 graphs read
+    # the original weights directly, so no weight refresh or recapture is needed.
 
 
-def close(model_runner):
+def _reset_decode_inputs(runner):
+    """Restore capture dummy inputs after live requests and KV-cache release.
+
+    Keep shared buffer addresses, but never reuse request/sequence/Mamba indices
+    written by the last decode batch after the request pool has been flushed.
+    Matches SGLang DecodeInputBuffers.create().
+    """
+    buffers = runner.buffers
+    for name in (
+        "input_ids", "input_embeds", "req_pool_indices", "out_cache_loc",
+        "positions", "mrope_positions", "num_token_non_padded",
+        "next_token_logits_buffer", "mamba_track_indices", "mamba_track_mask",
+        "global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu",
+    ):
+        tensor = getattr(buffers, name)
+        if tensor is not None:
+            tensor.zero_()
+    buffers.seq_lens.fill_(runner.seq_len_fill_value)
+    buffers.seq_lens_cpu.fill_(runner.seq_len_fill_value)
+    buffers.custom_mask.fill_(True)
+    if buffers.encoder_lens is not None:
+        buffers.encoder_lens.fill_(runner.encoder_len_fill_value)
+    if buffers.pp_proxy_tensors is not None:
+        for tensor in buffers.pp_proxy_tensors.values():
+            tensor.zero_()
+    info = buffers.ngram_embedding_info
+    if info is not None:
+        info.column_starts.zero_()
+        info.out_column_starts.zero_()
+        info.req_lens.fill_(1)
+        info.out_req_lens.fill_(1)
+
+
+def close(model_runner, *, keep_fp8=False):
     """Final teardown: discard outer graphs before freeing native addresses."""
-    global _decode_runtime
+    global _decode_runtime, _fp8_offloaded
     torch.cuda.synchronize()
     runner = getattr(model_runner, "graph_runner", None)
     if runner is not None:
@@ -503,4 +704,15 @@ def close(model_runner):
         _decode_runtime.close()
         _decode_runtime = None
     _graph_inputs.clear()
+    if keep_fp8 and not _fp8_offloaded:
+        for weights in _fp8_weights.values():
+            for tensor in weights._tensors():
+                host = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                host.copy_(tensor)
+                tensor.data = host
+        _fp8_offloaded = True
+    elif not keep_fp8:
+        _fp8_weights.clear()
+        _fp8_devices.clear()
+        _fp8_offloaded = False
     torch.cuda.empty_cache()

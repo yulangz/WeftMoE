@@ -5,6 +5,18 @@ import triton.language as tl
 
 
 @triton.jit
+def sanitize_routes(ids, weights, routes, gates, top_k: tl.constexpr,
+                    block: tl.constexpr):
+    row = tl.program_id(0)
+    slot = tl.arange(0, block)
+    offset = row * top_k + slot
+    expert = tl.load(ids + offset, slot < top_k, other=-1)
+    weight = tl.load(weights + offset, slot < top_k, other=0)
+    tl.store(routes + offset, tl.where(expert >= 0, expert, slot), slot < top_k)
+    tl.store(gates + offset, tl.where(expert >= 0, weight, 0), slot < top_k)
+
+
+@triton.jit
 def stage_inputs(
     x,
     ids,

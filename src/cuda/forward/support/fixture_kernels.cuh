@@ -89,7 +89,7 @@ __global__ void finalize_forward_weight_hash_kernel(
 }
 
 __global__ void initialize_forward_weights_kernel(
-    transport::BFloat16 *w1, transport::BFloat16 *w1_interleaved,
+    transport::BFloat16 *w1,
     std::uint64_t w1_elements,
     transport::BFloat16 *w2, std::uint64_t w2_elements,
     std::uint32_t global_expert_begin, std::uint64_t hidden,
@@ -106,13 +106,6 @@ __global__ void initialize_forward_weights_kernel(
     const auto column = within % hidden;
     const auto bits = forward_fixture_weight_bits(expert, 1U, row, column);
     w1[index].bits = bits;
-    const auto projection = row / intermediate;
-    const auto channel = row % intermediate;
-    const auto packed_row =
-        (channel / 8ULL) * 16ULL + projection * 8ULL + channel % 8ULL;
-    w1_interleaved[(index / expert_stride) * expert_stride +
-                   packed_row * hidden + column]
-        .bits = bits;
   }
   for (std::uint64_t index =
            static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

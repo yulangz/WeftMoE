@@ -72,8 +72,8 @@ window 容纳。Python 接口会将窗口设为 `max_tokens`，没有固定的 6
 必须使用一致配置。BF16 和 FP8 DT 的所有 token shape 固定使用 M64，
 不再提供 M16 路径、切换阈值或 M 维度调参。使用 `inference_eager(..., layer=layer_id)` 执行 eager 推理。
 CUDA Graph 接口为 `inference(layer_id, ...)`，
-先在 capture 外预热，并保持图使用的地址不变。设置 `layer` 会缓存重排后的权重：
-原地更新后调用 `refresh_inference_weights()`；更换权重地址时先丢弃外部图并
+先在 capture 外预热，并保持图使用的地址不变。设置 `layer` 会缓存权重 descriptor 并保留原张量：
+BF16 原地更新完成后可直接继续推理，无需重排或刷新副本；更换权重地址时先丢弃外部图并
 `invalidate_inference_layer()`，再预热、重新 capture。这些操作需所有 EP rank 一致执行。
 
 ## Block-wise FP8
@@ -290,7 +290,7 @@ Qwen35B 的 H/I 为 2048/512，Qwen122B 为 3072/1024。
 Qwen35B/2048 接近持平，Qwen35B/8192 仍慢约 29%。同一 Qwen35B/2048 workload
 使用底层默认 FP32 dW 时为 **3.198 ms**；不要将不同梯度输出类型的数字混为一谈。
 
-FP8 排除一次性权重准备，BF16 包含默认的每次权重重排；两者均不包含 optimizer
+这组历史测量中，FP8 排除一次性权重准备，BF16 包含当时的默认权重准备路径；两者均不包含 optimizer
 及参数更新后的 FP8 重新量化。因此这不是完整训练 step 的性能结论。
 当时的剩余瓶颈包括大 token 下的 Wgrad 列向量化缓存构建，以及 Dgrad 的 FP32 scale
 累加/同步开销。N64 子块流水线和更高 math 寄存器配额在本机未改善总时延，未默认启用。

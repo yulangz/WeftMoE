@@ -87,7 +87,6 @@ struct InferenceBucket {
 struct InferenceWeights {
   ForwardWeightLease lease;
   std::uintptr_t w1, w2;
-  py::object packed_w1, w1_owner, w2_owner;
 };
 
 struct InferencePlan {
@@ -332,6 +331,8 @@ public:
   }
 
   void drain_eager_inference() {
+    if (!training_)
+      drain_training();
     if (!pending_inference_)
       return;
     auto pending = std::move(pending_inference_);
@@ -419,14 +420,13 @@ public:
     } else if (layer) {
       weights = prepared_inference_weights(*layer, producer, w1, w2);
     } else {
-      auto packed_w1 = empty({elements(w1)}, "bfloat16");
       weights = producer.publish_weights(
           static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
           owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
           elements(w2), owner(w2),
           config_.num_experts / config_.topology.world_size,
           rank_ * (config_.num_experts / config_.topology.world_size),
-          hidden_, intermediate_, binding(packed_w1));
+          hidden_, intermediate_);
     }
     // Output/weights do not depend on the plan. Only a deferred training
     // tape needs the exact row count produced by standalone PF notify.
@@ -467,11 +467,17 @@ public:
                                    py::object gates, py::object weights,
                                    bool synchronize, bool retain_backward_state,
                                    bool fp32_weight_gradients) {
+    if (training_)
+      reap_training();
+    else
+      drain_eager_inference();
     weights.attr("wait")(py::arg("training") = training_ && retain_backward_state);
     auto tape = execute_forward(x, routes, gates, weights.attr("w1").attr("data"),
         weights.attr("w2").attr("data"), synchronize, std::nullopt,
         retain_backward_state, weights);
     tape->fp32_weight_gradients = fp32_weight_gradients;
+    if (!synchronize)
+      pending_training_.push_back({tape->forward, {}});
     return tape;
   }
 
@@ -632,23 +638,6 @@ public:
     inference_weights_.erase(layer);
   }
 
-  void refresh_inference_weights() {
-    // Explicit weight-update boundary: outer graphs keep their addresses.
-    // Weight owners must have been restored/updated before this call.
-    drain_eager_inference();
-    check_cuda(cudaDeviceSynchronize());
-    auto context = make_rank_collective_context(base_.session(), rank_,
-                                                execution_.token());
-    for (auto &[layer, weights] : inference_weights_) {
-      auto producer = make_external_cuda_producer(
-          context, execution_.device_ordinal(), stream_, owner(weights.w1_owner),
-          "inference-weight-refresh");
-      weights.lease = publish_inference_weights(
-          producer, weights.w1_owner, weights.w2_owner, weights.packed_w1);
-    }
-    check_cuda(cudaStreamSynchronize(stream_));
-  }
-
 private:
   std::uint64_t last_forward_tensor_bytes_ = 0, last_backward_tensor_bytes_ = 0;
   ForwardWeightLease prepared_fp8_weights(const RankCollectiveContext &context,
@@ -687,14 +676,14 @@ private:
 
   ForwardWeightLease publish_inference_weights(
       ExternalCudaProducer &producer, const py::object &w1,
-      const py::object &w2, const py::object &packed_w1) {
+      const py::object &w2) {
     return producer.publish_weights(
         static_cast<const transport::BFloat16 *>(pointer(w1)), elements(w1),
         owner(w1), static_cast<const transport::BFloat16 *>(pointer(w2)),
         elements(w2), owner(w2),
         config_.num_experts / config_.topology.world_size,
         rank_ * (config_.num_experts / config_.topology.world_size), hidden_,
-        intermediate_, binding(packed_w1));
+        intermediate_);
   }
 
   const ForwardWeightLease &
@@ -704,18 +693,15 @@ private:
     const auto w2_address = reinterpret_cast<std::uintptr_t>(pointer(w2));
     auto entry = inference_weights_.find(layer);
     if (entry == inference_weights_.end()) {
-      // One packed copy per layer, shared by all buckets. An explicit update
-      // may repack it in place while all graph addresses remain unchanged.
+      // Cache descriptors/owners only. TMA reads the original weight storage.
+      // In-place updates are visible after the caller completes their writes.
       auto weight_producer = make_external_cuda_producer(
           producer.context(), execution_.device_ordinal(), stream_, owner(w1),
           "inference-weights");
-      auto packed_w1 = empty({elements(w1)}, "bfloat16");
-      auto weights =
-          publish_inference_weights(weight_producer, w1, w2, packed_w1);
+      auto weights = publish_inference_weights(weight_producer, w1, w2);
       entry = inference_weights_
-                  .emplace(layer, InferenceWeights{
-                                      std::move(weights), w1_address, w2_address,
-                                      packed_w1, w1, w2})
+                  .emplace(layer, InferenceWeights{std::move(weights),
+                                                   w1_address, w2_address})
                   .first;
     } else if (entry->second.w1 != w1_address ||
                entry->second.w2 != w2_address) {
@@ -852,8 +838,7 @@ private:
 #endif
   py::object torch_;
   std::string device_;
-  // Destroy graph executables before their metadata, packed weights and
-  // workspace.
+  // Destroy graph executables before their metadata, weight owners and workspace.
   std::map<unsigned, InferenceWeights> inference_weights_;
   py::object cached_fp8_weights_ = py::none();
   ForwardWeightLease cached_fp8_lease_;
@@ -952,7 +937,6 @@ PYBIND11_MODULE(_runtime, m) {
            py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("caller_stream"), py::arg("fp8_weights") = py::none())
       .def("invalidate_inference_layer", &Runtime::invalidate_inference_layer)
-      .def("refresh_inference_weights", &Runtime::refresh_inference_weights)
       .def("eager_inference", &Runtime::eager_inference, py::arg("x"),
            py::arg("routes"), py::arg("gates"), py::arg("w1"), py::arg("w2"),
            py::arg("caller_stream"), py::arg("layer") = std::nullopt)

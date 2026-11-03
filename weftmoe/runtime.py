@@ -271,8 +271,7 @@ class TensorRuntime:
 
     def drain(self):
         """Finish the pending training call before inspecting or releasing leases."""
-        if self.training:
-            self.native.drain_training()
+        self.native.drain_training()
 
     def inference(self, layer, x, routes, gates, w1, w2):
         self._check(x, routes, gates, w1, w2)
@@ -311,10 +310,10 @@ class TensorRuntime:
             weights.w1.data, weights.w2.data, torch.cuda.current_stream().cuda_stream, weights)
 
     def inference_eager(self, x, routes, gates, w1, w2, *, layer=None):
-        """Run changing inputs/routes; an optional layer caches immutable weights.
+        """Run changing inputs/routes; an optional layer caches weight descriptors.
 
-        Invalidate before replacing weight addresses, or refresh after in-place
-        updates. Omit layer to repack on every call.
+        Invalidate before replacing weight addresses. Complete in-place updates
+        before submitting inference; BF16 descriptors read the original tensors.
         """
         self._check(x, routes, gates, w1, w2)
         return self.native.eager_inference(
@@ -328,23 +327,15 @@ class TensorRuntime:
         Call on every EP rank outside capture, after discarding any outer CUDA
         graphs containing this layer. This waits for in-flight device work.
         Then update weights, warm the layer again, and recapture outer graphs.
-        Prepared weights are immutable between these boundaries, including in-place
-        updates: pointer equality does not refresh the packed FC1 weight copy.
+        BF16 updates at unchanged addresses do not require invalidation; the
+        caller must complete all writes before inference resumes.
         """
         self.native.invalidate_inference_layer(
             layer, torch.cuda.current_stream().cuda_stream
         )
 
-    def refresh_inference_weights(self):
-        """Repack updated weights at the same addresses without recapturing graphs.
-
-        Call collectively outside capture, after restoring/updating the original
-        weight tensors and before resuming any inference. This drains GPU work.
-        """
-        self.native.refresh_inference_weights()
-
     def inference_eager_async(self, x, routes, gates, w1, w2, *, layer=None):
-        """Defer completion; optional layer uses the same immutable weight cache."""
+        """Defer completion; optional layer caches weight descriptors and owners."""
         self._check(x, routes, gates, w1, w2)
         return self.native.eager_inference_async(
             x, routes, gates, w1, w2, torch.cuda.current_stream().cuda_stream,

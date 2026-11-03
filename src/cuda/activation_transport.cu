@@ -546,7 +546,6 @@ void throw_production_status_error(
 
 struct ForwardAllocation {
   void *w1 = nullptr;
-  void *w1_interleaved = nullptr;
   void *w2 = nullptr;
   std::uint64_t bytes = 0;
   std::uint32_t device = 0;
@@ -556,25 +555,16 @@ struct ForwardAllocation {
   bool owns_w2 = true;
   std::shared_ptr<const void> w1_owner;
   std::shared_ptr<const void> w2_owner;
-  std::shared_ptr<tensor_storage_detail::Allocation> packed_w1_storage;
   std::shared_ptr<const internal::ExternalCudaProducerState> external_producer;
   ~ForwardAllocation() noexcept {
     (void)cudaSetDevice(static_cast<int>(device));
     if (ready) {
-      // A failed preparation may release the lease before packing completes.
-      // Native cudaFree used to drain this work before recycling its storage.
-      if (packed_w1_storage)
-        (void)cudaEventSynchronize(ready);
       internal::record_cuda_api(internal::CudaApiAuditKind::EventDestroy);
       (void)cudaEventDestroy(ready);
     }
     if (w2 && owns_w2) {
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
       (void)cudaFree(w2);
-    }
-    if (w1_interleaved && !packed_w1_storage) {
-      internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
-      (void)cudaFree(w1_interleaved);
     }
     if (w1 && owns_w1) {
       internal::record_cuda_api(internal::CudaApiAuditKind::DeviceFree);
@@ -589,7 +579,6 @@ struct ForwardWeightLease::Impl {
   fp8::Weights fp8;
   const transport::BFloat16 *w1 = nullptr;
   const transport::BFloat16 *w2 = nullptr;
-  const transport::BFloat16 *w1_interleaved = nullptr;
   std::vector<std::byte> session_identity;
   ExecutionToken execution;
   std::uint32_t owned_experts = 0;
@@ -597,8 +586,7 @@ struct ForwardWeightLease::Impl {
   std::uint64_t hidden = 0;
   std::uint64_t intermediate = 0;
   std::uint32_t device = 0;
-  CUtensorMap w1_map{};
-  CUtensorMap w1_interleaved_map{};
+  CUtensorMap fc1_w1_map{};
   CUtensorMap w2_map{};
   CUtensorMap decode_w1_map{};
   CUtensorMap decode_w2_map{};
@@ -606,9 +594,9 @@ struct ForwardWeightLease::Impl {
   CUtensorMap backward_w2_map{};
 
   void initialize_decode_maps() {
-    decode_w1_map = make_packed_w1_tma_map(
+    decode_w1_map = make_gate_up_w1_tma_map(
         const_cast<transport::BFloat16 *>(w1), hidden, intermediate,
-        owned_experts, weftmoe_dt::kN, weftmoe_dt::kK, "decode packed TMA W1");
+        owned_experts, weftmoe_dt::kN, weftmoe_dt::kK, "decode gate/up TMA W1");
     decode_w2_map = make_bf16_tma_map(
         const_cast<transport::BFloat16 *>(w2), intermediate,
         owned_experts * hidden, weftmoe_dt::kN, "decode W2", weftmoe_dt::kK);
@@ -908,7 +896,7 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
   const auto state = internal::checked_execution_state(execution);
   auto allocation = std::make_shared<ForwardAllocation>();
   allocation->device = state->device;
-  allocation->bytes = static_cast<std::uint64_t>(2ULL * w1_bytes) + w2_bytes;
+  allocation->bytes = static_cast<std::uint64_t>(w1_bytes) + w2_bytes;
   internal::throw_cuda(
       "forward-weight-create", cudaSetDevice(static_cast<int>(state->device)),
       0, session.world_size(), session.identity(), session.generation(),
@@ -919,12 +907,6 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
       ExchangeKind::ExpertCounts, "cudaMalloc(W1)");
   internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
   try {
-    internal::throw_cuda("forward-weight-create",
-                         cudaMalloc(&allocation->w1_interleaved, w1_bytes), 0,
-                         session.world_size(), session.identity(),
-                         session.generation(), ExchangeKind::ExpertCounts,
-                         "cudaMalloc(interleaved W1)");
-    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
     internal::throw_cuda(
         "forward-weight-create", cudaMalloc(&allocation->w2, w2_bytes), 0,
         session.world_size(), session.identity(), session.generation(),
@@ -938,7 +920,6 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
     internal::record_cuda_api(internal::CudaApiAuditKind::EventCreate);
     initialize_forward_weights_kernel<<<4096, 256, 0, state->stream>>>(
         static_cast<transport::BFloat16 *>(allocation->w1),
-        static_cast<transport::BFloat16 *>(allocation->w1_interleaved),
         w1_elements, static_cast<transport::BFloat16 *>(allocation->w2),
         w2_elements, global_expert_begin, hidden_size, intermediate_size);
     internal::throw_cuda("forward-weight-create", cudaGetLastError(), 0,
@@ -957,8 +938,6 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
   auto impl = std::make_shared<ForwardWeightLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->w1 = static_cast<const transport::BFloat16 *>(impl->allocation->w1);
-  impl->w1_interleaved = static_cast<const transport::BFloat16 *>(
-      impl->allocation->w1_interleaved);
   impl->w2 = static_cast<const transport::BFloat16 *>(impl->allocation->w2);
   impl->session_identity = session.stable_identity_bytes();
   impl->execution = execution.token();
@@ -969,13 +948,9 @@ ForwardWeightLease testing::make_deterministic_forward_weights_for_testing(
   impl->device = state->device;
   if (hidden_size == forward_tuning::kMainHidden &&
       intermediate_size == forward_tuning::kMainIntermediate) {
-    impl->w1_map = make_bf16_tma_map(
-        impl->allocation->w1, hidden_size,
-        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
-    impl->w1_interleaved_map = make_packed_w1_tma_map(
+    impl->fc1_w1_map = make_gate_up_w1_tma_map(
         impl->allocation->w1, hidden_size, intermediate_size, owned_experts,
-        forward_tuning::kFc1TileN, forward_tuning::kTileK, "packed TMA W1");
+        forward_tuning::kFc1TileN, forward_tuning::kTileK, "gate/up TMA W1");
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
@@ -1059,12 +1034,12 @@ ForwardWeightLease ExternalCudaProducer::publish_fp8_weights(
   impl->hidden = hidden_size;
   impl->intermediate = intermediate_size;
   impl->device = state_->backend->device;
-  impl->w1_interleaved_map = make_packed_w1_tma_map(
+  impl->fc1_w1_map = make_gate_up_w1_tma_map(
       buffers.w1.data, hidden_size, intermediate_size, owned_experts,
       forward_tuning::kFc1TileN, 128U, "FP8 W1", true);
   impl->w2_map = make_fp8_tma_map(buffers.w2.data, intermediate_size,
       std::uint64_t(owned_experts) * hidden_size, forward_tuning::kFc2TileN, "FP8 W2");
-  impl->decode_w1_map = make_packed_w1_tma_map(buffers.w1.data, hidden_size, intermediate_size,
+  impl->decode_w1_map = make_gate_up_w1_tma_map(buffers.w1.data, hidden_size, intermediate_size,
       owned_experts, 256U, 128U, "DT FP8 W1", true);
   impl->decode_w2_map = make_fp8_tma_map(buffers.w2.data, intermediate_size,
       std::uint64_t(owned_experts) * hidden_size, 256U, "DT FP8 W2");
@@ -1083,19 +1058,6 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
     std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
     std::uint32_t owned_experts, std::uint32_t global_expert_begin,
     std::uint64_t hidden_size, std::uint64_t intermediate_size) const {
-  return publish_weights(w1, w1_capacity_elements, std::move(w1_owner), w2,
-                         w2_capacity_elements, std::move(w2_owner),
-                         owned_experts, global_expert_begin, hidden_size,
-                         intermediate_size, {});
-}
-
-ForwardWeightLease ExternalCudaProducer::publish_weights(
-    const transport::BFloat16 *w1, std::uint64_t w1_capacity_elements,
-    std::shared_ptr<const void> w1_owner, const transport::BFloat16 *w2,
-    std::uint64_t w2_capacity_elements, std::shared_ptr<const void> w2_owner,
-    std::uint32_t owned_experts, std::uint32_t global_expert_begin,
-    std::uint64_t hidden_size, std::uint64_t intermediate_size,
-    const CudaTensorBuffer &packed_w1) const {
   if (!state_ || !w1_owner || !w2_owner || owned_experts == 0 ||
       hidden_size == 0 || intermediate_size == 0)
     transport_error(NotifyErrorCode::InvalidRuntimeConfig,
@@ -1125,28 +1087,8 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   const auto w1_bytes = checked_size(
       checked_mul(w1_elements, sizeof(transport::BFloat16), "W1 bytes"),
       "W1 bytes");
-  if (packed_w1.data || packed_w1.bytes || packed_w1.owner) {
-    allocation->packed_w1_storage = tensor_storage_detail::allocate(
-        w1_bytes, allocation->device, packed_w1);
-    tensor_storage_detail::validate_input_disjoint(
-        {allocation->packed_w1_storage}, w1, w1_bytes);
-    tensor_storage_detail::validate_input_disjoint(
-        {allocation->packed_w1_storage}, w2,
-        w2_elements * sizeof(transport::BFloat16));
-    allocation->w1_interleaved = allocation->packed_w1_storage->data;
-  } else {
-    internal::throw_cuda("external-weight-publish",
-                         cudaMalloc(&allocation->w1_interleaved, w1_bytes),
-                         state_->backend->context.calling_rank(),
-                         state_->backend->context.session().world_size(),
-                         state_->backend->context.session().identity(),
-                         state_->backend->context.session().generation(),
-                         ExchangeKind::ExpertCounts,
-                         "cudaMalloc(interleaved W1)");
-    internal::record_cuda_api(internal::CudaApiAuditKind::DeviceAllocate);
-  }
   allocation->bytes = checked_add(
-      checked_mul(2ULL, w1_bytes, "W1 plus interleaved W1 bytes"),
+      w1_bytes,
       checked_mul(w2_elements, sizeof(transport::BFloat16), "W2 bytes"),
       "weight bytes");
   internal::throw_cuda(
@@ -1170,8 +1112,6 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   auto impl = std::make_shared<ForwardWeightLease::Impl>();
   impl->allocation = std::move(allocation);
   impl->w1 = w1;
-  impl->w1_interleaved = static_cast<const transport::BFloat16 *>(
-      impl->allocation->w1_interleaved);
   impl->w2 = w2;
   impl->session_identity =
       state_->backend->context.session().stable_identity_bytes();
@@ -1183,13 +1123,9 @@ ForwardWeightLease ExternalCudaProducer::publish_weights(
   impl->device = state_->backend->device;
   if (hidden_size == forward_tuning::kMainHidden &&
       intermediate_size == forward_tuning::kMainIntermediate) {
-    impl->w1_map = make_bf16_tma_map(
-        impl->allocation->w1, hidden_size,
-        static_cast<std::uint64_t>(owned_experts) * 2ULL * intermediate_size,
-        forward_tuning::kFc1TileN, "W1", forward_tuning::kTileK);
-    impl->w1_interleaved_map = make_packed_w1_tma_map(
+    impl->fc1_w1_map = make_gate_up_w1_tma_map(
         impl->allocation->w1, hidden_size, intermediate_size, owned_experts,
-        forward_tuning::kFc1TileN, forward_tuning::kTileK, "packed TMA W1");
+        forward_tuning::kFc1TileN, forward_tuning::kTileK, "gate/up TMA W1");
     impl->w2_map = make_bf16_tma_map(
         impl->allocation->w2, intermediate_size,
         static_cast<std::uint64_t>(owned_experts) * hidden_size,
@@ -5487,7 +5423,7 @@ DeviceForwardHandle LocalCudaP2pForwardMegaKernel::enqueue(
         &launch, kStaticUnified, args,
         weight.fp8.w1 ? slot.forward_fp8_x_map : slot.forward_x_map,
         weight.fp8.w1 ? slot.forward_fp8_s_map : slot.forward_s_map,
-        weight.w1_interleaved_map, weight.w2_map, ordinary_output_store_map);
+        weight.fc1_w1_map, weight.w2_map, ordinary_output_store_map);
 #if WEFTMOE_DEBUG_VALIDATE
   debug_forward_host_phase("kernel_launch_returned");
 #endif
