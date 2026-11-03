@@ -1,0 +1,38 @@
+{
+  "qwen122b": {
+    "pass_marker_counts": {
+      "FP8_PREQUANT_INPUT_PASS": 16,
+      "FP8_PARITY_PASS": 16,
+      "FP8_MULTIVERSION_ASYNC_PASS": 8,
+      "FP8_CACHED_VERSION_CHECK_PASS": 8,
+      "FP8_CHECKPOINT_PASS": 8,
+      "FP8_OPTIMIZER_PASS": 8,
+      "FP8_INFERENCE_PASS": 8
+    },
+    "note": "stdout from eight ranks interleaves; counts are across all ranks"
+  },
+  "qwen35b": {
+    "pass_marker_counts": {
+      "FP8_PREQUANT_INPUT_PASS": 16,
+      "FP8_PARITY_PASS": 16,
+      "FP8_MULTIVERSION_ASYNC_PASS": 8,
+      "FP8_CACHED_VERSION_CHECK_PASS": 8,
+      "FP8_CHECKPOINT_PASS": 8,
+      "FP8_OPTIMIZER_PASS": 8,
+      "FP8_INFERENCE_PASS": 8
+    },
+    "note": "stdout from eight ranks interleaves; counts are across all ranks"
+  },
+  "flash": {
+    "pass_marker_counts": {
+      "FP8_PREQUANT_INPUT_PASS": 16,
+      "FP8_PARITY_PASS": 16,
+      "FP8_MULTIVERSION_ASYNC_PASS": 8,
+      "FP8_CACHED_VERSION_CHECK_PASS": 8,
+      "FP8_CHECKPOINT_PASS": 8,
+      "FP8_OPTIMIZER_PASS": 8,
+      "FP8_INFERENCE_PASS": 8
+    },
+    "note": "stdout from eight ranks interleaves; counts are across all ranks"
+  }
+}

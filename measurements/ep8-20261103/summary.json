@@ -1,0 +1,1103 @@
+{
+  "pf": [
+    {
+      "model": "qwen35b",
+      "tokens": 8192,
+      "mode": "cycle",
+      "bf16_ms": 6.5651155,
+      "bf16_round_ms": [
+        6.646748499999999,
+        6.5283315
+      ],
+      "fp8_ms": 6.7906949999999995,
+      "fp8_round_ms": [
+        6.7906949999999995,
+        6.7865445
+      ],
+      "latency_change_pct": 3.4360324658416097
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 8192,
+      "mode": "forward",
+      "bf16_ms": 2.8528935,
+      "bf16_round_ms": [
+        2.8424655000000003,
+        2.8528935
+      ],
+      "fp8_ms": 2.863891,
+      "fp8_round_ms": [
+        2.8762505000000003,
+        2.854866
+      ],
+      "latency_change_pct": 0.3854858234280556
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 8192,
+      "mode": "backward",
+      "bf16_ms": 3.787928,
+      "bf16_round_ms": [
+        3.807124,
+        3.779576
+      ],
+      "fp8_ms": 3.981883,
+      "fp8_round_ms": [
+        3.9704610000000002,
+        3.994008
+      ],
+      "latency_change_pct": 5.120345476471577
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 20480,
+      "mode": "cycle",
+      "bf16_ms": 15.5960455,
+      "bf16_round_ms": [
+        15.628106500000001,
+        15.559927
+      ],
+      "fp8_ms": 15.558579000000002,
+      "fp8_round_ms": [
+        15.592697,
+        15.558067
+      ],
+      "latency_change_pct": -0.2402307687548011
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 20480,
+      "mode": "forward",
+      "bf16_ms": 6.959994000000001,
+      "bf16_round_ms": [
+        6.949970499999999,
+        6.959994000000001
+      ],
+      "fp8_ms": 6.514806500000001,
+      "fp8_round_ms": [
+        6.508699000000001,
+        6.5180675
+      ],
+      "latency_change_pct": -6.396377640555439
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 20480,
+      "mode": "backward",
+      "bf16_ms": 8.660928,
+      "bf16_round_ms": [
+        8.657524,
+        8.660928
+      ],
+      "fp8_ms": 9.260546999999999,
+      "fp8_round_ms": [
+        9.256337,
+        9.27244
+      ],
+      "latency_change_pct": 6.923265035802162
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 8192,
+      "mode": "cycle",
+      "bf16_ms": 12.2824815,
+      "bf16_round_ms": [
+        12.340021,
+        12.254559
+      ],
+      "fp8_ms": 12.2174095,
+      "fp8_round_ms": [
+        12.257352,
+        12.215432
+      ],
+      "latency_change_pct": -0.5297952209412982
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 8192,
+      "mode": "forward",
+      "bf16_ms": 4.6492245,
+      "bf16_round_ms": [
+        4.6556615,
+        4.6396875
+      ],
+      "fp8_ms": 4.385151,
+      "fp8_round_ms": [
+        4.385151,
+        4.3898225
+      ],
+      "latency_change_pct": -5.6799472686251296
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 8192,
+      "mode": "backward",
+      "bf16_ms": 7.741923000000001,
+      "bf16_round_ms": [
+        7.7445770000000005,
+        7.741923000000001
+      ],
+      "fp8_ms": 7.8949205000000005,
+      "fp8_round_ms": [
+        7.8795095,
+        7.8949205000000005
+      ],
+      "latency_change_pct": 1.9762208949895221
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 20480,
+      "mode": "cycle",
+      "bf16_ms": 37.042522,
+      "bf16_round_ms": [
+        37.004709999999996,
+        37.064098
+      ],
+      "fp8_ms": 28.493724999999998,
+      "fp8_round_ms": [
+        28.541922,
+        28.4635785
+      ],
+      "latency_change_pct": -23.078334137184285
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 20480,
+      "mode": "forward",
+      "bf16_ms": 15.0494145,
+      "bf16_round_ms": [
+        15.1701195,
+        15.025941000000001
+      ],
+      "fp8_ms": 9.634057499999999,
+      "fp8_round_ms": [
+        9.648486499999999,
+        9.634057499999999
+      ],
+      "latency_change_pct": -35.98383844102374
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 20480,
+      "mode": "backward",
+      "bf16_ms": 22.059299,
+      "bf16_round_ms": [
+        22.073383000000003,
+        22.058049999999998
+      ],
+      "fp8_ms": 18.9356175,
+      "fp8_round_ms": [
+        18.887302499999997,
+        18.996706
+      ],
+      "latency_change_pct": -14.160384244304414
+    },
+    {
+      "model": "flash",
+      "tokens": 8192,
+      "mode": "cycle",
+      "bf16_ms": 19.130372499999996,
+      "bf16_round_ms": [
+        18.925811000000003,
+        19.130372499999996
+      ],
+      "fp8_ms": 17.6077925,
+      "fp8_round_ms": [
+        17.579665500000004,
+        17.6077925
+      ],
+      "latency_change_pct": -7.958966820954472
+    },
+    {
+      "model": "flash",
+      "tokens": 8192,
+      "mode": "forward",
+      "bf16_ms": 6.7243665,
+      "bf16_round_ms": [
+        6.733273,
+        6.6971165
+      ],
+      "fp8_ms": 5.510823,
+      "fp8_round_ms": [
+        5.5164444999999995,
+        5.479067
+      ],
+      "latency_change_pct": -18.046956542300308
+    },
+    {
+      "model": "flash",
+      "tokens": 8192,
+      "mode": "backward",
+      "bf16_ms": 12.419122999999999,
+      "bf16_round_ms": [
+        12.428769,
+        12.4046955
+      ],
+      "fp8_ms": 12.3424475,
+      "fp8_round_ms": [
+        12.433515500000002,
+        12.200721999999999
+      ],
+      "latency_change_pct": -0.6173986681668131
+    },
+    {
+      "model": "flash",
+      "tokens": 20480,
+      "mode": "cycle",
+      "bf16_ms": 45.9042985,
+      "bf16_round_ms": [
+        45.9921215,
+        45.862641499999995
+      ],
+      "fp8_ms": 42.026777,
+      "fp8_round_ms": [
+        41.988263,
+        42.070324
+      ],
+      "latency_change_pct": -8.446968207127703
+    },
+    {
+      "model": "flash",
+      "tokens": 20480,
+      "mode": "forward",
+      "bf16_ms": 15.575573,
+      "bf16_round_ms": [
+        15.5207425,
+        15.627310999999999
+      ],
+      "fp8_ms": 12.853479,
+      "fp8_round_ms": [
+        12.827692500000001,
+        12.875346000000002
+      ],
+      "latency_change_pct": -17.47668609045715
+    },
+    {
+      "model": "flash",
+      "tokens": 20480,
+      "mode": "backward",
+      "bf16_ms": 30.1053635,
+      "bf16_round_ms": [
+        30.015841,
+        30.2158695
+      ],
+      "fp8_ms": 29.1990665,
+      "fp8_round_ms": [
+        29.122972999999998,
+        29.3355395
+      ],
+      "latency_change_pct": -3.0104170640557038
+    }
+  ],
+  "dt": [
+    {
+      "model": "qwen122b",
+      "tokens": 64,
+      "max_rank_diff": 0.002846949707321282,
+      "bf16_us": 210.39871978759766,
+      "bf16_us_rounds": [
+        210.41793060302734,
+        210.34479522705078
+      ],
+      "fp8_online_us": 141.76815795898438,
+      "fp8_online_us_rounds": [
+        142.2630386352539,
+        141.41920471191406
+      ],
+      "fp8_prequant_us": 136.9916763305664,
+      "fp8_prequant_us_rounds": [
+        137.4849624633789,
+        136.6156768798828
+      ],
+      "online_latency_change_pct": -32.619286798844314
+    },
+    {
+      "model": "qwen122b",
+      "tokens": 512,
+      "max_rank_diff": 0.0028188601908595047,
+      "bf16_us": 422.9787292480469,
+      "bf16_us_rounds": [
+        422.81761169433594,
+        423.3185577392578
+      ],
+      "fp8_online_us": 321.93519592285156,
+      "fp8_online_us_rounds": [
+        320.2145538330078,
+        324.20912170410156
+      ],
+      "fp8_prequant_us": 320.64817810058594,
+      "fp8_prequant_us_rounds": [
+        318.5678405761719,
+        322.8870391845703
+      ],
+      "online_latency_change_pct": -23.888561371590978
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 64,
+      "max_rank_diff": 0.002840266779827413,
+      "bf16_us": 103.5670394897461,
+      "bf16_us_rounds": [
+        103.46752166748047,
+        103.71088027954102
+      ],
+      "fp8_online_us": 83.30687713623047,
+      "fp8_online_us_rounds": [
+        83.15679168701172,
+        83.50944137573242
+      ],
+      "fp8_prequant_us": 80.67455673217773,
+      "fp8_prequant_us_rounds": [
+        80.43167877197266,
+        80.9280014038086
+      ],
+      "online_latency_change_pct": -19.56236506646647
+    },
+    {
+      "model": "qwen35b",
+      "tokens": 512,
+      "max_rank_diff": 0.0028278138116663346,
+      "bf16_us": 214.6188735961914,
+      "bf16_us_rounds": [
+        214.35103607177734,
+        214.88848114013672
+      ],
+      "fp8_online_us": 218.84272003173828,
+      "fp8_online_us_rounds": [
+        219.59471893310547,
+        218.04193115234375
+      ],
+      "fp8_prequant_us": 217.74991607666016,
+      "fp8_prequant_us_rounds": [
+        218.49024200439453,
+        217.01343536376953
+      ],
+      "online_latency_change_pct": 1.9680684949889837
+    },
+    {
+      "model": "flash",
+      "tokens": 64,
+      "max_rank_diff": 0.002842910339286759,
+      "bf16_us": 441.05809020996094,
+      "bf16_us_rounds": [
+        441.0161590576172,
+        441.10816955566406
+      ],
+      "fp8_online_us": 278.824462890625,
+      "fp8_online_us_rounds": [
+        278.79359436035156,
+        279.06431579589844
+      ],
+      "fp8_prequant_us": 272.2772674560547,
+      "fp8_prequant_us_rounds": [
+        272.14369201660156,
+        272.4311981201172
+      ],
+      "online_latency_change_pct": -36.78282541923363
+    },
+    {
+      "model": "flash",
+      "tokens": 512,
+      "max_rank_diff": 0.0028346710732228223,
+      "bf16_us": 756.5057373046875,
+      "bf16_us_rounds": [
+        755.2712097167969,
+        757.8795166015625
+      ],
+      "fp8_online_us": 531.0245056152344,
+      "fp8_online_us_rounds": [
+        531.4763488769531,
+        530.6540832519531
+      ],
+      "fp8_prequant_us": 528.3313598632812,
+      "fp8_prequant_us_rounds": [
+        528.9806518554688,
+        527.9528198242188
+      ],
+      "online_latency_change_pct": -29.805620839414615
+    }
+  ],
+  "telemetry": {
+    "backward-flash-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1425.0,
+        1440.0,
+        1455.0,
+        1485.0,
+        1500.0,
+        1515.0,
+        1530.0,
+        1545.0,
+        1560.0,
+        1575.0,
+        1590.0,
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        53.0
+      ],
+      "max_power_w": 690.22,
+      "max_memory_mib": 30521.0
+    },
+    "backward-flash-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        47.0
+      ],
+      "max_power_w": 495.72,
+      "max_memory_mib": 28161.0
+    },
+    "backward-flash-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        47.0
+      ],
+      "max_power_w": 498.73,
+      "max_memory_mib": 28161.0
+    },
+    "backward-flash-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1350.0,
+        1410.0,
+        1425.0,
+        1440.0,
+        1485.0,
+        1500.0,
+        1515.0,
+        1530.0,
+        1545.0,
+        1560.0,
+        1575.0,
+        1590.0,
+        1605.0,
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        55.0
+      ],
+      "max_power_w": 683.87,
+      "max_memory_mib": 30521.0
+    },
+    "backward-qwen122b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        46.0
+      ],
+      "max_power_w": 514.38,
+      "max_memory_mib": 30457.0
+    },
+    "backward-qwen122b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        44.0
+      ],
+      "max_power_w": 425.14,
+      "max_memory_mib": 20559.0
+    },
+    "backward-qwen122b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        44.0
+      ],
+      "max_power_w": 427.23,
+      "max_memory_mib": 20559.0
+    },
+    "backward-qwen122b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        46.0
+      ],
+      "max_power_w": 530.42,
+      "max_memory_mib": 30457.0
+    },
+    "backward-qwen35b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        43.0
+      ],
+      "max_power_w": 437.39,
+      "max_memory_mib": 14815.0
+    },
+    "backward-qwen35b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        40.0
+      ],
+      "max_power_w": 358.93,
+      "max_memory_mib": 13163.0
+    },
+    "backward-qwen35b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        40.0
+      ],
+      "max_power_w": 341.58,
+      "max_memory_mib": 13163.0
+    },
+    "backward-qwen35b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        41.0
+      ],
+      "max_power_w": 414.05,
+      "max_memory_mib": 14815.0
+    },
+    "cycle-flash-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1410.0,
+        1440.0,
+        1455.0,
+        1470.0,
+        1485.0,
+        1500.0,
+        1515.0,
+        1530.0,
+        1560.0,
+        1575.0,
+        1590.0,
+        1605.0,
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        53.0
+      ],
+      "max_power_w": 694.44,
+      "max_memory_mib": 30521.0
+    },
+    "cycle-flash-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        48.0
+      ],
+      "max_power_w": 498.56,
+      "max_memory_mib": 28161.0
+    },
+    "cycle-flash-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        47.0
+      ],
+      "max_power_w": 500.32,
+      "max_memory_mib": 28161.0
+    },
+    "cycle-flash-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1365.0,
+        1395.0,
+        1440.0,
+        1455.0,
+        1470.0,
+        1485.0,
+        1500.0,
+        1515.0,
+        1530.0,
+        1545.0,
+        1560.0,
+        1575.0,
+        1590.0,
+        1605.0,
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        54.0
+      ],
+      "max_power_w": 679.41,
+      "max_memory_mib": 30521.0
+    },
+    "cycle-qwen122b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        28.0,
+        45.0
+      ],
+      "max_power_w": 523.14,
+      "max_memory_mib": 30459.0
+    },
+    "cycle-qwen122b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        43.0
+      ],
+      "max_power_w": 424.42,
+      "max_memory_mib": 20559.0
+    },
+    "cycle-qwen122b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        43.0
+      ],
+      "max_power_w": 424.46,
+      "max_memory_mib": 20559.0
+    },
+    "cycle-qwen122b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        47.0
+      ],
+      "max_power_w": 506.12,
+      "max_memory_mib": 30459.0
+    },
+    "cycle-qwen35b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        42.0
+      ],
+      "max_power_w": 391.96,
+      "max_memory_mib": 14817.0
+    },
+    "cycle-qwen35b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        40.0
+      ],
+      "max_power_w": 343.51,
+      "max_memory_mib": 13163.0
+    },
+    "cycle-qwen35b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        40.0
+      ],
+      "max_power_w": 346.79,
+      "max_memory_mib": 13163.0
+    },
+    "cycle-qwen35b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        42.0
+      ],
+      "max_power_w": 437.29,
+      "max_memory_mib": 14817.0
+    },
+    "dt-flash-1300.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        51.0
+      ],
+      "max_power_w": 668.88,
+      "max_memory_mib": 6211.0
+    },
+    "dt-flash-1700.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        51.0
+      ],
+      "max_power_w": 666.14,
+      "max_memory_mib": 6211.0
+    },
+    "dt-qwen122b-1300.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        47.0
+      ],
+      "max_power_w": 564.1,
+      "max_memory_mib": 4695.0
+    },
+    "dt-qwen122b-1700.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        47.0
+      ],
+      "max_power_w": 558.0,
+      "max_memory_mib": 4629.0
+    },
+    "dt-qwen35b-1300.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        42.0
+      ],
+      "max_power_w": 391.12,
+      "max_memory_mib": 3725.0
+    },
+    "dt-qwen35b-1700.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        41.0
+      ],
+      "max_power_w": 387.23,
+      "max_memory_mib": 3687.0
+    },
+    "forward-flash-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1560.0,
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        47.0
+      ],
+      "max_power_w": 591.68,
+      "max_memory_mib": 30911.0
+    },
+    "forward-flash-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        43.0
+      ],
+      "max_power_w": 477.29,
+      "max_memory_mib": 18799.0
+    },
+    "forward-flash-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        45.0
+      ],
+      "max_power_w": 477.93,
+      "max_memory_mib": 18799.0
+    },
+    "forward-flash-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        48.0
+      ],
+      "max_power_w": 637.27,
+      "max_memory_mib": 30911.0
+    },
+    "forward-qwen122b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        30.0,
+        43.0
+      ],
+      "max_power_w": 387.85,
+      "max_memory_mib": 18727.0
+    },
+    "forward-qwen122b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        42.0
+      ],
+      "max_power_w": 323.34,
+      "max_memory_mib": 12563.0
+    },
+    "forward-qwen122b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        41.0
+      ],
+      "max_power_w": 367.98,
+      "max_memory_mib": 12563.0
+    },
+    "forward-qwen122b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        42.0
+      ],
+      "max_power_w": 382.77,
+      "max_memory_mib": 18727.0
+    },
+    "forward-qwen35b-0-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        40.0
+      ],
+      "max_power_w": 279.27,
+      "max_memory_mib": 12851.0
+    },
+    "forward-qwen35b-1-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        38.0
+      ],
+      "max_power_w": 227.22,
+      "max_memory_mib": 8031.0
+    },
+    "forward-qwen35b-2-fp8.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        37.0
+      ],
+      "max_power_w": 233.01,
+      "max_memory_mib": 8533.0
+    },
+    "forward-qwen35b-3-bf16.gpu": {
+      "sm_clock_mhz": [
+        1620.0
+      ],
+      "memory_clock_mhz": [
+        2201.0,
+        3201.0
+      ],
+      "temperature_c": [
+        29.0,
+        39.0
+      ],
+      "max_power_w": 262.13,
+      "max_memory_mib": 14483.0
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "source_commit": "24a20996be2c38191cef0d6cd41945f694c2d413",
+  "world": 8,
+  "order": [
+    "bf16",
+    "fp8",
+    "fp8",
+    "bf16"
+  ],
+  "seed": 123,
+  "warmups": 10,
+  "samples": 30,
+  "priming": "one complete trace",
+  "ring_tokens": 512,
+  "ring_depth": 8,
+  "gpu": "0, NVIDIA L20X, 143771 MiB, 570.148.08\n1, NVIDIA L20X, 143771 MiB, 570.148.08\n2, NVIDIA L20X, 143771 MiB, 570.148.08\n3, NVIDIA L20X, 143771 MiB, 570.148.08\n4, NVIDIA L20X, 143771 MiB, 570.148.08\n5, NVIDIA L20X, 143771 MiB, 570.148.08\n6, NVIDIA L20X, 143771 MiB, 570.148.08\n7, NVIDIA L20X, 143771 MiB, 570.148.08\n",
+  "native": {
+    "qwen122b": {
+      "libweftmoe.so": "29452a9461b5264f02404e4afecc15af87ba5e2d2c9dbac2e0e6c56bed563dde",
+      "_runtime.cpython-312-x86_64-linux-gnu.so": "bb872c37775f7bf4a6cc943ba1c043219fd83c083e8e52bf67a4e21d471ba6cc"
+    },
+    "qwen35b": {
+      "libweftmoe.so": "f49e83ff31aec1e014929ea32bbfe00242b967e28b20d4088a3bfbf6f4eebc01",
+      "_runtime.cpython-312-x86_64-linux-gnu.so": "bb872c37775f7bf4a6cc943ba1c043219fd83c083e8e52bf67a4e21d471ba6cc"
+    },
+    "flash": {
+      "libweftmoe.so": "9c0aebecc303e11e78600e0faf6234d68bcdb53af897d2ab765eb04addf04c71",
+      "_runtime.cpython-312-x86_64-linux-gnu.so": "bb872c37775f7bf4a6cc943ba1c043219fd83c083e8e52bf67a4e21d471ba6cc"
+    }
+  },
+  "runner_sha256": "7bfa81594656e3930ade91f1573650e8116e1bd0d187e6e9c49cb0e78caf83f3",
+  "environment": {
+    "CUDA_LAUNCH_BLOCKING": null,
+    "CUDA_DEVICE_MAX_CONNECTIONS": null,
+    "NCCL_IB_DISABLE": null,
+    "PYTORCH_NO_CUDA_MEMORY_CACHING": null,
+    "TORCH_NCCL_BLOCKING_WAIT": null,
+    "OMP_NUM_THREADS": "1"
+  }
+}
