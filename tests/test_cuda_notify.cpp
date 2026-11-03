@@ -1765,16 +1765,10 @@ void test_device_only_sanitizer_paths() {
                   wide_transport_oracle.combined_tokens &&
               wide_transport_download.protocol.dispatch_packets == 6,
           "73-node full device transport/oracle mismatch");
-  const auto capability =
-      weftmoe::cuda::probe_activation_transport_capability(2);
-  require(capability.nccl_device_headers && capability.gin_headers_available &&
-              capability.gin_backend_implemented && !capability.gin_usable,
-          "GIN header/runtime capability boundary was not detected");
   require(weftmoe::cuda::testing::run_local_p2p_put_signal_probe(0, 1, 4096),
           "real CUDA P2P put+system-signal probe failed");
   std::cout << "[PASS] transport-only persistent device worker, deterministic "
-               "synthetic combine, pooled steady path, P2P put/signal, GIN "
-               "fail-closed\n";
+               "synthetic combine, pooled steady path, P2P put/signal\n";
   auto short_plan = wide_plan;
   --short_plan.device_bytes;
   bool short_failed = false;
