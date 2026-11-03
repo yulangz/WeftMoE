@@ -24,6 +24,7 @@ class MasterWeights:
         self.bindings = {}
         self.masters = {}
         self.weights = {}
+        self.writer_streams = {}
         self.device = next(iter(adapter._parameters(adapter.layers[0]))).device
         self.offloaded = False
         self.materialized = False
@@ -99,13 +100,18 @@ class MasterWeights:
         _extension().fp8_quantize_weight(master, row.data, row.scales,
                                          col.data, col.scales, stream.cuda_stream)
         master.record_stream(stream)
+        self.writer_streams[stream.cuda_stream] = stream
 
     def publish(self):
         if self.offloaded:
             return
+        consumer = torch.cuda.current_stream(self.device)
+        for writer in self.writer_streams.values():
+            consumer.wait_stream(writer)
+        self.writer_streams.clear()
         self.adapter.fp8_weights = {
             layer: (tuple(p._version for p in self.adapter._parameters(layer)),
-                    _seal_weights(weights, self.adapter.weight_version))
+                    _seal_weights(weights, self.adapter.weight_version, cache_key=id(layer)))
             for layer, weights in self.weights.items()
         }
 

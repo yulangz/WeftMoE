@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import MethodType
+from dataclasses import replace
 import os
 
 import torch
@@ -49,6 +50,7 @@ class MegatronAdapter:
         self.fp8 = os.environ.get("WEFTMOE_FP8", "0") == "1" if fp8 is None else fp8
         self.fp8_weights = {}
         self.master_weights = None
+        self._optimizer_hook = None
         self._models = tuple(models)
         self.weight_version = 0
         self.runtime = None
@@ -95,6 +97,19 @@ class MegatronAdapter:
         if self.fp8:
             from ._master_weights import MasterWeights
             self.master_weights = MasterWeights(self, optimizer)
+
+    def bind_optimizer(self, optimizer):
+        """Enable non-master cache reuse through a PyTorch optimizer step hook.
+
+        Optimizers without post-step hooks use fresh quantization per forward.
+        Direct parameter writes outside optimizer.step still require
+        weights_updated(), including checkpoint loads.
+        """
+        if self._optimizer_hook is not None:
+            self._optimizer_hook.remove()
+        self._optimizer_hook = optimizer.register_step_post_hook(
+            lambda *_: self.weights_updated())
+        self.weights_updated()
 
     def pack(self, parameters):
         count = len(parameters) // 2
@@ -143,14 +158,17 @@ class MegatronAdapter:
         from .fp8 import prepare_fp8_weights
 
         versions = tuple(p._version for p in parameters)
-        entry = self.fp8_weights.get(layer)
+        cacheable = self.master_weights is not None or self._optimizer_hook is not None
+        entry = self.fp8_weights.get(layer) if cacheable else None
         if entry is None or entry[0] != versions:
             if self.master_weights is not None:
                 raise RuntimeError("FP32-master FP8 weights are not ready for compute")
             weights = prepare_fp8_weights(*self.pack(parameters), training=True,
                                           version=self.weight_version)
+            weights = replace(weights, _cache_key=id(layer))
             entry = (versions, weights)
-            self.fp8_weights[layer] = entry
+            if cacheable:
+                self.fp8_weights[layer] = entry
         return runtime.forward_fp8(x, routes, gates, entry[1], synchronize=False,
                                    retain_backward_state=retain,
                                    weight_grad_dtype=torch.bfloat16)
@@ -229,7 +247,10 @@ class MegatronAdapter:
 
     def close(self):
         """Release buffers and the session when the training engine is destroyed."""
-        self.suspend()
+        if self.master_weights is not None:
+            self.master_weights.materialize()
+        else:
+            self.suspend()
         if self.runtime is not None:
             self.runtime.close()
             self.runtime = None
@@ -241,4 +262,7 @@ class MegatronAdapter:
                 del parameter._weftmoe_fp8_writer
                 del parameter._weftmoe_fp8_storage
             self.master_weights = None
+        if self._optimizer_hook is not None:
+            self._optimizer_hook.remove()
+            self._optimizer_hook = None
         torch.cuda.empty_cache()

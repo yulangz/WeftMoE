@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import functools
 import logging
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
@@ -28,6 +29,7 @@ _graph_inputs = {}
 _fp8_weights = {}
 _fp8_devices = {}
 _fp8_offloaded = False
+_fp8_needs_update = False
 _fp8_initial_pool = None
 
 
@@ -38,6 +40,9 @@ def _use_fp8():
 def _prepare_fp8_layer(layer):
     from .fp8 import prepare_fp8_weights
     global _fp8_initial_pool
+
+    if _fp8_needs_update:
+        raise RuntimeError("Complete the FP8 weight update before inference")
 
     if layer.layer_id not in _fp8_weights:
         if torch.cuda.is_current_stream_capturing():
@@ -53,8 +58,8 @@ def _prepare_fp8_layer(layer):
         if any(p.storage_offset() != 0 or p.numel() * p.element_size()
                != p.untyped_storage().nbytes() for p in parameters):
             raise ValueError("FP8 SGLang residency requires whole expert weight allocations")
-        _fp8_weights[layer.layer_id] = prepare_fp8_weights(
-            layer.w13_weight, layer.w2_weight, training=False)
+        _fp8_weights[layer.layer_id] = replace(prepare_fp8_weights(
+            layer.w13_weight, layer.w2_weight, training=False), _cache_key=id(layer))
         _fp8_devices[layer.layer_id] = layer.w13_weight.device
         torch.cuda.synchronize(layer.w13_weight.device)
         for p in parameters:
@@ -64,21 +69,28 @@ def _prepare_fp8_layer(layer):
 
 
 @torch.no_grad()
-def resume_fp8_weights():
+def resume_fp8_weights(*, for_update=False):
     global _fp8_offloaded
+    if _fp8_needs_update and not for_update:
+        raise RuntimeError("Complete the FP8 weight update before inference")
     if not _fp8_offloaded:
         return
     for key, weights in _fp8_weights.items():
         for tensor in weights._tensors():
-            tensor.data = tensor.to(device=_fp8_devices[key])
+            tensor.data = (torch.empty_like(tensor, device=_fp8_devices[key])
+                           if _fp8_needs_update else tensor.to(device=_fp8_devices[key]))
     _fp8_offloaded = False
-    commit_fp8_weights(0)
+    if not _fp8_needs_update:
+        commit_fp8_weights(0)
 
 
 def commit_fp8_weights(version):
+    global _fp8_needs_update
     from .fp8 import _seal_weights
     for key, weights in list(_fp8_weights.items()):
-        _fp8_weights[key] = _seal_weights((weights.w1, weights.w2, None, None), version)
+        _fp8_weights[key] = _seal_weights((weights.w1, weights.w2, None, None), version,
+                                         cache_key=weights._cache_key)
+    _fp8_needs_update = False
 
 
 def fp8_parameter_map(model):
@@ -86,11 +98,13 @@ def fp8_parameter_map(model):
     if not _use_fp8():
         return {}
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    resume_fp8_weights()
+    resume_fp8_weights(for_update=True)
     result = {}
     for layer in model.modules():
         if isinstance(layer, FusedMoE):
-            weights = _prepare_fp8_layer(layer)
+            weights = _fp8_weights.get(layer.layer_id)
+            if weights is None:
+                weights = _prepare_fp8_layer(layer)
             for parameter, weight in ((layer.w13_weight, weights.w1), (layer.w2_weight, weights.w2)):
                 result[id(parameter)] = (weight.data.view(torch.uint8), weight.scales)
     return result
@@ -380,19 +394,15 @@ def install():
             sanitize_routes[(local_tokens,)](
                 ids, weights, routes, gates, k, triton.next_power_of_2(k))
         else:
-            routes = (
-                torch.arange(k, dtype=torch.int32, device=x.device)
-                .expand(local_tokens, k)
-                .clone()
-            )
-            gates = torch.zeros(
-                (local_tokens, k), dtype=torch.float32, device=x.device
-            )
-            valid = ids >= 0
-            routes[:valid_tokens].copy_(
-                torch.where(valid, ids, routes[:valid_tokens])
-            )
-            gates[:valid_tokens].copy_(weights.float() * valid)
+            x = hidden_states.new_empty((local_tokens, hidden))
+            routes = torch.empty((local_tokens, k), dtype=torch.int32, device=x.device)
+            gates = torch.empty((local_tokens, k), dtype=torch.float32, device=x.device)
+            stage_inputs[(local_tokens,)](
+                hidden_states, topk_output.topk_ids, topk_output.topk_weights,
+                x, routes, gates, *hidden_states.stride(),
+                *topk_output.topk_ids.stride(), *topk_output.topk_weights.stride(),
+                start, valid_tokens, hidden, k,
+                triton.next_power_of_2(hidden), triton.next_power_of_2(k))
         inputs = (
             x,
             routes,
@@ -632,14 +642,14 @@ def _release_prefill():
     torch.cuda.empty_cache()
 
 
-def suspend(model_runner):
+def suspend(model_runner, *, discard_fp8=False):
     """Keep decode graphs, unless the low-memory policy is set."""
     global _recapture
     if _use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
         # Prepared FP8 versions are immutable. Rebuild plans after AWEX rather
         # than leaving captured graphs pointing at the previous weight version.
         _recapture = getattr(model_runner, "graph_runner", None) is not None
-        close(model_runner, keep_fp8=_use_fp8())
+        close(model_runner, keep_fp8=_use_fp8(), discard_fp8=discard_fp8)
     else:
         _release_prefill()
 
@@ -672,18 +682,19 @@ def _reset_decode_inputs(runner):
         "next_token_logits_buffer", "mamba_track_indices", "mamba_track_mask",
         "global_num_tokens_gpu", "global_num_tokens_for_logprob_gpu",
     ):
-        tensor = getattr(buffers, name)
+        tensor = getattr(buffers, name, None)
         if tensor is not None:
             tensor.zero_()
     buffers.seq_lens.fill_(runner.seq_len_fill_value)
     buffers.seq_lens_cpu.fill_(runner.seq_len_fill_value)
-    buffers.custom_mask.fill_(True)
-    if buffers.encoder_lens is not None:
+    if getattr(buffers, "custom_mask", None) is not None:
+        buffers.custom_mask.fill_(True)
+    if getattr(buffers, "encoder_lens", None) is not None:
         buffers.encoder_lens.fill_(runner.encoder_len_fill_value)
-    if buffers.pp_proxy_tensors is not None:
+    if getattr(buffers, "pp_proxy_tensors", None) is not None:
         for tensor in buffers.pp_proxy_tensors.values():
             tensor.zero_()
-    info = buffers.ngram_embedding_info
+    info = getattr(buffers, "ngram_embedding_info", None)
     if info is not None:
         info.column_starts.zero_()
         info.out_column_starts.zero_()
@@ -691,9 +702,9 @@ def _reset_decode_inputs(runner):
         info.out_req_lens.fill_(1)
 
 
-def close(model_runner, *, keep_fp8=False):
+def close(model_runner, *, keep_fp8=False, discard_fp8=False):
     """Final teardown: discard outer graphs before freeing native addresses."""
-    global _decode_runtime, _fp8_offloaded
+    global _decode_runtime, _fp8_offloaded, _fp8_needs_update
     torch.cuda.synchronize()
     runner = getattr(model_runner, "graph_runner", None)
     if runner is not None:
@@ -707,12 +718,24 @@ def close(model_runner, *, keep_fp8=False):
     if keep_fp8 and not _fp8_offloaded:
         for weights in _fp8_weights.values():
             for tensor in weights._tensors():
-                host = torch.empty_like(tensor, device="cpu", pin_memory=True)
-                host.copy_(tensor)
+                host = torch.empty_like(tensor, device="cpu", pin_memory=not discard_fp8)
+                if discard_fp8:
+                    host.untyped_storage().resize_(0)
+                else:
+                    host.copy_(tensor)
                 tensor.data = host
         _fp8_offloaded = True
+        _fp8_needs_update = discard_fp8
+    elif keep_fp8 and discard_fp8:
+        # A preceding KV-only offload may already have saved a CPU snapshot.
+        # Once a full weight update is scheduled, that snapshot is obsolete.
+        for weights in _fp8_weights.values():
+            for tensor in weights._tensors():
+                tensor.untyped_storage().resize_(0)
+        _fp8_needs_update = True
     elif not keep_fp8:
         _fp8_weights.clear()
         _fp8_devices.clear()
         _fp8_offloaded = False
+        _fp8_needs_update = False
     torch.cuda.empty_cache()

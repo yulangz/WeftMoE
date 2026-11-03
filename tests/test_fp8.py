@@ -155,8 +155,8 @@ def test_gemm(m, n, k, b_block_rows):
     aq, bq = quantize_fp8(a), quantize_fp8(b, block_rows=b_block_rows)
     expected = aq.dequantize().double() @ bq.dequantize().double().T
     actual = fp8_gemm(aq, bq, dtype=torch.float32)
-    # Global FP64 diff only; quantized-math and original BF16-operand references
-    # both use the shared acceptance threshold, including cancellation cases.
+    # Separate quantization error from arithmetic correctness: BF16 operands
+    # use 5e-3, while the already-quantized FP64 reference requires 1e-6.
     original = a.double() @ b.double().T
     assert_diff(actual, original, 'gemm')
     assert_diff(actual, expected, 'quantized_gemm')
@@ -225,3 +225,20 @@ def test_output_validation_and_cuda_graph():
     out.zero_()
     graph.replay()
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('nan_byte', [0x7f, 0xff])
+def test_imported_nan_weight_is_rejected(nan_byte):
+    x = torch.ones(1, 256, 128, device='cuda', dtype=torch.bfloat16)
+    w = quantize_fp8(x, block_rows=128)
+    w.data.view(torch.uint8)[0, 0, 0] = nan_byte
+    with pytest.raises(ValueError, match='finite'):
+        prepare_fp8_weights(w, quantize_fp8(x[:, :128].contiguous(), block_rows=128))
+
+
+@pytest.mark.parametrize('bad', [float('inf'), float('nan')])
+def test_nonfinite_source_weight_is_rejected(bad):
+    x = torch.ones(1, 256, 128, device='cuda', dtype=torch.bfloat16)
+    x[0, 0, 0] = bad
+    with pytest.raises(ValueError, match='finite'):
+        prepare_fp8_weights(x, x[:, :128].contiguous())

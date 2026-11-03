@@ -2,14 +2,18 @@
 import math
 
 DIFF_LIMIT = 5e-3
+QUANTIZED_DIFF_LIMIT = 1e-6
 POLICY = dict(version='bf16-global-diff-v1', reference='original BF16 operands',
               metric='sum((actual-reference)^2)/(sum(actual^2)+sum(reference^2))',
               diff_lt=DIFF_LIMIT, reduction='FP64; check every rank/expert separately',
               dprob='report only; finite values required',
+              quantized_reference_diff_lt=QUANTIZED_DIFF_LIMIT,
               source_and_graph_equivalence='bit-exact')
 
 
 def limit_for(name):
+    if name.startswith('quantized_gemm'):
+        return QUANTIZED_DIFF_LIMIT
     return None if name.rsplit('_', 1)[-1] in ('dg', 'dgate', 'dprob') else DIFF_LIMIT
 
 

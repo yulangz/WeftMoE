@@ -77,3 +77,35 @@ torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
 两侧分别设置 `NODE_RANK=0/1`，`MASTER_ADDR` 指向节点 0；库、环境和参数相同。
 设置适合机器的 `NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA` 等网络参数，不照搬其他集群的网卡名。
 EP8 指单机八卡，EP16 指双机十六卡；固定每 rank tokens 时，EP16 的全局工作量翻倍。
+
+## FP8 结果汇总与归档
+
+原始 JSON、候选补丁、SASS 和一次性实验脚本保存在
+[归档提交 f40a921](https://github.com/yulangz/WeftMoE/tree/f40a921ea75cbd0ac6b99a2fb3c0d1b0c05015e1)
+（分支 `archive/fp8-benchmarks-f40a921`），不随当前源码分发。
+归档提交用于定位原始证据；各次实验的实际源码／二进制 hash 以报告中的记录为准。
+不要将历史候选补丁应用到当前源码。
+
+| 对照 | 数据范围 | 结果 | 实现提交 |
+| --- | --- | --- | --- |
+| 122B AReaL 权重更新 | 单机 DP8/EP8，32×16，16K，第 2–10 step | baseline 22.10 s；BF16 WeftMoE 25.54 s；FP8 WeftMoE 25.48 s | f40a921 |
+| BF16 直接 TMA 权重读取 | 122B/EP8，每 rank | 去掉 18 GiB FC1 重排副本，PF/DT 直接读取原始布局 | f40a921 |
+| 固定 M64 PF/DT 一致性 | 三个预设 shape，BF16/FP8 | 含训练缓存的 PF 前向与 DT 严格逐位回归通过 | 6a2f213 |
+
+权重更新不含 decode graph 重捕获，数据量缩减不等于跨卡带宽同比加速。
+RL 的采样长度不同，以上不是完整训练吞吐对照，也不承诺所有 shape 的 FP8 都快于 BF16。
+当前可复用入口为 `benchmarks/torchrun_training.py`、`benchmarks/torchrun_sglang_decode.py`
+和 `tools/autotune_dt_fp8.py`。
+
+固定 M64 的 DT 历史回放结果（EP8、256 experts、静态路由、单位 µs；实现提交 `6a2f213`）：
+
+| 规模 | 每 rank tokens | BF16 | FP8 在线量化 | 预量化 FP8 输入 |
+| --- | ---: | ---: | ---: | ---: |
+| qwen35b | 64 | 104.66 | 82.83 | 80.37 |
+| qwen35b | 512 | 215.80 | 218.29 | 216.93 |
+| qwen122b | 64 | 210.24 | 141.66 | 137.06 |
+| qwen122b | 512 | 423.40 | 326.64 | 324.18 |
+| flash | 64 | 442.56 | 276.83 | 270.33 |
+| flash | 512 | 790.67 | 536.30 | 534.19 |
+
+此表只统计已准备权重和图的 decode 回放；预量化输入列不含上游量化成本，不能直接代表端到端收益。

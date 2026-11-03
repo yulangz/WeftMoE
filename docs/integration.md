@@ -26,15 +26,20 @@ adapter.prepare()
 支持整层 checkpoint：首次 `no_grad` FWD 不保存 X/GU，BWD 中重算 FWD 时才保存。
 
 设置 `WEFTMOE_FP8=1`（或 `MegatronAdapter(..., fp8=True)`）启用 routed experts 的
-blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。每层权重量化结果在
-micro-batch 和重算之间复用。引擎必须在每次 optimizer step 和 checkpoint load 后调用
-`adapter.weights_updated()`；仅检查 Tensor version 无法检测优化器的 `.data` 写入。
-未绑定 master 的独立 adapter 在 offload 后重新准备缓存。router/shared experts 保持原实现。
+blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。
+未绑定 master 时，默认每次 forward 从参数重新量化，避免 `.data` 更新绕过 Tensor version
+后静默使用旧权重。支持 PyTorch step post hook 的优化器可调用 `adapter.bind_optimizer(optimizer)`，
+由 hook 自动失效缓存，从而在 micro-batch 和重算之间复用；checkpoint load 等 step 之外的
+直接写入仍需调用 `adapter.weights_updated()`。不支持该 hook 的优化器保持默认行为。
+router/shared experts 保持原实现。
 
 AReaL 的 GPU-staged Muon 在初始化后调用 `adapter.bind_fp32_masters(optimizer)`。
 当前支持 expert DP=1、ETP=1：routed expert 的 BF16 GPU storage 释放，不保留 CPU BF16 副本；
 Parameter 对象、DDP hooks 和 FP32 梯度 buffer 保留。每次更新直接在 Muon compute stream
 将 FP32 master 量化为 W/Wᵀ，跳过 BF16 写回，所有 micro-batch 和重算复用。
+引擎在完整 optimizer step 后调用 `adapter.weights_updated()`；发布会等待所有量化 writer
+stream，再记录消费者等待的 ready event。`close()` 从 master 恢复普通 BF16 参数后解除绑定，
+因此退出 adapter 后仍可读取模型 checkpoint。
 `suspend()` 释放 FP8 缓存，不保留 CPU FP8 W/Wᵀ 备份；`release_bf16_weights()` 从
 已有 CPU FP32 master 重建 GPU FP8 缓存。重建仅在恢复计算/传权阶段发生，micro-batch 间复用。
 checkpoint 按需从 FP32 master 生成临时 BF16 参数。FP32 直接量化不承诺与经过 BF16
@@ -75,6 +80,9 @@ BF16 的 PF/DT 通过 5D TMA 直接读取原始 FC1 权重，在共享内存形�
 
 FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
 FP8 权重字节（uint8 view）和 FP32 block scale，不恢复 BF16，不重新量化。
+AWEX 确定下一次完整覆盖权重时调用 `suspend(..., discard_fp8=True)`，只保留张量元数据，
+不拷贝旧 FP8 到 CPU；接收时分配 GPU 空间，`commit_fp8_weights()` 后才允许推理。
+普通 suspend/resume 需要继续使用旧权重，默认仍保存 CPU 副本。
 启用 TMS 时，初始专家 BF16 分配使用临时普通 CUDA pool，避免其释放后仍由 TMS 持久池
 保留并在 onload 时重新占用显存。此兼容路径使用 PyTorch 2.9 / 当前 TMS 的内部接口，
 升级依赖时需重跑包含 TMS、权重更新和图重捕获的 8 卡生命周期测试。
@@ -101,7 +109,7 @@ DT 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 �
 
 ## AReaL
 
-配套 AReaL 提交为 `6cb3fff5`（`feat/weftmoe-fp8-residency`），包含 FP8 AWEX 和权重
+配套 AReaL 提交为 `88572016`（`feat/weftmoe-fp8-residency`），包含 FP8 AWEX 和权重
 生命周期改动；不是任意上游版本均已内置接入。
 关键位置：
 

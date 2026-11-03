@@ -1,5 +1,0 @@
-{
-  "status": "Historical experiment; superseded by fixed-M64 DT.",
-  "archived_scripts": "build/dt-m64-20261101/archived-experiments/dt_m_shapes",
-  "report": "docs/benchmarks/dt_m_shapes_20261101.json"
-}

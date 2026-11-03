@@ -42,3 +42,14 @@ def test_nonfinite_and_wrong_shape_are_not_hidden():
         assert_diff(torch.tensor([float('nan')]), torch.ones(1), 'dprob')
     with pytest.raises(ValueError):
         global_diff(torch.zeros(1), torch.zeros(2))
+
+
+def test_quantized_reference_catches_missing_small_k_block():
+    reference = torch.ones(128)
+    # Dropping a small K-block contribution must not use the BF16 error budget.
+    actual = reference - 0.01
+    assert_diff(actual, reference, 'gemm')
+    for name in ('quantized_gemm', 'quantized_gemm_accumulate'):
+        assert limit_for(name) == 1e-6
+        with pytest.raises(AssertionError):
+            assert_diff(actual, reference, name)

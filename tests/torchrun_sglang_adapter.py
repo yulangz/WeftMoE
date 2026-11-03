@@ -194,6 +194,8 @@ def main():
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
         if iteration == 2:
+            ids[-1] = torch.arange(top_k, device='cuda')
+            ids[-1, 0] = top_k - 1
             ids[-1, -1] = -1  # SGLang's masked route must stage as zero gate.
         gates.mul_(0.95)
         eager = layer(x, topk)
@@ -209,7 +211,10 @@ def main():
     discard_graphs = adapter._use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0"
     if discard_graphs:
         del graph, captured
-    adapter.suspend(model_runner)
+    adapter.suspend(model_runner, discard_fp8=adapter._use_fp8())
+    if adapter._use_fp8():
+        assert all(t.untyped_storage().nbytes() == 0
+                   for weights in adapter._fp8_weights.values() for t in weights._tensors())
     if memory_saver:
         memory_saver.pause("weights")
         scratch = torch.empty_like(layer.w13_weight)

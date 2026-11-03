@@ -46,7 +46,10 @@ __device__ __forceinline__ float block_scale(float amax) {
 __device__ __forceinline__ void store_fp8_eight(
     uint4 value, std::uint8_t *base, unsigned columns, unsigned column,
     float *scales = nullptr, unsigned scale_stride = 1U) {
-  const unsigned mask = __activemask();
+  // All callers own complete K128 groups (16 lanes), even when the other
+  // half-warp has no tail block. Independent scheduling cannot change the
+  // logical membership of this reduction.
+  const unsigned mask = 0xffffU << (threadIdx.x & 16U);
   const unsigned words[4] = {value.x, value.y, value.z, value.w};
   float2 values[4];
   float maximum = 0;

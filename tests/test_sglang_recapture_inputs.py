@@ -7,6 +7,15 @@ import pytest
 import torch
 
 
+def test_recapture_without_optional_version_specific_buffers():
+    from weftmoe.sglang import _reset_decode_inputs
+    buffers = SimpleNamespace(seq_lens=torch.full((4,), 19),
+                              seq_lens_cpu=torch.full((4,), 19))
+    _reset_decode_inputs(SimpleNamespace(buffers=buffers, seq_len_fill_value=2))
+    assert torch.equal(buffers.seq_lens, torch.full((4,), 2))
+    assert torch.equal(buffers.seq_lens_cpu, torch.full((4,), 2))
+
+
 def test_recapture_restores_sglang_constructor_inputs():
     pytest.importorskip("sglang")
     from sglang.srt.model_executor.cuda_graph_runner import DecodeInputBuffers

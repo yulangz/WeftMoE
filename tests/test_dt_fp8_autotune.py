@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("dt_autotune", Path(__file__).resolve().parents[1] /
-    "benchmarks/experiments/dt_fp8/autotune.py")
+    "tools/autotune_dt_fp8.py")
 tune = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(tune)
 

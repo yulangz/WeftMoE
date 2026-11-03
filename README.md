@@ -1,6 +1,6 @@
 # WeftMoE
 
-面向 Hopper/SM90a 的 BF16 routed MoE 算子，将专家计算与机内、跨机通信流水化。
+面向 Hopper/SM90a 的 BF16 / blockwise FP8 routed MoE 算子，将专家计算与机内、跨机通信流水化。
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
 | 实现 | 用途 | 通信范围 | 训练缓存与反向 |
@@ -38,7 +38,8 @@ PF 使用静态任务划分、有界计算/通信 ring 和逐槽代际同步。F
 
 ## 支持范围
 
-激活/权重为 BF16，专家为无 bias 的 SwiGLU，专家均匀分片且 `E % EP == 0`。
+支持 BF16 或 E4M3 blockwise FP8 计算（FP32 累加）；FP8 权重预量化，激活支持在线或预量化输入。
+输出与输入梯度为 BF16，框架接入默认 BF16 dW。专家为无 bias 的 SwiGLU，专家均匀分片且 `E % EP == 0`。
 native 库按 hidden/intermediate 编译；其他模型可配置 shape 后重新编译或 autotune，
 不是修改 Python 参数就能复用任意二进制。单机 EP2/4/8 等拓扑可用，具体容量取决于 profile 与显存。
 多机需要相同的每节点 GPU 数、连续排列的机内 EP rank，以及可用的 GDAKI 网络。

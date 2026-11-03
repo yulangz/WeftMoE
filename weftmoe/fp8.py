@@ -165,6 +165,7 @@ class PreparedFP8Weights:
     _ready: torch.cuda.Event = field(repr=False, compare=False)
     _tensor_versions: tuple[int, ...] = field(repr=False)
     _sources: tuple = field(default=(), repr=False, compare=False)
+    _cache_key: int = field(default=0, repr=False, compare=False)
 
     def _tensors(self):
         return tuple(t for w in (self.w1, self.w2, self.w1_t, self.w2_t)
@@ -200,14 +201,14 @@ class PreparedFP8Weights:
                 raise RuntimeError("FP8 cache is stale after a parameter update; prepare new weights")
 
 
-def _seal_weights(weights, version, sources=()):
+def _seal_weights(weights, version, sources=(), *, cache_key=0):
     """Publish an already-written weight version without copying its tensors."""
     with torch.cuda.device(weights[0].data.device):
         event = torch.cuda.Event()
         event.record()
     tensors = tuple(t for w in weights if w is not None for t in (w.data, w.scales))
     return PreparedFP8Weights(*weights, version, event,
-                              tuple(t._version for t in tensors), tuple(sources))
+                              tuple(t._version for t in tensors), tuple(sources), cache_key)
 
 
 @torch.inference_mode(False)
@@ -255,11 +256,16 @@ def prepare_fp8_weights(w1: torch.Tensor | FP8Tensor,
     with torch.cuda.device(a.data.device):
         # Preparation is explicitly outside capture/hot paths. Reject corrupt
         # checkpoint scales before they can enter a distributed computation.
-        for w in prepared:
-            if not (torch.isfinite(w.scales) & (w.scales > 0)).all().item():
-                raise ValueError("FP8 weight scales must be finite and positive")
-            if not torch.isfinite(w.data.float()).all().item():
-                raise ValueError("FP8 weights must be finite")
+        valid = []
+        for source, w in zip((w1, w2), prepared):
+            valid.append((torch.isfinite(w.scales) & (w.scales > 0)).all())
+            # Our quantizer records every nonfinite source block as a NaN
+            # scale. Imported E4M3FN bytes additionally need a NaN-bit check;
+            # E4M3FN has no infinity encoding. Never expand weights to FP32.
+            if isinstance(source, FP8Tensor):
+                valid.append(((w.data.view(torch.uint8) & 0x7f) != 0x7f).all())
+        if not torch.stack(valid).all().item():
+            raise ValueError("FP8 weights must be finite and scales finite and positive")
         at, bt = ((qt if qt is not None else transpose_fp8_weight(q)) if training else None
                   for q, qt in zip(prepared, transposed))
     return _seal_weights((a, b, at, bt), version, sources)

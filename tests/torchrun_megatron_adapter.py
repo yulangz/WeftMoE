@@ -1,6 +1,7 @@
 """Compare the real Megatron router/experts/autograd path with the adapter."""
 
 import os
+import io
 from functools import partial
 
 import torch
@@ -157,6 +158,7 @@ def main():
             optimizer.bind_managed_checkpoint_process_group(dist.new_group(backend="gloo"))
     else:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        adapter.bind_optimizer(optimizer)
     primary = os.environ.get("TEST_FP32_MASTER") == "1"
     if primary:
         assert adapter.fp8 and use_muon and reference_adapter
@@ -199,6 +201,8 @@ def main():
             # Rebuild the standalone BF16-backed cache for the replay check.
             adapter.fp8_weights.clear()
         actual = run(x)
+        if adapter.fp8:
+            assert adapter.runtime.native.usage()['fp8_weight_cache_entries'] == len(model)
         if recompute:
             adapter.runtime.drain()
             # The initial no-grad pass must not leave backward tapes alive.
@@ -314,7 +318,16 @@ def main():
                 assert torch.equal(actual_tensor.view(torch.uint8).cpu(), expected_tensor.view(torch.uint8))
         assert all(p.untyped_storage().nbytes() == 0 for layer in model for p in adapter._parameters(layer))
         print(dist.get_rank(), "FP32_MASTER_CHECKPOINT_ROUNDTRIP_PASS", flush=True)
+    if primary:
+        close_expected = {id(p): adapter.master_weights.masters[id(p)].view(p.shape).bfloat16().cpu()
+                          for layer in model for p in adapter._parameters(layer)}
     adapter.close()
+    if primary:
+        for layer in model:
+            for p in adapter._parameters(layer):
+                assert torch.equal(p.cpu(), close_expected[id(p)])
+        # A checkpoint remains readable after removing the adapter.
+        torch.save(model.state_dict(), io.BytesIO())
     assert adapter.runtime is None and adapter.session is None and not adapter.packed
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()

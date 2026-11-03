@@ -530,6 +530,7 @@ public:
     auto n = notify_pool_.usage();
     py::dict result;
     result["compute_bytes"] = p.compute_device_bytes;
+    result["fp8_weight_cache_entries"] = fp8_weight_cache_.size();
     result["last_forward_tensor_bytes"] = last_forward_tensor_bytes_;
     result["last_backward_tensor_bytes"] = last_backward_tensor_bytes_;
     result["gin_bytes"] = p.gin_registered_bytes;
@@ -546,8 +547,7 @@ public:
     plans_.clear();
     buckets_.clear();
     inference_weights_.clear();
-    cached_fp8_lease_ = {};
-    cached_fp8_weights_ = py::none();
+    fp8_weight_cache_.clear();
     pool_.retire_peer_mappings();
   }
 
@@ -642,9 +642,10 @@ private:
   std::uint64_t last_forward_tensor_bytes_ = 0, last_backward_tensor_bytes_ = 0;
   ForwardWeightLease prepared_fp8_weights(const RankCollectiveContext &context,
                                             const py::object &fp8_weights) {
-    if (fp8_weights.is(cached_fp8_weights_)) {
-      return cached_fp8_lease_;
-    }
+    const auto key = fp8_weights.attr("_cache_key").cast<std::uint64_t>();
+    auto found = fp8_weight_cache_.find(key);
+    if (found != fp8_weight_cache_.end() && fp8_weights.is(found->second.first))
+      return found->second.second;
     const auto count = config_.num_experts / config_.topology.world_size;
     FP8WeightBuffers fp8;
     const auto matrix = [&](const char *name, unsigned rows, unsigned columns,
@@ -663,14 +664,13 @@ private:
       matrix("w2_t", intermediate_, hidden_, fp8.w2_t, fp8.s2_t);
     }
     fp8.version = fp8_weights.attr("version").cast<std::uint64_t>();
-    // Cache one immutable version, without retaining the current input.
-    // Forward tapes independently own their leases when a new version arrives.
+    // Keep one immutable version per layer; tapes retain older versions.
+    // Standalone weights use key zero and retain the bounded single-slot policy.
     auto weight_producer = make_external_cuda_producer(
         context, execution_.device_ordinal(), stream_, owner(fp8_weights), "fp8-weights");
     auto weights = weight_producer.publish_fp8_weights(fp8, count, rank_ * count,
                                                   hidden_, intermediate_);
-    cached_fp8_weights_ = fp8_weights;
-    cached_fp8_lease_ = weights;
+    fp8_weight_cache_.insert_or_assign(key, std::make_pair(fp8_weights, weights));
     return weights;
   }
 
@@ -840,8 +840,7 @@ private:
   std::string device_;
   // Destroy graph executables before their metadata, weight owners and workspace.
   std::map<unsigned, InferenceWeights> inference_weights_;
-  py::object cached_fp8_weights_ = py::none();
-  ForwardWeightLease cached_fp8_lease_;
+  std::map<std::uint64_t, std::pair<py::object, ForwardWeightLease>> fp8_weight_cache_;
   std::map<std::uint64_t, std::unique_ptr<InferenceBucket>> buckets_;
   std::map<std::pair<unsigned, std::uint64_t>, std::unique_ptr<InferencePlan>>
       plans_;

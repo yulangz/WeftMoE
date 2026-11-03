@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unattended, resumable single-node EP8 DT FP8 Cartesian search.
 
-Launch: python benchmarks/experiments/dt_fp8/autotune.py --output build/dt-autotune --detach
+Launch: python tools/autotune_dt_fp8.py --output build/dt-autotune --detach
 Resume: repeat the command (source snapshot and successful stages are reused).
 Stop: kill -TERM $(cat build/dt-autotune/pid)
 Only DT FP8 compile-time overrides are changed; BF16 and 224/56 registers stay fixed.
@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from benchmarks.fp8_validation import POLICY, passes
 MODELS = {"qwen35b": (2048, 512, 8), "qwen122b": (3072, 1024, 8), "flash": (4096, 2048, 6)}
@@ -310,7 +310,7 @@ def execute_job(output, manifest, model, candidate, phase, retry_failed):
             waived = log.read_text().count('"known_failure_waived": true') if log.exists() else 0
             atomic_json(base / "correctness.json", dict(passed=True, seconds=seconds, known_case_waivers=waived))
         idle_gpus()
-        rec["benchmark_seconds"] = run_command([*launcher, "benchmarks/experiments/dt_fp8/benchmark.py"],
+        rec["benchmark_seconds"] = run_command([*launcher, "benchmarks/benchmark_dt_fp8.py"],
             cwd=source, env=env, log=job / "benchmark.log", timeout=600)
         rec.update(rows=parse_measurements(job / "benchmark.log"), status="passed")
     except RuntimeError as error:
@@ -424,7 +424,7 @@ def main():
             raise RuntimeError("validation policy changed; use a new output directory with --reuse-builds")
         if args.allow_known_one_token and not json.loads(path.read_text()).get("allow_known_one_token", False):
             raise RuntimeError("known-case waiver changed; use a new output directory")
-        command = [sys.executable, str(args.output / "source/benchmarks/experiments/dt_fp8/autotune.py"),
+        command = [sys.executable, str(args.output / "source/tools/autotune_dt_fp8.py"),
                    "--output", str(args.output), "--worker"]
         if args.retry_failed:
             command.append("--retry-failed")
