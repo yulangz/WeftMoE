@@ -4,6 +4,7 @@ The operator boundary starts with selected routes/probabilities, like WeftMoE;
 router projection/top-k and the optimizer are not part of either measurement.
 """
 
+from functools import partial
 from importlib.metadata import version
 from types import SimpleNamespace
 
@@ -53,7 +54,10 @@ class MegatronTrainingBackend:
                                      config, groups)
         spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=args.experts, moe_grouped_gemm=True)
-        self.experts = spec.submodules.mlp.submodules.experts(owned, config, pg_collection=groups)
+        mlp = spec.submodules.mlp
+        # Megatron-Core 0.19 uses partial builders instead of nested ModuleSpecs.
+        submodules = mlp.keywords["submodules"] if isinstance(mlp, partial) else mlp.submodules
+        self.experts = submodules.experts(owned, config, pg_collection=groups)
         self.w1 = [getattr(self.experts.linear_fc1, f"weight{i}") for i in range(owned)]
         self.w2 = [getattr(self.experts.linear_fc2, f"weight{i}") for i in range(owned)]
         self.accumulate_main_grad = config.gradient_accumulation_fusion
