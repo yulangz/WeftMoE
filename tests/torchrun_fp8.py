@@ -227,6 +227,9 @@ def main():
     else:
         raise AssertionError("cached FP8 lease accepted mutated scales")
     print(rank, "FP8_CACHED_VERSION_CHECK_PASS", flush=True)
+    # Release the full-expert reference weights/gradients before the checkpoint
+    # test dequantizes another full copy (Flash E256 otherwise exceeds 140 GiB).
+    del tapes, reference_w1, reference_w2, expected, target
 
 
     # Imported checkpoint scales need not be powers of two; never silently
