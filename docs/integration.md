@@ -154,12 +154,5 @@ rollout TP8/EP8、Muon CPU-staged offload、整层重算、8 prompts ×4 samples
 8K Muon 配置为同目录 `dapo-math_grpo_qwen3_5_122b_muon.yaml`，测试 35B 时覆盖
 `actor.path` 并使用 35B native profile，不能仅按 YAML 文件名判断实际模型。
 
-SGLang 服务端 context 需要为中断后续生成留出输入余量。SGLang 0.5.10.post1 的
-`max_req_input_len = min(context_len - 1, max_token_pool_size - 1) - 5`，
-且拒绝长度大于或等于该值的输入，即使未启用 speculative decoding 也适用。
-8K 配置可保留 `gconfig.max_tokens=8191` 和 proxy `engine_max_tokens=8191`，
-将 `sglang.context_length` 设为 `8208`（同时确保 KV pool 足够），训练 microbatch token 上限独立设置。
-不要用自动截断绕过续生成长度检查，以免已有 token、logprob 和训练轨迹不一致。
-
 短测关闭 saver/recover 的 steps、epochs、secs 频率，`recover.mode=disabled`；
 需要 W&B 时显式配置 online 和凭据，不把密钥写进仓库。RL 回归结果见 [Benchmark](benchmarks.md)。

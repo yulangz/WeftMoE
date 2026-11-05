@@ -149,7 +149,7 @@ FP8 对 SGLang 的数值结果需在相同输入、路由和计时边界下联�
 源码基线：`12977054368b0fe8978b4515e7e74ecd95bc27b4`；实际源文件清单 SHA256：`ade0890051bfdb1b1d87eeb158fca9716637b2b7edb0ac66a9007a62bc605939`。
 测量使用该 commit 的干净源码快照；每个规模单独构建，BF16/FP8 共用该规模的二进制。
 构建启用 `WEFTMOE_FORWARD_USE_GENERATED_TUNING=1`，选择对应 `configs/profiles/<model>/`；不启用 autotune。
-仓库保留[分位数汇总 CSV](benchmark_results/ep8-2026-11-05.csv)，包含 p25/p50/p75、样本数、seed、源码 commit 和二进制 hash。
+性能概览见 [README](../README.md#性能)，以下保留完整计时口径与结果。
 完整逐 rank 样本、workload hash 和源码文件 hash 保留在本地测量包中，原始大日志不入库。
 未锁定时钟；500 ms GPU 遥测的 SM 时钟为 1410–1620 MHz，温度 29–53°C，峰值功耗约 692 W。
 遥测包含启动和退出阶段，不能精确对应单个计时样本；结果包含默认功耗管理的影响。
