@@ -30,19 +30,25 @@ blockwise FP8 FWD/BWD，dW 返回 BF16；模型参数和优化器精度不变。
 未绑定 master 时，默认每次 forward 从参数重新量化，避免 `.data` 更新绕过 Tensor version
 后静默使用旧权重。未绑定时原生缓存只保留一个槽位，活跃 tape 单独保留所需版本。BF16/FP32 参数现量化不做主机有限性检查，不在每层或重算时读取 GPU
 标量；非有限块通过 NaN scale 传播。导入的 FP8 权重仍检查字节和 scale，并同步一次。
-当前优化器接入范围是 AdamW 和下述 AReaL GPU-staged Muon。
+当前优化器接入范围是 AdamW 和下述 AReaL GPU-staged AdamW/Muon。
 `adapter.bind_optimizer(optimizer)` 只接受具有 step post hook 的 `torch.optim.AdamW`，
 由 hook 自动失效缓存，从而在 micro-batch 和重算之间复用；checkpoint load 等 step 之外的
 直接写入仍需调用 `adapter.weights_updated()`。
 Megatron 的 `MegatronOptimizer` / `ChainedOptimizer` 包装器不支持此绑定，会明确抛出
 `TypeError`；不会递归绑定其内部 optimizer，以免在完整 step 结束前发布部分权重。
-使用这些包装器的 AdamW 用户应不调用 `bind_optimizer()`，保持每次 forward 异步现量化。
+AReaL GPU-staged AdamW 使用下面的 master 绑定；其他包装器保持每次 forward 异步现量化。
 router/shared experts 保持原实现。
 
-AReaL 的 GPU-staged Muon 在初始化后调用 `adapter.bind_fp32_masters(optimizer)`。
+AReaL 的 GPU-staged AdamW/Muon 接入需要配套的
+[AReaL 接入改动](https://github.com/areal-project/AReaL/pull/1890)，在初始化后调用 `adapter.bind_fp32_masters(optimizer)`。
 当前支持 expert DP=1、ETP=1：routed expert 的 BF16 GPU storage 释放，不保留 CPU BF16 副本；
-Parameter 对象、DDP hooks 和 FP32 梯度 buffer 保留。每次更新直接在 Muon compute stream
+Parameter 对象、DDP hooks 和 FP32 梯度 buffer 保留。每次更新直接在 optimizer compute stream
 将 FP32 master 量化为 W/Wᵀ，跳过 BF16 写回，所有 micro-batch 和重算复用。
+AdamW 要求开启 distributed optimizer 和 precision-aware optimizer。其 staging 分块保持
+专家矩阵完整，单个矩阵必须能装入一个 staging slot；量化直接消费更新后的 GPU master，
+不会再搬运一次 CPU master。仅含本地专家的 DDP 参数 buffer 整块释放，并跳过 expert DP=1
+的参数 all-gather；dense 参数与梯度同步不变。checkpoint/close 按原尺寸恢复整个 buffer，
+保留参数及 shard 视图；close 也恢复 AdamW 的 BF16 写回和参数同步。
 第一次 master 写入立即使旧版本和旧 tape 失效，未发布期间禁止新计算；原生写入也显式更新
 Tensor version，直接持有旧 `PreparedFP8Weights` 的调用者同样会报错。更新必须发生在全部
 反向完成后，不支持与旧版本计算并发覆写。引擎在完整 optimizer step 后调用 `adapter.weights_updated()`；发布会等待所有量化 writer

@@ -79,9 +79,13 @@ def test_close_does_not_discard_materialized_parameters(monkeypatch):
         parameter.untyped_storage().resize_(8)
         parameter.data.fill_(3)
 
-    manager.master_weights = SimpleNamespace(
-        materialize=materialize, bindings={0: (None, None, None, parameter)}
-    )
+    master = MasterWeights.__new__(MasterWeights)
+    master.materialize = materialize
+    master.bindings = {0: (None, None, None, parameter)}
+    master.adamw_writers = {}
+    master.bucket_groups = []
+    master.buffers = []
+    manager.master_weights = master
     # suspend after materialize would discard the restored BF16 storage again.
     manager.suspend = lambda: parameter.untyped_storage().resize_(0)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
