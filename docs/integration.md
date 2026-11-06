@@ -49,6 +49,8 @@ AdamW 要求开启 distributed optimizer 和 precision-aware optimizer。其 sta
 不会再搬运一次 CPU master。仅含本地专家的 DDP 参数 buffer 整块释放，并跳过 expert DP=1
 的参数 all-gather；dense 参数与梯度同步不变。checkpoint/close 按原尺寸恢复整个 buffer，
 保留参数及 shard 视图；close 也恢复 AdamW 的 BF16 写回和参数同步。
+绑定前 DDP 参数 buffer 必须完整驻留。staged optimizer 的 checkpoint 恢复须原地更新
+CPU master；若替换了 master Tensor，恢复/重建 FP8 前会明确报错。
 第一次 master 写入立即使旧版本和旧 tape 失效，未发布期间禁止新计算；原生写入也显式更新
 Tensor version，直接持有旧 `PreparedFP8Weights` 的调用者同样会报错。更新必须发生在全部
 反向完成后，不支持与旧版本计算并发覆写。引擎在完整 optimizer step 后调用 `adapter.weights_updated()`；发布会等待所有量化 writer

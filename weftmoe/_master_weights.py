@@ -24,6 +24,7 @@ class MasterWeights:
         self.optimizer = optimizer
         self.bindings = {}
         self.masters = {}
+        self.master_sources = {}
         self.weights = {}
         self.writer_streams = {}
         self.dirty = False
@@ -40,7 +41,14 @@ class MasterWeights:
                 if torch.distributed.get_world_size(optimizer.pg_collection.expt_dp) != 1:
                     raise ValueError("FP8 master weights require expert DP=1")
                 owners.update((id(unit.param), (leaf, unit.param)) for unit in getattr(leaf, "units", ()))
-            elif callable(getattr(leaf, "set_master_writers", None)):
+            elif (callable(getattr(leaf, "set_master_writers", None))
+                  and getattr(leaf, "optimizer_kind", None) != "scalar_adamw"):
+                # Muon's scalar-only leaf does not own routed expert matrices.
+                config = getattr(wrapper, "config", None)
+                if not getattr(config, "use_distributed_optimizer", False):
+                    raise ValueError("FP8 staged AdamW requires use_distributed_optimizer=True")
+                if not getattr(config, "use_precision_aware_optimizer", False):
+                    raise ValueError("FP8 staged AdamW requires use_precision_aware_optimizer=True")
                 for parameter, (group, index) in getattr(wrapper, "model_param_group_index_map", {}).items():
                     region = wrapper._get_model_param_range_map(parameter)["param"]
                     if region.start == 0 and region.end == parameter.numel():
@@ -62,6 +70,9 @@ class MasterWeights:
                     raise ValueError("FP8 master buffer must contain only selected experts")
                 if buf.data_parallel_world_size != 1:
                     raise ValueError("FP8 master weights require expert DP=1")
+                if buf.param_data.untyped_storage().nbytes() != (
+                        buf.param_data.numel() * buf.param_data.element_size()):
+                    raise ValueError("FP8 master DDP parameter buffer must be fully resident before binding")
                 self.buffers.append(buf)
                 flat_storages.add(buf.param_data.untyped_storage()._cdata)
             for group in getattr(model, "expert_parallel_bucket_groups", ()):
@@ -81,10 +92,13 @@ class MasterWeights:
                 if id(p) not in owners:
                     raise ValueError("Every FP8 expert must have a complete staged AdamW or Muon master")
                 leaf, shard = owners[id(p)]
-                master = leaf.state[shard]["master_param"]
+                master = leaf.state.get(shard, {}).get("master_param")
+                if not isinstance(master, torch.Tensor):
+                    raise ValueError("FP8 experts require initialized staged optimizer master_param state")
                 if master.dtype != torch.float32 or master.numel() != p.numel():
                     raise ValueError("Expected a complete FP32 master matrix")
                 self.masters[id(p)] = master
+                self.master_sources[id(p)] = (leaf, shard)
                 if callable(getattr(leaf, "set_master_writers", None)):
                     if p.numel() > leaf.staged_config.bucket_numel:
                         raise ValueError("FP8 expert matrix exceeds the AdamW staging slot size")
@@ -92,6 +106,8 @@ class MasterWeights:
                 storage = p.untyped_storage()
                 if not storage.resizable() or not p.is_contiguous():
                     raise ValueError("FP8 masters require contiguous, resizable expert storage")
+                if (p.storage_offset() + p.numel()) * p.element_size() > storage.nbytes():
+                    raise ValueError("FP8 expert parameter extends beyond its allocated storage")
                 if storage._cdata not in flat_storages and (
                         p.storage_offset() or storage.nbytes() != p.numel() * p.element_size()
                         or storage._cdata in self.storages):
@@ -147,7 +163,17 @@ class MasterWeights:
             drain()
         else:
             for leaf in self.leaves:
-                leaf.optimizer.drain()
+                drain = getattr(leaf.optimizer, "drain", None)
+                if callable(drain):
+                    drain()
+
+    def _validate_masters(self):
+        # Supported staged optimizers load checkpoints into existing CPU slabs.
+        # Replacing a tensor would also break optimizer staging aliases; reject
+        # it rather than silently rebuilding from the cached, obsolete master.
+        for key, (leaf, shard) in self.master_sources.items():
+            if leaf.state.get(shard, {}).get("master_param") is not self.masters[key]:
+                raise RuntimeError("Optimizer replaced a bound FP32 master; checkpoint restore must update it in place")
 
     @staticmethod
     def _skip_param_sync(group, force_sync=False):
@@ -229,6 +255,7 @@ class MasterWeights:
     def resume(self):
         if not self.offloaded:
             return
+        self._validate_masters()
         for weights in self.weights.values():
             for weight in weights:
                 for tensor in (weight.data, weight.scales):
@@ -245,6 +272,7 @@ class MasterWeights:
     @torch.no_grad()
     def materialize(self):
         """Checkpoint-only BF16 view derived from FP32; never a saved shadow."""
+        self._validate_masters()
         self.adapter.suspend()
         self._drain()
         for storage, size in self.storages.values():
@@ -259,6 +287,7 @@ class MasterWeights:
     def refresh(self):
         """Rebuild after a checkpoint updates the optimizer's FP32 master values."""
         self._drain()
+        self._validate_masters()
         self.discard_materialized()
         if self.offloaded:
             self.resume()
