@@ -44,7 +44,7 @@ def main():
         tensor_model_parallel_size=tp,
         expert_model_parallel_size=world,
         expert_tensor_parallel_size=1,
-        create_gloo_process_groups=False,
+        create_gloo_process_groups=os.environ.get("TEST_STAGED_ADAMW") == "1",
     )
     # Router weights are initialized on CPU; CUDA's model-parallel RNG alone
     # neither reproduces them nor gives replicas the same initial parameters.
@@ -98,11 +98,12 @@ def main():
     )
     for i, layer in enumerate(model):
         layer.set_layer_number(i + 1)
+    staged_adamw = os.environ.get("TEST_STAGED_ADAMW") == "1"
     ddp = None
     if os.environ.get("TEST_DDP") == "1":
         ddp = DistributedDataParallel(
             config,
-            DistributedDataParallelConfig(grad_reduce_in_fp32=True),
+            DistributedDataParallelConfig(grad_reduce_in_fp32=True, use_distributed_optimizer=staged_adamw),
             model,
         )
 
@@ -134,7 +135,22 @@ def main():
     adapter.prepare()
     adapted = [layer.forward for layer in model]
     use_muon = os.environ.get("TEST_MUON") == "1"
-    if use_muon:
+    if staged_adamw:
+        from megatron.core.optimizer import OptimizerConfig
+        from areal.engine.megatron_utils.gpu_staged_optimizer import (
+            GPUStagedAdamWConfig, get_megatron_optimizer_with_gpu_staged_adamw,
+        )
+        assert ddp is not None
+        optimizer = get_megatron_optimizer_with_gpu_staged_adamw(
+            OptimizerConfig(
+                optimizer="adam", lr=0.001, min_lr=0.0, bf16=True,
+                use_distributed_optimizer=True, use_precision_aware_optimizer=True,
+                main_params_dtype=torch.float32, main_grads_dtype=torch.float32,
+                exp_avg_dtype=torch.float32, exp_avg_sq_dtype=torch.float32, clip_grad=0.0,
+            ),
+            [ddp], GPUStagedAdamWConfig(buffer_count=1, bucket_size_mb=128),
+        )
+    elif use_muon:
         from megatron.core.optimizer import OptimizerConfig
         from megatron.core.process_groups_config import ProcessGroupCollection
         from areal.engine.megatron_utils.gpu_staged_muon import (
@@ -161,11 +177,11 @@ def main():
         adapter.bind_optimizer(optimizer)
     primary = os.environ.get("TEST_FP32_MASTER") == "1"
     if primary:
-        assert adapter.fp8 and use_muon and reference_adapter
+        assert adapter.fp8 and (use_muon or staged_adamw) and reference_adapter
         adapter.bind_fp32_masters(optimizer)
 
     def clear_gradients():
-        optimizer.zero_grad() if use_muon else optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad() if (use_muon or staged_adamw) else optimizer.zero_grad(set_to_none=True)
         if ddp is not None:
             ddp.zero_grad_buffer()
         x.grad = None
@@ -238,18 +254,18 @@ def main():
                         (a.float() - b.float()).abs().max().item(),
                     )
                 )
-        if ddp is not None and not use_muon:
+        if ddp is not None and not (use_muon or staged_adamw):
             for p in model.parameters():
                 p.grad = p.main_grad.to(p.dtype)
         weight_version = adapter.weight_version
         update = optimizer.step()
-        if use_muon:
+        if use_muon or staged_adamw:
             assert update[0] and torch.isfinite(torch.as_tensor(update[1])), update
             adapter.weights_updated()
         assert adapter.weight_version == weight_version + 1
         if primary:
             from weftmoe.fp8 import _quantize_fp8_weight_pair
-            optimizer.drain()
+            adapter.master_weights._drain()
             for layer in model:
                 weights = adapter.fp8_weights[layer][1]
                 for kind, index in ((0, 0), (1, layer.num_local_experts)):
@@ -279,6 +295,13 @@ def main():
             resident = [p for p in model.parameters() if p.untyped_storage().nbytes()]
             saved = [p.detach().cpu().clone() for p in resident]
             identities = [p.untyped_storage()._cdata for p in model.parameters()]
+            # Exercise the older MCore API with real DDP buffers, too. These
+            # optional residency methods are not present in every MCore build.
+            if os.environ.get("TEST_BUFFER_FALLBACK") == "1":
+                for cls in {type(b) for b in (*ddp.buffers, *ddp.expert_parallel_buffers)}:
+                    for name in ("offload_to_cpu", "reload_from_cpu"):
+                        if name in cls.__dict__:
+                            delattr(cls, name)
             residency.release_memory(tags=["weights"])
             if use_muon and not primary:
                 assert len(residency._master_backed_weights) > 0
@@ -286,6 +309,11 @@ def main():
             residency.resume_memory(tags=["weights"])
             residency.ensure_grad_buffers()
             assert identities == [p.untyped_storage()._cdata for p in model.parameters()]
+            if primary:
+                assert all(p.untyped_storage().nbytes() == 0
+                           for layer in model for p in adapter._parameters(layer))
+            if os.environ.get("TEST_BUFFER_FALLBACK") == "1":
+                print(dist.get_rank(), "DDP_BUFFER_FALLBACK_PASS", flush=True)
             assert all(torch.equal(a, p.cpu()) for a, p in zip(saved, resident))
         print(
             dist.get_rank(),
@@ -308,12 +336,15 @@ def main():
         adapter.restore_bf16_weights()
         for key, (_, _, _, parameter) in manager.bindings.items():
             assert torch.equal(parameter.cpu(), manager.masters[key].view(parameter.shape).bfloat16())
-        checkpoint_state = copy.deepcopy(optimizer.state_dict())
+        checkpoint_owners = ([leaf.optimizer for leaf in manager.leaves]
+                             if staged_adamw else [optimizer])
+        checkpoint_state = [copy.deepcopy(owner.state_dict()) for owner in checkpoint_owners]
         for master in manager.masters.values():
             master.mul_(0.5)
         manager.refresh()
         adapter.restore_bf16_weights()
-        optimizer.load_state_dict(checkpoint_state)
+        for owner, state in zip(checkpoint_owners, checkpoint_state):
+            owner.load_state_dict(state)
         manager.refresh()
         for layer, expected_tensors in saved_weights.items():
             for actual_tensor, expected_tensor in zip(adapter.fp8_weights[layer][1]._tensors(), expected_tensors):
@@ -323,6 +354,7 @@ def main():
     if primary:
         close_expected = {id(p): adapter.master_weights.masters[id(p)].view(p.shape).bfloat16().cpu()
                           for layer in model for p in adapter._parameters(layer)}
+    manager = adapter.master_weights
     adapter.close()
     if primary:
         for layer in model:
@@ -330,6 +362,15 @@ def main():
                 assert torch.equal(p.cpu(), close_expected[id(p)])
         # A checkpoint remains readable after removing the adapter.
         torch.save(model.state_dict(), io.BytesIO())
+        if staged_adamw:
+            for p in model.parameters():
+                p.main_grad.fill_(0.01)
+            optimizer.step()
+            manager._drain()
+            for key, (_, _, _, p) in manager.bindings.items():
+                torch.testing.assert_close(p.cpu(), manager.masters[key].view(p.shape).bfloat16(),
+                                           rtol=0, atol=0)
+            print(dist.get_rank(), "ADAMW_BF16_WRITEBACK_AFTER_CLOSE_PASS", flush=True)
     assert adapter.runtime is None and adapter.session is None and not adapter.packed
     parallel_state.destroy_model_parallel()
     dist.destroy_process_group()

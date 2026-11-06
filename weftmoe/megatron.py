@@ -102,7 +102,7 @@ class MegatronAdapter:
         """Enable non-master cache reuse for a torch.optim.AdamW instance.
 
         Megatron optimizer wrappers are not unwrapped; use the unbound path
-        or bind_fp32_masters() for the supported AReaL GPU-staged Muon path.
+        or bind_fp32_masters() for the supported AReaL GPU-staged AdamW/Muon path.
         Direct parameter writes outside optimizer.step still require
         weights_updated(), including checkpoint loads.
         """
@@ -112,7 +112,7 @@ class MegatronAdapter:
                 "bind_optimizer requires torch.optim.AdamW with register_step_post_hook; "
                 "MegatronOptimizer/ChainedOptimizer wrappers are not supported. "
                 "Leave the adapter unbound for per-forward quantization, or use "
-                "bind_fp32_masters() for AReaL GPU-staged Muon.")
+                "bind_fp32_masters() for AReaL GPU-staged AdamW/Muon.")
         hook = register(
             lambda *_: self.weights_updated())
         if self._optimizer_hook is not None:
@@ -271,9 +271,7 @@ class MegatronAdapter:
         self.fp8_weights.clear()
         self.session = None
         if self.master_weights is not None:
-            for _, _, _, parameter in self.master_weights.bindings.values():
-                del parameter._weftmoe_fp8_writer
-                del parameter._weftmoe_fp8_storage
+            self.master_weights.detach()
             self.master_weights = None
         if self._optimizer_hook is not None:
             self._optimizer_hook.remove()

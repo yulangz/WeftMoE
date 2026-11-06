@@ -79,9 +79,13 @@ def test_close_does_not_discard_materialized_parameters(monkeypatch):
         parameter.untyped_storage().resize_(8)
         parameter.data.fill_(3)
 
-    manager.master_weights = SimpleNamespace(
-        materialize=materialize, bindings={0: (None, None, None, parameter)}
-    )
+    master = MasterWeights.__new__(MasterWeights)
+    master.materialize = materialize
+    master.bindings = {0: (None, None, None, parameter)}
+    master.adamw_writers = {}
+    master.bucket_groups = []
+    master.buffers = []
+    manager.master_weights = master
     # suspend after materialize would discard the restored BF16 storage again.
     manager.suspend = lambda: parameter.untyped_storage().resize_(0)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
@@ -222,3 +226,184 @@ def test_master_dirty_blocks_forward_until_publication():
     manager.weights_updated()
     assert manager.weight_version == 4  # write already invalidated this generation
     assert not manager.master_weights.dirty
+
+
+@pytest.fixture
+def staged_master_inputs():
+    """Small CPU objects exercising validation before any native allocation."""
+    backing = torch.zeros(32, dtype=torch.bfloat16)
+    params = [torch.nn.Parameter(backing[i:i + 16].view(4, 4)) for i in (0, 16)]
+
+    class Leaf:
+        def drain(self):
+            pass
+
+        def set_master_writers(self, writers):
+            pytest.fail("invalid binding must not install writers")
+
+    leaf = Leaf()
+    leaf.param_groups = [{"params": params}]
+    leaf.state = {p: {"master_param": torch.ones_like(p, dtype=torch.float32)} for p in params}
+    leaf.staged_config = SimpleNamespace(bucket_numel=16)
+    wrapper = SimpleNamespace(
+        optimizer=leaf,
+        config=SimpleNamespace(use_distributed_optimizer=True, use_precision_aware_optimizer=True),
+        model_param_group_index_map={p: (0, i) for i, p in enumerate(params)},
+        _get_model_param_range_map=lambda p: {"param": SimpleNamespace(start=0, end=p.numel())},
+    )
+    buffer = SimpleNamespace(params=params.copy(), param_data=backing, data_parallel_world_size=1)
+    group = SimpleNamespace(
+        params=params.copy(), ddp_config=SimpleNamespace(use_distributed_optimizer=True),
+        intra_distributed_optimizer_instance_size=1, param_gather_handle=None,
+    )
+    model = SimpleNamespace(expert_parallel_buffers=[buffer], expert_parallel_bucket_groups=[group])
+    layer = SimpleNamespace(experts=SimpleNamespace(linear_fc1=object(), linear_fc2=object()))
+    adapter = SimpleNamespace(layers=[layer], _parameters=lambda _: params, _models=[model])
+    return SimpleNamespace(adapter=adapter, wrapper=wrapper, leaf=leaf, buffer=buffer,
+                           group=group, params=params, backing=backing)
+
+
+@pytest.mark.parametrize("size", [0, 32, 96])
+def test_master_binding_rejects_incomplete_flat_storage(staged_master_inputs, size):
+    inputs = staged_master_inputs
+    storage = inputs.backing.untyped_storage()
+    original = storage.nbytes()
+    try:
+        storage.resize_(size)
+        with pytest.raises(ValueError, match="buffer must be fully resident"):
+            MasterWeights(inputs.adapter, inputs.wrapper)
+        assert storage.nbytes() == size
+        assert not hasattr(inputs.params[0], "_weftmoe_fp8_writer")
+    finally:
+        storage.resize_(original)
+
+
+def test_master_binding_rejects_parameter_outside_flat_storage(staged_master_inputs):
+    inputs = staged_master_inputs
+    storage = inputs.backing.untyped_storage()
+    size = storage.nbytes()
+    storage.resize_(80)
+    with torch.no_grad():
+        inputs.params[1].set_(storage, 24, (4, 4), (4, 1))
+    storage.resize_(size)
+    try:
+        with pytest.raises(ValueError, match="beyond its allocated storage"):
+            MasterWeights(inputs.adapter, inputs.wrapper)
+    finally:
+        with torch.no_grad():
+            inputs.params[1].set_(storage, 16, (4, 4), (4, 1))
+
+
+@pytest.mark.parametrize("case,match", [
+    ("distributed", "use_distributed_optimizer=True"),
+    ("precision", "use_precision_aware_optimizer=True"),
+    ("state", "initialized staged optimizer master_param"),
+    ("mixed_buffer", "buffer must contain only selected experts"),
+    ("mixed_bucket", "bucket must contain only selected experts"),
+    ("buffer_dp", "expert DP=1"),
+    ("bucket_dp", "expert DP=1"),
+    ("slot", "exceeds the AdamW staging slot"),
+])
+def test_master_binding_rejects_unsupported_adamw(staged_master_inputs, case, match):
+    inputs = staged_master_inputs
+    if case == "distributed":
+        inputs.wrapper.config.use_distributed_optimizer = False
+        del inputs.wrapper.model_param_group_index_map
+    elif case == "precision":
+        inputs.wrapper.config.use_precision_aware_optimizer = False
+    elif case == "state":
+        del inputs.leaf.state[inputs.params[0]]["master_param"]
+    elif case.startswith("mixed_"):
+        target = inputs.buffer if case == "mixed_buffer" else inputs.group
+        target.params.append(torch.nn.Parameter(torch.ones(1)))
+    elif case == "buffer_dp":
+        inputs.buffer.data_parallel_world_size = 2
+    elif case == "bucket_dp":
+        inputs.group.intra_distributed_optimizer_instance_size = 2
+    elif case == "slot":
+        inputs.leaf.staged_config.bucket_numel = 15
+    with pytest.raises(ValueError, match=match):
+        MasterWeights(inputs.adapter, inputs.wrapper)
+    assert inputs.backing.untyped_storage().nbytes() == 64
+    assert not hasattr(inputs.params[0], "_weftmoe_fp8_writer")
+
+
+def test_master_drain_ignores_ordinary_dense_leaf():
+    drained = []
+    master = MasterWeights.__new__(MasterWeights)
+    staged = SimpleNamespace(drain=lambda: drained.append("staged"))
+    ordinary = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    master.leaves = (SimpleNamespace(optimizer=staged), SimpleNamespace(optimizer=ordinary))
+    master.optimizer = SimpleNamespace(chained_optimizers=master.leaves)
+    master._drain()
+    assert drained == ["staged"]
+    master.optimizer.drain = lambda: drained.append("chain")
+    master._drain()
+    assert drained == ["staged", "chain"]
+
+
+@pytest.mark.parametrize("operation", ["refresh", "materialize", "resume"])
+def test_master_restore_rejects_replaced_checkpoint_tensor(operation):
+    parameter = torch.nn.Parameter(torch.ones(2))
+    tensor = torch.ones(2)
+    leaf = SimpleNamespace(state={parameter: {"master_param": tensor}})
+    master = MasterWeights.__new__(MasterWeights)
+    master.masters = {id(parameter): tensor}
+    master.master_sources = {id(parameter): (leaf, parameter)}
+    master.optimizer = SimpleNamespace(drain=lambda: None)
+    master.offloaded = True
+    # In-place checkpoint loads retain the supported slab identity.
+    tensor.copy_(torch.full_like(tensor, 3))
+    master._validate_masters()
+    leaf.state[parameter]["master_param"] = tensor.clone()
+    with pytest.raises(RuntimeError, match="replaced a bound FP32 master"):
+        getattr(master, operation)()
+    assert master.offloaded  # Fail before attempting allocation or suspension.
+
+
+def test_master_detach_restores_writers_and_group_sync():
+    from types import MethodType
+
+    class Group:
+        def start_param_sync(self, force_sync=False):
+            return "class method"
+
+    inherited, overridden = Group(), Group()
+    original = lambda force_sync=False: "instance override"
+    overridden.start_param_sync = original
+    groups = [(g, g.__dict__.get("start_param_sync")) for g in (inherited, overridden)]
+    for group, _ in groups:
+        group.param_gather_handle = None
+        group.param_gather_dispatched = False
+        group.start_param_sync = MethodType(MasterWeights._skip_param_sync, group)
+        group.start_param_sync(force_sync=True)
+        assert group.param_gather_dispatched
+    inherited.param_gather_handle = object()
+    with pytest.raises(AssertionError):
+        inherited.start_param_sync()
+    inherited.param_gather_handle = None
+
+    calls = []
+
+    class Leaf:
+        def set_master_writers(self, writers):
+            calls.append(writers)
+
+    parameter = torch.nn.Parameter(torch.ones(2))
+    parameter._weftmoe_fp8_storage = parameter.untyped_storage()
+    parameter._weftmoe_fp8_writer = object()
+    buffer = SimpleNamespace(_weftmoe_fp8_master_managed=True)
+    master = MasterWeights.__new__(MasterWeights)
+    master.adamw_writers = {Leaf(): {parameter: object()}}
+    master.bucket_groups = groups
+    master.buffers = [buffer]
+    master.bindings = {id(parameter): (None, None, None, parameter)}
+    master.detach()
+    assert calls == [{}]
+    assert "start_param_sync" not in inherited.__dict__
+    assert inherited.start_param_sync() == "class method"
+    assert overridden.start_param_sync is original
+    assert overridden.start_param_sync() == "instance override"
+    assert not hasattr(buffer, "_weftmoe_fp8_master_managed")
+    assert not hasattr(parameter, "_weftmoe_fp8_writer")
+    assert not hasattr(parameter, "_weftmoe_fp8_storage")
