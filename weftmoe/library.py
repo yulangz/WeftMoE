@@ -5,12 +5,13 @@ from pathlib import Path
 def get_include() -> str:
     path = Path(__file__).resolve().parent / 'include'
     if not path.is_dir():
-        raise RuntimeError('WeftMoE headers are not installed; run pip install .')
+        from .jit import source_root
+        path = source_root() / 'include'
     return str(path)
 
 
 def get_library_path() -> str:
     path = Path(__file__).resolve().parent / 'lib/libweftmoe.so'
     if not path.is_file():
-        raise RuntimeError('WeftMoE native library is not built; run pip install .')
+        raise RuntimeError('No model-independent native library. Use TensorRuntime for JIT or build_native.py for an explicit library.')
     return str(path)

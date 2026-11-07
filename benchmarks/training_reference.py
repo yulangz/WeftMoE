@@ -12,7 +12,7 @@ def gather_rows(value, lengths):
     return torch.cat([peer[:count] for peer, count in zip(peers, lengths)])
 
 
-def verify_step(runtime, x, routes, gates, w1, w2, dy):
+def verify_step(runtime, x, routes, gates, w1, w2, dy, *, fp8=False):
     """Check all five results without replicating the global expert weights.
 
     Each rank evaluates its owned experts against all source tokens. FP32
@@ -56,7 +56,15 @@ def verify_step(runtime, x, routes, gates, w1, w2, dy):
     expected = (output[owned_rows].to(x.dtype), dx[owned_rows].to(x.dtype),
                 dg[owned_rows], dw1, dw2)
     errors = {}
+    valid = True
     for name, value, target in zip(("output", "dx", "dgate", "dw1", "dw2"), actual, expected):
+        if fp8:
+            from benchmarks.fp8_validation import global_diff, passes
+            pairs = zip(value.unbind(), target.unbind()) if name in ("dw1", "dw2") else [(value, target)]
+            values = [global_diff(a, b) for a, b in pairs]
+            errors[name] = dict(diff=values)
+            valid &= all(passes(value, name) for value in values)
+            continue
         value, target = value.float(), target.float()
         difference = value - target
         relative_l2 = (difference.norm() / target.norm().clamp_min(1e-30)).item()
@@ -64,4 +72,8 @@ def verify_step(runtime, x, routes, gates, w1, w2, dy):
         assert relative_l2 < 0.01, (rank, name, errors[name])
         torch.testing.assert_close(value, target, rtol=0.02, atol=1e-4,
                                    msg=lambda detail: f"rank={rank} tensor={name}\n{detail}")
+    if fp8:
+        agreed = torch.tensor(int(valid), device=x.device)
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN)
+        assert agreed.item(), (rank, errors, "FP8 global diff failed on at least one rank")
     return errors

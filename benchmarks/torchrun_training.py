@@ -102,9 +102,8 @@ def main():
         parser.error("--prequantized-inputs requires --fp8")
     if args.weight_grad_dtype is not None and not args.fp8:
         parser.error("--weight-grad-dtype is an FP8 option; BF16 already returns BF16 dW")
-    if args.fp8 and (args.backend != "pf" or args.prepared_weights or args.verify):
-        parser.error("--fp8 requires PF timing without --prepared-weights/--verify; "
-                     "use tests/torchrun_fp8.py for FP8 numerical verification")
+    if args.fp8 and (args.backend != "pf" or args.prepared_weights):
+        parser.error("--fp8 requires PF without --prepared-weights")
     if args.backward_identity and (args.backend != "pf" or not args.verify):
         parser.error("--backward-identity requires PF --verify and an identity diagnostic build")
     if args.prepared_weights and (args.backend != "pf" or not args.forward_only):
@@ -277,7 +276,8 @@ def main():
                     errors = {"identity_dx_exact": True, "identity_dgate_zero": True}
                     del tape, dx, dg, dw1, dw2
                 else:
-                    errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy)
+                    errors = verify_step(runtime, x, cpu_routes.cuda(), cpu_gates.cuda(), w1, w2, dy,
+                                         fp8=args.fp8)
                 if probe is not None:
                     probe.stop()
                     kernels = sorted({event.name for event in probe.events()

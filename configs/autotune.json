@@ -154,19 +154,38 @@
   "timeout_seconds": 900,
   "modes": {
     "inference": {
-      "stages": ["forward", "ring"]
+      "stages": [
+        "forward",
+        "ring"
+      ]
     },
     "decode": {
-      "stages": ["decode"],
-      "workload": {"tokens": [1, 8, 64]},
+      "stages": [
+        "decode"
+      ],
+      "workload": {
+        "tokens": [
+          1,
+          8,
+          64
+        ]
+      },
       "token_std_fraction": 0,
       "graph_replays": 50
     }
   },
   "decode": {
     "axes": {
-      "v4.decode_stages": [2, 3],
-      "v4.decode_cta_multiplier": [0, 1, 2, 3]
+      "v4.decode_stages": [
+        2,
+        3
+      ],
+      "v4.decode_cta_multiplier": [
+        0,
+        1,
+        2,
+        3
+      ]
     }
   },
   "workload": {
@@ -187,5 +206,11 @@
     "jobs": 4,
     "output": "../build/autotune/{model}/h{hidden}_i{intermediate}_e{experts}_k{top_k}/{mode}/ep{world}",
     "cache": "../build/autotune/cache"
-  }
+  },
+  "batch_invariant": true,
+  "token_buckets": [
+    8192,
+    20480,
+    65536
+  ]
 }

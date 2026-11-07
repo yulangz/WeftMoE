@@ -4,7 +4,7 @@ from autotune_common import require
 import unified_tuning
 
 
-DEFAULTS = dict(decode_stages=3, decode_cta_multiplier=0,
+DEFAULTS = dict(dt_fp8_stages=3, dt_fp8_slices=1, dt_fp8_ctas=0, decode_stages=3, decode_cta_multiplier=0,
                 decode_slice_schedule=0,
                 cta_count=0, network_lanes=2, packet_rows=32,
                 return_packet_rows=32, network_min_depth=8,
@@ -24,6 +24,9 @@ DEFAULTS = dict(decode_stages=3, decode_cta_multiplier=0,
 
 
 MACROS = {
+    "dt_fp8_stages": "WEFTMOE_DT_FP8_STAGES",
+    "dt_fp8_slices": "WEFTMOE_DT_FP8_SLICE_SCHEDULE",
+    "dt_fp8_ctas": "WEFTMOE_DT_FP8_CTAS",
     "return_rails": "WEFTMOE_PF_RETURN_RAILS",
     "network_private_dr": "WEFTMOE_PF_NETWORK_PRIVATE_DR",
     "network_vector_pull": "WEFTMOE_PF_NETWORK_VECTOR_PULL",
@@ -69,7 +72,7 @@ def validate(config):
     require(set(v) == set(DEFAULTS), "incomplete V4 candidate")
     require(all(type(x) is int and x >= 0 for x in v.values()),
             "V4 parameters must be nonnegative integers")
-    choices = dict(local_prefill_streaming=(0, 1), local_prefill_fast_math=(0, 1),
+    choices = dict(dt_fp8_stages=(1, 2, 3), dt_fp8_slices=(0, 1), dt_fp8_ctas=(0, 32, 64, 96, 132), local_prefill_streaming=(0, 1), local_prefill_fast_math=(0, 1),
                    return_rails=(0, 1, 2, 4, 8),
                    local_pull_warps=(1, 2, 3),
                    local_compact_return=(0, 1),

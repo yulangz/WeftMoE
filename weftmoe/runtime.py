@@ -7,9 +7,7 @@ all ranks must call layers in the same order. Expert weights use BF16
 
 from __future__ import annotations
 
-import importlib.util
 import os
-from pathlib import Path
 import socket
 
 import torch
@@ -17,16 +15,8 @@ import torch.distributed as dist
 
 
 def _extension():
-    import sys
-
-    if "weftmoe._runtime" in sys.modules:
-        return sys.modules["weftmoe._runtime"]
-    path = Path(os.environ["WEFTMOE_TENSOR_EXTENSION"]).resolve()
-    spec = importlib.util.spec_from_file_location("weftmoe._runtime", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules[spec.name] = module
-    return module
+    from .jit import helpers
+    return helpers()
 
 
 class TensorRuntime:
@@ -48,6 +38,7 @@ class TensorRuntime:
         decode_only: bool = False,
         fp8_workspace: bool = False,
         session=None,
+        batch_invariant: bool = True,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -76,35 +67,59 @@ class TensorRuntime:
             self.stream = (
                 torch.cuda.current_stream() if training else torch.cuda.Stream()
             )
-        native = _extension()
-        tuning = None
-        decision = dict(profile=None, key=None, error=None)
-        if os.environ.get("WEFTMOE_AUTOTUNE_TABLE"):
-            from .tuning import select_profile
-
-            # All ranks agree before any native pool/GIN allocation. A missing
-            # entry or stale binary must not leave peers blocked in bootstrap.
-            try:
-                key = dict(gpu=torch.cuda.get_device_name(),
-                           interconnect=interconnect or ("nvlink" if self.nodes == 1 else "nvlink+gin"),
-                           dtype="bfloat16", hidden=hidden, intermediate=intermediate,
-                           experts=experts, top_k=top_k, nodes=self.nodes,
-                           gpus_per_node=self.world // self.nodes, max_tokens=max_tokens,
-                           input_layout=input_layout, training=training)
-                tuning = select_profile(os.environ["WEFTMOE_AUTOTUNE_TABLE"], key,
-                                        native.forward_tuning_id())
-                decision = dict(profile=tuning, key=key, error=None)
-            except (OSError, ValueError, KeyError, AttributeError) as error:
-                decision = dict(profile=None, key=None, error=str(error))
-        decision["fp8_workspace"] = fp8_workspace
-        decision["decode_only"] = decode_only
-        decision["reuse_session"] = session is not None
+        from . import jit
+        key = dict(gpu=torch.cuda.get_device_name(),
+                   interconnect=interconnect or ("nvlink" if self.nodes == 1 else "nvlink+gin"),
+                   dtype="fp8" if fp8_workspace else "bfloat16", hidden=hidden,
+                   intermediate=intermediate, experts=experts, top_k=top_k,
+                   nodes=self.nodes, gpus_per_node=self.world // self.nodes,
+                   input_layout=input_layout,
+                   mode="decode" if decode_only else "training" if training else "inference")
+        # Agree before compilation or native collectives. A bad shape/build on
+        # one node must report a collective error, not strand peers in bootstrap.
+        requests = [None] * self.world
+        request = dict(key=key, max_tokens=max_tokens, batch_invariant=batch_invariant,
+                       fp8_workspace=fp8_workspace, decode_only=decode_only)
+        dist.all_gather_object(requests, request, group=group)
+        if any(r != request for r in requests):
+            raise ValueError("EP ranks requested incompatible WeftMoE configurations")
+        native, tuning, entry = None, None, None
+        decision = dict(error=None)
+        try:
+            explicit = os.environ.get("WEFTMOE_TENSOR_EXTENSION")
+            if explicit:
+                native = jit.load(explicit)
+                if os.environ.get("WEFTMOE_AUTOTUNE_TABLE"):
+                    from .tuning import select_profile
+                    legacy_key = {k: v for k, v in key.items() if k != "mode"}
+                    legacy_key.update(dtype="bfloat16", max_tokens=max_tokens, training=training)
+                    tuning = select_profile(os.environ["WEFTMOE_AUTOTUNE_TABLE"], legacy_key,
+                                            native.forward_tuning_id())
+                identity = native.forward_tuning_id()
+            else:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("Prepare WeftMoE before CUDA Graph capture")
+                entry = jit.prepare(key, max_tokens, batch_invariant=batch_invariant)
+                tuning = entry["tuning"]
+                native = jit.load(entry["extension"])
+                identity = entry["header_digest"]
+            if tuple(native.forward_shape()) != (hidden, intermediate):
+                raise ValueError("Native library shape does not match the requested model")
+            # A session is owned by its native module. Different bucket binaries
+            # bootstrap separately; never pass a foreign C++ session across DSOs.
+            if session is not None and not isinstance(session, native.Session):
+                session = None
+            decision.update(identity=identity, tuning=tuning, reuse_session=session is not None)
+        except Exception as error:
+            decision["error"] = f"{type(error).__name__}: {error}"
         decisions = [None] * self.world
         dist.all_gather_object(decisions, decision, group=group)
         if any(d["error"] for d in decisions):
-            raise ValueError(f"collective autotune preparation failed: {decisions}")
+            raise RuntimeError(f"collective WeftMoE preparation failed: {decisions}")
         if any(d != decision for d in decisions):
-            raise ValueError("EP ranks selected incompatible autotune profiles")
+            raise ValueError("EP ranks selected incompatible WeftMoE binaries")
+        self.compilation = entry
+        self._module = native  # keep its DSO alive for every tape/graph
         bootstrap = [b""]
         if session is None:
             bootstrap = [native.bootstrap_id() if self.rank == 0 else None]

@@ -1,7 +1,7 @@
 # 框架接入
 
-先完成 [native 库和 Tensor 绑定构建](usage.md)，确保每个 worker 都能 import `weftmoe`，
-并收到同一个 shape 对应的 `WEFTMOE_TENSOR_EXTENSION`。adapter 归 WeftMoE；
+先按[安装与自动编译说明](usage.md)准备依赖，确保每个 worker 都能 import `weftmoe`，
+并使用一致的 tune 表和编译环境。默认在首次准备 runtime 时自动编译；`WEFTMOE_TENSOR_EXTENSION` 仅用于显式固定已有扩展。adapter 归 WeftMoE；
 RL 启动、调度、权重同步及共卡生命周期 hook 归 AReaL，不需要把 CUDA 实现复制进框架。
 
 ## Megatron
@@ -144,16 +144,18 @@ BF16 共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：�
 
 ```yaml
 AREAL_USE_WEFTMOE: "1"
-WEFTMOE_TENSOR_EXTENSION: "/absolute/path/to/_runtime.cpython-312-x86_64-linux-gnu.so"
-WEFTMOE_AUTOTUNE_TABLE: ""
+WEFTMOE_ROOT: "/absolute/path/to/weftmoe-cache"
+# 可选：默认读取 WEFTMOE_ROOT/tuning.json。
+# WEFTMOE_AUTOTUNE_TABLE: "/absolute/path/to/tuning.json"
 WEFTMOE_STATIC_RING_TOKENS: "2048"
 WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS: "2"
 WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS: "1"
 ```
 
-扩展文件名以本机 Python 构建结果为准；同时传递所需的 `PYTHONPATH`、`LD_LIBRARY_PATH` 和网络环境。
-开启 autotune 表时分别核对 actor/rollout 的 training 标记、容量与图 bucket；
-不能把一张仅含训练项的表直接用于两侧。运行 DeepEP baseline 时两侧都去掉 WeftMoE 开关，
+同时传递所需的 `PYTHONPATH`、`LD_LIBRARY_PATH`、开发依赖路径和网络环境。
+开启 autotune 表时分别核对 actor/rollout 的模式、精度、容量与图 bucket；
+共享表可包含训练和推理项，缺项按默认配置编译。显式固定库时才设置 `WEFTMOE_TENSOR_EXTENSION`。
+运行 DeepEP baseline 时两侧都去掉 WeftMoE 开关，
 Megatron 显式选择 Flex/DeepEP；两组保持模型、数据、并行策略和缓存口径一致。
 
 已通过的快速 RL 配置：35B Base、DAPO-Math-17k、8K、actor TP2×DP4/EP8、

@@ -50,7 +50,7 @@ class AutotuneTest(unittest.TestCase):
             candidate = tune.candidates()[0]
             tune.atomic_json(native / "complete.json", dict(candidate=candidate))
             tune.atomic_json(native.parent / "correctness.json", dict(passed=True))
-            tune.atomic_json(previous / "manifest.json", dict(source_hashes={
+            tune.atomic_json(previous / "manifest.json", dict(kernel_policy=tune.KERNEL_POLICY, source_hashes={
                 "src/kernel.cu": "original", "tests/check.py": "old test"}))
             info = tune.reuse_builds(output, previous, {
                 "src/kernel.cu": "original", "tests/check.py": "BF16 test"})

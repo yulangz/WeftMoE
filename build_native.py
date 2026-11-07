@@ -90,10 +90,10 @@ def compile_source(source, command, cache):
 
 
 def build(target='lib', output=None, jobs=None):
-    if target not in {'lib', 'cuda-test', 'host-test', 'metadata-dump', 'metadata-bench'}:
+    if target not in {'lib', 'fp8', 'cuda-test', 'host-test', 'metadata-dump', 'metadata-bench'}:
         raise ValueError(f'unknown native target: {target}')
-    cuda = target in {'lib', 'cuda-test'}
-    testing = target != 'lib'
+    cuda = target in {'lib', 'fp8', 'cuda-test'}
+    testing = target not in {'lib', 'fp8'}
     jobs = jobs or int(os.environ.get('MAX_JOBS', '4'))
     if jobs < 1:
         raise ValueError('MAX_JOBS / --jobs must be positive')
@@ -126,7 +126,8 @@ def build(target='lib', output=None, jobs=None):
     if os.environ.get('WERROR') == '1':
         host += ['-Werror']
         device += ['-Xcompiler=-Werror']
-    sources = list(HOST_SOURCES) + (list(CUDA_SOURCES) if cuda else [])
+    sources = (['src/cuda/fp8.cu'] if target == 'fp8' else
+               list(HOST_SOURCES) + (list(CUDA_SOURCES) if cuda else []))
     mains = {'cuda-test': TEST_SOURCE, 'host-test': 'tests/test_notify_dispatch.cpp',
              'metadata-dump': 'tests/metadata_dump.cpp',
              'metadata-bench': 'benchmarks/notify_dispatch_bench.cpp'}
@@ -139,14 +140,15 @@ def build(target='lib', output=None, jobs=None):
         return compile_source(source, command, cache)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         objects = list(pool.map(compile_one, sources))
-    names = {'lib': 'libweftmoe.so', 'cuda-test': 'test_cuda_notify',
+    names = {'fp8': 'libweftmoe_fp8.so', 'lib': 'libweftmoe.so', 'cuda-test': 'test_cuda_notify',
              'host-test': 'test_notify_dispatch', 'metadata-dump': 'metadata_dump',
              'metadata-bench': 'notify_dispatch_bench'}
     output = Path(output or ROOT / 'build' / names[target]).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [nvcc if cuda else cxx]
-    if target == 'lib':
-        command += ['-shared', '-Xlinker=-soname', '-Xlinker=libweftmoe.so', '-Xlinker=--gc-sections']
+    if target in {'lib', 'fp8'}:
+        soname = os.environ.get('WEFTMOE_NATIVE_SONAME', 'libweftmoe.so')
+        command += ['-shared', '-Xlinker=-soname', '-Xlinker=' + soname, '-Xlinker=--gc-sections']
     command += [str(p) for p in objects]
     command += shlex.split(os.environ.get('LDFLAGS', ''))
     if cuda:
@@ -163,7 +165,7 @@ def build(target='lib', output=None, jobs=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('target', choices=['lib', 'cuda-test', 'host-test', 'metadata-dump', 'metadata-bench'])
+    parser.add_argument('target', choices=['lib', 'fp8', 'cuda-test', 'host-test', 'metadata-dump', 'metadata-bench'])
     parser.add_argument('--output', type=Path)
     parser.add_argument('--jobs', type=int)
     args = parser.parse_args()

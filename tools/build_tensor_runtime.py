@@ -14,6 +14,7 @@ import torch
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--ops", action="store_true", help="Build only shape-independent FP8 bindings")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     library = args.library.resolve()
@@ -34,7 +35,7 @@ def main():
             "-I" + sysconfig.get_paths()["include"],
             "-I"
             + str(Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "include"),
-            str(root / "src/python/runtime.cpp"),
+            str(root / ("src/python/ops.cpp" if args.ops else "src/python/runtime.cpp")),
             str(library),
             "-L" + str(Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")) / "lib64"),
             "-lcudart",

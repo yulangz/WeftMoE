@@ -30,7 +30,7 @@ class TokenBucket:
 
 
 TOKEN_BUCKETS = (TokenBucket(0, 64), TokenBucket(65, 8192),
-                 TokenBucket(8193, 65536))
+                 TokenBucket(8193, 20480), TokenBucket(20481, 65536))
 
 
 def token_bucket(tokens: int) -> TokenBucket:
