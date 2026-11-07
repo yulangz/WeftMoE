@@ -24,15 +24,31 @@ export WEFTMOE_ROOT=/path/to/weftmoe-cache
 
 1. 查询本次请求的已编译缓存，命中后直接加载。
 2. 未命中则查询 `WEFTMOE_AUTOTUNE_TABLE`（默认 `$WEFTMOE_ROOT/tuning.json`）；精确 shape 和长度桶命中时，按已验证的配置编译。
-3. 没有匹配配置则按 shape 默认配置编译。自动路径要求 H/I 为不小于 512 的 256 倍数。
+3. 没有匹配配置则使用已验证 shape 的默认配置编译：H/I 为 2048/512、3072/1024 或 4096/2048。其他 shape 需要先通过手动 autotune 的数值检查，或显式使用 `TensorRuntime(..., allow_unvalidated_shape=True)` 进行实验性编译；不能把维度整除当作正确性证明。所有自动生成的 profile 仍要求 H/I 不小于 512 且为 256 的倍数。
 
 该流程只编译和加载，不运行搜索、计时或 benchmark。缓存包含源码、配置、Python/PyTorch ABI、CUDA 架构、工具链及依赖标识；不同 shape/配置的库使用独立名称，可共存于同一进程。多进程用文件锁避免重复构建；失败构建不会发布完整缓存，错误信息指向 `build.log`。
 
 长度选择按 runtime 的 **`max_tokens` 容量**，不是每次调用的实际 token 数。一个 runtime 生命周期内固定实现，训练 tape 和 CUDA Graph 不会被中途换库；需要不同桶时在 capture 外准备对应容量的 runtime。先预热再捕获 CUDA Graph。
 
-已编译请求优先于后来更新的 tune 表。重新 tune 后，要让已命中的请求重新选配置，可在无任务使用缓存时删除 `$WEFTMOE_ROOT/jit/requests`，保留二进制缓存；或使用新的 `WEFTMOE_ROOT`。不会修改已加载的库。
+先检查 tune 表的文件版本（仅 stat，不解析或选配置），再查有效的已编译请求缓存。手动 tune 发布新表后，旧请求选择自动失效，下次准备 runtime 会采用新配置；未改动的表仍优先命中编译缓存。版本检查不修改已加载的 runtime、tape 或图；新选择仍会复用匹配的二进制产物。构建 header 保留在确定性缓存目录中，失败重试可复用已经编好的对象文件。
 
 需要固定手工构建时，仍可使用 `build_native.py lib --output ...` 和 `tools/build_tensor_runtime.py --library ...`，然后设置 `WEFTMOE_TENSOR_EXTENSION`。该变量显式覆盖自动选择，使用者负责 shape 和一致性；旧 schema-1 表仅供这种固定库路径使用，不与新的自动 tune 表混用。
+
+`get_include()` 返回公开头文件目录。`get_library_path()` 仅用于旧式预构建安装；lazy wheel 没有统一的 `libweftmoe.so`，因此该调用会明确报错。C++ 用户使用 `build_native.py lib --output ...` 显式构建并链接该路径；Tensor 用户使用 runtime 或下面的预热入口。`tests/check_install.py --wheel ...` / `--editable` 验证源码载荷和头文件，另可传入 `--native-library ...` 验证显式 native 库的 C++ 链接与运行。
+
+### 多机启动前预热
+
+首次完整 CUDA 编译可能需要数分钟，取决于 CPU、并发度和缓存状态。不同节点缓存不一致时，已准备好的 rank 会在 collective 等待其他节点，可能耗尽调用方配置的 process-group timeout。不要依赖某个固定的编译耗时上限。
+
+在**每个节点、初始化 process group 之前**运行相同的预热命令；它不建立 NCCL process group，也不运行 benchmark：
+
+```bash
+python -m weftmoe.jit prepare --hidden 2048 --intermediate 512 \
+  --experts 256 --top-k 8 --max-tokens 8192 \
+  --nodes 2 --gpus-per-node 8 --mode training --dtype fp8
+```
+
+预热与实际 worker 必须使用相同 Python、依赖、`WEFTMOE_ROOT`、tune 表以及 shape、拓扑、精度、模式和容量；混合 GPU 型号时分别指定 `--device`。FP8 预热同时准备量化 helper。自定义未验证 shape 可显式使用 `--allow-unvalidated-shape`。未预热时需在框架创建 process group 处配置能覆盖首次编译的 timeout；WeftMoE 不修改调用方的 timeout。
 
 ## Tensor API
 
@@ -315,13 +331,13 @@ python tools/autotune.py --model flash --mode training --gpus-per-node 8 \
 
 CLI 覆盖配置。`--token-buckets 8192 20480 65536` 设置长度上界；`--tokens` 提供各桶用于计时的代表负载。同桶多个代表负载共同选择一个实现，不同桶独立搜索。DT 仅支持单机。
 
-默认 `--batch-invariant` 不仅固定算术参数，还对最终候选执行严格 PF（保留真实反向缓存）/DT、不同 batch 长度与 token 位置、重复前向的逐位比较，并检查重复反向的有限值与 `diff ≤ 1e-6`。覆盖小 M 边界和桶端点；多机不运行 DT。所有桶对照同一 shape 的默认算术路径，避免各桶独立通过却互不一致。普通 FP8 对 BF16 的误差检查另行保留。
+默认 `--batch-invariant` 不仅固定算术参数，还对最终候选执行严格 PF 训练（保留真实反向缓存）/PF 推理/DT、不同 batch 长度与 token 位置、重复前向的逐位比较，并检查重复反向的有限值与 `diff ≤ 1e-6`。覆盖小 M 边界和桶端点；候选与参考各自使用对应的 ring 参数，PF 推理与 DT 通过 graph 接口验证，重复调用保留输入地址。多机不运行 DT。所有桶对照同一 shape 的默认算术路径，避免各桶独立通过却互不一致。普通 FP8 对 BF16 的误差检查另行保留。
 
 显式 `--no-batch-invariant` 可扩大搜索，但结果标为非一致性配置。部署时还需显式传入 `TensorRuntime(..., batch_invariant=False)` 才会采用它；默认加载器忽略该配置。直接设置自定义二进制不受此保护。
 
 输出按 shape、模式、EP、长度桶分目录。`result.json` 保留候选/测量/验证，`table.json` 保存该桶的生成 header、源码标识和 ring 配置，`runtime.json` 给出部署环境。脚本还将结果原子合并到 `--table` 指定的共享表，默认 `$WEFTMOE_ROOT/tuning.json`。
 
-查表 **精确匹配 GPU、dtype、H/I/E/K、节点拓扑、模式、输入布局**；只有 tokens 使用区间匹配，拒绝重叠区间。源码过期、无精确 shape、未覆盖容量或一致性不兼容时回退默认配置，不寻找相近模型。BF16/FP8、训练/PF 推理/DT 分别记录性能选择，但默认共享前向算术约束。编译时 ABI、工具链及依赖变化还会使二进制缓存失效。
+查表 **精确匹配 GPU、dtype、H/I/E/K、节点拓扑、模式、输入布局**；只有 tokens 使用区间匹配，拒绝重叠区间。源码过期、无精确 shape、未覆盖容量或一致性不兼容时，仅已验证 shape 回退默认配置，不寻找相近模型。未知 shape 的查表结果还必须带有调优脚本在通过数值校验后写出的 `validated` 标记；不匹配时默认报错。BF16/FP8、训练/PF 推理/DT 分别记录性能选择，但默认共享前向算术约束。编译时 ABI、工具链及依赖变化还会使二进制缓存失效。
 
 不使用 tune 表时也可显式设置 `WEFTMOE_STATIC_RING_TOKENS` 和 `WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS`。新调优建议使用统一脚本；`autotune_dt_fp8.py` 是独立的诊断 sweep，不发布自动加载表。
 

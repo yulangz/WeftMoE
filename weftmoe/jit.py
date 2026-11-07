@@ -23,6 +23,8 @@ from .tuning import cache_root, default_table, digest, find_entry
 logger = logging.getLogger(__name__)
 _MODULES = {}
 _LOAD_LOCK = threading.RLock()
+VALIDATED_SHAPES = {(2048, 512): 'qwen35b', (3072, 1024): 'qwen122b',
+                    (4096, 2048): 'flash'}
 
 
 def source_root():
@@ -48,8 +50,7 @@ def default_header(hidden, intermediate):
     if any(type(x) is not int or x < 512 or x % 256 for x in (hidden, intermediate)):
         raise ValueError('automatic profiles require hidden/intermediate >= 512 and multiples of 256; '
                          'smaller shapes require a separately validated explicit extension')
-    profile = {(2048, 512): 'qwen35b', (3072, 1024): 'qwen122b',
-               (4096, 2048): 'flash'}.get((hidden, intermediate), 'qwen35b')
+    profile = VALIDATED_SHAPES.get((hidden, intermediate), 'qwen35b')
     header = (source_root() / 'configs/profiles' / profile /
               'weftmoe_forward_tuning_generated.hpp').read_text()
     replacements = {f'WEFTMOE_{phase}_MAIN_{dim}': value
@@ -140,14 +141,16 @@ def compile_artifact(header, context, *, ops=False):
             # resolve its dependencies against the first shape's libweftmoe.so.
             soname = f'libweftmoe_{key}.so'
             directory.mkdir(exist_ok=True)
+            header_path = directory / 'weftmoe_forward_tuning_generated.hpp'
+            if not header_path.exists() or header_path.read_text() != header:
+                header_path.write_text(header)
             with tempfile.TemporaryDirectory(dir=root) as temporary:
                 stage = Path(temporary)
-                (stage / 'weftmoe_forward_tuning_generated.hpp').write_text(header)
                 env = os.environ | {'WEFTMOE_NATIVE_SONAME': soname}
                 flags = env.get('NVCCFLAGS', '')
                 if 'WEFTMOE_' in flags:
                     raise ValueError('automatic builds own WEFTMOE macros; unset NVCCFLAGS or use an explicit extension')
-                env['NVCCFLAGS'] = flags + ' -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 ' + shlex.quote('-I' + str(stage))
+                env['NVCCFLAGS'] = flags + ' -DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 ' + shlex.quote('-I' + str(directory))
                 root_source = source_root()
                 commands = [[sys.executable, str(root_source / 'build_native.py'),
                              'fp8' if ops else 'lib', '--output', str(stage / soname)],
@@ -169,28 +172,49 @@ def compile_artifact(header, context, *, ops=False):
     return directory / ('_runtime' + sysconfig.get_config_var('EXT_SUFFIX'))
 
 
-def prepare(key, tokens, *, batch_invariant=True):
-    """1. compiled request cache; 2. exact shape/bucket tune; 3. shape defaults."""
+def _table_stamp(path):
+    try:
+        info = path.stat()
+        return [info.st_mtime_ns, info.st_size, info.st_ino]
+    except FileNotFoundError:
+        return None
+
+
+def prepare(key, tokens, *, batch_invariant=True, allow_unvalidated_shape=False):
+    """1. valid compiled request cache; 2. exact shape/bucket tune; 3. defaults."""
     header = default_header(key['hidden'], key['intermediate'])
     context = build_context()
     if tuple(context['arch']) != (9, 0):
         raise ValueError('WeftMoE automatic compilation currently supports Hopper/SM90 only')
+    table = default_table().resolve()
     request = digest(dict(context=context, key=key, tokens=tokens, batch_invariant=batch_invariant,
-                          table=str(default_table().resolve())))
+                          allow_unvalidated_shape=allow_unvalidated_shape, table=str(table)))
     index = cache_root() / 'jit/requests' / (request + '.json')
+    # Metadata only: do not parse/select a tune entry before a valid cache hit.
+    # Atomic table publication invalidates old selections, including defaults.
+    stamp = _table_stamp(table)
     if index.exists():
-        entry = json.loads(index.read_text())
-        path = Path(entry['extension'])
-        if _ready(path.parent):
-            return entry
-    tune = find_entry(default_table(), key, tokens, source=context['source'],
+        record = json.loads(index.read_text())
+        entry = record.get('entry')
+        if entry and (record.get('table_stamp') == stamp or stamp is None):
+            if _ready(Path(entry['extension']).parent):
+                return entry
+    tune = find_entry(table, key, tokens, source=context['source'],
                       canonical_header=header, batch_invariant=batch_invariant)
+    known_shape = (key['hidden'], key['intermediate']) in VALIDATED_SHAPES
+    if not known_shape and not allow_unvalidated_shape and not (tune and tune.get('validated')):
+        raise ValueError('No validated automatic profile for this shape/workload/bucket; '
+                         'run tools/autotune.py and pass its numerical checks first, or explicitly '
+                         'set allow_unvalidated_shape=True for experimental default compilation')
+    if not known_shape and not (tune and tune.get('validated')):
+        logger.warning('Compiling an unvalidated experimental shape: H=%s I=%s',
+                       key['hidden'], key['intermediate'])
     selected = tune['header'] if tune else header
     path = compile_artifact(selected, context)
     tuning = {k: tune[k] for k in ('window_tokens', 'contribution_windows')} if tune else {}
     entry = dict(extension=str(path), header_digest=digest(selected), tuning=tuning,
                  origin='tuned' if tune else 'default', batch_invariant=batch_invariant)
-    _atomic_json(index, entry)
+    _atomic_json(index, dict(entry=entry, table_stamp=stamp))
     return entry
 
 
@@ -220,3 +244,45 @@ def helpers():
         return load(explicit)
     context = build_context()
     return load(compile_artifact('#pragma once\n', context, ops=True))
+
+
+def main(argv=None):
+    """Warm artifacts on each node before initializing any process group."""
+    import argparse
+    import torch
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument('command', choices=['prepare'])
+    for name in ('hidden', 'intermediate', 'experts', 'top-k', 'max-tokens'):
+        parser.add_argument('--' + name, type=int, required=True)
+    parser.add_argument('--nodes', type=int, default=1)
+    parser.add_argument('--gpus-per-node', type=int, default=8)
+    parser.add_argument('--dtype', choices=['bfloat16', 'fp8'], default='bfloat16')
+    parser.add_argument('--mode', choices=['training', 'inference', 'decode'], default='training')
+    parser.add_argument('--input-layout', default='dp')
+    parser.add_argument('--interconnect')
+    parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--batch-invariant', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--allow-unvalidated-shape', action='store_true')
+    args = parser.parse_args(argv)
+    if min(args.nodes, args.gpus_per_node, args.experts, args.top_k) <= 0 or args.max_tokens < 0:
+        parser.error('topology, experts and top-k must be positive; max-tokens must be nonnegative')
+    if args.experts % (args.nodes * args.gpus_per_node) or args.top_k > args.experts:
+        parser.error('experts must be divisible by EP world size and top-k must not exceed experts')
+    if args.mode == 'decode' and args.nodes != 1:
+        parser.error('DT only supports a single node')
+    torch.cuda.set_device(args.device)
+    key = dict(gpu=torch.cuda.get_device_name(), hidden=args.hidden, intermediate=args.intermediate,
+               experts=args.experts, top_k=args.top_k, nodes=args.nodes, gpus_per_node=args.gpus_per_node,
+               dtype=args.dtype, mode=args.mode, input_layout=args.input_layout,
+               interconnect=args.interconnect or ('nvlink' if args.nodes == 1 else 'nvlink+gin'))
+    entry = prepare(key, args.max_tokens, batch_invariant=args.batch_invariant,
+                    allow_unvalidated_shape=args.allow_unvalidated_shape)
+    load(entry['extension'])
+    if args.dtype == 'fp8':
+        helpers()
+    print(json.dumps(entry, sort_keys=True))
+
+
+if __name__ == '__main__':
+    main()

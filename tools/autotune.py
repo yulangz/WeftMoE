@@ -239,6 +239,9 @@ class Benchmark:
                "--experts", str(args.experts), "--top-k", str(args.top_k),
                "--tokens", *map(str, sizes), "--candidate", str(extension(candidate)),
                "--reference", str(extension(self.reference))]
+        for role, item in (("candidate", candidate), ("reference", self.reference)):
+            cli += [f"--{role}-ring-tokens", str(item["config"]["v4"]["window_tokens"]),
+                    f"--{role}-ring-depth", str(item["config"]["v4"]["contribution_windows"])]
         if args.remotes:
             cli.append("--skip-dt")
         paths, processes, streams = [], [], []
@@ -365,7 +368,7 @@ def export_table(path, selected, args, compiler):
                          nodes=1 + len(args.remotes), gpus_per_node=args.gpus_per_node,
                          input_layout="dp", mode=args.mode),
                  tokens=args.token_interval, source=source_digest(), header=header,
-                 header_digest=digest(header), batch_invariant=args.batch_invariant,
+                 header_digest=digest(header), batch_invariant=args.batch_invariant, validated=True,
                  window_tokens=selected["config"]["v4"]["window_tokens"],
                  contribution_windows=selected["config"]["v4"]["contribution_windows"])
     write_result(path, dict(schema=2, entries=[entry]))

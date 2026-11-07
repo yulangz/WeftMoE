@@ -7,6 +7,7 @@ all ranks must call layers in the same order. Expert weights use BF16
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 
@@ -39,6 +40,7 @@ class TensorRuntime:
         fp8_workspace: bool = False,
         session=None,
         batch_invariant: bool = True,
+        allow_unvalidated_shape: bool = False,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -79,7 +81,8 @@ class TensorRuntime:
         # one node must report a collective error, not strand peers in bootstrap.
         requests = [None] * self.world
         request = dict(key=key, max_tokens=max_tokens, batch_invariant=batch_invariant,
-                       fp8_workspace=fp8_workspace, decode_only=decode_only)
+                       fp8_workspace=fp8_workspace, decode_only=decode_only,
+                       allow_unvalidated_shape=allow_unvalidated_shape)
         dist.all_gather_object(requests, request, group=group)
         if any(r != request for r in requests):
             raise ValueError("EP ranks requested incompatible WeftMoE configurations")
@@ -99,7 +102,8 @@ class TensorRuntime:
             else:
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("Prepare WeftMoE before CUDA Graph capture")
-                entry = jit.prepare(key, max_tokens, batch_invariant=batch_invariant)
+                entry = jit.prepare(key, max_tokens, batch_invariant=batch_invariant,
+                                    allow_unvalidated_shape=allow_unvalidated_shape)
                 tuning = entry["tuning"]
                 native = jit.load(entry["extension"])
                 identity = entry["header_digest"]
@@ -108,6 +112,9 @@ class TensorRuntime:
             # A session is owned by its native module. Different bucket binaries
             # bootstrap separately; never pass a foreign C++ session across DSOs.
             if session is not None and not isinstance(session, native.Session):
+                logging.getLogger(__name__).warning(
+                    "Cannot reuse a WeftMoE session from another native library; "
+                    "creating a separate NCCL/GIN session and workspace")
                 session = None
             decision.update(identity=identity, tuning=tuning, reuse_session=session is not None)
         except Exception as error:

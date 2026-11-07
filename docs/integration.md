@@ -4,6 +4,8 @@
 并使用一致的 tune 表和编译环境。默认在首次准备 runtime 时自动编译；`WEFTMOE_TENSOR_EXTENSION` 仅用于显式固定已有扩展。adapter 归 WeftMoE；
 RL 启动、调度、权重同步及共卡生命周期 hook 归 AReaL，不需要把 CUDA 实现复制进框架。
 
+多机冷启动建议先在每个节点执行[无 process-group 的 JIT 预热](usage.md#多机启动前预热)，参数与实际 worker 一致；否则命中缓存的节点可能在 collective 中等到首次编译超出框架设置的 timeout。不同 native 库的 session 无法共用，runtime 会明确警告并重新创建通信资源。
+
 ## Megatron
 
 ```python

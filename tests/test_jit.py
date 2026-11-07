@@ -86,23 +86,33 @@ def test_request_cache_precedes_tuning_and_survives_missing_table(tmp_path,monke
     monkeypatch.setattr(jit,'compile_artifact',build)
     first=jit.prepare(key(),4096)
     assert first['origin']=='default'
-    tuning.publish_entry(tuning.default_table(),entry())
-    assert jit.prepare(key(),4096)==first and len(built)==1
+    tuning.publish_entry(tuning.default_table(),entry(window_tokens=512,contribution_windows=8))
+    refreshed=jit.prepare(key(),4096)
+    assert refreshed['origin']=='tuned' and len(built)==2
+    assert refreshed['header_digest']==first['header_digest']
+    assert refreshed['tuning']==dict(window_tokens=512,contribution_windows=8)
+    # A valid compiled request wins without reading/selecting a tune entry.
+    with monkeypatch.context() as m:
+        m.setattr(jit,'find_entry',lambda *a,**kw:pytest.fail('tune lookup on a cache hit'))
+        assert jit.prepare(key(),4096)==refreshed
     second=jit.prepare(key(),8192)
-    assert second['origin']=='tuned' and second['tuning']['window_tokens']==2048
+    assert second['origin']=='tuned' and second['tuning']['window_tokens']==512
     tuning.default_table().unlink()
-    assert jit.prepare(key(),8192)==second and len(built)==2
+    assert jit.prepare(key(),8192)==second and len(built)==3
     Path(second['extension']).write_bytes(b'corrupted')
-    assert jit.prepare(key(),8192)['origin']=='default' and len(built)==3
+    assert jit.prepare(key(),8192)['origin']=='default' and len(built)==4
 
 
 def test_concurrent_compile_publishes_once_and_retries_failure(tmp_path,monkeypatch):
     monkeypatch.setenv('WEFTMOE_ROOT',str(tmp_path))
     monkeypatch.delenv('NVCCFLAGS',raising=False)
     calls=[]
+    includes=[]
     fail=[True]
     def run(command,**kwargs):
         calls.append(command)
+        if '--output' in command:
+            includes.append(kwargs['env']['NVCCFLAGS'])
         if fail[0]:
             return SimpleNamespace(returncode=1)
         if '--output' in command:
@@ -119,6 +129,10 @@ def test_concurrent_compile_publishes_once_and_retries_failure(tmp_path,monkeypa
     with ThreadPoolExecutor(4) as pool:
         paths=list(pool.map(lambda _:jit.compile_artifact('#pragma once\n',{}),range(4)))
     assert len(set(paths))==1 and len(calls)==3
+    assert includes[0]==includes[1], 'retry must preserve the object-cache command'
+    import shlex
+    include=next(flag[2:] for flag in shlex.split(includes[0]) if flag.startswith('-I'))
+    assert (Path(include)/'weftmoe_forward_tuning_generated.hpp').is_file()
     assert jit._ready(paths[0].parent)
 
 
@@ -132,3 +146,65 @@ def test_default_shape_is_independent_of_model_name():
         jit.default_header(2049,512)
     with pytest.raises(ValueError, match='>= 512'):
         jit.default_header(256,256)
+
+
+@pytest.mark.parametrize('macro,default', [
+    ('WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH','0'),
+    ('WEFTMOE_DT_FP8_SLICE_SCHEDULE','1'),
+    ('WEFTMOE_FWD_LOCAL_PREFILL_STREAMING','0'),
+    ('WEFTMOE_DT_SLICE_SCHEDULE','0'),
+    ('WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS','0'),
+])
+def test_runtime_rejects_changed_arithmetic_and_path_selectors(tmp_path,macro,default):
+    import re
+    a=entry()
+    original=tuning.arithmetic(a['header'])[macro]
+    header=re.sub(r'^#define '+macro+r'[^\n]*\n?', '', a['header'], flags=re.MULTILINE)
+    assert tuning.arithmetic(header)[macro]==default
+    changed=header+f'\n#define {macro} {1-int(original)}\n'
+    b=entry((8193,20480),header=changed,header_digest=tuning.digest(changed))
+    path=tmp_path/'table.json'
+    tuning.publish_entry(path,b)
+    assert find(path,8193) is None
+    with pytest.raises(ValueError,match='different arithmetic'):
+        tuning.publish_entry(path,a)
+
+
+def test_unknown_shape_needs_validation_or_explicit_opt_in(tmp_path,monkeypatch):
+    monkeypatch.setenv('WEFTMOE_ROOT',str(tmp_path))
+    monkeypatch.delenv('WEFTMOE_AUTOTUNE_TABLE',raising=False)
+    monkeypatch.setattr(jit,'build_context',lambda:dict(source='test-source',arch=(9,0)))
+    monkeypatch.setattr(jit,'compile_artifact',lambda header,ctx:fake_artifact(tmp_path/tuning.digest(header)))
+    workload=key(hidden=7168,intermediate=2560)
+    with pytest.raises(ValueError,match='No validated automatic profile'):
+        jit.prepare(workload,8192)
+    assert jit.prepare(workload,8192,allow_unvalidated_shape=True)['origin']=='default'
+    # An experimental cache must not bypass the normal guard.
+    with pytest.raises(ValueError,match='No validated automatic profile'):
+        jit.prepare(workload,8192)
+    header=jit.default_header(7168,2560)
+    a=entry(key=workload,header=header,header_digest=tuning.digest(header))
+    tuning.publish_entry(tuning.default_table(),a)
+    with pytest.raises(ValueError,match='No validated automatic profile'):
+        jit.prepare(workload,8192)
+    tuning.publish_entry(tuning.default_table(),dict(a,validated=True))
+    assert jit.prepare(workload,8192)['origin']=='tuned'
+
+
+def test_prewarm_does_not_initialize_a_process_group(monkeypatch,capsys):
+    import torch
+    monkeypatch.setattr(torch.cuda,'set_device',lambda device:None)
+    monkeypatch.setattr(torch.cuda,'get_device_name',lambda:'test SM90')
+    monkeypatch.setattr(torch.distributed,'init_process_group',lambda *a,**kw:pytest.fail('initialized PG'))
+    seen=[]
+    def prepare(key,tokens,**kwargs):
+        seen.append((key,tokens,kwargs))
+        return dict(extension='/fake/runtime.so',origin='default')
+    monkeypatch.setattr(jit,'prepare',prepare)
+    monkeypatch.setattr(jit,'load',lambda path:seen.append(path))
+    monkeypatch.setattr(jit,'helpers',lambda:seen.append('helpers'))
+    jit.main(['prepare','--hidden','2048','--intermediate','512','--experts','256',
+              '--top-k','8','--max-tokens','8192','--nodes','2','--dtype','fp8'])
+    assert seen[0][0]==key(gpu='test SM90',nodes=2,interconnect='nvlink+gin',dtype='fp8')
+    assert seen[0][1]==8192 and seen[-1]=='helpers'
+    assert json.loads(capsys.readouterr().out)['origin']=='default'
