@@ -38,9 +38,10 @@ def arithmetic(header):
                 'WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS': '0',
                 'WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH': '0',
                 'WEFTMOE_DT_FP8_SLICE_SCHEDULE': '1',
-                'WEFTMOE_FWD_LOCAL_PREFILL_STREAMING': '0',
+                'WEFTMOE_FWD_LOCAL_PREFILL_STREAMING': '1',
                 'WEFTMOE_DT_SLICE_SCHEDULE': '0',
-                'WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS': '0'}
+                'WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS':
+                    values.get('WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS', '0')}
     return {name: values.get(name, defaults.get(name)) for name in ARITHMETIC_MACROS}
 
 

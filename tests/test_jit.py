@@ -151,7 +151,7 @@ def test_default_shape_is_independent_of_model_name():
 @pytest.mark.parametrize('macro,default', [
     ('WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH','0'),
     ('WEFTMOE_DT_FP8_SLICE_SCHEDULE','1'),
-    ('WEFTMOE_FWD_LOCAL_PREFILL_STREAMING','0'),
+    ('WEFTMOE_FWD_LOCAL_PREFILL_STREAMING','1'),
     ('WEFTMOE_DT_SLICE_SCHEDULE','0'),
     ('WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS','0'),
 ])
@@ -168,6 +168,40 @@ def test_runtime_rejects_changed_arithmetic_and_path_selectors(tmp_path,macro,de
     assert find(path,8193) is None
     with pytest.raises(ValueError,match='different arithmetic'):
         tuning.publish_entry(path,a)
+
+
+@pytest.mark.parametrize('macro,prefill,expected', [
+    ('WEFTMOE_FWD_LOCAL_PREFILL_STREAMING', None, '1'),
+    ('WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS', None, '0'),
+    ('WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS', '128', '128'),
+])
+def test_omitted_path_macros_match_native_defaults(tmp_path,macro,prefill,expected):
+    import re
+    prefill_macro='WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS'
+    header=entry()['header']
+    for name in (macro,prefill_macro):
+        header=re.sub(r'^#define '+name+r'[^\n]*\n?', '', header, flags=re.MULTILINE)
+    if prefill is not None:
+        header+=f'\n#define {prefill_macro} {prefill}\n'
+    assert tuning.arithmetic(header)[macro]==expected
+    a=entry(header=header,header_digest=tuning.digest(header))
+    path=tmp_path/'table.json'
+    tuning.publish_entry(path,a)
+    explicit=header+f'\n#define {macro} {expected}\n'
+    assert tuning.arithmetic(explicit)==tuning.arithmetic(header)
+    b=entry((8193,20480),header=explicit,header_digest=tuning.digest(explicit))
+    tuning.publish_entry(path,b)
+    assert tuning.find_entry(path,key(),8193,source='test-source',canonical_header=header)==b
+
+    different='0' if expected!='0' else '1'
+    changed=header+f'\n#define {macro} {different}\n'
+    incompatible=entry((20481,65536),header=changed,header_digest=tuning.digest(changed))
+    with pytest.raises(ValueError,match='different arithmetic'):
+        tuning.publish_entry(path,incompatible)
+    # A standalone table must also be checked against the runtime's header.
+    other=tmp_path/'incompatible.json'
+    tuning.publish_entry(other,incompatible)
+    assert tuning.find_entry(other,key(),20481,source='test-source',canonical_header=header) is None
 
 
 def test_unknown_shape_needs_validation_or_explicit_opt_in(tmp_path,monkeypatch):
