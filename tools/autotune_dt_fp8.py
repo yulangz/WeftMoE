@@ -33,7 +33,7 @@ from benchmarks.fp8_validation import POLICY, passes
 MODELS = {"qwen35b": (2048, 512, 8), "qwen122b": (3072, 1024, 8), "flash": (4096, 2048, 6)}
 SIZES = [1, 16, 32, 64, 128, 256, 512]
 METRICS = ["fp8_online_us", "fp8_prequant_us"]
-KERNEL_POLICY = "fixed-m64-v1"
+KERNEL_POLICY = "fixed-m64-batch-invariant-v2"
 
 
 def atomic_json(path, value):
@@ -42,10 +42,10 @@ def atomic_json(path, value):
     temp.replace(path)
 
 
-def candidates():
+def candidates(batch_invariant=True):
     result = [dict(id="default", stages=3, slices=1, ctas=0)]
     # M64 and the 224/56 register partition are fixed in every configuration.
-    for stages, slices, ctas in itertools.product([1, 2, 3], [0, 1], [32, 64, 96, 132]):
+    for stages, slices, ctas in itertools.product([1, 2, 3], [1] if batch_invariant else [0, 1], [32, 64, 96, 132]):
         result.append(dict(id=f"m64-s{stages}-r{slices}-c{ctas}",
                            stages=stages, slices=slices, ctas=ctas))
     tail = result[1:]
@@ -72,13 +72,15 @@ def reuse_builds(output, previous, hashes):
     """Reuse immutable binaries only; never reuse old correctness verdicts."""
     previous = previous.resolve()
     old = json.loads((previous / "manifest.json").read_text())
+    if old.get("kernel_policy") != KERNEL_POLICY:
+        raise RuntimeError("cannot reuse binaries: kernel/SONAME policy changed")
     def native_inputs(values):
         return {k: v for k, v in values.items() if k.startswith(("src/", "include/", "configs/"))
                 or k in ("build_native.py", "tools/build_tensor_runtime.py")}
     if native_inputs(old["source_hashes"]) != native_inputs(hashes):
         raise RuntimeError("cannot reuse binaries: native source/configuration hashes differ")
     count = 0
-    for candidate in candidates():
+    for candidate in candidates(False):
         for model in MODELS:
             relative = Path("jobs") / model / candidate["id"] / "native"
             source = previous / relative
@@ -283,12 +285,13 @@ def execute_job(output, manifest, model, candidate, phase, retry_failed):
     env["NVCCFLAGS"] = shlex.join(["-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1",
         "-I" + str(source / "configs/profiles" / model), "-Xptxas=-v",
         *[f"-DWEFTMOE_DT_FP8_{key}={value}" for key, value in flags.items()]])
+    env["WEFTMOE_NATIVE_SONAME"] = f"libweftmoe_{model}_{candidate['id']}.so"
     python = manifest["python"]
     try:
         if not (native / "complete.json").exists():
-            run_command([python, "build_native.py", "lib", "--output", str(native / "libweftmoe.so"), "--jobs", "2"],
+            run_command([python, "build_native.py", "lib", "--output", str(native / env["WEFTMOE_NATIVE_SONAME"]), "--jobs", "2"],
                         cwd=source, env=env, log=base / "build.log", timeout=1800)
-            run_command([python, "tools/build_tensor_runtime.py", "--library", str(native / "libweftmoe.so")],
+            run_command([python, "tools/build_tensor_runtime.py", "--library", str(native / env["WEFTMOE_NATIVE_SONAME"])],
                         cwd=source, env=env, log=base / "adapter.log", timeout=600)
             atomic_json(native / "complete.json", dict(flags=env["NVCCFLAGS"], candidate=candidate))
         h, i, topk = MODELS[model]
@@ -308,6 +311,15 @@ def execute_job(output, manifest, model, candidate, phase, retry_failed):
                                   log=base / "correctness.log", timeout=420)
             log = base / "correctness.log"
             waived = log.read_text().count('"known_failure_waived": true') if log.exists() else 0
+            if manifest.get("batch_invariant", True):
+                reference = output / "jobs" / model / "default/native"
+                seconds += run_command([
+                    *launcher, "tests/torchrun_batch_invariant.py", "--hidden", str(h),
+                    "--intermediate", str(i), "--experts", "256", "--top-k", str(topk),
+                    "--tokens", "1", "16", "63", "64", "65", "128", "129", "512",
+                    "--candidate", env["WEFTMOE_TENSOR_EXTENSION"],
+                    "--reference", str(next(reference.glob("_runtime*.so")))],
+                    cwd=source, env=env, log=base / "invariance.log", timeout=600)
             atomic_json(base / "correctness.json", dict(passed=True, seconds=seconds, known_case_waivers=waived))
         idle_gpus()
         rec["benchmark_seconds"] = run_command([*launcher, "benchmarks/benchmark_dt_fp8.py"],
@@ -385,13 +397,15 @@ def main():
     parser.add_argument("--reuse-builds", type=Path,
                         help="reuse identical native builds from an earlier sweep; recheck and remeasure all candidates")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--batch-invariant", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-known-one-token", action="store_true",
                         help="explicitly waive only the bounded Qwen35B rank7 replay-1-0-0 failure")
     args = parser.parse_args()
     args.output = args.output.resolve()
+    selected_candidates = candidates(args.batch_invariant)
     if args.dry_run:
-        print(json.dumps(dict(candidates=candidates(), models=MODELS, sizes=SIZES,
-            builds=len(candidates()) * len(MODELS), search_measurements=len(candidates()) * len(MODELS) * len(SIZES) * 2), indent=2))
+        print(json.dumps(dict(candidates=selected_candidates, models=MODELS, sizes=SIZES,
+            builds=len(selected_candidates) * len(MODELS), search_measurements=len(selected_candidates) * len(MODELS) * len(SIZES) * 2), indent=2))
         return
     if args.worker:
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt("SIGTERM")))
@@ -411,10 +425,10 @@ def main():
             env = {k: os.environ[k] for k in keys if k in os.environ}
             atomic_json(path, dict(repository=str(ROOT), python=sys.executable, created=time.time(),
                 git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                source_hashes=hashes, environment=env, candidates=candidates(), models=MODELS, sizes=SIZES,
+                source_hashes=hashes, environment=env, candidates=selected_candidates, models=MODELS, sizes=SIZES,
                 hardware=subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,uuid,driver_version", "--format=csv"], text=True),
-                registers=[224, 56], candidate_builds=len(candidates()) * len(MODELS), includes_default=True,
-                validation=POLICY, kernel_policy=KERNEL_POLICY,
+                registers=[224, 56], candidate_builds=len(selected_candidates) * len(MODELS), includes_default=True,
+                validation=POLICY, kernel_policy=KERNEL_POLICY, batch_invariant=args.batch_invariant,
                 allow_known_one_token=args.allow_known_one_token,
                 reuse=reuse,
                 timing="EP8 max-rank CUDA events; alternating BF16/FP8 source variants; weights excluded; source preparation included"))
@@ -422,6 +436,8 @@ def main():
             raise RuntimeError("DT kernel policy changed; use a new output directory")
         if json.loads(path.read_text()).get("validation") != POLICY:
             raise RuntimeError("validation policy changed; use a new output directory with --reuse-builds")
+        if json.loads(path.read_text()).get("batch_invariant") != args.batch_invariant:
+            raise RuntimeError("batch-invariant policy changed; use a new output directory")
         if args.allow_known_one_token and not json.loads(path.read_text()).get("allow_known_one_token", False):
             raise RuntimeError("known-case waiver changed; use a new output directory")
         command = [sys.executable, str(args.output / "source/tools/autotune_dt_fp8.py"),

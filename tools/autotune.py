@@ -32,15 +32,53 @@ import unified_tuning
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from benchmarks.models import add_model_arguments, resolve_model  # noqa: E402
+from weftmoe.jit import default_header, source_digest
+from weftmoe.tuning import arithmetic, default_table, digest, publish_entry
+
+# Conservative whitelist: new search axes are excluded until reviewed. Keep
+# arithmetic tiles, WGMMA atoms, quantization and reduction policy canonical.
+INVARIANT_FORWARD = frozenset({
+    "fc1_stages", "fc2_stages", "static_v4_fc1_stages", "static_v4_fc2_stages",
+    "fc2_claim_tiles", "task_idle_nanosleep", "transport_idle_nanosleep",
+    "setup_nanosleep", "return_idle_nanosleep", "reduce_queue_nanosleep", "finalize_nanosleep",
+})
+INVARIANT_BACKWARD = frozenset({
+    "dab_stages", "dx_stages", "dw1_stages", "dw2_stages", "dw1_claim_tiles", "dw2_claim_tiles",
+})
+INVARIANT_V4 = frozenset({"window_tokens", "contribution_windows", "decode_stages", "decode_cta_multiplier", "dt_fp8_stages", "dt_fp8_ctas"})
+
+
+def invariant_changes(config, reference):
+    allowed = dict(forward=INVARIANT_FORWARD, backward=INVARIANT_BACKWARD, v4=INVARIANT_V4)
+    return [f"{phase}.{name}" for phase in allowed for name in config[phase]
+            if name not in allowed[phase] and config[phase][name] != reference[phase][name]]
+
+
+def length_bucket(tokens, boundaries):
+    require(boundaries and all(type(n) is int and n > 0 for n in boundaries)
+            and sorted(set(boundaries)) == boundaries, "token_buckets must be increasing positive integers")
+    lower = 0
+    for upper in boundaries:
+        if tokens <= upper:
+            return [lower, upper]
+        lower = upper + 1
+    upper = boundaries[-1]
+    while tokens > upper:
+        lower, upper = upper + 1, upper * 2
+    return [lower, upper]
+
 
 PHASES = {"forward": forward, "backward": backward}
 
 
 def load_incumbent(spec, args):
     """Expand the frozen header using the same C++ defaults as native builds."""
+    require(not (spec.get("batch_invariant", True) and spec.get("base_header")),
+            "custom base_header requires --no-batch-invariant; invariant mode uses the canonical shape default")
     header = (args.config.parent / spec["base_header"]).resolve() if spec.get("base_header") else (
         ROOT / "configs/profiles" / args.model / "weftmoe_forward_tuning_generated.hpp")
-    source = '#include "cuda/forward/tuning_config.hpp"\n#include "cuda/backward/tuning_config.hpp"\n'
+    source = default_header(args.hidden, args.intermediate) if not spec.get("base_header") else header.read_text()
+    source += '\n#include "cuda/forward/tuning_config.hpp"\n#include "cuda/backward/tuning_config.hpp"\n'
     for phase, module in PHASES.items():
         source += "".join(f"PF_VALUE {phase} {key} {macro}\n"
                           for key, macro in module.PARAMETER_MACROS.items())
@@ -51,7 +89,7 @@ def load_incumbent(spec, args):
         spec.get("environment", {}).get("CXX", os.environ.get("CXX", "c++")),
         "-E", "-P", "-x", "c++", "-",
         "-I" + str(ROOT / "src"), "-I" + str(header.parent),
-        "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1"], input=source, text=True)
+        ], input=source, text=True)
     config = {phase: {} for phase in (*PHASES, "v4")}
     for line in output.splitlines():
         if line.startswith("PF_VALUE "):
@@ -69,11 +107,20 @@ def load_incumbent(spec, args):
         if extent % (2 * config["backward"][key]):
             config["backward"][key] = 128
     topology = "local" if not args.remotes else "network"
-    config["v4"] = ring.DEFAULTS | config["v4"] | spec.get("v4", {}) | spec["ring"][topology][0]
+    config["v4"] = ring.DEFAULTS | config["v4"] | spec["ring"][topology][0]
+    reference = copy.deepcopy(config)
+    require(set(spec.get("v4", {})) <= set(config["v4"]), "unknown v4 settings")
+    config["v4"].update(spec.get("v4", {}))
     for phase, overrides in spec.get("initial", {}).items():
         require(phase in config and set(overrides) <= set(config[phase]),
                 f"unknown initial tuning parameter: {phase}: {overrides}")
         config[phase].update(overrides)
+    if spec.get("batch_invariant", True):
+        changed = invariant_changes(config, reference)
+        require(not changed, f"batch-invariant initial overrides change arithmetic/policy: {changed}")
+        require(arithmetic(generated_header(config)) == arithmetic(default_header(args.hidden, args.intermediate)),
+                "batch-invariant base header differs from canonical M/N/K arithmetic")
+    spec["_invariant_reference"] = reference
     return config
 
 
@@ -131,6 +178,9 @@ def candidates_for(stage, incumbent, spec, args):
             continue
         seen.add(name)
         try:
+            if spec.get("batch_invariant", True):
+                changed = invariant_changes(config, spec.get("_invariant_reference", incumbent["config"]))
+                require(not changed, f"batch-invariant excludes {changed}")
             validate(config)
         except PlanError as error:
             rejected.append(dict(config=config, reason=str(error)))
@@ -155,9 +205,9 @@ class NativeCompiler:
         content = generated_header(candidate["config"])
         if not header.exists() or header.read_text() != content:
             header.write_text(content)
-        library = directory / "libweftmoe.so"
+        library = directory / ("libweftmoe_" + candidate_digest(compiled_config(candidate["config"])) + ".so")
         log_path = log_dir / (candidate["name"] + ".build.log")
-        env = self.environment | {"NVCCFLAGS": self.environment.get("NVCCFLAGS", "")
+        env = self.environment | {"WEFTMOE_NATIVE_SONAME": library.name, "NVCCFLAGS": self.environment.get("NVCCFLAGS", "")
                            + " -lineinfo -Xptxas=-v,--warn-on-spills "
                            "-DWEFTMOE_FORWARD_USE_GENERATED_TUNING=1 "
                            + shlex.quote("-I" + str(directory))}
@@ -178,6 +228,49 @@ class Benchmark:
         self.args, self.spec, self.output, self.compiler = args, spec, output, compiler
         self.fingerprints = {}
 
+    def invariance(self, candidate, label):
+        args, spec = self.args, self.spec
+        # Include the actual bucket endpoints and low-M boundaries, not just
+        # the timing representatives. Anchor values/routes remain identical.
+        lower, upper = args.token_interval
+        sizes = sorted(set([1, 17, 63, 64, 65, 127, 128, 129, max(1, lower), upper]))
+        extension = lambda c: self.compiler.directory(c) / ("_runtime" + sysconfig.get_config_var("EXT_SUFFIX"))
+        cli = ["--hidden", str(args.hidden), "--intermediate", str(args.intermediate),
+               "--experts", str(args.experts), "--top-k", str(args.top_k),
+               "--tokens", *map(str, sizes), "--candidate", str(extension(candidate)),
+               "--reference", str(extension(self.reference))]
+        for role, item in (("candidate", candidate), ("reference", self.reference)):
+            cli += [f"--{role}-ring-tokens", str(item["config"]["v4"]["window_tokens"]),
+                    f"--{role}-ring-depth", str(item["config"]["v4"]["contribution_windows"])]
+        if args.remotes:
+            cli.append("--skip-dt")
+        paths, processes, streams = [], [], []
+        env = {k:v for k,v in os.environ.items() if k.startswith(("NCCL_", "UCX_", "CUDA_")) or k == "LD_LIBRARY_PATH"}
+        env.update(spec.get("environment", {}))
+        env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1")
+        try:
+            for node, remote in enumerate([None] + args.remotes):
+                command = ["env", "-u", "WEFTMOE_AUTOTUNE_TABLE", *(f"{k}={v}" for k,v in env.items()),
+                           "timeout", "--kill-after=20s", str(spec["timeout_seconds"]),
+                           sys.executable, "-m", "torch.distributed.run",
+                           f"--nnodes={1+len(args.remotes)}", f"--nproc-per-node={args.gpus_per_node}",
+                           f"--node-rank={node}", f"--master-addr={args.master_addr}",
+                           f"--master-port={args.master_port}",
+                           str(ROOT / "tests/torchrun_batch_invariant.py"), *cli]
+                if remote:
+                    command = ["ssh", "-p", str(args.ssh_port), "-o", "BatchMode=yes", remote,
+                               "cd " + shlex.quote(str(ROOT)) + " && " + shlex.join(command)]
+                path = self.output / f"{label}.node{node}.log"
+                paths.append(path)
+                streams.append(path.open("w"))
+                processes.append(subprocess.Popen(command, cwd=ROOT, stdout=streams[-1], stderr=subprocess.STDOUT))
+            codes = [process.wait() for process in processes]
+        finally:
+            for stream in streams:
+                stream.close()
+        require(not any(codes), f"batch-invariant verification failed ({codes}); see {paths}")
+        return dict(passed=True, logs=list(map(str, paths)), tokens=sizes)
+
     def run(self, candidate, label, *, verify=False, final=False):
         args, spec = self.args, self.spec
         training = args.mode == "training"
@@ -193,6 +286,8 @@ class Benchmark:
                "--route-bias-std", str(spec["route_bias_std"]),
                "--ring-tokens", str(candidate["config"]["v4"]["window_tokens"]),
                "--ring-depth", str(candidate["config"]["v4"]["contribution_windows"])]
+        if args.fp8:
+            cli += ["--fp8"] + (["--weight-grad-dtype", "bf16"] if training else [])
         if verify:
             cli.append("--verify")
             if not training:
@@ -265,19 +360,19 @@ class Benchmark:
 
 
 def export_table(path, selected, args, compiler):
-    config, entries = selected["config"], []
-    for record in selected["final"]["records"]:
-        entries.append(dict(
-            key=dict(gpu=record["gpu"], interconnect="nvlink+gin" if args.remotes else "nvlink",
-                     dtype="bfloat16", hidden=args.hidden, intermediate=args.intermediate,
-                     experts=args.experts, top_k=args.top_k, nodes=1 + len(args.remotes),
-                     gpus_per_node=args.gpus_per_node, max_tokens=record["max_tokens_capacity"],
-                     input_layout="dp", training=args.mode == "training"),
-            config_digest=candidate_digest(config), compiled_digest=candidate_digest(compiled_config(config)),
-            header=str(compiler.directory(selected) / "weftmoe_forward_tuning_generated.hpp"),
-            window_tokens=config["v4"]["window_tokens"],
-            contribution_windows=config["v4"]["contribution_windows"]))
-    write_result(path, dict(schema=1, entries=entries))
+    record = selected["final"]["records"][0]
+    header = generated_header(selected["config"])
+    entry = dict(key=dict(gpu=record["gpu"], interconnect="nvlink+gin" if args.remotes else "nvlink",
+                         dtype="fp8" if args.fp8 else "bfloat16", hidden=args.hidden,
+                         intermediate=args.intermediate, experts=args.experts, top_k=args.top_k,
+                         nodes=1 + len(args.remotes), gpus_per_node=args.gpus_per_node,
+                         input_layout="dp", mode=args.mode),
+                 tokens=args.token_interval, source=source_digest(), header=header,
+                 header_digest=digest(header), batch_invariant=args.batch_invariant, validated=True,
+                 window_tokens=selected["config"]["v4"]["window_tokens"],
+                 contribution_windows=selected["config"]["v4"]["contribution_windows"])
+    write_result(path, dict(schema=2, entries=[entry]))
+    publish_entry(args.table, entry)
 
 
 def parse_args(argv=None):
@@ -301,6 +396,11 @@ def parse_args(argv=None):
     parser.add_argument("--cache", type=Path, default=ROOT / "build/autotune/cache")
     parser.add_argument("--output", type=Path, default=ROOT / "build/autotune")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--batch-invariant", action=argparse.BooleanOptionalAction,
+                        default=spec.get("batch_invariant", True))
+    parser.add_argument("--fp8", action="store_true", help="FP8 training (dW BF16)")
+    parser.add_argument("--table", type=Path, default=default_table())
+    parser.add_argument("--token-buckets", type=int, nargs="+", default=spec.get("token_buckets", [8192, 20480, 65536]))
     for section in ("workload", "system", "run"):
         values = dict(spec.get(section, {}))
         known = {action.dest for action in parser._actions}
@@ -311,6 +411,9 @@ def parse_args(argv=None):
                 values[name] = path if path.is_absolute() else config_args.config.resolve().parent / path
         parser.set_defaults(**values)
     args = parser.parse_args(argv)
+    spec["batch_invariant"] = args.batch_invariant
+    if args.fp8 and args.mode == "decode":
+        spec["decode"] = {"axes": {"v4.dt_fp8_stages": [1, 2, 3], "v4.dt_fp8_ctas": [0, 32, 64, 96, 132]}}
     args.config = args.config.resolve()
     resolve_model(args)
     fields = vars(args) | dict(nodes=1 + len(args.remotes),
@@ -321,8 +424,7 @@ def parse_args(argv=None):
     return args, spec
 
 
-def main(argv=None):
-    args, spec = parse_args(argv)
+def run_search(args, spec):
     require(not args.remotes or args.master_addr != "127.0.0.1", "multi-node requires --master-addr")
     require(args.mode != "decode" or not args.remotes, "DT uses node-local communication")
     require(args.jobs > 0 and args.gpus_per_node > 0 and min(args.tokens) > 0,
@@ -351,6 +453,11 @@ def main(argv=None):
         print(output / "plan.json")
         return
     builds = {}
+    reference = copy.deepcopy(incumbent)
+    reference["build"] = compiler.compile(reference, compiler, output, command_jobs=args.jobs)
+    require(reference["build"]["returncode"] == 0, "canonical reference compilation failed")
+    benchmark.reference = reference
+    builds[candidate_digest(compiled_config(reference["config"]))] = reference["build"]
     for stage_index, stage in enumerate(spec["stages"]):
         candidates, rejected = candidates_for(stage, incumbent, spec, args)
         stage_result = dict(stage=stage, candidates=candidates, rejected=rejected)
@@ -404,6 +511,8 @@ def main(argv=None):
             candidate["aggregate_metric_us"] = statistics.mean(r["metric_us"] for r in candidate["confirmations"])
             try:
                 candidate["parity"] = benchmark.run(candidate, f"s{stage_index}_parity_{candidate['name']}", verify=True)
+                if args.batch_invariant:
+                    candidate["invariance"] = benchmark.invariance(candidate, f"s{stage_index}_invariant_{candidate['name']}")
             except PlanError as error:
                 candidate["error"] = str(error)
                 del candidate["aggregate_metric_us"]
@@ -412,18 +521,29 @@ def main(argv=None):
         print(f"SELECT {stage}: {stage_result['decision']}", flush=True)
         write_result(output / "result.json", result)
     incumbent["final_parity"] = benchmark.run(incumbent, "final_parity", verify=True, final=True)
+    if args.batch_invariant:
+        incumbent["batch_invariance"] = benchmark.invariance(incumbent, "final_invariance")
     incumbent["final"] = benchmark.run(incumbent, "final", final=True)
     result["selected"] = incumbent
     write_result(output / "result.json", result)
     export_table(output / "table.json", incumbent, args, compiler)
-    write_result(output / "runtime.json", dict(
-        environment=dict(spec.get("environment", {}),
-                         WEFTMOE_TENSOR_EXTENSION=str(compiler.directory(incumbent) / (
-                             "_runtime" + sysconfig.get_config_var("EXT_SUFFIX"))),
-                         WEFTMOE_AUTOTUNE_TABLE=str(output / "table.json")),
-        header=str(compiler.directory(incumbent) / "weftmoe_forward_tuning_generated.hpp")))
+    write_result(output / "runtime.json", dict(environment={"WEFTMOE_AUTOTUNE_TABLE": str(args.table.resolve())},
+                                              tokens=args.token_interval, batch_invariant=args.batch_invariant))
     print(f"Selected library: {incumbent['build']['library']}", flush=True)
     print(f"Validated {args.mode} table: {output / 'table.json'}", flush=True)
+
+
+def main(argv=None):
+    args, spec = parse_args(argv)
+    groups = {}
+    for tokens in args.tokens:
+        interval = tuple(length_bucket(tokens, args.token_buckets))
+        groups.setdefault(interval, []).append(tokens)
+    for interval, tokens in groups.items():
+        bucket_args = copy.deepcopy(args)
+        bucket_args.tokens, bucket_args.token_interval = tokens, list(interval)
+        bucket_args.output = args.output / f"tokens_{interval[0]}_{interval[1]}"
+        run_search(bucket_args, copy.deepcopy(spec))
 
 
 if __name__ == "__main__":

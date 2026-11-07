@@ -15,6 +15,16 @@ PF 使用静态任务划分、有界计算/通信 ring 和逐槽代际同步。F
 单机采用 CUDA IPC/NVLink；跨机采用 NCCL GIN/GDAKI。多机协议按同构节点组织，
 已验证单机与双机，更多节点尚待硬件验证。
 
+## 数值一致性与稳定性
+
+- **训推一致 / batch-invariant 前向**：在同一硬件和编译环境、相同精度、权重、token 输入及其路由/概率下，PF 训练前向（实际保存反向缓存）与 PF 推理、M64 DT 推理前向保持逐位一致。同一 token 不因 batch 长度、位置或其他 token 的加入而改变输出；相同输入重复调用的前向也保持逐位一致。
+- **必要条件是算术路径一致**：不同长度桶、PF/DT 的 MMA M/N/K 分解、K 累加顺序、量化与 scale 处理、激活和归约策略必须兼容。PF 的 CTA M128 不等于 MMA 的 M64，不能只比较 CTA 外形。默认 autotune 固定这些算术选择，只搜索通过一致性检查的流水线、调度与通信参数。仅固定 M/N/K 还不足以容许任意数学优化。
+- **反向数值稳定**：重复反向检查有限值及全局误差；不将 BWD 描述为跨 batch 逐位一致，因为 dW 会聚合 batch，FP8 列量化也依赖 token 分组。重复 BWD 回归使用 `diff ≤ 1e-6`；FP8 对 BF16 的量化精度检查使用独立的 `diff < 5e-3` 标准（dprob 只检查有限值）。
+
+这些约束针对 WeftMoE 专家算子，不覆盖上游 router、attention 或整个训练系统，也不承诺跨 GPU 架构、编译器版本或 BF16/FP8 两种精度的逐位一致。使用自定义二进制或关闭 `batch_invariant` 后，应自行验证上述条件。
+
+安装方式与模型无关。首次准备算子时依次使用已编译缓存、精确 shape 与长度桶匹配的手动 tune 配置、默认配置；后两者按需编译。**运行时不做 autotune**。用法和缓存规则见[使用文档](docs/usage.md)。
+
 ## 性能
 
 2026-11-05 在空闲单机 8× NVIDIA L20X（SM90，约 140 GiB/卡）上实测，EP8。
@@ -83,8 +93,9 @@ DT decode 对比 SGLang 0.5.10.post1 的 Triton FusedMoE + DP all-gather/reduce-
 
 支持 BF16 或 E4M3 blockwise FP8 计算（FP32 累加）；FP8 权重预量化，激活支持在线或预量化输入。
 输出与输入梯度为 BF16，框架接入默认 BF16 dW。专家为无 bias 的 SwiGLU，专家均匀分片且 `E % EP == 0`。
-native 库按 hidden/intermediate 编译；其他模型可配置 shape 后重新编译或 autotune，
-不是修改 Python 参数就能复用任意二进制。单机 EP2/4/8 等拓扑可用，具体容量取决于 profile 与显存。
+native 库按 hidden/intermediate 自动编译并独立缓存；自动路径要求 H/I 为不小于 512 的 256 倍数，
+自动默认配置限于下列三种已验证 shape；其他 shape 需先通过手动 tune 的数值校验，
+或显式设置 `allow_unvalidated_shape=True` 进行实验性编译（不代表已验证正确性）。单机 EP2/4/8 等拓扑可用，具体容量取决于 profile 与显存。
 多机需要相同的每节点 GPU 数、连续排列的机内 EP rank，以及可用的 GDAKI 网络。
 
 当前维护三种 benchmark shape：Qwen3.5-35B-A3B、Qwen3.5-122B-A10B、DeepSeek V4 Flash。

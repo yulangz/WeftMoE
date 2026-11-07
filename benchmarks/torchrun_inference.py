@@ -120,7 +120,10 @@ def main():
                         help="Reuse PF's immutable layer weights across changing token counts/routes")
     parser.add_argument("--forward-cache", choices=("off", "on"),
                         help="PF forward-only cache experiment; both modes use the same native tape API")
+    parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
+    if args.fp8 and (args.backend == "megamoe" or args.forward_cache or args.profile_device):
+        parser.error("--fp8 requires PF/DT without forward-cache/profile-device")
     resolve_model(args)
     if args.trace_stage_kernels and (args.backend != "pf" or args.verify or
                                     args.forward_cache or args.graph_replays):
@@ -160,6 +163,10 @@ def main():
     owned = args.experts // world
     w1 = rand(owned, 2 * args.intermediate, args.hidden)
     w2 = rand(owned, args.hidden, args.intermediate)
+    fp8_weights = None
+    if args.fp8:
+        from weftmoe.fp8 import prepare_fp8_weights
+        fp8_weights = prepare_fp8_weights(w1, w2, training=False)
     if args.backend == "megamoe":
         packed_w1, packed_w2 = deep_gemm.transform_weights_for_mega_moe(w1, w2)
     for nominal in args.tokens:
@@ -182,7 +189,7 @@ def main():
                                     top_k=args.top_k, hidden=args.hidden,
                                     intermediate=args.intermediate, max_tokens=capacity,
                                     max_rows=max_rows, training=args.forward_cache == "on",
-                                    decode_only=args.backend == "dt",
+                                    decode_only=args.backend == "dt", fp8_workspace=args.fp8,
                                     **({"stream": torch.cuda.current_stream()}
                                        if args.forward_cache else {}))
         else:
@@ -217,13 +224,13 @@ def main():
                 graph_routes.copy_(routes)
                 graph_gates.copy_(gates)
                 if graph is None:
-                    graph_output = runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2)
+                    graph_output = (runtime.inference_fp8(0, graph_x, graph_routes, graph_gates, fp8_weights) if args.fp8 else runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2))
                     torch.cuda.synchronize()
                     dist.barrier()
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
                         for _ in range(args.graph_replays):
-                            runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2)
+                            (runtime.inference_fp8(0, graph_x, graph_routes, graph_gates, fp8_weights) if args.fp8 else runtime.inference(0, graph_x, graph_routes, graph_gates, w1, w2))
             dist.barrier()
             torch.cuda.synchronize()
             probe = None
@@ -239,7 +246,11 @@ def main():
                 device_end.record()
                 output = graph_output
             elif args.backend != "megamoe":
-                if args.forward_cache:
+                if args.fp8:
+                    tape = runtime.forward_fp8(x, routes, gates, fp8_weights, retain_backward_state=False)
+                    output = tape.output
+                    del tape
+                elif args.forward_cache:
                     tape = runtime.native.forward(x, routes, gates, w1, w2,
                         **({"layer": 0} if args.prepared_weights else {}))
                     output = tape.output
@@ -283,9 +294,14 @@ def main():
                              max_abs=delta.abs().max().item())
                 # Fail collectively: otherwise successful peers enter the next
                 # reference collective while a failed rank tears down NCCL.
-                failed = torch.tensor(int(error["relative_l2"] >= 0.01 or not
-                    torch.allclose(output.float(), expected, rtol=0.02, atol=1e-4)),
-                    device="cuda")
+                if args.fp8:
+                    from benchmarks.fp8_validation import global_diff, passes
+                    error["diff"] = global_diff(output, expected)
+                    failed = torch.tensor(int(not passes(error["diff"])), device="cuda")
+                else:
+                    failed = torch.tensor(int(error["relative_l2"] >= 0.01 or not
+                        torch.allclose(output.float(), expected, rtol=0.02, atol=1e-4)),
+                        device="cuda")
                 dist.all_reduce(failed, op=dist.ReduceOp.MAX)
                 assert not failed.item(), {"rank": rank, **error}
                 errors.append(error)
@@ -347,7 +363,8 @@ def main():
                        if args.forward_cache else
                        "eager inference + synchronize; includes input staging; no training cache"),
                 forward_cache=args.forward_cache,
-                weights_prepared_once=args.backend == "megamoe" or args.prepared_weights,
+                compute_dtype="fp8_e4m3fn" if args.fp8 else "bf16",
+                weights_prepared_once=args.fp8 or args.backend == "megamoe" or args.prepared_weights,
                 device_slowest_rank_p50_us=(statistics.median(
                     map(max, zip(*(r["device_samples_us"] for r in records))))
                     if device_samples else None),

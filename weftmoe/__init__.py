@@ -1,4 +1,4 @@
-"""WeftMoE runtime configuration; CUDA bindings are built separately."""
+"""WeftMoE configuration and lazy, shape-specific CUDA compilation."""
 
 from .config import ModelSpec, TokenBucket, TOKEN_BUCKETS, token_bucket
 

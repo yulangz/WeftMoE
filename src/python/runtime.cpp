@@ -869,7 +869,7 @@ private:
 
 PYBIND11_MODULE(_runtime, m) {
   weftmoe::python_fp8::bind(m);
-  py::class_<NcclSession>(m, "Session");
+  py::class_<NcclSession>(m, "Session", py::module_local());
   m.def("forward_tuning_id", &forward_tuning_id);
   m.def("forward_shape", &forward_shape);
   m.def("bootstrap_id", [] {
@@ -877,7 +877,7 @@ PYBIND11_MODULE(_runtime, m) {
     return py::bytes(reinterpret_cast<const char *>(id.bytes().data()),
                      id.bytes().size());
   });
-  auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape").def_readonly(
+  auto tape = py::class_<Tape, std::shared_ptr<Tape>>(m, "Tape", py::module_local()).def_readonly(
       "output", &Tape::output);
   tape.def_property_readonly("tensor_bytes", [](const Tape &tape) {
     return tape.forward.tensors().bytes();
@@ -905,7 +905,7 @@ PYBIND11_MODULE(_runtime, m) {
         "overflow_events"_a = snapshot.overflow_events, "events"_a = events);
   });
 #endif
-  py::class_<Runtime, std::shared_ptr<Runtime>>(m, "Runtime")
+  py::class_<Runtime, std::shared_ptr<Runtime>>(m, "Runtime", py::module_local())
       .def(py::init<py::bytes, unsigned, unsigned, unsigned, unsigned,
                     std::uintptr_t, py::object, unsigned, unsigned, unsigned,
                     unsigned, std::uint64_t, std::uint64_t, bool, unsigned>())
