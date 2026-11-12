@@ -85,6 +85,11 @@ runtime.close()  # 所有 rank 在全部 backward 完成后共同关闭。
 热点超过初始 peer 容量时可能扩容。`max_saved` 限制同时存活的训练 tape 数。
 固定 workspace 应跨层、跨调用复用，不要每层创建/销毁 runtime。
 
+主通信池每个 slot 的申请长度向上对齐到 64 KiB，避免 CUDA IPC 导入时因长度
+未对齐而可能将整段 peer 映射限制为 4 KiB 小页。内部张量偏移、容量与 MNK 不变；
+每个 slot 增加不足 64 KiB，`usage()` 的显存统计包含该尾部。对齐解除长度对
+大页的限制，实际页大小仍由驱动和物理分配决定。
+
 `moe()` 是同步便利接口。性能接入使用 `forward_async()` / `backward_async()`，
 或直接使用 [Megatron adapter](integration.md)；训练提交必须使用 runtime 的准备流。
 异步执行不等于取消依赖：stream/event 负责 workspace 复用，调用持有者保留输入与缓存。

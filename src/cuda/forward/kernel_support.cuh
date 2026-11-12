@@ -1511,7 +1511,16 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                "forward GIN context completion records");
   }
   layout.status = append(cursor, 1, sizeof(TransportDeviceStatus), "status");
-  layout.total = cursor;
+  // Legacy CUDA IPC can map only the requested allocation extent (rounded to
+  // 4 KiB). An unaligned length then forces the whole peer mapping to use small
+  // pages, stalling scattered FC2 stores. Align the exported arena length, not
+  // individual fields: offsets/strides stay unchanged and usage includes the
+  // padding. This removes the length restriction; it does not force a page size.
+  constexpr std::uint64_t ipc_alignment = 64ULL * 1024ULL;
+  layout.total = checked_size(
+      checked_add(cursor, ipc_alignment - 1U, "IPC arena alignment") &
+          ~(ipc_alignment - 1U),
+      "IPC arena bytes");
   return layout;
 }
 
