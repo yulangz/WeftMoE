@@ -1620,6 +1620,13 @@ void test_device_only_sanitizer_paths() {
   transport_pool_config.max_inflight_generations = 2;
   auto transport_pool = weftmoe::cuda::make_activation_transport_pool(
       session, execution, transport_pool_config);
+  const auto transport_usage = transport_pool.usage();
+  // No BackwardPeerWorkspace exists yet: compute_device_bytes is only the
+  // sum of the equal-sized IPC arenas, without its exchange/storage buffers.
+  require(transport_usage.compute_device_bytes != 0 &&
+              transport_usage.compute_device_bytes %
+                  (transport_pool_config.max_inflight_generations * 65536ULL) == 0,
+          "transport pool must account for 64 KiB aligned IPC arenas per slot");
   auto activation_lease =
       weftmoe::cuda::testing::upload_bfloat16_activations_for_testing(
           activations, 3, 33, context, execution, transport_pool);
@@ -3667,6 +3674,11 @@ void run_rank_workload(std::uint32_t rank, std::uint32_t nodes,
                 usage.gin_registered_bytes != 0 &&
                 usage.device_bytes > usage.compute_device_bytes,
             "GIN pool did not separate compute and registered storage");
+    // This transport-only pool has no BackwardPeerWorkspace, whose exchange
+    // buffer would also count toward compute_device_bytes after kernel setup.
+    require(usage.compute_device_bytes %
+                (config.max_inflight_generations * 65536ULL) == 0,
+            "GIN local IPC arenas must be 64 KiB aligned per slot");
     std::cout << "GIN_TEAM_POOL rank=" << rank << " world=" << world
               << " nodes=" << nodes << " local_world=" << gpus_per_node
               << " local_rank=" << local_rank

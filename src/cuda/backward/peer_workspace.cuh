@@ -93,7 +93,8 @@ struct BackwardPeerWorkspace {
                             sizeof(backward_detail::PeerPayload),
                             "Backward peer payload addresses");
     result->allocation =
-        tensor_storage_detail::allocate(cursor, execution.device_ordinal());
+        tensor_storage_detail::allocate(ipc_allocation_bytes(cursor),
+                                        execution.device_ordinal());
     auto *base = result->allocation->data;
     check(cudaIpcGetMemHandle(&result->descriptor.handle, base));
     return result;
