@@ -47,6 +47,19 @@ std::size_t checked_size(std::uint64_t value, const char *field) {
   return static_cast<std::size_t>(value);
 }
 
+// Round the allocation extent, not the tensor layout. Legacy CUDA IPC can
+// otherwise restrict the whole peer mapping to 4 KiB pages. Base/offset and
+// physical allocation alignment still determine the actual mapping page size.
+// 64 KiB removed the measured PF bottleneck; a 2 MiB comparison did not improve
+// it materially and would impose larger padding on small Backward payloads.
+std::size_t ipc_allocation_bytes(std::uint64_t bytes) {
+  constexpr std::uint64_t alignment = 64ULL * 1024ULL;
+  return checked_size(
+      checked_add(bytes, alignment - 1U, "IPC allocation alignment") &
+          ~(alignment - 1U),
+      "IPC allocation bytes");
+}
+
 void validate_external_cuda_range(const void *pointer,
                                   std::uint64_t required_elements,
                                   std::uint64_t capacity_elements,
@@ -1516,11 +1529,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
   // pages, stalling scattered FC2 stores. Align the exported arena length, not
   // individual fields: offsets/strides stay unchanged and usage includes the
   // padding. This removes the length restriction; it does not force a page size.
-  constexpr std::uint64_t ipc_alignment = 64ULL * 1024ULL;
-  layout.total = checked_size(
-      checked_add(cursor, ipc_alignment - 1U, "IPC arena alignment") &
-          ~(ipc_alignment - 1U),
-      "IPC arena bytes");
+  layout.total = ipc_allocation_bytes(cursor);
   return layout;
 }
 
