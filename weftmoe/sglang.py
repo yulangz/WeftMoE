@@ -114,7 +114,7 @@ def fp8_parameter_map(model):
     return result
 
 
-def _prepare_runtime(layer, group, top_k, max_tokens, *, decode_only=False):
+def _prepare_runtime(layer, group, top_k, max_tokens, *, batch_invariant, decode_only=False):
     global _stream
     if _stream is None:
         _stream = torch.cuda.Stream()
@@ -130,6 +130,7 @@ def _prepare_runtime(layer, group, top_k, max_tokens, *, decode_only=False):
         stream=_stream,
         decode_only=decode_only,
         fp8_workspace=_use_fp8(),
+        batch_invariant=batch_invariant,
     )
 
 
@@ -211,7 +212,7 @@ def _check_fp8_tms_compatibility(impl):
             "interfaces; revalidate the TMS lifecycle before upgrading")
 
 
-def install():
+def install(*, batch_invariant=True):
     # Keep graph allocations outside TMS: their native child-graph addresses
     # stay resident, or are explicitly destroyed by the low-memory policy.
     # Model weights and KV memory still use TMS normally.
@@ -228,6 +229,8 @@ def install():
         patch_dp_attention_layout()
         _dp_layout_patched = True
     if getattr(FusedMoE, "_weftmoe_installed", False):
+        if FusedMoE._weftmoe_batch_invariant != batch_invariant:
+            raise ValueError("SGLang adapter already installed with a different batch_invariant setting")
         return
 
     from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
@@ -349,7 +352,7 @@ def install():
             if not rows_are_dp_sharded:
                 max_tokens = (max_tokens + world - 1) // world
             _runtime = _prepare_runtime(
-                layer, group, topk_output.topk_ids.shape[-1], max_tokens
+                layer, group, topk_output.topk_ids.shape[-1], max_tokens, batch_invariant=batch_invariant
             )
         rank = dist.get_rank(group)
         # Two layouts reach this point:
@@ -438,7 +441,7 @@ def install():
                 if not rows_are_dp_sharded:
                     capacity = (capacity + world - 1) // world
                 _decode_runtime = _prepare_runtime(
-                    layer, group, k, capacity, decode_only=True
+                    layer, group, k, capacity, batch_invariant=batch_invariant, decode_only=True
                 )
             runtime = _decode_runtime
         if _use_fp8():
@@ -484,6 +487,7 @@ def install():
         return gathered[:tokens]
 
     FusedMoE.forward = forward
+    FusedMoE._weftmoe_batch_invariant = batch_invariant
     FusedMoE._weftmoe_installed = True
 
 

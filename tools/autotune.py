@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline PF training/inference and DT tuning on reproducible route traces.
+"""Offline MoE tuning on Hopper and Blackwell using reproducible route traces.
 
 One config describes workload, topology, search and measurement. CLI options
 override it. Multi-node runs use SSH and a shared repository/cache path.
@@ -223,6 +223,38 @@ class NativeCompiler:
                     log=str(log_path), library=str(library), header=str(header))
 
 
+def launch_workers(args, label, script, cli, env, timeout):
+    """Run one torchrun agent per node, collecting separate logs on shared storage."""
+    processes, paths, logs = [], [], []
+    try:
+        for node, remote in enumerate([None, *args.remotes]):
+            command = ["env", "-u", "WEFTMOE_AUTOTUNE_TABLE", *(f"{k}={v}" for k, v in env.items()),
+                       "timeout", "--kill-after=20s", str(timeout),
+                       sys.executable, "-m", "torch.distributed.run",
+                       f"--nnodes={1 + len(args.remotes)}", f"--nproc-per-node={args.gpus_per_node}",
+                       f"--node-rank={node}", f"--master-addr={args.master_addr}",
+                       f"--master-port={args.master_port}", str(script), *cli]
+            if remote:
+                command = ["ssh", "-p", str(args.ssh_port), "-o", "BatchMode=yes", remote,
+                           "cd " + shlex.quote(str(ROOT)) + " && " + shlex.join(command)]
+            path = Path(f"{label}.node{node}.log")
+            paths.append(path)
+            logs.append(path.open("w"))
+            processes.append(subprocess.Popen(command, cwd=ROOT, stdout=logs[-1], stderr=subprocess.STDOUT))
+        codes = [process.wait() for process in processes]
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+        raise
+    finally:
+        for log in logs:
+            log.close()
+    require(not any(codes), f"{label} failed ({codes}); see {paths}")
+    return paths
+
+
 class Benchmark:
     def __init__(self, args, spec, output, compiler):
         self.args, self.spec, self.output, self.compiler = args, spec, output, compiler
@@ -244,31 +276,11 @@ class Benchmark:
                     f"--{role}-ring-depth", str(item["config"]["v4"]["contribution_windows"])]
         if args.remotes:
             cli.append("--skip-dt")
-        paths, processes, streams = [], [], []
         env = {k:v for k,v in os.environ.items() if k.startswith(("NCCL_", "UCX_", "CUDA_")) or k == "LD_LIBRARY_PATH"}
         env.update(spec.get("environment", {}))
         env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1")
-        try:
-            for node, remote in enumerate([None] + args.remotes):
-                command = ["env", "-u", "WEFTMOE_AUTOTUNE_TABLE", *(f"{k}={v}" for k,v in env.items()),
-                           "timeout", "--kill-after=20s", str(spec["timeout_seconds"]),
-                           sys.executable, "-m", "torch.distributed.run",
-                           f"--nnodes={1+len(args.remotes)}", f"--nproc-per-node={args.gpus_per_node}",
-                           f"--node-rank={node}", f"--master-addr={args.master_addr}",
-                           f"--master-port={args.master_port}",
-                           str(ROOT / "tests/torchrun_batch_invariant.py"), *cli]
-                if remote:
-                    command = ["ssh", "-p", str(args.ssh_port), "-o", "BatchMode=yes", remote,
-                               "cd " + shlex.quote(str(ROOT)) + " && " + shlex.join(command)]
-                path = self.output / f"{label}.node{node}.log"
-                paths.append(path)
-                streams.append(path.open("w"))
-                processes.append(subprocess.Popen(command, cwd=ROOT, stdout=streams[-1], stderr=subprocess.STDOUT))
-            codes = [process.wait() for process in processes]
-        finally:
-            for stream in streams:
-                stream.close()
-        require(not any(codes), f"batch-invariant verification failed ({codes}); see {paths}")
+        paths = launch_workers(args, self.output / label, ROOT / "tests/torchrun_batch_invariant.py", cli, env,
+                               spec["timeout_seconds"])
         return dict(passed=True, logs=list(map(str, paths)), tokens=sizes)
 
     def run(self, candidate, label, *, verify=False, final=False):
@@ -308,33 +320,14 @@ class Benchmark:
         env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1", WEFTMOE_TENSOR_EXTENSION=str(extension),
                    NCCL_DEBUG_FILE=str(self.output / f"{label}.nccl.%h.%p.log"))
         env.update(spec.get("environment", {}))
-        processes, logs, paths = [], [], []
         start = time.monotonic()
         print(f"START {label}", flush=True)
-        for node, remote in enumerate([None] + args.remotes):
-            command = ["env", "-u", "WEFTMOE_AUTOTUNE_TABLE", *(f"{k}={v}" for k, v in env.items()),
-                       "timeout", "--kill-after=20s", str(spec["timeout_seconds"]),
-                       sys.executable, "-m", "torch.distributed.run",
-                       f"--nnodes={1 + len(args.remotes)}", f"--nproc-per-node={args.gpus_per_node}",
-                       f"--node-rank={node}", f"--master-addr={args.master_addr}",
-                       f"--master-port={args.master_port}",
-                       str(ROOT / "benchmarks" / (
-                           "torchrun_training.py" if training else "torchrun_inference.py")), *cli]
-            if remote:
-                command = ["ssh", "-p", str(args.ssh_port), "-o", "BatchMode=yes", remote,
-                           "cd " + shlex.quote(str(ROOT)) + " && " + shlex.join(command)]
-            path = self.output / f"{label}.node{node}.log"
-            paths.append(path)
-            logs.append(path.open("w"))
-            processes.append(subprocess.Popen(command, cwd=ROOT, stdout=logs[-1], stderr=subprocess.STDOUT))
-        codes = [process.wait() for process in processes]
-        for log in logs:
-            log.close()
+        script = "torchrun_training.py" if training else "torchrun_inference.py"
+        paths = launch_workers(args, self.output / label, ROOT / "benchmarks/sm90" / script, cli, env, spec["timeout_seconds"])
         prefix = (("TRAINING_PARITY_JSON " if verify else "TRAINING_CYCLE_JSON ")
                   if training else "INFERENCE_BENCHMARK_JSON ")
         records = [json.loads(line[len(prefix):]) for line in paths[0].read_text().splitlines()
                    if line.startswith(prefix)]
-        require(not any(codes), f"{label} failed ({codes}); see {paths}")
         require(len(records) == len(tokens) * (spec["verify_samples"] if verify and training else 1),
                 f"incomplete result: {paths[0]}")
         result = dict(logs=list(map(str, paths)), elapsed_seconds=time.monotonic() - start,
@@ -386,6 +379,8 @@ def parse_args(argv=None):
     overrides = spec.get("modes", {}).get(mode, {})
     spec = spec | overrides | {"workload": spec.get("workload", {}) | overrides.get("workload", {})}
     add_model_arguments(parser, default=spec.get("workload", {}).get("model", "qwen35b"))
+    parser.add_argument("--arch", choices=("auto", "sm90", "sm100"), default="auto")
+    parser.add_argument("--precision", choices=("bf16", "nvfp4"), default="bf16")
     parser.add_argument("--tokens", type=int, nargs="+", default=[8192, 20480])
     parser.add_argument("--gpus-per-node", type=int, default=8)
     parser.add_argument("--remotes", nargs="*", default=[])
@@ -535,6 +530,22 @@ def run_search(args, spec):
 
 def main(argv=None):
     args, spec = parse_args(argv)
+    if args.arch == "auto":
+        try:
+            import torch
+        except ModuleNotFoundError:
+            torch = None
+        if torch is not None and torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability()
+            require(major in (9, 10), f"Unsupported CUDA compute capability {major}")
+            args.arch = "sm100" if major == 10 else "sm90"
+        else:
+            require(args.dry_run, "CUDA device required for autotune")
+            args.arch = "sm90"
+    require(args.arch == "sm100" or args.precision != "nvfp4", "NVFP4 requires --arch sm100")
+    require(args.arch == "sm90" or not args.fp8, "Blackwell supports --precision bf16 or nvfp4")
+    require(args.tokens and min(args.tokens) > 0 and len(set(args.tokens)) == len(args.tokens),
+            "tokens must be distinct positive integers")
     groups = {}
     for tokens in args.tokens:
         interval = tuple(length_bucket(tokens, args.token_buckets))
@@ -543,7 +554,13 @@ def main(argv=None):
         bucket_args = copy.deepcopy(args)
         bucket_args.tokens, bucket_args.token_interval = tokens, list(interval)
         bucket_args.output = args.output / f"tokens_{interval[0]}_{interval[1]}"
-        run_search(bucket_args, copy.deepcopy(spec))
+        if args.arch == "sm100":
+            from autotune_blackwell import run_blackwell_search
+            policy = "strict" if args.batch_invariant else "relaxed"
+            bucket_args.output = args.output / "sm100" / args.precision / policy / bucket_args.output.name
+            run_blackwell_search(bucket_args, spec, launch_workers)
+        else:
+            run_search(bucket_args, copy.deepcopy(spec))
 
 
 if __name__ == "__main__":

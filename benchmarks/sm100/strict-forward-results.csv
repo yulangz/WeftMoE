@@ -1,0 +1,49 @@
+ep,model,precision,stage,tokens_per_rank,strict_p50_us,framework,framework_p50_us,speedup
+8,flash,bf16,decode,64,278.823,SGLang,308.033,1.1048
+8,flash,bf16,decode,512,376.899,SGLang,586.557,1.5563
+8,flash,bf16,prefill,8192,2603.51,Megatron alltoall,5684.658,2.1835
+8,flash,bf16,prefill,20480,6119.752,Megatron alltoall,12346.531,2.0175
+8,flash,nvfp4,decode,64,114.56,SGLang,230.333,2.0106
+8,flash,nvfp4,decode,512,150.513,SGLang,431.05,2.8639
+8,flash,nvfp4,prefill,8192,1302.145,Megatron alltoall,8823.502,6.7761
+8,flash,nvfp4,prefill,20480,2892.249,Megatron alltoall,13083.832,4.5238
+8,qwen122b,bf16,decode,64,135.12,SGLang,164.577,1.218
+8,qwen122b,bf16,decode,512,180.508,SGLang,318.601,1.765
+8,qwen122b,bf16,prefill,8192,1857.126,Megatron alltoall,4781.715,2.5748
+8,qwen122b,bf16,prefill,20480,4378.725,Megatron alltoall,10050.622,2.2953
+8,qwen122b,nvfp4,decode,64,74.44,SGLang,136.207,1.8298
+8,qwen122b,nvfp4,decode,512,125.108,SGLang,279.363,2.233
+8,qwen122b,nvfp4,prefill,8192,1458.549,Megatron alltoall,9340.37,6.4039
+8,qwen122b,nvfp4,prefill,20480,3392.736,Megatron alltoall,11835.32,3.4884
+8,qwen35b,bf16,decode,64,72.127,SGLang,98.349,1.3636
+8,qwen35b,bf16,decode,512,107.979,SGLang,193.773,1.7945
+8,qwen35b,bf16,prefill,8192,1318.645,Megatron alltoall,3944.468,2.9913
+8,qwen35b,bf16,prefill,20480,2986.796,Megatron alltoall,6144.675,2.0573
+8,qwen35b,nvfp4,decode,64,52.631,SGLang,91.502,1.7385
+8,qwen35b,nvfp4,decode,512,97.497,SGLang,208.481,2.1383
+8,qwen35b,nvfp4,prefill,8192,1160.761,Megatron alltoall,8131.717,7.0055
+8,qwen35b,nvfp4,prefill,20480,2651.847,Megatron alltoall,9465.657,3.5695
+16,flash,bf16,decode,64,301.446,SGLang,430.805,1.4291
+16,flash,bf16,decode,512,568.806,SGLang,1015.528,1.7854
+16,flash,bf16,prefill,8192,6330.497,Megatron flex,8486.341,1.3405
+16,flash,bf16,prefill,20480,15147.575,Megatron flex,18843.548,1.244
+16,flash,nvfp4,decode,64,220.526,SGLang,372.127,1.6874
+16,flash,nvfp4,decode,512,407.485,SGLang,919.15,2.2557
+16,flash,nvfp4,prefill,8192,4816.235,Megatron flex,9894.668,2.0544
+16,flash,nvfp4,prefill,20480,11312.029,Megatron flex,17932.817,1.5853
+16,qwen122b,bf16,decode,64,208.659,SGLang,345.356,1.6551
+16,qwen122b,bf16,decode,512,432.894,SGLang,717.821,1.6582
+16,qwen122b,bf16,prefill,8192,5577.418,Megatron flex,7659.566,1.3733
+16,qwen122b,bf16,prefill,20480,13495.849,Megatron flex,17067.999,1.2647
+16,qwen122b,nvfp4,decode,64,176.176,SGLang,334.307,1.8976
+16,qwen122b,nvfp4,decode,512,385.578,SGLang,720.419,1.8684
+16,qwen122b,nvfp4,prefill,8192,4816.404,Megatron flex,10482.595,2.1764
+16,qwen122b,nvfp4,prefill,20480,11828.54,Megatron flex,18353.037,1.5516
+16,qwen35b,bf16,decode,64,173.981,SGLang,306.778,1.7633
+16,qwen35b,bf16,decode,512,327.657,SGLang,539.676,1.6471
+16,qwen35b,bf16,prefill,8192,3989.533,Megatron flex,7324.856,1.836
+16,qwen35b,bf16,prefill,20480,9704.409,Megatron flex,14178.012,1.461
+16,qwen35b,nvfp4,decode,64,158.549,SGLang,309.172,1.95
+16,qwen35b,nvfp4,decode,512,301.622,SGLang,580.926,1.926
+16,qwen35b,nvfp4,prefill,8192,3499.432,Megatron flex,9769.587,2.7918
+16,qwen35b,nvfp4,prefill,20480,8521.512,Megatron flex,17093.59,2.0059

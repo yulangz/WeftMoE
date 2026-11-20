@@ -53,7 +53,7 @@ def default_table():
     return Path(os.environ.get('WEFTMOE_AUTOTUNE_TABLE') or cache_root() / 'tuning.json')
 
 
-def find_entry(path, key, tokens, *, source, canonical_header, batch_invariant=True):
+def match_entry(path, key, tokens, source):
     """Missing/stale/incompatible entries fall back; malformed tables fail loudly."""
     path = Path(path)
     if not path.exists():
@@ -63,22 +63,29 @@ def find_entry(path, key, tokens, *, source, canonical_header, batch_invariant=T
         raise ValueError('automatic compilation requires autotune schema 2; rerun tools/autotune.py')
     matches = []
     for entry in table['entries']:
-        if entry['key'] != {k: key[k] for k in KEY_FIELDS} or entry['source'] != source:
+        if entry['key'] != key or entry['source'] != source:
             continue
         lower, upper = entry['tokens']
         if not (type(lower) is int and type(upper) is int and 0 <= lower <= upper):
             raise ValueError('invalid autotune token interval')
         if not lower <= tokens <= upper:
             continue
-        if digest(entry['header']) != entry['header_digest']:
-            raise ValueError('autotune header digest mismatch')
-        if batch_invariant and (not entry.get('batch_invariant') or
-                                arithmetic(entry['header']) != arithmetic(canonical_header)):
-            continue
         matches.append(entry)
     if len(matches) > 1:
         raise ValueError('overlapping autotune token intervals for the same workload')
     return matches[0] if matches else None
+
+
+def find_entry(path, key, tokens, *, source, canonical_header, batch_invariant=True):
+    entry = match_entry(path, {k: key[k] for k in KEY_FIELDS}, tokens, source)
+    if entry is None:
+        return None
+    if digest(entry['header']) != entry['header_digest']:
+        raise ValueError('autotune header digest mismatch')
+    if batch_invariant and (not entry.get('batch_invariant') or
+                            arithmetic(entry['header']) != arithmetic(canonical_header)):
+        return None
+    return entry
 
 
 def publish_entry(path, entry):
@@ -100,7 +107,8 @@ def publish_entry(path, entry):
                     continue
                 if max(old['tokens'][0], entry['tokens'][0]) <= min(old['tokens'][1], entry['tokens'][1]):
                     raise ValueError('overlapping autotune token intervals')
-                if old.get('batch_invariant') and entry.get('batch_invariant') and arithmetic(old['header']) != arithmetic(entry['header']):
+                if ('header' in entry and old.get('batch_invariant') and entry.get('batch_invariant')
+                        and arithmetic(old['header']) != arithmetic(entry['header'])):
                     raise ValueError('batch-invariant buckets have different arithmetic')
             entries.append(old)
         table['entries'] = entries + [entry]

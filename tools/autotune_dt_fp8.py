@@ -60,7 +60,8 @@ def snapshot(output):
     dest.mkdir()
     for name in ("src", "include", "configs", "tools", "tests", "benchmarks", "weftmoe"):
         shutil.copytree(ROOT / name, dest / name,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.so", "*.pyc", ".pytest_cache"))
+                        ignore=shutil.ignore_patterns("__pycache__", "*.so", "*.pyc",
+                                                     ".pytest_cache", "results"))
     for name in ("build_native.py", "setup.py", "pyproject.toml", "MANIFEST.in"):
         shutil.copy2(ROOT / name, dest / name)
     hashes = {str(p.relative_to(dest)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -322,7 +323,7 @@ def execute_job(output, manifest, model, candidate, phase, retry_failed):
                     cwd=source, env=env, log=base / "invariance.log", timeout=600)
             atomic_json(base / "correctness.json", dict(passed=True, seconds=seconds, known_case_waivers=waived))
         idle_gpus()
-        rec["benchmark_seconds"] = run_command([*launcher, "benchmarks/benchmark_dt_fp8.py"],
+        rec["benchmark_seconds"] = run_command([*launcher, "benchmarks/sm90/benchmark_dt_fp8.py"],
             cwd=source, env=env, log=job / "benchmark.log", timeout=600)
         rec.update(rows=parse_measurements(job / "benchmark.log"), status="passed")
     except RuntimeError as error:

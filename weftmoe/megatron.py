@@ -43,10 +43,11 @@ class _Routed(torch.autograd.Function):
 
 
 class MegatronAdapter:
-    def __init__(self, models, *, max_tokens, fp8=None):
+    def __init__(self, models, *, max_tokens, fp8=None, batch_invariant=True):
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         self.max_tokens = max_tokens
+        self.batch_invariant = batch_invariant
         self.fp8 = os.environ.get("WEFTMOE_FP8", "0") == "1" if fp8 is None else fp8
         self.fp8_weights = {}
         self.master_weights = None
@@ -202,6 +203,7 @@ class MegatronAdapter:
                 max_saved=len(self.layers) + 8,
                 session=self.session,
                 fp8_workspace=self.fp8,
+                batch_invariant=self.batch_invariant,
             )
             self.session = self.runtime.native.session()
         return self.runtime

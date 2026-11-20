@@ -166,7 +166,8 @@ def main():
                   "weight-refresh-graph")
         if world * max_tokens * args.top_k > max_rows:
             x, routes, gates = inputs(max_tokens, skew=True)
-            ring = int(os.getenv("WEFTMOE_STATIC_RING_TOKENS", "0")) != 0
+            ring = (torch.cuda.get_device_capability()[0] == 10 or
+                    int(os.getenv("WEFTMOE_STATIC_RING_TOKENS", "0")) != 0)
             if ring:
                 expected = reference(x, routes, gates, all_w1, all_w2)
                 check(runtime.inference_eager(x, routes, gates, w1, w2), expected,

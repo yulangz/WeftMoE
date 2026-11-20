@@ -1,6 +1,56 @@
 # 使用与 autotune
 
-## 安装与自动编译
+## B300 / Blackwell
+
+BF16 任务沿用下方的 `TensorRuntime` API。先安装配套 DeepGEMM，再按 compute capability 自动选择 Blackwell 实现。B300 支持 DP-sharded BF16 输入、原始布局专家权重、训练及推理。单机使用 NVLink，多机使用 NCCL device GIN 和节点内 NVLink。双路 400G RoCE 的 NCCL 设置需在创建 process group 前生效，`benchmarks/sm100/run.sh` 会为本集群的八个 bonded HCA 设置这些参数。安装命令和实测结果见 [B300 benchmark](benchmarks-sm100.md)。
+
+### B300 前向的 batch invariance
+
+`TensorRuntime(..., batch_invariant=True)` 是默认设置。BF16 和 NVFP4 的两个专家 GEMM 均固定 M=128、N=128，专家尾块也执行完整宽度的 MMA。对于同一模型和精度，K 同样固定。BF16 用 K=64，NVFP4 在 intermediate 能被 256 整除时用 K=256，其余支持的形状用 K=128。训练前向、prefill、decode、单机和多机窗口共享这套选型。
+
+在相同权重、输入行、路由、gate 和量化因子下，严格模式要求该行的前向结果跨 batch 和 EP 逐位一致；同 EP、相同输入的反向重跑要求逐位一致。参数梯度会累加整个 batch 的贡献。切换设置需重新创建 runtime，所有 EP rank 必须选择相同设置。
+
+| 构造参数 | B300 前向选择 |
+| --- | --- |
+| `batch_invariant=True` | 固定 M=128，全宽 MMA，拒绝冲突的 M 覆盖 |
+| `batch_invariant=False` | 优先采用同模式、同容量桶的离线策略，缺省启发式选 M，均保留尾块优化 |
+| `batch_invariant=False, blackwell_block_m=128` | 固定外层 M，保留尾块优化，用于单独比较选 M 的影响 |
+
+手动 M 支持 16、32、64、128、192、240。三种模式的 N/K 规则相同。单机的启发式使用本次本地启动的 token 数，多机使用每个已准备通信窗口向节点内核提交的行数。各负载的开销见 [动态与固定 M 实测](benchmarks-sm100.md#动态与固定-m-实测)。
+
+### B300 离线 autotune
+
+`tools/autotune.py` 在有 GPU 的机器上按 CUDA compute capability 选择 SM90 或 SM100 后端。训练、推理和 decode 共用 `--mode`、`--tokens`、`--token-buckets`、`--table`、`--dry-run` 和多机 SSH 启动参数。无 GPU 的规划机用 `--arch sm100 --dry-run` 查看 Blackwell 计划。B300 支持 BF16 和 NVFP4，Hopper 的 FP8 沿用 `--fp8`。
+
+```bash
+python tools/autotune.py --model qwen35b --mode training --precision nvfp4 --dry-run
+python tools/autotune.py --model qwen35b --mode inference --precision nvfp4 \
+    --no-batch-invariant --tokens 1024 8192 20480 --token-buckets 1024 8192 20480
+```
+
+B300 的离线搜索只调整前向 M。严格模式只测 M128 全宽。放宽模式将启发式与六个固定 M 配对计时，用独立路由种子复测入围者，达到配置的最小提升且通过数值检查才替代启发式。训练以 FWD+BWD 为计时范围，核对输出与四个梯度。推理以 eager FWD 计时，decode 以 CUDA Graph 回放计时。Blackwell 使用配套 DeepGEMM 的 JIT 缓存；SM90 仍生成 PF/DT 头文件和扩展。
+
+每个桶使用该组最大的代表长度准备工作区。部署时 `TensorRuntime` 在构造时按 `max_tokens` 查一次表；所选策略可以是固定 M，也可以是运行时启发式。表项区分硬件、精度、模型形状、EP 拓扑、模式和严格开关，内核源码指纹变更后回退默认。使用自选 `--table PATH` 时在所有 worker 上设 `WEFTMOE_AUTOTUNE_TABLE=PATH`。多机沿用 SM90 的 `--remotes` 和共享路径约定，环境需预先配置 GIN 及双口 RDMA。
+
+### B300 NVFP4
+
+在 EP 组创建 `TensorRuntime(..., precision="nvfp4", training=False)`，使用现有 BF16 输入、int32 路由、FP32 gate 和标准布局 BF16 权重。推理时可以预先量化固定专家权重，每次调用仍会在线量化 X 和 SwiGLU 中间结果。
+
+```python
+from weftmoe.nvfp4 import prepare_nvfp4_weights
+
+weights = prepare_nvfp4_weights(w1, w2, weight_scales=(1/64, 1/64))
+y = runtime.inference_nvfp4(0, x, routes, gates, weights,
+                            x_scale=1/32, intermediate_scale=1/512)
+```
+
+每 16 个值共享一个 E4M3 块尺度，由块内绝对值最大值和该层的反量化因子计算。E2M1 使用最近偶数舍入。层级因子必须是有限正数，可随层配置，并在该层的各 EP rank 上保持一致。
+
+训练时使用 `training=True, precision="nvfp4"`，通过常规 `forward`、`backward` 或 `moe` 自动求导接口调用。可从 `weftmoe.nvfp4` 导入 `NVFP4Scales`，通过 `nvfp4_scales=NVFP4Scales(x=..., w1=..., intermediate=..., w2=..., dy=..., dgate_up=...)` 设置六个因子。每次训练前向量化当前 BF16 权重，四个反向 GEMM 沿各自的 K 维重新量化。输入、输出、激活梯度及参数梯度为 BF16，gate 及其梯度为 FP32。这套训练配方使用确定性舍入，未启用随机舍入或 Hadamard 变换。
+
+多机推理经 GIN 发送打包的 E2M1 激活及 E4M3 尺度，训练保留并传输 BF16 输入，供反向沿转置方向独立量化。反向传输的 dY 同样为 BF16。
+
+## Hopper 安装与自动编译
 
 需要 Linux、Python ≥3.10、C++17、支持 SM90a 的 CUDA、CUTLASS/CUTE、NCCL，
 以及运行 Tensor API 所需的 PyTorch。多机还需要 NCCL device API 与 GIN/GDAKI；
@@ -274,7 +324,7 @@ kernel 同时输出 W、Wᵀ 及两份 scale；每个 128×128 block 只读取�
 FP8 benchmark 的权重量化与 W/Wᵀ 输出全部在计时外，源端激活在线量化仍计时；
 JSON 中以 `weight_preparation_in_timing=false` 和
 `fp8_weight_preparation="fused_quantize_transpose"` 标明。
-独立准备耗时诊断可运行 `benchmarks/torchrun_fp8_weight_preparation.py --output <json>`，
+独立准备耗时诊断可运行 `benchmarks/sm90/torchrun_fp8_weight_preparation.py --output <json>`，
 沿用 torchrun 和扩展环境变量。历史测试与原始数据见 [Benchmark](benchmarks.md)。
 
 实现参考 [DeepGEMM SM90 的 producer/math 流水线与 FP32 promotion](https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh)。
@@ -290,7 +340,7 @@ NCCL_DEBUG=WARN TEST_TOKENS=257 torchrun --standalone --nproc-per-node=2 tests/t
 # 可选：空输入 rank；TEST_HIDDEN/TEST_INTERMEDIATE 可指定其他构建 profile 的形状。
 TEST_TOKENS=1 TEST_ZERO_RANK=1 torchrun --standalone --nproc-per-node=2 tests/torchrun_fp8.py
 # 权重准备不计入计时；测试固定权重的前向+反向，不含 optimizer.step。
-torchrun --standalone --nproc-per-node=2 benchmarks/torchrun_training.py \
+torchrun --standalone --nproc-per-node=2 benchmarks/sm90/torchrun_training.py \
   --backend pf --fp8 --weight-grad-dtype bf16 --model qwen35b \
   --tokens 256 512 2048 8192 --stream-ordered --warmups 5 --samples 20
 ```
@@ -352,7 +402,7 @@ CLI 覆盖配置。`--token-buckets 8192 20480 65536` 设置长度上界；`--to
 
 ```bash
 python -m pytest -q
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_training.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_training.py \
   --backend pf --model qwen35b --tokens 129 --warmups 0 --samples 2 --verify
 ```
 

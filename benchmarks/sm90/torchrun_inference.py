@@ -21,7 +21,7 @@ import time
 import torch
 import torch.distributed as dist
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from benchmarks.training_reference import gather_rows  # noqa: E402
 from benchmarks.workload import make_workload  # noqa: E402

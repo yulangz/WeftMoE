@@ -1,6 +1,6 @@
 """Isolated FP8 W/W.T preparation cost; never part of training-cycle timing.
 
-torchrun --standalone --nproc-per-node=2 benchmarks/torchrun_fp8_weight_preparation.py
+torchrun --standalone --nproc-per-node=2 benchmarks/sm90/torchrun_fp8_weight_preparation.py
 requires WEFTMOE_TENSOR_EXTENSION pointing at the freshly built adapter.
 """
 import argparse
@@ -14,7 +14,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.models import MODELS
 from weftmoe.fp8 import _storage
 from weftmoe.runtime import _extension
