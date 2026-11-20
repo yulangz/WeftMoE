@@ -17,6 +17,10 @@ Hopper 单机采用 CUDA IPC/NVLink，跨机采用 NCCL GIN/GDAKI。多机协议
 
 ## 数值一致性与稳定性
 
+B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant` 时要求跨 EP 训推前向逐位一致、同 EP 反向重跑逐位一致。输入条件和选型规则见[B300 使用文档](docs/usage.md#b300-前向的-batch-invariance)。
+
+### Hopper / SM90 数值约定
+
 - **训推一致 / batch-invariant 前向**：在同一硬件和编译环境、相同精度、权重、token 输入及其路由/概率下，PF 训练前向（实际保存反向缓存）与 PF 推理、M64 DT 推理前向保持逐位一致。同一 token 不因 batch 长度、位置或其他 token 的加入而改变输出；相同输入重复调用的前向也保持逐位一致。
 - **必要条件是算术路径一致**：不同长度桶、PF/DT 的 MMA M/N/K 分解、K 累加顺序、量化与 scale 处理、激活和归约策略必须兼容。PF 的 CTA M128 不等于 MMA 的 M64，不能只比较 CTA 外形。默认 autotune 固定这些算术选择，只搜索通过一致性检查的流水线、调度与通信参数。仅固定 M/N/K 还不足以容许任意数学优化。
 - **反向数值稳定**：重复反向检查有限值及全局误差；不将 BWD 描述为跨 batch 逐位一致，因为 dW 会聚合 batch，FP8 列量化也依赖 token 分组。重复 BWD 回归使用 `diff ≤ 1e-6`；FP8 对 BF16 的量化精度检查使用独立的 `diff < 5e-3` 标准（dprob 只检查有限值）。

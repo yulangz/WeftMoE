@@ -84,7 +84,6 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         precision="nvfp4" if nvfp4 else "bf16",
         batch_invariant=args.batch_invariant,
     )
-    window = rt.native.windows[0] if hasattr(rt.native, "windows") else rt.native
     ref = (
         dg.SymmBuffer(
             group,
@@ -94,8 +93,6 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             args.hidden,
             args.intermediate,
             mma_type="fp8xfp4" if mixed_weights else "nvfp4" if nvfp4 else "bf16xbf16",
-            fixed_block_m=0 if mixed_weights else window.buffer.fixed_block_m,
-            full_mma_tiles=False if mixed_weights else window.buffer.full_mma_tiles,
         )
         if packed is not None and group.size() == int(os.environ["LOCAL_WORLD_SIZE"])
         else None
@@ -220,7 +217,6 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             model=args.model,
             mode=args.mode,
             batch_invariant=args.batch_invariant,
-            fixed_block_m=window.buffer.fixed_block_m,
             tokens_per_rank=n,
             ep=world,
             dtype="nvfp4" if nvfp4 else "bf16",

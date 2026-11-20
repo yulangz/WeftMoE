@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline MoE tuning on Hopper and Blackwell using reproducible route traces.
+"""Offline MoE tuning on Hopper using reproducible route traces.
 
 One config describes workload, topology, search and measurement. CLI options
 override it. Multi-node runs use SSH and a shared repository/cache path.
@@ -546,6 +546,9 @@ def main(argv=None):
     require(args.arch == "sm90" or not args.fp8, "Blackwell supports --precision bf16 or nvfp4")
     require(args.tokens and min(args.tokens) > 0 and len(set(args.tokens)) == len(args.tokens),
             "tokens must be distinct positive integers")
+    if args.arch == "sm100":
+        print("Blackwell selects M dynamically at launch. No offline tuning is required.")
+        return
     groups = {}
     for tokens in args.tokens:
         interval = tuple(length_bucket(tokens, args.token_buckets))
@@ -554,13 +557,7 @@ def main(argv=None):
         bucket_args = copy.deepcopy(args)
         bucket_args.tokens, bucket_args.token_interval = tokens, list(interval)
         bucket_args.output = args.output / f"tokens_{interval[0]}_{interval[1]}"
-        if args.arch == "sm100":
-            from autotune_blackwell import run_blackwell_search
-            policy = "strict" if args.batch_invariant else "relaxed"
-            bucket_args.output = args.output / "sm100" / args.precision / policy / bucket_args.output.name
-            run_blackwell_search(bucket_args, spec, launch_workers)
-        else:
-            run_search(bucket_args, copy.deepcopy(spec))
+        run_search(bucket_args, copy.deepcopy(spec))
 
 
 if __name__ == "__main__":

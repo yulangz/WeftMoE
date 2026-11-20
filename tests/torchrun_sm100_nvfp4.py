@@ -6,7 +6,6 @@ import os
 import torch
 import torch.distributed as dist
 
-from weftmoe.blackwell_tuning import STRICT_BLOCK_M
 from weftmoe.nvfp4 import _pack_rows, prepare_nvfp4_weights
 from weftmoe.runtime import TensorRuntime
 
@@ -76,9 +75,8 @@ def main():
     gates[3] = 0
     scales = (1 / 32, 1 / 64, 1 / 512, 1 / 64)
     expected = reference(x, ids, gates, *weights, scales)
-    import deep_gemm as dg
 
-    results, tiles = [], []
+    results = []
     for g in (single, dist.group.WORLD):
         n = total // g.size()
         rows = slice(g.rank() * n, (g.rank() + 1) * n)
@@ -93,21 +91,6 @@ def main():
             training=False,
             precision="nvfp4",
         )
-        window = rt.native.windows[0] if hasattr(rt.native, "windows") else rt.native
-        buf = window.buffer
-        assert buf.full_mma_tiles and buf.fixed_block_m == STRICT_BLOCK_M
-        launched = len(window.dummy) if hasattr(window, "dummy") else n
-        tiles.append(
-            dg.get_block_m_for_mega_moe(
-                buf.group.size(),
-                buf.num_experts,
-                buf.num_max_tokens_per_rank,
-                launched,
-                k,
-                "nvfp4",
-                buf.fixed_block_m,
-            )
-        )
         w = prepare_nvfp4_weights(*(v.chunk(g.size())[g.rank()] for v in weights))
         y = rt.inference_nvfp4(0, x[rows], ids[rows], gates[rows], w)
         short = n // 2
@@ -116,6 +99,7 @@ def main():
         if g.size() == 1:
             # A truncated expert metadata pool overwrites the beginning of packed X.
             # Check the stored bytes even when dispatch consumed the rows before the overwrite.
+            buf = rt.native.buffer
             count = min(256, n)
             data = torch.empty_like(buf.x[:count])
             sf = torch.empty_like(buf.x_sf[:count])
@@ -138,7 +122,7 @@ def main():
             first = difference.nonzero()[0].tolist()
             row, col = first
             print(
-                f"rank={rank} EP={g.size()} tile={tiles[-1]} unequal={int(difference.sum())} "
+                f"rank={rank} EP={g.size()} unequal={int(difference.sum())} "
                 f"rows={int(difference.any(1).sum())} first={first} "
                 f"values={float(y[row, col])},{float(z[n - 1 - row, col])} "
                 f"reference={float(expected[rows][row, col])}",
@@ -169,7 +153,7 @@ def main():
     assert err.item() < 0.005, err
     if rank == 0:
         print(
-            f"NVFP4 EP1/EP{world} bitwise parity, M={tiles} N=128 K={256 if i % 256 == 0 else 128}; independent reference relative L2 {err.item():.6g}",
+            f"NVFP4 EP1/EP{world} bitwise parity, independent reference relative L2 {err.item():.6g}",
             flush=True,
         )
     dist.destroy_process_group()

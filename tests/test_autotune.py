@@ -105,24 +105,8 @@ def test_invariance_runs_candidate_and_reference_ring_settings(tmp_path,monkeypa
         assert command[command.index(flag)+1]==value
 
 
-def test_blackwell_profiles_are_capacity_and_policy_specific(tmp_path, monkeypatch):
-    from weftmoe import blackwell_tuning as bw
-    from weftmoe.tuning import publish_entry
-
-    path = tmp_path / "shared.json"
-    monkeypatch.setenv("WEFTMOE_AUTOTUNE_TABLE", str(path))
-    monkeypatch.setattr(bw, "source_digest", lambda: "kernels")
-    key = dict(arch=[10, 3], dtype="nvfp4", mode="decode", batch_invariant=False)
-    for bounds, m in [([0, 64], 32), ([65, 512], 192)]:
-        publish_entry(path, dict(key=key, source="kernels", tokens=bounds, fixed_block_m=m,
-                                 batch_invariant=False, validated=True))
-    assert [bw.tile_policy(key, n, None) for n in (1, 64, 65, 512, 513)] == [32, 32, 192, 192, 0]
-    assert bw.tile_policy(key, 64, 240) == 240
-    strict = dict(key, batch_invariant=True)
-    assert bw.tile_policy(strict, 64, None) == bw.STRICT_BLOCK_M
-    publish_entry(path, dict(key=strict, source="kernels", tokens=[0, 64], fixed_block_m=32,
-                             batch_invariant=True, validated=True))
-    with pytest.raises(ValueError, match="Invalid Blackwell"):
-        bw.tile_policy(strict, 64, None)
-    monkeypatch.setattr(bw, "source_digest", lambda: "new-kernels")
-    assert bw.tile_policy(key, 64, None) == 0
+@pytest.mark.parametrize("extra", [[], ["--dry-run", "--precision", "nvfp4"]])
+def test_blackwell_uses_dynamic_m(tmp_path, capsys, extra):
+    autotune.main(["--arch", "sm100", "--output", str(tmp_path), *extra])
+    assert "selects M dynamically" in capsys.readouterr().out
+    assert not list(tmp_path.iterdir())

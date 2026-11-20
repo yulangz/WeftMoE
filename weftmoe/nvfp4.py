@@ -186,13 +186,11 @@ class NVFP4Runtime(BlackwellRuntime):
 
     def __init__(
         self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1,
-        *, fixed_block_m=0, full_mma_tiles=False,
     ):
         import deep_gemm as dg
 
         self.buffer = dg.SymmBuffer(
             group, experts, max(1, capacity), top_k, hidden, intermediate, mma_type="nvfp4",
-            fixed_block_m=fixed_block_m, full_mma_tiles=full_mma_tiles,
         )
         self.stream = (
             stream

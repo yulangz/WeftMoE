@@ -49,16 +49,14 @@ def check_companion(precision, training):
     import deep_gemm
     launch = deep_gemm.nvfp4_mega_moe if precision == "nvfp4" else deep_gemm.bf16_mega_moe
     params = inspect.signature(launch).parameters
-    if ("full_mma_tiles" not in inspect.signature(deep_gemm.SymmBuffer).parameters or
-            "compute_sms" not in params or (training and "saved" not in params)):
+    if "compute_sms" not in params or (training and "saved" not in params):
         raise ImportError("Build the companion DeepGEMM checkout described in docs/benchmarks-sm100.md")
 
 
 class BlackwellRuntime:
     """One symmetric workspace, serialized on the supplied CUDA stream."""
 
-    def __init__(self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *,
-                 fixed_block_m=0, full_mma_tiles=False):
+    def __init__(self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved):
         import deep_gemm
 
         # A legacy default stream cannot join a caller's CUDA Graph capture.
@@ -80,8 +78,6 @@ class BlackwellRuntime:
             intermediate,
             mma_type="bf16xbf16",
             canonical_l1=True,
-            fixed_block_m=fixed_block_m,
-            full_mma_tiles=full_mma_tiles,
         )
 
         if training:

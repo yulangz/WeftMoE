@@ -179,9 +179,9 @@ CSV 汇总与逐样本日志位于 `benchmarks/results/sm100-b300/deepep/`。
 
 ## Blackwell 单机 BF16
 
-下文 BF16 和 NVFP4 的历史性能矩阵均使用动态 M 和可缩小的专家尾块。用当前 benchmark 复现这些矩阵时，向 `weft` 和 `weft-training` 加 `--no-batch-invariant`。当前默认严格模式的独立对照见[动态与固定 M 实测](#动态与固定-m-实测)。
+下文 BF16 和 NVFP4 的历史性能矩阵均使用动态 M 和可缩小的专家尾块。这也是当前默认路径。历史固定 M 的性能对照见[动态与固定 M 实测](#动态与固定-m-实测)。
 
-配套的 DeepGEMM 提交为 `faa68bc849b48168f77dea28a34ddaea3da74704`（分支 `feat/blackwell-moe`，基于 `5081f851`）。该版本增加了原始 FC1 权重的 5 维 TMA 描述符和可选训练 checkpoint。单机 `TensorRuntime` 按 CUDA compute capability 选择实现。权重保持 `[E_local, 2I, H]` 和 `[E_local, H, I]`。输入按 (expert, slot) 稳定排序，NVLink dispatch、两层 TCGEN05 GEMM、SwiGLU 和 combine 在一个 persistent kernel 中执行。训练时固定每个源 rank 的 expert 行序号，在同一 kernel 内写出 BF16 X 和 gate/up。BWD 通过对称内存读取 dY、返回 dX 和 dGate，按固定行序用 grouped GEMM 计算 dW。
+配套的 DeepGEMM 提交为 `cd3f06dfe368d17004279727f99e30ba18dad27a`（分支 `feat/blackwell-moe`，基于 `5081f851`）。该版本增加了原始 FC1 权重的 5 维 TMA 描述符和可选训练 checkpoint。单机 `TensorRuntime` 按 CUDA compute capability 选择实现。权重保持 `[E_local, 2I, H]` 和 `[E_local, H, I]`。输入按 (expert, slot) 稳定排序，NVLink dispatch、两层 TCGEN05 GEMM、SwiGLU 和 combine 在一个 persistent kernel 中执行。训练时固定每个源 rank 的 expert 行序号，在同一 kernel 内写出 BF16 X 和 gate/up。BWD 通过对称内存读取 dY、返回 dX 和 dGate，按固定行序用 grouped GEMM 计算 dW。
 
 本机已在仓库的 `build/sm100-env` 建立独立 Python 环境。使用下面的命令复现。
 
@@ -384,7 +384,21 @@ torchrun --standalone --nproc-per-node=8 tests/torchrun_sm100_nvfp4_backward.py 
 
 大负载前向测试使用双机 torchrun 和 `--total-tokens 65536`。双窗口反向测试使用双机 torchrun 和 `--capacity 4096 --tokens 2052 --hidden 512 --port-counters`。逐样本记录和网口计数保存在 `benchmarks/results/sm100-b300/weft/nvfp4-calibrated-*.node*.log`。
 
+## 动态 M 的数值回归
+
+[逐位回归脚本](../tests/torchrun_sm100_training_invariance.py)使用 128 个固定 token 作为 EP1 参考。分布式运行打乱这些 token 的位置并加入其他 token，以 EP1 训练前向对照分布式推理前向，再以 EP1 推理前向对照分布式训练前向。反向测试在相同 EP 下插入另一批次的前反向，然后重跑原批次，逐位比较 dX、dGate、dW1、dW2。
+
+默认开启 `batch_invariant` 后，BF16、NVFP4 共跑了 95 组精度、形状、EP 和长度组合（EP8 30 组，EP16 35 组，EP32 30 组）。包含 Qwen35B 专家形状、NVFP4 的 K128/K256 及 EP16 跨窗口批次。实际选到的 M 有 16、32、64、128、192、240，包含 EP1 用 M16、分布式用 M240 的对照。两个方向的训练/推理前向与四个同 EP 梯度均为零逐位差异。
+
+单机 EP8 的 NVFP4 回归可用下面的命令复现。多机使用相同脚本和每节点 8 个进程，并传入各节点的 torchrun rendezvous 参数。
+
+```bash
+torchrun --standalone --nproc-per-node=8 tests/torchrun_sm100_training_invariance.py --precision nvfp4
+```
+
 ## 动态与固定 M 实测
+
+本节保留历史消融数据。复现本节的固定 M、全宽尾块及其命令需使用 WeftMoE `18e8f63` 和 DeepGEMM `faa68bc`。当前实现统一使用动态 M。
 
 在 B300 上对三个模型、BF16/NVFP4、EP8/EP16 分别做配对前向测试。每个 runtime 统一预留 20,480 tokens/rank，依次提交 8192、20480、1024、64、512，再循环。每轮各 rank 重新生成输入和路由，同一轮内所有策略复用相同输入、专家权重、对称工作区和 GIN 窗口。测的是含 staging、通信、两次专家 GEMM、combine 的推理前向。NVFP4 权重在计时前准备。
 
@@ -413,7 +427,7 @@ torchrun --standalone --nproc-per-node=8 tests/torchrun_sm100_nvfp4_backward.py 
 | 192 | +1.0% | +2.6% | -0.3% | -0.2% |
 | 240 | +2.7% | +4.5% | +0.5% | +0.8% |
 
-统一的严格配置取 M128。全宽 M128 在 60 个等权负载上相对动态的几何平均开销为 0.45%，M192 为 1.17%；双机单独计算时两者相差约 0.2%。单机 M128 的逐点范围为 −7.0% 至 +10.4%，后者来自 Qwen35B NVFP4 的 64 tokens/rank（49.97 → 55.16 µs）。仅固定外层 M128 时，EP8/EP16 的平均开销分别为 0.48%/0.14%。这些百分比是样本统计量。
+当时的严格配置取 M128。全宽 M128 在 60 个等权负载上相对动态的几何平均开销为 0.45%，M192 为 1.17%；双机单独计算时两者相差约 0.2%。单机 M128 的逐点范围为 −7.0% 至 +10.4%，后者来自 Qwen35B NVFP4 的 64 tokens/rank（49.97 → 55.16 µs）。仅固定外层 M128 时，EP8/EP16 的平均开销分别为 0.48%/0.14%。这些百分比是样本统计量。
 
 EP8 的动态策略在 64 tokens/rank 时三个模型都选择 M32。负载依次为 8K、20K、1K 时，两个 Qwen 模型选择 240、240、192，Flash 选择 240、240、240。双机的节点内 GEMM 使用预留通信窗口的行数，本实验五个长度全部选择 M240。为 decode 单独准备小容量 runtime 会改变双机启发式的输入。
 
@@ -427,7 +441,7 @@ EP8 的动态策略在 64 tokens/rank 时三个模型都选择 M32。负载依�
 | qwen122b | 6.744 / 6.717 | 5.132 / 5.259 | 18.110 / 18.108 | 15.211 / 15.680 |
 | flash | 8.761 / 9.509 | 4.742 / 4.521 | 19.437 / 20.467 | 16.473 / 16.275 |
 
-原始样本、各策略的 p50、实际选用的 M 和逐位差异计数见[逐点 CSV](../benchmarks/sm100/tile-m-results.csv)。从仓库根目录运行下面的命令可复现主测试；双机在两台主机设置相同的 `NNODES=2`、`MASTER_ADDR`、`MASTER_PORT` 及各自的 `NODE_RANK`。两种精度分别使用 `bf16` 和 `nvfp4`。
+原始样本、各策略的 p50、实际选用的 M 和逐位差异计数见[逐点 CSV](../benchmarks/sm100/tile-m-results.csv)。在上述历史版本的仓库根目录运行下面的命令可复现主测试；双机在两台主机设置相同的 `NNODES=2`、`MASTER_ADDR`、`MASTER_PORT` 及各自的 `NODE_RANK`。两种精度分别使用 `bf16` 和 `nvfp4`。
 
 ```bash
 benchmarks/sm100/run.sh weft-tile-m --model qwen35b --precision nvfp4 --full-m 32 64 128 240

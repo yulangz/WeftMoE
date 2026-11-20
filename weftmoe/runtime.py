@@ -42,7 +42,6 @@ class TensorRuntime:
         nvfp4_scales=None,
         session=None,
         batch_invariant: bool = True,
-        blackwell_block_m: int | None = None,
         allow_unvalidated_shape: bool = False,
     ):
         if group is None:
@@ -85,29 +84,25 @@ class TensorRuntime:
         # one node must report a collective error, not strand peers in bootstrap.
         requests = [None] * self.world
         capability = torch.cuda.get_device_capability()
-        policy_error = None
-        fixed_m = None
+        companion_error = None
         if capability[0] == 10:
-            from .blackwell_tuning import tile_policy
-            self.profile_key = dict(key, arch=list(capability), dtype=self.precision,
-                                    batch_invariant=batch_invariant)
             try:
                 from .blackwell import check_companion
                 check_companion(self.precision, training)
-                fixed_m = tile_policy(self.profile_key, max_tokens, blackwell_block_m)
             except Exception as exc:
-                policy_error = str(exc)
-        request = dict(key=key, blackwell_block_m=blackwell_block_m, precision=self.precision, nvfp4_scales=nvfp4_scales, capability=capability, max_tokens=max_tokens, max_saved=max_saved, batch_invariant=batch_invariant,
-                       fp8_workspace=fp8_workspace, decode_only=decode_only,
-                       allow_unvalidated_shape=allow_unvalidated_shape)
-        dist.all_gather_object(requests, (request, fixed_m, policy_error), group=group)
-        if any(r != request for r, _, _ in requests):
+                companion_error = str(exc)
+        request = dict(
+            key=key, precision=self.precision, nvfp4_scales=nvfp4_scales, capability=capability,
+            max_tokens=max_tokens, max_saved=max_saved, batch_invariant=batch_invariant,
+            fp8_workspace=fp8_workspace, decode_only=decode_only,
+            allow_unvalidated_shape=allow_unvalidated_shape,
+        )
+        dist.all_gather_object(requests, (request, companion_error), group=group)
+        if any(r != request for r, _ in requests):
             raise ValueError("EP ranks requested incompatible WeftMoE configurations")
-        for _, selected_m, error in requests:
+        for _, error in requests:
             if error is not None:
                 raise ValueError(f"Blackwell preparation failed: {error}")
-            if selected_m != fixed_m:
-                raise ValueError("EP ranks loaded different Blackwell tile policies")
         if nvfp4_scales is not None and self.precision != "nvfp4":
             raise ValueError("nvfp4_scales requires NVFP4 precision")
         if capability[0] == 10:
@@ -124,28 +119,24 @@ class TensorRuntime:
                 self.nvfp4_scales = NVFP4Scales() if nvfp4_scales is None else NVFP4Scales(*nvfp4_scales)
                 _validate_scales(self.nvfp4_scales)
             args = (group, experts, top_k, hidden, intermediate, max_tokens, self.stream, training, max_saved)
-            options = dict(fixed_block_m=fixed_m, full_mma_tiles=batch_invariant)
             if self.nodes == 1:
                 from .blackwell import BlackwellRuntime
                 from .nvfp4 import NVFP4Runtime
                 backend = NVFP4Runtime if nvfp4 else BlackwellRuntime
+                self.native = backend(*args)
             elif max_tokens >= 4096:
                 from .blackwell_pipeline import PipelinedMultiNodeRuntime
-                backend = PipelinedMultiNodeRuntime
-                options.update(nodes=self.nodes, nvfp4=nvfp4)
+                self.native = PipelinedMultiNodeRuntime(*args, nodes=self.nodes, nvfp4=nvfp4)
             else:
                 from .blackwell_multinode import MultiNodeRuntime, NVFP4MultiNodeRuntime
                 backend = NVFP4MultiNodeRuntime if nvfp4 else MultiNodeRuntime
-                options["nodes"] = self.nodes
+                self.native = backend(*args, nodes=self.nodes)
             self.compilation = None
-            self.native = backend(*args, **options)
             if nvfp4:
                 self.native.scales = self.nvfp4_scales
                 for window in getattr(self.native, "windows", ()):
                     window.scales = self.nvfp4_scales
             return
-        if blackwell_block_m is not None:
-            raise ValueError("blackwell_block_m requires Blackwell")
         if self.precision != ("fp8" if fp8_workspace else "bf16"):
             raise ValueError("Unsupported runtime precision")
         native, tuning, entry = None, None, None

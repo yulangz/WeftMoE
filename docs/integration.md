@@ -85,7 +85,7 @@ from weftmoe.sglang import install
 install(batch_invariant=True)
 ```
 
-Megatron 和 SGLang adapter 都默认传入 `batch_invariant=True`。允许动态选 M 时，在创建 adapter 或安装 SGLang hook 时显式传 `False`，所有 worker 使用相同设置。
+Megatron 和 SGLang adapter 都默认传入 `batch_invariant=True`。在 B300 上保留默认值即可使用动态 M，所有 EP worker 使用相同设置。
 
 只在启动父进程调用不足以覆盖 spawn 出来的 worker。当前接入的是 BF16 权重的 `FusedMoE`，
 要求 `ep_size == tp_size`、expert TP=1，不直接接收 SGLang 的量化 checkpoint。

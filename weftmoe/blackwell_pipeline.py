@@ -70,7 +70,6 @@ class PipelinedMultiNodeRuntime(BlackwellRuntime):
         max_saved,
         nodes,
         nvfp4=False,
-        *, fixed_block_m=0, full_mma_tiles=False,
     ):
         self.training, self.max_saved = training, max_saved
         self.tapes = weakref.WeakSet()
@@ -91,7 +90,6 @@ class PipelinedMultiNodeRuntime(BlackwellRuntime):
             worker = torch.cuda.Stream(device=stream.device)
             window = child_type(
                 group, experts, top_k, hidden, intermediate, self.split, worker, training, max_saved, nodes,
-                fixed_block_m=fixed_block_m, full_mma_tiles=full_mma_tiles,
             )
             window.rail.compact = True
             window.launch = self._serialize_compute(window.launch)

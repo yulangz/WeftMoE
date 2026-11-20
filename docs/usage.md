@@ -6,31 +6,14 @@ BF16 任务沿用下方的 `TensorRuntime` API。先安装配套 DeepGEMM，再�
 
 ### B300 前向的 batch invariance
 
-`TensorRuntime(..., batch_invariant=True)` 是默认设置。BF16 和 NVFP4 的两个专家 GEMM 均固定 M=128、N=128，专家尾块也执行完整宽度的 MMA。对于同一模型和精度，K 同样固定。BF16 用 K=64，NVFP4 在 intermediate 能被 256 整除时用 K=256，其余支持的形状用 K=128。训练前向、prefill、decode、单机和多机窗口共享这套选型。
+`TensorRuntime(..., batch_invariant=True)` 默认开启。对于 BF16 和 NVFP4，在同一硬件、内核版本和精度下，有两项约定。
 
-在相同权重、输入行、路由、gate 和量化因子下，严格模式要求该行的前向结果跨 batch 和 EP 逐位一致；同 EP、相同输入的反向重跑要求逐位一致。参数梯度会累加整个 batch 的贡献。切换设置需重新创建 runtime，所有 EP rank 必须选择相同设置。
+- 跨 EP 比较训练与推理前向时，只要专家权重和量化因子相同，同一 token 的输入、路由和 gate 相同，该 token 的输出就逐位一致，即使它在 batch 中的位置和相邻 token 改变。
+- 同一 EP 下，固定输入、权重、路由、gate、量化因子和上游梯度，重跑反向时 dX、dGate、dW1、dW2 逐位一致。
 
-| 构造参数 | B300 前向选择 |
-| --- | --- |
-| `batch_invariant=True` | 固定 M=128，全宽 MMA，拒绝冲突的 M 覆盖 |
-| `batch_invariant=False` | 优先采用同模式、同容量桶的离线策略，缺省启发式选 M，均保留尾块优化 |
-| `batch_invariant=False, blackwell_block_m=128` | 固定外层 M，保留尾块优化，用于单独比较选 M 的影响 |
+两种开关设置在 B300 上都使用动态 M。单机按本次调用的本地 token 数估算每个专家的负载，多机按通信窗口实际提交给节点内核的行数估算。专家尾块按需缩窄。M 改变的是一次并排计算的行数，每行的 K 累加顺序和每个 token 的专家结果合并顺序保持一致。两个专家 GEMM 均用 N=128。BF16 用 K=64，NVFP4 按模型的 intermediate 维度选 K，可被 256 整除时用 256，其余支持的形状用 128。
 
-手动 M 支持 16、32、64、128、192、240。三种模式的 N/K 规则相同。单机的启发式使用本次本地启动的 token 数，多机使用每个已准备通信窗口向节点内核提交的行数。各负载的开销见 [动态与固定 M 实测](benchmarks-sm100.md#动态与固定-m-实测)。
-
-### B300 离线 autotune
-
-`tools/autotune.py` 在有 GPU 的机器上按 CUDA compute capability 选择 SM90 或 SM100 后端。训练、推理和 decode 共用 `--mode`、`--tokens`、`--token-buckets`、`--table`、`--dry-run` 和多机 SSH 启动参数。无 GPU 的规划机用 `--arch sm100 --dry-run` 查看 Blackwell 计划。B300 支持 BF16 和 NVFP4，Hopper 的 FP8 沿用 `--fp8`。
-
-```bash
-python tools/autotune.py --model qwen35b --mode training --precision nvfp4 --dry-run
-python tools/autotune.py --model qwen35b --mode inference --precision nvfp4 \
-    --no-batch-invariant --tokens 1024 8192 20480 --token-buckets 1024 8192 20480
-```
-
-B300 的离线搜索只调整前向 M。严格模式只测 M128 全宽。放宽模式将启发式与六个固定 M 配对计时，用独立路由种子复测入围者，达到配置的最小提升且通过数值检查才替代启发式。训练以 FWD+BWD 为计时范围，核对输出与四个梯度。推理以 eager FWD 计时，decode 以 CUDA Graph 回放计时。Blackwell 使用配套 DeepGEMM 的 JIT 缓存；SM90 仍生成 PF/DT 头文件和扩展。
-
-每个桶使用该组最大的代表长度准备工作区。部署时 `TensorRuntime` 在构造时按 `max_tokens` 查一次表；所选策略可以是固定 M，也可以是运行时启发式。表项区分硬件、精度、模型形状、EP 拓扑、模式和严格开关，内核源码指纹变更后回退默认。使用自选 `--table PATH` 时在所有 worker 上设 `WEFTMOE_AUTOTUNE_TABLE=PATH`。多机沿用 SM90 的 `--remotes` 和共享路径约定，环境需预先配置 GIN 及双口 RDMA。
+B300 无需预报负载或生成离线 M 配置表。`tools/autotune.py` 自动识别 B300 后会提示使用动态 M 并退出。SM90 的离线 autotune 用法见下文。固定与动态 M 的性能对照见[历史消融测试](benchmarks-sm100.md#动态与固定-m-实测)。
 
 ### B300 NVFP4
 

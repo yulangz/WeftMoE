@@ -1,13 +1,11 @@
-"""Bitwise cross-EP and route-order parity at identical BF16 MMA tile sizes."""
+"""Bitwise cross-EP and route-order parity with dynamic BF16 M tiles."""
 
 import argparse
 import os
 
-import deep_gemm as dg
 import torch
 import torch.distributed as dist
 
-from weftmoe.blackwell_tuning import STRICT_BLOCK_M
 from weftmoe.runtime import TensorRuntime
 
 
@@ -37,7 +35,6 @@ def main():
     ids[0] = 3
     ids[1] = -1
     counts = [total, total // world]
-    tiles = set()
     outputs = []
     for group, n in zip((single, dist.group.WORLD), counts):
         rt = TensorRuntime(
@@ -50,21 +47,6 @@ def main():
             max_rows=total * k,
             training=False,
         )
-        for window in getattr(rt.native, "windows", [rt.native]):
-            buf = window.buffer
-            assert buf.full_mma_tiles and buf.fixed_block_m == STRICT_BLOCK_M
-            launched_tokens = window.dummy.shape[0] if hasattr(window, "dummy") else n
-            tiles.add(
-                dg.get_block_m_for_mega_moe(
-                    buf.group.size(),
-                    buf.num_experts,
-                    buf.num_max_tokens_per_rank,
-                    launched_tokens,
-                    k,
-                    "bf16xbf16",
-                    buf.fixed_block_m,
-                )
-            )
         rows = slice(0, total) if group.size() == 1 else slice(rank * n, (rank + 1) * n)
         w1, w2 = [w.chunk(group.size())[group.rank()] for w in (first, second)]
         local = (x[rows], ids[rows], gates[rows])
@@ -78,31 +60,12 @@ def main():
         assert torch.equal(prefix.view(torch.int16), y[:short].view(torch.int16))
         outputs.append(y.clone())
         rt.close()
-    assert len(tiles) == 1, tiles
     same = torch.equal(outputs[0].chunk(world)[rank].view(torch.int16), outputs[1].view(torch.int16))
     agreed = torch.tensor(int(same), device="cuda")
     dist.all_reduce(agreed, op=dist.ReduceOp.MIN)
     assert agreed.item(), f"EP1/EP{world} output bits differ"
     if rank == 0:
-        print(f"BF16 EP1/EP{world} bitwise parity passed, MMA tile {next(iter(tiles))}x128x64")
-    # Exercise the public policy switch independently of the timing harness.
-    opts = dict(group=single, experts=experts, top_k=k, hidden=h, intermediate=i,
-                max_tokens=total, max_rows=total * k, training=False)
-    for requested in (None, 32):
-        relaxed = TensorRuntime(**opts, batch_invariant=False, blackwell_block_m=requested)
-        assert relaxed.native.buffer.fixed_block_m == (requested or 0)
-        assert not relaxed.native.buffer.full_mma_tiles
-        result = relaxed.inference_eager(x, ids, gates, first, second)
-        assert torch.isfinite(result).all()
-        relaxed.close()
-    for group, override, reason in ((single, 32, "Noncanonical"),
-                                    (dist.group.WORLD, 32 if rank else None, "incompatible")):
-        try:
-            TensorRuntime(**dict(opts, group=group), blackwell_block_m=override)
-        except ValueError as exc:
-            assert reason in str(exc)
-        else:
-            raise AssertionError("Strict mode accepted an inconsistent M policy")
+        print(f"BF16 EP1/EP{world} bitwise parity passed")
     if args.forward_only:
         dist.destroy_process_group()
         return

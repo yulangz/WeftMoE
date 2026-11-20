@@ -5,13 +5,12 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 extra=()
 case "${1:-}" in
   weft) entry=torchrun_forward.py ;;
-  weft-tile-m) entry=torchrun_tile_m.py ;;
   weft-gin) entry=torchrun_gin.py ;;
   weft-training) entry=torchrun_training.py; extra=(--backend weft) ;;
   megatron) entry=torchrun_training.py ;;
   sglang) entry=torchrun_sglang_decode.py ;;
   *)
-    printf 'Usage: %s {weft|weft-training|weft-tile-m|weft-gin|megatron|sglang} [benchmark arguments]\n' "$0" >&2
+    printf 'Usage: %s {weft|weft-training|weft-gin|megatron|sglang} [benchmark arguments]\n' "$0" >&2
     exit 2
     ;;
 esac
