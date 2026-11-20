@@ -14,6 +14,8 @@ python -m pip install --no-build-isolation .
 
 多机要求各节点使用相同数量的 GPU，EP rank 按节点连续排列。在初始化 NCCL 进程组前配置 HCA 和 GIN。仓库的启动脚本支持本次实测的每 GPU 双 400G RoCE 拓扑。其他集群按实际 HCA 名称和 GIN 后端配置。[网络配置与端口验证](benchmarks-sm100.md#每卡双路-400g-roce)
 
+每个通信条带用 `ncclGin(comm, stripe)` 选择自己的 GIN context。NCCL 2.29.7 的 GDAKI 和 Proxy 都从当前 context 的 signal 表取槽，shadow 表也按 context 单独寻址，因此每个条带可使用相同的 peer signal 编号。[context 与 shadow 初始化](https://github.com/NVIDIA/nccl/blob/v2.29.7-1/src/include/nccl_device/impl/gin__funcs.h#L49-L66) · [GDAKI signal](https://github.com/NVIDIA/nccl/blob/v2.29.7-1/src/include/nccl_device/gin/gdaki/gin_gdaki.h#L275-L282) · [Proxy signal](https://github.com/NVIDIA/nccl/blob/v2.29.7-1/src/include/nccl_device/gin/proxy/gin_proxy.h#L228-L234)
+
 ## 调用
 
 假设每个进程已选好本地 GPU，创建了 NCCL 专家并行组 `ep_group`。每个 rank 提供本地 BF16 输入 `x[T,H]`、全局专家编号 `routes[T,K]`（int32）、权重 `gates[T,K]`（FP32），以及本地 BF16 专家参数 `w1[E/EP,2I,H]`、`w2[E/EP,H,I]`。下面以 Qwen35B 的专家形状为例，容量按每个 rank 的最大 token 数设置。
@@ -44,7 +46,7 @@ y = infer.inference_nvfp4(0, x, routes, gates, weights, x_scale=1/32, intermedia
 infer.close()
 ```
 
-默认层级因子来自 benchmark。训练时应按实际模型、loss 归一化和梯度缩放方式标定，包括反向的 dY 和 dGateUp。对非零的块最大绝对值 `amax` 和层级因子 `s`，当 `amax ≤ 6s × 2⁻¹⁰` 时块尺度舍入为零，当 `amax > 6s × 448` 时幅值超出可表示范围。靠近下界的非零尺度可能是 E4M3 次正规数。
+默认层级因子来自 benchmark。创建 NVFP4 训练 runtime 时，若省略 `nvfp4_scales`，EP 组的 rank 0 会记录一条警告。训练时应按实际模型、loss 归一化和梯度缩放方式标定，包括反向的 dY 和 dGateUp。对非零的块最大绝对值 `amax` 和层级因子 `s`，当 `amax ≤ 6s × 2⁻¹⁰` 时块尺度舍入为零，当 `amax > 6s × 448` 时幅值超出可表示范围。靠近下界的非零尺度可能是 E4M3 次正规数。
 
 | 操作数 | 默认 s | 整块清零阈值 | 幅值上限 |
 | --- | ---: | ---: | ---: |

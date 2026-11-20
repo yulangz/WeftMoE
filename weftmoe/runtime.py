@@ -120,6 +120,12 @@ class TensorRuntime:
                 from .nvfp4 import NVFP4Scales, _validate_scales
                 self.nvfp4_scales = NVFP4Scales() if nvfp4_scales is None else NVFP4Scales(*nvfp4_scales)
                 _validate_scales(self.nvfp4_scales)
+                if training and nvfp4_scales is None and self.rank == 0:
+                    logging.getLogger(__name__).warning(
+                        "NVFP4 training is using default tensor scales. Small dY blocks can quantize "
+                        "entirely to zero. Pass calibrated nvfp4_scales for your loss normalization "
+                        "and gradient scaling."
+                    )
             args = (group, experts, top_k, hidden, intermediate, max_tokens, self.stream, training, max_saved)
             if self.nodes == 1:
                 from .blackwell import BlackwellRuntime
