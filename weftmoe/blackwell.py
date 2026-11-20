@@ -69,6 +69,7 @@ class BlackwellRuntime:
         )
 
         if training:
+            self.wgrad_stream = torch.cuda.Stream(device=stream.device)
             self.alignment = 128
             self.peers = torch.tensor(self.buffer.handle.buffer_ptrs, dtype=torch.int64, device=stream.device)
 

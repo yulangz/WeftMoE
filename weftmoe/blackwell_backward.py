@@ -66,7 +66,7 @@ def _gather_dy(
     row = tl.program_id(0) * R + tl.arange(0, R)
     orig = tl.load(Origins + row, row < rows, -1)
     addr = tl.maximum(orig, 0)
-    base = tl.load(Peers + addr // (CAP * K)) + X_OFFSET
+    base = tl.multiple_of(tl.load(Peers + addr // (CAP * K)), 16) + X_OFFSET
     dy = base.to(tl.pointer_type(tl.bfloat16))
     token = addr % (CAP * K) // K
     col = tl.arange(0, BH)
@@ -129,7 +129,7 @@ def _return(
     row = tl.program_id(0) * R + tl.arange(0, R)
     orig = tl.load(Origins + row, row < rows, -1)
     addr = tl.maximum(orig, 0)
-    base = tl.load(Peers + addr // (CAP * K))
+    base = tl.multiple_of(tl.load(Peers + addr // (CAP * K)), 16)
     slot = addr % (CAP * K)
     dx = (base + DX_OFFSET).to(tl.pointer_type(tl.bfloat16))
     dg = (base + DG_OFFSET).to(tl.pointer_type(tl.float32))
@@ -203,7 +203,7 @@ def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
         b.handle.barrier()
     recv = torch.empty_like(x)
     u = torch.empty((rows, i), dtype=x.dtype, device=x.device)
-    du = torch.zeros_like(u)
+    du = torch.empty_like(u)
     dab = torch.empty_like(ab)
     eg = torch.empty_like(gates)
     dw1, dw2 = torch.empty_like(w1), torch.empty_like(w2)
@@ -216,6 +216,15 @@ def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
         _swiglu[grid](ab, du, gates, u, dab, eg, rows, i, triton.next_power_of_2(i), 4)
         local_dx = torch.empty_like(x)
         grouped_bf16(dab, w1, local_dx, ends)
+        # Both weight gradients read completed local activations. Run them on a
+        # separate stream while the caller returns dX/dGate to their source ranks.
+        compute = runtime.wgrad_stream
+        compute.wait_stream(torch.cuda.current_stream())
+        for tensor in (dab, x, dw1, recv, u, dw2, ends):
+            tensor.record_stream(compute)
+        with torch.cuda.stream(compute):
+            grouped_bf16(dab, x, dw1, ends, wgrad=True)
+            grouped_bf16(recv, u, dw2, ends, wgrad=True)
         _return[grid](
             runtime.peers,
             origins,
@@ -230,16 +239,6 @@ def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
             triton.next_power_of_2(h),
             4,
         )
-        # On multiple nodes, the rail can return dX/dGate while the tensor
-        # cores finish the two independent weight gradients.
-        compute = getattr(runtime, "wgrad_stream", None)
-        if compute is not None:
-            compute.wait_stream(torch.cuda.current_stream())
-            for tensor in (dab, x, dw1, recv, u, dw2, ends):
-                tensor.record_stream(compute)
-        with torch.cuda.stream(compute):
-            grouped_bf16(dab, x, dw1, ends, wgrad=True)
-            grouped_bf16(recv, u, dw2, ends, wgrad=True)
     else:
         dw1.zero_()
         dw2.zero_()
@@ -277,6 +276,8 @@ def gradients(runtime, tape, dy):
             triton.next_power_of_2(k),
             512,
         )
+    if runtime.wgrad_stream is not None:
+        torch.cuda.current_stream().wait_stream(runtime.wgrad_stream)
     tape.state = None
     runtime.tapes.discard(tape)
     return dx, dgate, dw1, dw2

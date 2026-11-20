@@ -202,26 +202,48 @@ python -m pip install --no-build-isolation .
 
 `weft` 默认独立运行。单机复现表中的 MegaMoE 对照时另外安装外部基线并加 `--compare-mega`，混合精度对照沿用 `--mega-mixed`。批量脚本用 `COMPARE_MEGAMOE=1` 开启该对照。
 
-前向的路由调度、TCGEN05 流水线和设备端通信代码沿用并改写了 MIT 授权的 MegaMoE 实现，源码与许可随 WeftMoE 发布。WeftMoE 自己管理对称显存、TMA 描述符、编译缓存和 kernel launch。BF16 和 NVFP4 的反向 grouped GEMM 使用 CUTLASS。
+前向的路由调度、TCGEN05 流水线和设备端通信代码沿用并改写了 MIT 授权的 MegaMoE 实现，源码与许可随 WeftMoE 发布。WeftMoE 自己管理对称显存、TMA 描述符、编译缓存和 kernel launch。BF16 和 NVFP4 的反向 grouped GEMM 使用 CUTLASS。BF16 反向使用两个 CTA 协作的 TCGEN05 GEMM。dgrad 和 wgrad 均使用 256×256×64 的 cluster tile。dgrad 计算转置乘积，以列主序视图写回原始行主序输出。两个权重梯度在独立 CUDA stream 上计算，dX、dGate 同时回传，调用方在使用结果前等待两个 stream。
 
 ### 独立 wheel 数值验证
 
-在屏蔽 `deep_gemm` 和 `deep_jit` 导入的环境中，`tests/torchrun_sm100_training_invariance.py` 使用动态 M 和 `batch_invariant=True` 跑了 95 组。EP8、EP16、EP32 分别为 30、35、30 组，EP16 包含跨通信窗口的 batch。对相同锚点 token，EP1 训练与分布式推理、EP1 推理与分布式训练的 BF16 输出均逐位相等。同一 EP 重跑 BWD，dX、dGate、dW1、dW2 均逐位相等。用例覆盖 BF16、NVFP4，以及 NVFP4 的 K128 和 K256。
+在屏蔽 `deep_gemm` 和 `deep_jit` 导入的环境中，`tests/torchrun_sm100_training_invariance.py` 使用动态 M 和 `batch_invariant=True` 跑了 114 组。EP8、EP16、EP32 分别为 36、42、36 组，EP16 包含跨通信窗口的 batch。对相同锚点 token，EP1 训练与分布式推理、EP1 推理与分布式训练的 BF16 输出均逐位相等。同一 EP 重跑 BWD，dX、dGate、dW1、dW2 均逐位相等。用例覆盖 BF16 的 I128/I256、NVFP4 的 K128/K256，以及 Qwen35B 的专家维度。
 
 BF16 在 Qwen35B、2048 tokens/rank 的独立 PyTorch 参考上，输出和四个梯度的最大相对 L2 为 EP8 的 `9.50e-5` 和 EP16 的 `1.15e-4`（向上取整）。NVFP4 在 EP8 测了默认尺度和两组非二次幂尺度。独立参考按 E2M1 × E4M3 还原块，FP32 累加结束后乘两个操作数的 tensor scale 乘积。三组的输出、dX、dW1、dW2 相对 L2 均为 0，dGate 最大为 `1.48e-7`（向上取整）。
 
+BF16 grouped GEMM 还逐专家对照了 FP32 矩阵乘后舍入到 BF16 的结果。用例覆盖零行专家、仅一个有效 token、非满 tile 和 128/384 输出列，dgrad 与 wgrad 的最大相对 L2 为 `1.49e-4`（向上取整）。
+
 ### 独立 wheel 与框架基线
 
-Qwen35B，每个样本取最慢 rank 的耗时，再取 p50。每格为 WeftMoE / 框架基线。decode 为 64 tokens/rank，以 SGLang 为基线。prefill 与 BWD 均为名义 8192 tokens/rank 的变长 workload，取历史 Megatron 两种 dispatcher 中较快的一项。prefill 计时 WeftMoE 推理前向，Megatron 对应计时包含训练缓存写入。12 个测试点逐 rank 路由 SHA-256 均与基线一致。
+Qwen35B，每个样本取最慢 rank 的耗时，再取 p50。每格为 WeftMoE / 框架基线。decode 为 64 tokens/rank，以 SGLang 为基线。prefill 与 BWD 均为名义 8192 tokens/rank 的变长 workload，取历史 Megatron 两种 dispatcher 中较快的一项。prefill 计时 WeftMoE 推理前向，Megatron 对应计时包含训练缓存写入。12 个测试点逐 rank 路由 SHA-256 均与基线一致。独立 wheel 的 EP16 实测使用下文的 A 组，日志位于 `benchmarks/results/sm100-b300/weft/group-wide-perf{8,16}.node0.log`。
 
 | EP | 精度 | decode（µs） | prefill（ms） | BWD（ms） |
 | ---: | --- | ---: | ---: | ---: |
-| 8 | BF16 | 69.59 / 98.35 | 1.336 / 3.944 | 2.302 / 4.397 |
-| 8 | NVFP4 | 49.62 / 91.50 | 1.196 / 8.132 | 2.246 / 7.359 |
-| 16 | BF16 | 191.02 / 306.78 | 3.986 / 7.325 | 3.799 / 6.241 |
-| 16 | NVFP4 | 177.65 / 309.17 | 3.664 / 9.770 | 3.677 / 7.446 |
+| 8 | BF16 | 68.72 / 98.35 | 1.308 / 3.944 | 2.055 / 4.397 |
+| 8 | NVFP4 | 49.63 / 91.50 | 1.225 / 8.132 | 2.258 / 7.359 |
+| 16 | BF16 | 172.46 / 306.78 | 3.967 / 7.325 | 3.500 / 6.241 |
+| 16 | NVFP4 | 159.55 / 309.17 | 3.687 / 9.770 | 3.666 / 7.446 |
 
-与迁移前 WeftMoE 的记录比较，EP16 decode 的 BF16/NVFP4 延迟分别增加 11.0%/12.0%，EP8 BF16 BWD 增加 8.6%。EP8 NVFP4 BWD 为 2.246 ms，两版在该精度下相同。原始复测记录在 `benchmarks/results/sm100-b300/weft/routed-dist-perf-{8,16}.node0.log`。下文其他模型和 token 数的历史表保留原测量值。
+EP16 的 decode 延迟受双机组合影响。固定路由和 NCCL 设置，各组按「旧、新、新、旧」交替运行，取同版两轮 p50 的均值。迁移前版本与独立后端 `fd9a6e0` 在 A 组的 BF16 为 172.56 / 172.49 µs，NVFP4 为 159.00 / 159.22 µs。B 组分别为 191.60 / 191.06 µs 和 177.16 / 177.72 µs。单独记录 CUDA Graph 内耗时，B 组的 dispatch 和 return 分别多用约 9.7 µs 和 10.1 µs。原始记录在 `benchmarks/results/sm100-b300/weft/attribution-ab-decode{,-a}.node0.log`。
+
+
+Qwen35B、EP16、8192 tokens/rank 的 prefill 另做了同进程交替对照。在同一组 B300 上，两个 runtime 使用相同的输入和权重，每一步交替交换运行先后，并逐元素比较输出。BF16 的旧版 / 新版 p50 为 3.795 / 3.853 ms，NVFP4 为 3.180 / 3.212 ms。对同一步分别计算新版相对旧版的延迟变化后取中位数，BF16 为 +0.30%，NVFP4 为 +0.43%。两种精度每步的输出均相等。逐样本日志位于 `benchmarks/results/sm100-b300/weft/group-interleaved-wide.node0.log`。
+
+### BF16 反向与迁移前同机对照
+
+两版分别使用同一组 B300、同一 NCCL GIN 配置和相同的逐 rank 路由。每个样本取最慢 rank 的反向就绪时间，10 次 warmup 后取 30 个样本的 p50。前向和权重梯度均使用 BF16。旧版为 WeftMoE `8a70d31` 搭配 DeepGEMM `cd3f06d`，新版使用独立 CUTLASS wheel。
+
+在 EP8 Qwen35B、8192 tokens/rank 上，只替换分组 GEMM 的 profiler 对照共采集 8 个 rank、每个 rank 3 个训练步。每步四个 GEMM 内核耗时之和的中位数为新版 621.3 µs、旧版 623.6 µs。新版另有四次分组描述符准备，合计中位数 33.0 µs。下表的端到端时间包括描述符准备、梯度回传和 stream 等待。
+
+| EP | 模型 | 8192 tokens/rank，旧 / 新（ms） | 20480 tokens/rank，旧 / 新（ms） |
+| ---: | --- | ---: | ---: |
+| 8 | qwen35b | 2.095 / 2.048 | 5.106 / 4.858 |
+| 8 | qwen122b | 3.953 / 3.871 | 9.990 / 9.600 |
+| 8 | flash | 6.226 / 6.052 | 16.102 / 15.211 |
+| 16 | qwen35b | 3.623 / 3.529 | 8.470 / 8.161 |
+| 16 | qwen122b | 6.195 / 5.655 | 15.400 / 13.501 |
+| 16 | flash | 9.232 / 8.314 | 22.392 / 20.495 |
+
+两档 token 数为变长 workload 的名义值。与迁移前同机复测相比，12 个配置的 BF16 反向 p50 均下降，降幅为 2.1%–12.3%。逐样本数据位于 `benchmarks/results/sm100-b300/weft/group-{legacy,wide-final}-{8,16}.node0.log`。
 
 ### EP8 与 MegaMoE 同轮对照
 

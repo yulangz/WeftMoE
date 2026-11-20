@@ -1,5 +1,6 @@
 // CUTLASS grouped NN activation gradients and TN weight gradients.
-// Each expert's padded row interval is contiguous. One CTA owns each output tile.
+// Each pair of SMs computes one output tile. Dgrad writes the transposed GEMM
+// through a column-major view of the original row-major output.
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
@@ -13,24 +14,24 @@ using BF = cutlass::bfloat16_t;
 using Row = cutlass::layout::RowMajor;
 using Col = cutlass::layout::ColumnMajor;
 using Shape3 = Shape<int, int, int>;
-using Tile = Shape<_128, _128, _64>;
-using Cluster = Shape<_1, _1, _1>;
-using Arch = cutlass::arch::Sm100;
-using Op = cutlass::arch::OpClassTensorOp;
-using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    Arch, Op, Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto, float, float, BF, Row *, 8, BF,
-    Row *, 8, cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>::CollectiveOp;
-
 template <bool Wgrad> struct Plan {
+    using Tile = Shape<_256, _256, _64>;
+    using Cluster = Shape<_2, _1, _1>;
+    using OutputLayout = std::conditional_t<Wgrad, Row, Col>;
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
+        cutlass::epilogue::collective::EpilogueTileAuto, float, float, void, OutputLayout *, 8, BF, OutputLayout *,
+        8, cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
     using Main = typename cutlass::gemm::collective::CollectiveBuilder<
-        Arch, Op, BF, std::conditional_t<Wgrad, Col, Row> *, 8, BF, Row *, 8, float, Tile, Cluster,
-        cutlass::gemm::collective::StageCountAutoCarveout<sizeof(Epilogue::SharedStorage)>,
-        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100>::CollectiveOp;
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, BF, Col *, 8, BF,
+        std::conditional_t<Wgrad, Row, Col> *, 8, float, Tile, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epilogue::SharedStorage)>,
+        cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100>::CollectiveOp;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<cutlass::gemm::GroupProblemShape<Shape3>, Main, Epilogue>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
     struct alignas(256) Groups {
         Shape3 shape[512];
-        BF const *a[512], *b[512], *c[512];
+        BF const *a[512], *b[512];
         BF *d[512];
         typename Kernel::InternalStrideA da[512];
         typename Kernel::InternalStrideB db[512];
@@ -43,7 +44,7 @@ template <bool Wgrad> struct Plan {
         typename Gemm::Arguments a{cutlass::gemm::GemmUniversalMode::kGrouped,
                                    {count, p->shape, nullptr},
                                    {p->a, p->da, p->b, p->db},
-                                   {{}, p->c, p->dd, p->d, p->dd},
+                                   {{}, nullptr, p->dd, p->d, p->dd},
                                    info};
         a.epilogue.thread.alpha = 1.f;
         a.epilogue.thread.beta = 0.f;
@@ -59,17 +60,23 @@ __global__ void describe(typename Plan<Wgrad>::Groups *p, BF const *a, BF const 
         return;
     int64_t start = e ? ends[e - 1] : 0;
     int length = ends[e] - start;
-    p->shape[e] = make_shape(Wgrad ? outer : length, n, Wgrad ? length : outer);
-    p->a[e] = a + start * outer;
-    p->b[e] = b + (Wgrad ? start : int64_t(e) * outer) * n;
-    p->d[e] = d + (Wgrad ? int64_t(e) * outer : start) * n;
-    p->c[e] = p->d[e];
-    if constexpr (Wgrad)
+    if constexpr (Wgrad) {
+        p->shape[e] = make_shape(outer, n, length);
+        p->a[e] = a + start * outer;
+        p->b[e] = b + start * n;
+        p->d[e] = d + int64_t(e) * outer * n;
         p->da[e] = {_1{}, int64_t(outer), _0{}};
-    else
-        p->da[e] = {int64_t(outer), _1{}, _0{}};
-    p->db[e] = {_1{}, int64_t(n), _0{}};
-    p->dd[e] = {int64_t(n), _1{}, _0{}};
+        p->db[e] = {_1{}, int64_t(n), _0{}};
+        p->dd[e] = {int64_t(n), _1{}, _0{}};
+    } else {
+        p->shape[e] = make_shape(n, length, outer);
+        p->a[e] = b + int64_t(e) * outer * n;
+        p->b[e] = a + start * outer;
+        p->d[e] = d + start * n;
+        p->da[e] = {_1{}, int64_t(n), _0{}};
+        p->db[e] = {int64_t(outer), _1{}, _0{}};
+        p->dd[e] = {_1{}, int64_t(n), _0{}};
+    }
 }
 
 template <bool Wgrad> size_t workspace(int groups, int device, int sms) {

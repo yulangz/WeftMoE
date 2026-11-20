@@ -214,6 +214,7 @@ class NVFP4Runtime(BlackwellRuntime):
         self.training, self.max_saved = training, max_saved
         self.tapes = weakref.WeakSet()
         self.scales = NVFP4Scales()
+        self.wgrad_stream = None
         if training:
             import torch.distributed._symmetric_memory as symm
             from .nvfp4_backward import expert_gradients

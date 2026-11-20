@@ -283,7 +283,8 @@ class MultiNodeRuntime(BlackwellRuntime):
         self.send_offset = nodes * self.packet_stride
         self.recv_offset = self.send_offset + nodes * region_bytes
         self.rail = RailWindow(group, self.recv_offset + nodes * region_bytes, nodes)
-        self.wgrad_stream = torch.cuda.Stream(device=stream.device) if training else None
+        if self.nvfp4 and training:
+            self.wgrad_stream = torch.cuda.Stream(device=stream.device)
         self.sizes = torch.empty(nodes, dtype=torch.int64, device=stream.device)
         self.owner_ids = torch.arange(nodes, device=stream.device, dtype=torch.int32).view(nodes, 1)
         self.dummy = torch.empty(self.cap * nodes, hidden, dtype=torch.bfloat16, device=stream.device)
