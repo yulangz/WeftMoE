@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.models import add_model_arguments, resolve_model
 from benchmarks.nccl_library import loaded_nccl_libraries, nccl_runtime_version
 from benchmarks.sm100.hardware import check_blackwell, check_finite
+from benchmarks.workload import decode_routes
 
 
 RUNNER = "flashinfer_trtllm_routed"
@@ -80,16 +81,14 @@ def measure(args, tokens, layer, group, rank, world):
     gates = torch.empty_like(ids, dtype=torch.float32)
     topk = StandardTopKOutput(gates, ids, logits)
     batch = SimpleNamespace(dp_padding_mode=DpPaddingMode.MAX_LEN)
-    routing_rng = torch.Generator(device=x.device).manual_seed(args.seed + global_tokens)
+    routing = decode_routes(args, logits)
     input_rng = torch.Generator(device=x.device).manual_seed(args.seed + global_tokens + rank)
-    bias = torch.randn(args.experts, device=x.device, generator=routing_rng) * args.route_bias_std
 
     def prepare():
         x.normal_(0, 0.03, generator=input_rng)
-        logits.normal_(generator=routing_rng).add_(bias)
-        scores, selected = logits.topk(args.top_k, dim=-1)
+        selected, weights = next(routing)
         ids.copy_(selected)
-        gates.copy_(scores.softmax(-1))
+        gates.copy_(weights)
 
     def forward():
         dp_gather_partial(gathered, x, batch)

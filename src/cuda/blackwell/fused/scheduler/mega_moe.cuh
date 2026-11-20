@@ -84,12 +84,9 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
 enum class BlockPhase : uint32_t {
     None = 0,
     Linear1 = 1,
-    Linear2 = 2,
-    SharedLinear1 = 3,
-    SharedLinear2 = 4
+    Linear2 = 2
 };
 
-template <bool kHasSharedExperts>
 struct alignas(16) TaskInfo {
     BlockPhase block_phase;
     uint32_t local_expert_idx;
@@ -129,12 +126,7 @@ struct alignas(16) TaskInfo {
         return math::align(valid_m, 16u);
     }
 
-    CUTLASS_DEVICE uint32_t is_shared() const {
-        return kHasSharedExperts ? (block_phase > BlockPhase::Linear2) : false;
-    }
 };
-
-WEFT_STATIC_ASSERT(sizeof(sched::TaskInfo<true>) == sizeof(sched::TaskInfo<false>), "Invalid layout");
 
 #if defined(__CUDACC__) or defined(__CLION_IDE__)
 
@@ -172,28 +164,18 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kNumRingBlocks, uint32_t kNumLocalityDomains,
-          uint32_t kNumSharedExperts = 0,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
           uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
 struct MegaMoEScheduler {
-    static constexpr bool kHasShared = kNumSharedExperts > 0;
-    static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
-    static constexpr uint32_t SHARED_L1_SHAPE_K = L1_SHAPE_K;
-    static constexpr uint32_t SHARED_L2_SHAPE_N = L2_SHAPE_N;
-    static constexpr uint32_t SHARED_L2_SHAPE_K = L2_SHAPE_K * kNumSharedExperts;
-    using task_info_t = TaskInfo<kHasShared>;
+    using task_info_t = TaskInfo;
 
     WEFT_STATIC_ASSERT(L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
     WEFT_STATIC_ASSERT(L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
     WEFT_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     WEFT_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
-    WEFT_STATIC_ASSERT(SHARED_L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
-    WEFT_STATIC_ASSERT(SHARED_L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
-    WEFT_STATIC_ASSERT(SHARED_L1_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
-    WEFT_STATIC_ASSERT(SHARED_L2_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
 
     // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
     // always land on the same m_block_idx with n_block_idx differing by 1
@@ -419,38 +401,9 @@ struct MegaMoEScheduler {
         advance_sched_pipeline();
     }
 
-    template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK>
-    CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr) {
-        constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / 2;
-        WEFT_STATIC_ASSERT(kNumNClusters % kNumLocalityDomains == 0, "Each domain must take whole clusters");
-        const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
-        uint32_t m_block_idx, n_cluster_idx;
-        while (true) {
-            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
-
-            // Use dynamic scheduling to reduce tailing across shared L1/L2 tile shapes.
-            if (not get_next_task_idx<kNumNClusters>(task_count_ptr, num_m_blocks, m_block_idx, n_cluster_idx))
-                break;
-            const uint32_t valid_m = cute::min(num_tokens - m_block_idx * BLOCK_M, BLOCK_M);
-            publish_task(task_info_t(kBlockPhase, 0, m_block_idx, n_cluster_idx, m_block_idx, valid_m, kShapeN, kShapeK), lane_idx);
-        }
-    }
-
-    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains) {
+    CUTLASS_DEVICE void mainloop(const uint8_t* sm_locality_domains) {
         const auto lane_idx = ptx::get_lane_idx();
         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
-
-        // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
-        constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
-        const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
-        if constexpr (kHasShared) {
-            // Shared expert L1 tasks do not depend on dispatch.
-            shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
-                num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());
-            if (is_shared_l2_early)
-                shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
-                    num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
-        }
 
         // Wait dispatch's results
         fetch_expert_recv_count();
@@ -464,12 +417,6 @@ struct MegaMoEScheduler {
             task_info = get_next_task();
             if (task_info.is_valid()) publish_task(task_info, lane_idx);
         } while (task_info.is_valid());
-
-        if constexpr (kHasShared) {
-            if (not is_shared_l2_early)
-                shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
-                    num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
-        }
 
         // Sentinel.
         task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);

@@ -45,7 +45,7 @@ struct Workspace {
         if (fp4)
             for (int m : layout::kCandidateBlockM)
                 sf_ring = std::max(sf_ring, layout::get_num_sf_ring_tokens(ring, m));
-        layout::MegaMoEBuffer b(nullptr, h, i, ranks, experts, capacity, topk, ring, sf_ring, fp4, 0, true, fp4);
+        layout::MegaMoEBuffer b(nullptr, h, i, ranks, experts, capacity, topk, ring, sf_ring, fp4);
         bytes = b.get_num_bytes();
         offsets = {(Ptr)b.input_token_buffer.base,    (Ptr)b.input_sf_buffer.base,
                    (Ptr)b.input_topk_idx_buffer.base, (Ptr)b.input_topk_weights_buffer.base,
@@ -168,6 +168,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
         .def_readonly("sf_ring", &Workspace::sf_ring)
         .def_readonly("bytes", &Workspace::bytes)
         .def_readonly("offsets", &Workspace::offsets);
-    mod.attr("task_bytes") = sizeof(sched::TaskInfo<true>);
+    mod.attr("task_bytes") = sizeof(sched::TaskInfo);
     py::class_<Kernel>(mod, "Kernel").def(py::init<const std::string &, int, int>()).def("run", &Kernel::run);
 }

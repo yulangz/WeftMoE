@@ -2,6 +2,7 @@
 
 WeftMoE 在 Hopper/SM90a 上支持 BF16 和 blockwise FP8，在 Blackwell B300/SM103 上支持 BF16 和 NVFP4 routed MoE。
 B300 的前向和分组反向 GEMM 由 WeftMoE 直接编译 CUTLASS/CuTe 内核，wheel 随附固定版本的 CUTLASS 头文件。
+安装步骤、BF16/NVFP4 调用示例及单机和双机延迟见 [B300 使用与性能](docs/blackwell.md)。
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
 | Hopper 实现 | 用途 | 通信范围 | 训练缓存与反向 |
@@ -18,7 +19,7 @@ Hopper 单机采用 CUDA IPC/NVLink，跨机采用 NCCL GIN/GDAKI。多机协议
 
 ## 数值一致性与稳定性
 
-B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant` 时要求跨 EP 训推前向逐位一致、同 EP 反向重跑逐位一致。输入条件和选型规则见[B300 使用文档](docs/usage.md#b300-前向的-batch-invariance)。
+B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant` 时要求跨 EP 训推前向逐位一致、同 EP 反向重跑逐位一致。输入条件和选型规则见[B300 使用文档](docs/blackwell.md#batch-invariance-与-autotune)。
 
 ### Hopper / SM90 数值约定
 

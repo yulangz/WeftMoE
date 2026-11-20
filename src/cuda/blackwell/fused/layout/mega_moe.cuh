@@ -17,16 +17,15 @@ static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 1920;
 
-// Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
+// Allow for every source slot plus per-expert tail padding at any supported tile M.
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_tokens_per_rank, T num_topk,
-                                                        T num_experts_per_rank, bool allow_duplicate_routes = false) {
+                                                        T num_experts_per_rank) {
     const auto num_max_recv_tokens = num_ranks * num_max_tokens_per_rank;
     // Repeated slots can all target one expert. Padding is independent: every
     // locally owned expert may still need a partial final M tile.
-    const auto num_max_experts_per_token = allow_duplicate_routes ? num_topk : math::constexpr_min(num_topk, num_experts_per_rank);
     return math::constexpr_align(
-        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
+        num_max_recv_tokens * num_topk + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
         static_cast<T>(kLCMCandidateBlockM));
 }
 
@@ -34,12 +33,6 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T block_m) {
     return (num_ring_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
-}
-
-// Shared L2 input SF capacity: worst-case aligned SF pages over all candidate BLOCK_M.
-template <typename T>
-CUTLASS_HOST_DEVICE constexpr T get_num_max_shared_sf_tokens(const T& num_max_tokens_per_rank) {
-    return math::constexpr_ceil_div<T>(num_max_tokens_per_rank, kMinCandidateBlockM) * 128;
 }
 
 // Per-token source metadata for combine write-back
@@ -59,7 +52,6 @@ struct alignas(128) MegaMoESignals {
     static constexpr uint32_t kNumMaxExperts = 2048;
     static constexpr uint32_t kNumMaxExpertsPerRank = 512;
     static constexpr uint32_t kNumMaxRingBlocks = 1u << 20;  // 20 MiB for the ring signals
-    static constexpr uint32_t kNumMaxSharedL2Blocks = 1u << 15;  // 128 KiB
 
     // Grid and NVLink synchronization
     uint32_t grid_sync_count[kNumMaxGridSyncCounters];
@@ -69,8 +61,6 @@ struct alignas(128) MegaMoESignals {
     // Task scheduling
     uint32_t l1_task_count[kNumDeviceLocalityDomains];
     uint32_t l2_task_count[kNumDeviceLocalityDomains];
-    uint32_t shared_l1_task_count[kNumDeviceLocalityDomains];
-    uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
 
     // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
     // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
@@ -88,8 +78,6 @@ struct alignas(128) MegaMoESignals {
     uint64_t l2_full_mask[kNumMaxRingBlocks];
     uint32_t l2_empty_count[kNumMaxRingBlocks];
 
-    // Shared-expert signals
-    uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
 };
 WEFT_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 
@@ -109,7 +97,6 @@ struct Workspace {
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t source_slots_per_expert;
-    uint32_t num_shared_l2_pool_blocks;
 
     // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
@@ -122,13 +109,12 @@ struct Workspace {
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
               const uint32_t& num_topk,
-              const uint32_t& num_ring_tokens, bool allow_duplicate_routes = false):
+              const uint32_t& num_ring_tokens):
         signals(static_cast<MegaMoESignals*>(base)),
         num_ranks(num_ranks), num_experts(num_experts),
-        source_slots_per_expert(num_max_tokens_per_rank * (allow_duplicate_routes ? num_topk : 1)) {
+        source_slots_per_expert(num_max_tokens_per_rank * num_topk) {
         num_experts_per_rank = num_experts / num_ranks;
-        num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank, allow_duplicate_routes);
-        num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
+        num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
 
         WEFT_UNIFIED_ASSERT(num_ranks > 0);
         WEFT_UNIFIED_ASSERT(num_ranks <= kNumMaxRanks);
@@ -136,7 +122,6 @@ struct Workspace {
         WEFT_UNIFIED_ASSERT(num_experts <= MegaMoESignals::kNumMaxExperts);
         WEFT_UNIFIED_ASSERT(num_experts_per_rank <= MegaMoESignals::kNumMaxExpertsPerRank);
         WEFT_UNIFIED_ASSERT(num_ring_tokens <= MegaMoESignals::kNumMaxRingBlocks * kMinCandidateBlockM);
-        WEFT_UNIFIED_ASSERT(num_shared_l2_pool_blocks <= MegaMoESignals::kNumMaxSharedL2Blocks);
     }
 
     CUTLASS_HOST_DEVICE
@@ -201,16 +186,6 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
-    uint32_t* get_shared_l1_task_count_ptr() const {
-        return signals->shared_l1_task_count;
-    }
-
-    CUTLASS_DEVICE
-    uint32_t* get_shared_l2_task_count_ptr() const {
-        return signals->shared_l2_task_count;
-    }
-
-    CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return signals->expert_send_count + expert_idx;
     }
@@ -244,11 +219,6 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_l2_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
         return signals->l2_empty_count + ring_block_idx;
-    }
-
-    CUTLASS_DEVICE
-    uint32_t* get_shared_l2_full_count_ptr(const uint32_t& block_idx = 0) const {
-        return signals->shared_l2_full_count + block_idx;
     }
 
     // For dispatch pulling
@@ -366,11 +336,6 @@ struct MegaMoEBuffer {
            input_topk_weights_buffer;
 
     // Routed expert ring buffers
-    // NOTE: shared L1 tokens reuse `input_token_buffer`.
-    Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
-           shared_l2_token_buffer, shared_l2_sf_buffer;
-
-    // Routed expert ring buffers
     Buffer l1_token_buffer,
            l1_sf_buffer,
            l1_topk_weights_buffer,
@@ -388,25 +353,17 @@ struct MegaMoEBuffer {
                   const uint32_t& num_topk,
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
-                  const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0, bool allow_duplicate_routes = false, bool nvfp4 = false) {
+                  bool nvfp4) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
-                              num_max_tokens_per_rank, num_topk, num_ring_tokens, allow_duplicate_routes);
-
-        // Shared
-        const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-        const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
+                              num_max_tokens_per_rank, num_topk, num_ring_tokens);
 
         // Layouts
-        const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes / (nvfp4 ? 2 : 1));
+        const auto input_token_layout = layout::Data(nvfp4 ? hidden / 2 : hidden * 2);
         const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes / (nvfp4 ? 2 : 1));
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes / (nvfp4 ? 2 : 1));
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / (nvfp4 ? 16 : 32) : 0, false);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / (nvfp4 ? 16 : 32) : 0, false);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / (nvfp4 ? 16 : 32) : 0, false);
+        const auto intermediate_token_layout = layout::Data(nvfp4 ? intermediate_hidden / 2 : intermediate_hidden * 2);
+        const auto input_sf_layout = layout::Data(nvfp4 ? hidden / 16 : 0, false);
+        const auto intermediate_sf_layout = layout::Data(nvfp4 ? intermediate_hidden / 16 : 0, false);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
@@ -420,36 +377,22 @@ struct MegaMoEBuffer {
             input_token_buffer.get_end_ptr());
         input_topk_idx_buffer = Buffer(
             input_topk_idx_layout, 1, num_max_tokens_per_rank,
-            with_sf ? input_sf_buffer.get_end_ptr() : input_token_buffer.get_end_ptr());
+            nvfp4 ? input_sf_buffer.get_end_ptr() : input_token_buffer.get_end_ptr());
         input_topk_weights_buffer = Buffer(
             input_topk_weights_layout, 1, num_max_tokens_per_rank,
             input_topk_idx_buffer.get_end_ptr());
 
-        // Shared expert buffers
-        shared_l1_token_buffer = input_token_buffer;
-        shared_l1_sf_buffer = Buffer(
-            input_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
-            input_topk_weights_buffer.get_end_ptr());
-        shared_l2_token_buffer = Buffer(
-            shared_intermediate_token_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
-            with_sf ? shared_l1_sf_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr());
-        shared_l2_sf_buffer = Buffer(
-            shared_intermediate_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
-            shared_l2_token_buffer.get_end_ptr());
-
         // Routed expert ring buffers
         l1_token_buffer = Buffer(
             input_token_layout, 1, num_ring_tokens,
-            num_shared_experts > 0 ?
-                (with_sf ? shared_l2_sf_buffer.get_end_ptr() : shared_l2_token_buffer.get_end_ptr()) :
-                input_topk_weights_buffer.get_end_ptr()
+            input_topk_weights_buffer.get_end_ptr()
         );
         l1_sf_buffer = Buffer(
             input_sf_layout, 1, num_sf_ring_tokens,
             l1_token_buffer.get_end_ptr());
         l1_topk_weights_buffer = Buffer(
             l1_topk_weights_layout, 1, num_ring_tokens,
-            with_sf ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+            nvfp4 ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
 
         l2_token_buffer = Buffer(
             intermediate_token_layout, 1, num_ring_tokens,
@@ -459,8 +402,8 @@ struct MegaMoEBuffer {
             l2_token_buffer.get_end_ptr());
 
         combine_token_buffer = Buffer(
-            bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
-            with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+            bf16_token_layout, num_topk, num_max_tokens_per_rank,
+            nvfp4 ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE

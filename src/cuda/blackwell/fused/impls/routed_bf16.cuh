@@ -39,7 +39,6 @@ template <
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
     uint32_t L2_SHAPE_K = kIntermediateHidden,
-    uint32_t SHARED_L2_SHAPE_K = 0,
     uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
@@ -48,7 +47,7 @@ template <
     uint32_t kNumTokensPerWarp = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
-    typename task_info_t = sched::TaskInfo<false>
+    typename task_info_t = sched::TaskInfo
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 routed_bf16(void* y,
@@ -60,10 +59,6 @@ routed_bf16(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-
-
-
-
 
                          const uint8_t* sm_locality_domains,
                          const __grid_constant__ layout::BF16Checkpoint checkpoint) {
@@ -105,8 +100,7 @@ routed_bf16(void* y,
         kNumRanks, kNumExperts,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, 0,
-        /*with_sf=*/ false,
-        0, true
+        /*nvfp4=*/ false
     );
     const auto workspace = buffer.workspace;
 
@@ -247,8 +241,7 @@ routed_bf16(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks, kNumLocalityDomains,
-        0>(
+        kNumRingBlocks, kNumLocalityDomains>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -577,12 +570,8 @@ routed_bf16(void* y,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumDeviceLocalityDomains; ++ i) {
                     workspace.get_l1_task_count_ptr()[i] = workspace.get_l2_task_count_ptr()[i] = 0;
-                    workspace.get_shared_l1_task_count_ptr()[i] = workspace.get_shared_l2_task_count_ptr()[i] = 0;
                 }
             }
-            __syncwarp();
-            for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
-                *workspace.get_shared_l2_full_count_ptr(i) = 0;
             __syncwarp();
         } else {
             // Other SMs: clean blocks
@@ -642,17 +631,12 @@ routed_bf16(void* y,
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
-            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the token arrival
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
+                const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
-            } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
-                const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
-                const auto num_expected_blocks = SHARED_L2_SHAPE_K / (BLOCK_N / 2);
-                while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
@@ -666,7 +650,7 @@ routed_bf16(void* y,
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
                 // Compute token offset from ring block index
-                uint32_t m_idx = block_idx * BLOCK_M;
+                uint32_t m_idx = ring_block_idx * BLOCK_M;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
 
                 // Add 2 CTA offsets for non-leader CTA
@@ -702,7 +686,7 @@ routed_bf16(void* y,
             const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
 
             const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
-            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
+            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.local_expert_idx;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
@@ -828,7 +812,7 @@ routed_bf16(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens, sm_locality_domains);
+            scheduler.mainloop(sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -882,20 +866,16 @@ routed_bf16(void* y,
             const uint32_t valid_m = ptx::exchange(task_info.valid_m, 0);
             const uint32_t pool_block_idx = task_info.pool_block_idx;
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
-            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
-            const uint32_t m_idx = block_idx * BLOCK_M;
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;  // Full-pool offset for non-ring metadata
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
-                if (not task_info.is_shared()) {
-                    // Wait L2 block empty
-                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
-                }
+            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                // Wait L2 block empty
+                const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
+                while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -922,7 +902,7 @@ routed_bf16(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         WEFT_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                        if ((j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
@@ -1027,7 +1007,7 @@ routed_bf16(void* y,
                             tensor_map_l1_output_ptr,
                             shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx],
                             out_n_idx,
-                            m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
+                            ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
                         cute::tma_store_arrive();
                     }
                     __syncwarp();
@@ -1038,27 +1018,20 @@ routed_bf16(void* y,
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    if (task_info.is_shared()) {
-                        ptx::red_add_rel(
-                            workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
-                    } else {
-                        L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
+                    L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
 
-                        // Increment L1 empty count for this physical slot (one per N block)
-                        ptx::red_add(
-                            workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
-                    }
+                    // Increment L1 empty count for this physical slot (one per N block)
+                    ptx::red_add(
+                        workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
                 }
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if (not task_info.is_shared()) {
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        ptx::red_add(
-                            workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
-                    }
-                    __syncwarp();
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    ptx::red_add(
+                        workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
                 }
+                __syncwarp();
 
                 WEFT_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
@@ -1080,9 +1053,7 @@ routed_bf16(void* y,
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
                         const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
                         if (m_idx_in_block < valid_m)
-                            cached_src_metadata[j] = task_info.is_shared() ?
-                                layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
-                                *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                            cached_src_metadata[j] = *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
                     }
                     __syncwarp();
 
@@ -1258,9 +1229,9 @@ routed_bf16(void* y,
             uint32_t mask = total_mask;
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {
-                    // Shared slot goes first, then routed slots in top-k order
-                    const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
-                    mask ^= 1 << slot_idx;
+                    // Reduce routed slots in ascending order.
+                    const uint32_t slot_idx = __ffs(mask) - 1;
+                    mask &= mask - 1;
 
                     // Load
                     if (cute::elect_one_sync()) {

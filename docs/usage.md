@@ -2,36 +2,7 @@
 
 ## B300 / Blackwell
 
-BF16 任务沿用下方的 `TensorRuntime` API。安装 WeftMoE 后，runtime 按 compute capability 自动选择仓库内的 CUTLASS/CuTe 实现。wheel 随附 CUTLASS 头文件，从源码安装时先执行 `git submodule update --init third_party/cutlass`。首次遇到新的前向特化时用 CUDA 13 的 NVCC 编译，后续复用 `$WEFTMOE_ROOT/blackwell` 下的 cubin。B300 支持 DP-sharded BF16 输入、原始布局专家权重、训练及推理。单机使用 NVLink，多机使用 NCCL device GIN 和节点内 NVLink。双路 400G RoCE 的 NCCL 设置需在创建 process group 前生效，`benchmarks/sm100/run.sh` 会为本集群的八个 bonded HCA 设置这些参数。安装命令和实测结果见 [B300 benchmark](benchmarks-sm100.md)。
-
-### B300 前向的 batch invariance
-
-`TensorRuntime(..., batch_invariant=True)` 默认开启。对于 BF16 和 NVFP4，在同一硬件、内核版本和精度下，有两项约定。
-
-- 跨 EP 比较训练与推理前向时，只要专家权重和量化因子相同，同一 token 的输入、路由和 gate 相同，该 token 的输出就逐位一致，即使它在 batch 中的位置和相邻 token 改变。
-- 同一 EP 下，固定输入、权重、路由、gate、量化因子和上游梯度，重跑反向时 dX、dGate、dW1、dW2 逐位一致。
-
-两种开关设置在 B300 上都使用动态 M。单机按本次调用的本地 token 数估算每个专家的负载，多机按通信窗口实际提交给节点内核的行数估算。专家尾块按需缩窄。M 改变的是一次并排计算的行数，每行的 K 累加顺序和每个 token 的专家结果合并顺序保持一致。两个专家 GEMM 均用 N=128。BF16 用 K=64，NVFP4 按模型的 intermediate 维度选 K，可被 256 整除时用 256，其余支持的形状用 128。
-
-B300 无需预报负载或生成离线 M 配置表。`tools/autotune.py` 自动识别 B300 后会提示使用动态 M 并退出。SM90 的离线 autotune 用法见下文。固定与动态 M 的性能对照见[历史消融测试](benchmarks-sm100.md#动态与固定-m-实测)。
-
-### B300 NVFP4
-
-在 EP 组创建 `TensorRuntime(..., precision="nvfp4", training=False)`，使用现有 BF16 输入、int32 路由、FP32 gate 和标准布局 BF16 权重。推理时可以预先量化固定专家权重，每次调用仍会在线量化 X 和 SwiGLU 中间结果。
-
-```python
-from weftmoe.nvfp4 import prepare_nvfp4_weights
-
-weights = prepare_nvfp4_weights(w1, w2, weight_scales=(1/64, 1/64))
-y = runtime.inference_nvfp4(0, x, routes, gates, weights,
-                            x_scale=1/32, intermediate_scale=1/512)
-```
-
-每 16 个值共享一个 E4M3 块尺度，由块内绝对值最大值和该层的反量化因子计算。E2M1 使用最近偶数舍入。层级因子必须是有限正数，可随层配置，并在该层的各 EP rank 上保持一致。
-
-训练时使用 `training=True, precision="nvfp4"`，通过常规 `forward`、`backward` 或 `moe` 自动求导接口调用。可从 `weftmoe.nvfp4` 导入 `NVFP4Scales`，通过 `nvfp4_scales=NVFP4Scales(x=..., w1=..., intermediate=..., w2=..., dy=..., dgate_up=...)` 设置六个因子。每次训练前向量化当前 BF16 权重，四个反向 GEMM 沿各自的 K 维重新量化。输入、输出、激活梯度及参数梯度为 BF16，gate 及其梯度为 FP32。这套训练配方使用确定性舍入，未启用随机舍入或 Hadamard 变换。
-
-多机推理经 GIN 发送打包的 E2M1 激活及 E4M3 尺度，训练保留并传输 BF16 输入，供反向沿转置方向独立量化。反向传输的 dY 同样为 BF16。
+B300 的安装、BF16/NVFP4 训练及推理示例、动态 M 和实测延迟见 [B300 使用与性能](blackwell.md)。
 
 ## Hopper 安装与自动编译
 

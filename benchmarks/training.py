@@ -12,7 +12,6 @@ its cache-ready measurement ends with gradients live, before external release.
 """
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -24,7 +23,7 @@ import torch
 import torch.distributed as dist
 
 from benchmarks.models import add_model_arguments, resolve_model
-from benchmarks.workload import make_workload
+from benchmarks.workload import make_workload, workload_sha256
 
 
 def main(*, blackwell=False):
@@ -162,13 +161,8 @@ def main(*, blackwell=False):
     w2 = rand(owned, args.hidden, args.intermediate)
     for tokens in args.tokens:
         batches = make_workload(args, tokens, rank, "cuda", args.route_distribution)
-        digest = hashlib.sha256()
-        for routes, gates in batches:
-            digest.update(routes.shape[0].to_bytes(8, "little"))
-            digest.update(routes.numpy().tobytes())
-            digest.update(gates.numpy().tobytes())
         workload = dict(tokens=[routes.shape[0] for routes, _ in batches],
-                        sha256=digest.hexdigest())
+                        sha256=workload_sha256(batches))
         workloads = [None] * world
         dist.all_gather_object(workloads, workload)
         communication = None

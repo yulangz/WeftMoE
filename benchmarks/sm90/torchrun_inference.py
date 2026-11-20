@@ -24,7 +24,7 @@ import torch.distributed as dist
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from benchmarks.training_reference import gather_rows  # noqa: E402
-from benchmarks.workload import make_workload  # noqa: E402
+from benchmarks.workload import make_workload, workload_sha256  # noqa: E402
 from benchmarks.models import add_model_arguments, resolve_model  # noqa: E402
 from weftmoe.runtime import TensorRuntime  # noqa: E402
 
@@ -171,12 +171,7 @@ def main():
         packed_w1, packed_w2 = deep_gemm.transform_weights_for_mega_moe(w1, w2)
     for nominal in args.tokens:
         batches = make_workload(args, nominal, rank, "cuda")
-        digest = hashlib.sha256()
-        for routes, gates in batches:
-            digest.update(routes.shape[0].to_bytes(8, "little"))
-            digest.update(routes.numpy().tobytes())
-            digest.update(gates.numpy().tobytes())
-        workload = dict(tokens=[r.shape[0] for r, _ in batches], sha256=digest.hexdigest())
+        workload = dict(tokens=[r.shape[0] for r, _ in batches], sha256=workload_sha256(batches))
         workloads = [None] * world
         dist.all_gather_object(workloads, workload)
         capacity = max(args.pool_tokens, max(max(w["tokens"]) for w in workloads))

@@ -15,22 +15,19 @@ import torch.distributed as dist
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from benchmarks.models import add_model_arguments, resolve_model
 from benchmarks.sm100.hardware import check_blackwell
-from benchmarks.workload import make_workload
+from benchmarks.workload import decode_routes, make_workload, workload_sha256
 from weftmoe.runtime import TensorRuntime
 
 
 def decode_trace(args, n, rank, world):
-    # Mirror SGLang's global routing RNG, including the capture and parity inputs.
-    rng = torch.Generator(device="cuda").manual_seed(args.seed + n * world)
-    bias = torch.randn(args.experts, device="cuda", generator=rng) * args.route_bias_std
     logits = torch.empty(n * world, args.experts, device="cuda")
+    routes = decode_routes(args, logits)
+    next(routes)  # CUDA Graph capture input
+    next(routes)  # eager/replay parity input
     trace = []
     digest = hashlib.sha256()
-    for step in range(2 + args.warmups + args.samples):
-        scores, ids = logits.normal_(generator=rng).add_(bias).topk(args.top_k)
-        if step < 2:
-            continue
-        ids, gates = ids.int(), scores.softmax(-1)
+    for _ in range(args.warmups + args.samples):
+        ids, gates = next(routes)
         digest.update(ids.cpu().numpy().tobytes())
         digest.update(gates.cpu().numpy().tobytes())
         rows = slice(n * rank, n * (rank + 1))
@@ -64,12 +61,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         trace, digest = decode_trace(args, n, rank, world)
     else:
         trace = make_workload(args, n, rank, "cuda")
-        digest = hashlib.sha256()
-        for ids, gates in trace:
-            digest.update(len(ids).to_bytes(8, "little"))
-            digest.update(ids.numpy().tobytes())
-            digest.update(gates.numpy().tobytes())
-        digest = digest.hexdigest()
+        digest = workload_sha256(trace)
     capacity = torch.tensor(max(len(ids) for ids, _ in trace), device="cuda")
     dist.all_reduce(capacity, op=dist.ReduceOp.MAX)
     cap = int(capacity)

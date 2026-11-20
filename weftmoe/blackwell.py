@@ -8,6 +8,12 @@ import triton.language as tl
 
 
 @triton.jit
+def _sorted_route_keys(ids, slots, experts: tl.constexpr, block: tl.constexpr):
+    # Invalid routes sort last. The original slot breaks ties between experts.
+    return tl.sort(tl.where((ids >= 0) & (ids < experts), ids, experts) * block + slots)
+
+
+@triton.jit
 def _stage_inputs(
     X,
     Routes,
@@ -36,8 +42,7 @@ def _stage_inputs(
     valid = (rows[:, None] < tokens) & (slots[None, :] < K)
     ids = tl.load(Routes + indices, valid, -1)
     weights = tl.load(Gates + indices, valid, 0.0)
-    key = tl.where((ids >= 0) & (ids < E), ids, E) * BK + slots[None, :]
-    ordered = tl.sort(key, descending=False)
+    ordered = _sorted_route_keys(ids, slots[None, :], E, BK)
     expert = ordered // BK
     tl.store(SR + indices, tl.where(expert < E, expert, -1), valid)
     tl.store(SG + indices, tl.gather(weights, ordered % BK, axis=1), valid)
@@ -46,7 +51,9 @@ def _stage_inputs(
 class BlackwellRuntime:
     """One symmetric workspace, serialized on the supplied CUDA stream."""
 
-    def __init__(self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved):
+    def __init__(
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *, fp4=False,
+    ):
         from .blackwell_cutlass import ExpertWorkspace, launch
 
         # A legacy default stream cannot join a caller's CUDA Graph capture.
@@ -66,10 +73,11 @@ class BlackwellRuntime:
             top_k,
             hidden,
             intermediate,
+            fp4=fp4,
         )
 
         if training:
-            self.wgrad_stream = torch.cuda.Stream(device=stream.device)
+            self.wgrad_stream = None if fp4 else torch.cuda.Stream(device=stream.device)
             self.alignment = 128
             self.peers = torch.tensor(self.buffer.handle.buffer_ptrs, dtype=torch.int64, device=stream.device)
 

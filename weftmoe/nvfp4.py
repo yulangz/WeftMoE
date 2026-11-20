@@ -2,14 +2,13 @@
 
 from dataclasses import dataclass
 import math
-import weakref
 from typing import NamedTuple
 
 import torch
 import triton
 import triton.language as tl
 
-from .blackwell import BlackwellRuntime
+from .blackwell import BlackwellRuntime, _sorted_route_keys
 
 
 @triton.jit
@@ -72,7 +71,7 @@ def _route(R, G, SR, SG, E: tl.constexpr, K: tl.constexpr, BK: tl.constexpr):
     slot = tl.arange(0, BK)
     ids = tl.load(R + row * K + slot, slot < K, -1)
     gates = tl.load(G + row * K + slot, slot < K, 0.0)
-    keys = tl.sort(tl.where((ids >= 0) & (ids < E), ids, E) * BK + slot, descending=False)
+    keys = _sorted_route_keys(ids, slot, E, BK)
     tl.store(SR + row * K + slot, tl.where(keys // BK < E, keys // BK, -1), slot < K)
     tl.store(SG + row * K + slot, tl.gather(gates, keys % BK, 0), slot < K)
 
@@ -198,29 +197,15 @@ class NVFP4Runtime(BlackwellRuntime):
     def __init__(
         self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1,
     ):
-
-        from .blackwell_cutlass import ExpertWorkspace, launch
-
-        self.buffer = ExpertWorkspace(
-            group, experts, max(1, capacity), top_k, hidden, intermediate, fp4=True,
+        super().__init__(
+            group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, fp4=True,
         )
-        self.stream = (
-            stream
-            if training or stream != torch.cuda.default_stream(stream.device)
-            else torch.cuda.Stream(device=stream.device)
-        )
-
-        self.launch = launch
-        self.training, self.max_saved = training, max_saved
-        self.tapes = weakref.WeakSet()
         self.scales = NVFP4Scales()
-        self.wgrad_stream = None
         if training:
             import torch.distributed._symmetric_memory as symm
             from .nvfp4_backward import expert_gradients
 
             self.expert_gradients = expert_gradients
-            self.alignment = 128
             allocator = torch if group.size() == 1 else symm
             self.dy_buffer = allocator.empty(
                 (self.buffer.num_max_tokens_per_rank, hidden), dtype=torch.bfloat16, device=stream.device
@@ -228,7 +213,6 @@ class NVFP4Runtime(BlackwellRuntime):
             self.dy_handle = None if group.size() == 1 else symm.rendezvous(self.dy_buffer, group=group)
             pointers = self.dy_handle.buffer_ptrs if self.dy_handle else [self.dy_buffer.data_ptr()]
             self.dy_peers = torch.tensor(pointers, device=stream.device, dtype=torch.int64)
-            self.peers = torch.tensor(self.buffer.handle.buffer_ptrs, device=stream.device, dtype=torch.int64)
 
     def _run(self, x, routes, gates, w1, w2, *, save=False):
         from .blackwell_backward import Tape, checkpoint
@@ -288,6 +272,6 @@ class NVFP4Runtime(BlackwellRuntime):
         return result
 
     def retire_peer_mappings(self):
-        self.buffer.destroy()
+        super().retire_peer_mappings()
         if self.training:
             self.dy_handle = self.dy_buffer = None

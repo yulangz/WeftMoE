@@ -11,7 +11,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from .blackwell import BlackwellRuntime
+from .blackwell import BlackwellRuntime, _sorted_route_keys
 from .nvfp4 import NVFP4Runtime, _encode_row, _pack_rows, prepare_nvfp4_weights, save_routed_x
 from .blackwell_gin import RailWindow
 
@@ -55,7 +55,7 @@ def _packet(
         slot = tl.arange(0, BK)
         ids = tl.load(Routes + row * K + slot, slot < K, -1)
         weights = tl.load(Gates + row * K + slot, slot < K, 0.0)
-        keys = tl.sort(tl.where((ids >= 0) & (ids < E), ids, E) * BK + slot)
+        keys = _sorted_route_keys(ids, slot, E, BK)
         expert = keys // BK
         tl.store((base + payload).to(tl.pointer_type(tl.int32)) + slot, expert, slot < K)
         tl.store(
@@ -227,7 +227,7 @@ def _gradient_sum(
     if part == 0:
         slots = tl.arange(0, BK)
         ids = tl.load(Routes + row * K + slots, slots < K, -1)
-        keys = tl.sort(tl.where((ids >= 0) & (ids < E), ids, E) * BK + slots)
+        keys = _sorted_route_keys(ids, slots, E, BK)
         owner = (keys // BK) // (E // NODES)
         value = tl.full((BK,), 0, tl.float32)
         for node in tl.static_range(NODES):

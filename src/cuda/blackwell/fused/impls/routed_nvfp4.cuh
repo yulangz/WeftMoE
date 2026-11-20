@@ -43,7 +43,6 @@ template <
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
     uint32_t L2_SHAPE_K = kIntermediateHidden,
-    uint32_t SHARED_L2_SHAPE_K = 0,
     uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
@@ -52,8 +51,7 @@ template <
     uint32_t kNumTokensPerWarp = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
-    uint32_t kNumSharedSFTokens = layout::get_num_max_shared_sf_tokens(kNumMaxTokensPerRank),
-    typename task_info_t = sched::TaskInfo<false>
+    typename task_info_t = sched::TaskInfo
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 routed_nvfp4(void* y,
@@ -69,14 +67,6 @@ routed_nvfp4(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf,
-
-
-
-
-
-
-
-
 
                             const uint8_t* sm_locality_domains, float fc1_scale, float hidden_scale, float hidden_inv_scale, float fc2_scale,
                             const __grid_constant__ layout::BF16Checkpoint checkpoint) {
@@ -123,8 +113,7 @@ routed_nvfp4(void* y,
         kNumRanks, kNumExperts,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens,
-        /*with_sf=*/ true,
-        0, true, true
+        /*nvfp4=*/ true
     );
     const auto workspace = buffer.workspace;
 
@@ -148,7 +137,6 @@ routed_nvfp4(void* y,
     // Data types
     // Activation storage is byte-addressed; each byte holds two E2M1 values.
     using a_dtype_t = cutlass::float_e4m3_t;
-    using shared_b_dtype_t = cutlass::float_e4m3_t;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -293,8 +281,7 @@ routed_nvfp4(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks, kNumLocalityDomains,
-        0>(
+        kNumRingBlocks, kNumLocalityDomains>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -637,12 +624,8 @@ routed_nvfp4(void* y,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumDeviceLocalityDomains; ++ i) {
                     workspace.get_l1_task_count_ptr()[i] = workspace.get_l2_task_count_ptr()[i] = 0;
-                    workspace.get_shared_l1_task_count_ptr()[i] = workspace.get_shared_l2_task_count_ptr()[i] = 0;
                 }
             }
-            __syncwarp();
-            for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
-                *workspace.get_shared_l2_full_count_ptr(i) = 0;
             __syncwarp();
         } else {
             // Other SMs: clean blocks
@@ -704,17 +687,12 @@ routed_nvfp4(void* y,
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
-            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
 
             // Wait the entire token arrival
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
+                const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
-            } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
-                const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
-                const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
-                while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
@@ -726,9 +704,9 @@ routed_nvfp4(void* y,
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
                 // Compute token offsets from block index
-                uint32_t m_idx = block_idx * BLOCK_M;
+                uint32_t m_idx = ring_block_idx * BLOCK_M;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
-                const uint32_t sfa_m_idx = block_idx * SF_BLOCK_M;
+                const uint32_t sfa_m_idx = ring_block_idx * SF_BLOCK_M;
                 uint32_t sfa_k_idx = k_block_idx * (BLOCK_K / kSFGroupK);
 
                 // Add 2 CTA offsets for non-leader CTA
@@ -769,7 +747,7 @@ routed_nvfp4(void* y,
             const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
 
             const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
-            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
+            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.local_expert_idx;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
@@ -778,7 +756,7 @@ routed_nvfp4(void* y,
                 // Compute weight offset
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / kSFGroupK) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / kSFGroupK);
+                uint32_t sfb_k_idx = task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / kSFGroupK);
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
@@ -804,21 +782,15 @@ routed_nvfp4(void* y,
         if (is_leader_cta) {
             // Make instruction descriptor with block scaling
             // NOTES: always swap A/B
-            auto routed_instr_desc = cute::UMMA::make_instr_desc_block_scaled<
+            auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
                     cutlass::float_e2m1_t,
                     cutlass::float_e2m1_t, float,
                     cutlass::float_ue4m3_t,
                     UMMA_M, UMMA_N,
                     cute::UMMA::Major::K, cute::UMMA::Major::K
                 >();
-            auto shared_instr_desc = cute::UMMA::make_instr_desc_block_scaled<
-                shared_b_dtype_t, a_dtype_t, float, cutlass::float_ue8m0_t,
-                UMMA_M, UMMA_N,
-                cute::UMMA::Major::K, cute::UMMA::Major::K
-            >();
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
-            WEFT_STATIC_ASSERT(sizeof(weight_dtype_t) == sizeof(shared_b_dtype_t), "Weight SMEM descriptors must use identical addressing");
             WEFT_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K / kPack, kSwizzleAMode>(shared_storage.smem_a[0], 0, 0);
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K / kPack, kSwizzleBMode>(shared_storage.smem_b[0], 0, 0);
@@ -838,7 +810,6 @@ routed_nvfp4(void* y,
                 const auto num_k_blocks = task_info.shape_k / BLOCK_K;
 
                 // Dynamic update of UMMA N based on effective M
-                auto& instr_desc = task_info.is_shared() ? shared_instr_desc : routed_instr_desc;
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
 
                 // Wait tensor memory empty barrier arrival
@@ -930,7 +901,7 @@ routed_nvfp4(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens, sm_locality_domains);
+            scheduler.mainloop(sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -984,9 +955,7 @@ routed_nvfp4(void* y,
             const uint32_t num_valid_wg_rows = valid_m <= wg_start_m ? 0u : cute::min(valid_m - wg_start_m, WG_BLOCK_M);
             const uint32_t pool_block_idx = task_info.pool_block_idx;
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
-            const uint32_t block_idx = task_info.is_shared() ? pool_block_idx : ring_block_idx;
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
-            const uint32_t m_idx = block_idx * BLOCK_M;
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;  // Full-pool offset for non-ring metadata
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             uint32_t n_idx = n_block_idx * BLOCK_N;
@@ -1043,13 +1012,11 @@ routed_nvfp4(void* y,
                     load_epi_block_if_valid(s + kNumPrefetchStages, num_valid_store_blocks, raw_values);
             };
 
-            if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
-                if (not task_info.is_shared()) {
-                    // Wait L2 block empty
-                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
-                }
+            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+                // Wait L2 block empty
+                const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
+                while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -1080,7 +1047,7 @@ routed_nvfp4(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         WEFT_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                        if ((j * ATOM_M) % 32 == 0 and
                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *buffer.l1_topk_weights_buffer
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
@@ -1173,7 +1140,7 @@ routed_nvfp4(void* y,
                         const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L1
                                            + i * ATOM_M + (lane_idx % 4) * 2;
                         const uint32_t feature = n_block_idx * L1_OUT_BLOCK_N + warp_idx_in_wg * 16;
-                        const auto sf_row = block_idx * SF_BLOCK_M + transform_sf_token_idx(row);
+                        const auto sf_row = ring_block_idx * SF_BLOCK_M + transform_sf_token_idx(row);
                         const auto sf_group = feature / 16;
                         auto* scales = buffer.l2_sf_buffer.get_base_ptr<uint8_t>();
                         const float factor = hidden_inv_scale * (1.f / 6.f);
@@ -1231,7 +1198,7 @@ routed_nvfp4(void* y,
                             tensor_map_l1_output_ptr,
                             shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx],
                             out_n_idx,
-                            m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L1);
+                            ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L1);
                         cute::tma_store_arrive();
                     }
                     __syncwarp();
@@ -1242,27 +1209,20 @@ routed_nvfp4(void* y,
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    if (task_info.is_shared()) {
-                        ptx::red_add_rel(
-                            workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
-                    } else {
-                        L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
+                    L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
 
-                        // Increment L1 empty count for this physical slot (one per N block)
-                        ptx::red_add(
-                            workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
-                    }
+                    // Increment L1 empty count for this physical slot (one per N block)
+                    ptx::red_add(
+                        workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
                 }
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if (not task_info.is_shared()) {
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        ptx::red_add(
-                            workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
-                    }
-                    __syncwarp();
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    ptx::red_add(
+                        workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
                 }
+                __syncwarp();
 
                 constexpr uint32_t kNumAtomsPerStore = STORE_BLOCK_M_L2 / ATOM_M;
                 constexpr uint32_t kNumStoreBlocks = WG_BLOCK_M / STORE_BLOCK_M_L2;
@@ -1287,9 +1247,7 @@ routed_nvfp4(void* y,
                     for (uint32_t j = 0; j < kNumAtomsPerStore; ++ j) {
                         const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M_L2 + j * ATOM_M + warp_idx_in_wg * 2 + lane_idx / 16;
                         if (m_idx_in_block < valid_m)
-                            cached_src_metadata[j] = task_info.is_shared() ?
-                                layout::TokenSrcMetadata(sym_buffer.rank_idx, pool_m_idx + m_idx_in_block, kNumTopk) :
-                                *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
+                            cached_src_metadata[j] = *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
                     }
                     __syncwarp();
 
@@ -1451,9 +1409,9 @@ routed_nvfp4(void* y,
             uint32_t mask = total_mask;
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {
-                    // Shared slot goes first, then routed slots in top-k order
-                    const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
-                    mask ^= 1 << slot_idx;
+                    // Reduce routed slots in ascending order.
+                    const uint32_t slot_idx = __ffs(mask) - 1;
+                    mask &= mask - 1;
 
                     // Load
                     if (cute::elect_one_sync()) {

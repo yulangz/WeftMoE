@@ -1,5 +1,6 @@
 """Reproducible varying-token route traces shared by all MoE benchmarks."""
 
+import hashlib
 import math
 import random
 
@@ -51,3 +52,23 @@ def make_workload(args, nominal_tokens, rank, device, route_distribution="random
             routes = balanced_routes(tokens, args.experts, args.top_k, device, balanced_rng)
         batches.append((routes.int().cpu(), scores.softmax(dim=-1).cpu()))
     return batches
+
+
+def workload_sha256(batches):
+    """Hash CPU route traces, including each variable-length batch boundary."""
+    digest = hashlib.sha256()
+    for routes, gates in batches:
+        digest.update(len(routes).to_bytes(8, "little"))
+        digest.update(routes.numpy().tobytes())
+        digest.update(gates.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def decode_routes(args, logits):
+    """Yield global decode routes for capture, parity, warmup and timed steps."""
+    tokens, experts = logits.shape
+    rng = torch.Generator(device=logits.device).manual_seed(args.seed + tokens)
+    bias = torch.randn(experts, device=logits.device, generator=rng) * args.route_bias_std
+    while True:
+        scores, ids = logits.normal_(generator=rng).add_(bias).topk(args.top_k, dim=-1)
+        yield ids.int(), scores.softmax(-1)

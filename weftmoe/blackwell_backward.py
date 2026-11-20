@@ -8,6 +8,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from .blackwell import _sorted_route_keys
+
 
 @dataclass(eq=False)
 class Tape:
@@ -161,7 +163,7 @@ def _combine(
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     slots = tl.arange(0, BK)
     ids = tl.load(Routes + row * K + slots, slots < K, -1)
-    keys = tl.sort(tl.where((ids >= 0) & (ids < E), ids, E) * BK + slots)
+    keys = _sorted_route_keys(ids, slots, E, BK)
     acc = tl.full((BLOCK,), 0, tl.float32)
     for j in tl.static_range(K):
         key = tl.sum(tl.where(slots == j, keys, 0), 0)
