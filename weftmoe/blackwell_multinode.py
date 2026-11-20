@@ -273,7 +273,7 @@ class MultiNodeRuntime(BlackwellRuntime):
             training,
             max_saved,
         )
-        self.nvfp4 = self.buffer.mma_type == "nvfp4"
+        self.nvfp4 = self.buffer.fp4
         self.compact_nvfp4 = self.nvfp4 and not training
         payload = hidden // 2 + hidden // 16 if self.compact_nvfp4 else hidden * 2
         self.packet_stride = triton.cdiv(16 + self.cap * (payload + 8 * top_k), 128) * 128
@@ -368,7 +368,7 @@ class MultiNodeRuntime(BlackwellRuntime):
 
                 if len(self.tapes) >= self.max_saved:
                     raise RuntimeError("Blackwell training tape capacity exhausted")
-                buffers, ends = checkpoint(b, cap * nodes, x.device, self.alignment, pad_empty=self.nvfp4)
+                buffers, ends = checkpoint(b, cap * nodes, x.device, self.alignment)
             options = dict(saved=buffers if save else ())
             if self.nvfp4:
                 if prepared is None:

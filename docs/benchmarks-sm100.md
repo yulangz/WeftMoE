@@ -177,11 +177,11 @@ EP8 使用 DeepEP `1.2.1+9af0e0d` 和 NVSHMEM 3.4.5。EP16 使用回移补丁构
 
 CSV 汇总与逐样本日志位于 `benchmarks/results/sm100-b300/deepep/`。
 
-## Blackwell 单机 BF16
+## Blackwell CUTLASS 实现
 
 下文 BF16 和 NVFP4 的历史性能矩阵均使用动态 M 和可缩小的专家尾块。这也是当前默认路径。历史固定 M 的性能对照见[动态与固定 M 实测](#动态与固定-m-实测)。
 
-配套的 DeepGEMM 提交为 `cd3f06dfe368d17004279727f99e30ba18dad27a`（分支 `feat/blackwell-moe`，基于 `5081f851`）。该版本增加了原始 FC1 权重的 5 维 TMA 描述符和可选训练 checkpoint。单机 `TensorRuntime` 按 CUDA compute capability 选择实现。权重保持 `[E_local, 2I, H]` 和 `[E_local, H, I]`。输入按 (expert, slot) 稳定排序，NVLink dispatch、两层 TCGEN05 GEMM、SwiGLU 和 combine 在一个 persistent kernel 中执行。训练时固定每个源 rank 的 expert 行序号，在同一 kernel 内写出 BF16 X 和 gate/up。BWD 通过对称内存读取 dY、返回 dX 和 dGate，按固定行序用 grouped GEMM 计算 dW。
+当前实现使用 WeftMoE 的 CUTLASS/CuTe 内核。较早的性能矩阵使用 WeftMoE `8a70d31` 对应的外置 DeepGEMM 路径（配套提交 `cd3f06d`）。单机 `TensorRuntime` 按 CUDA compute capability 选择实现。权重保持 `[E_local, 2I, H]` 和 `[E_local, H, I]`。输入按 (expert, slot) 稳定排序，NVLink dispatch、两层 TCGEN05 GEMM、SwiGLU 和 combine 在一个 persistent kernel 中执行。训练时固定每个源 rank 的 expert 行序号，在同一 kernel 内写出 BF16 X 和 gate/up。BWD 通过对称内存读取 dY、返回 dX 和 dGate，按固定行序用 grouped GEMM 计算 dW。
 
 本机已在仓库的 `build/sm100-env` 建立独立 Python 环境。使用下面的命令复现。
 
@@ -193,12 +193,46 @@ benchmarks/sm100/run.sh weft-training --model qwen35b --precision bf16 --samples
 PYTHONPATH=. "$PYTHON" -m torch.distributed.run --standalone --nproc-per-node=8 tests/torchrun_sm100_invariant.py
 ```
 
-在另一套已有 PyTorch、Triton、CUDA 13、GCC 13 和 elfutils 开发头文件的环境中，可从本工作区旁边的 DeepGEMM 源码单独安装。两个仓库的修改需要配套使用。
+从源码构建 WeftMoE 时，初始化固定版本的 NVIDIA CUTLASS 头文件。wheel 包含相同头文件。在 B300 运行前配置 CUDA 13、可用的 C++ 编译器、PyTorch 和 Triton，多机另需本节的 NCCL GIN 环境。
 
 ```bash
-git -C ../DeepGEMM submodule update --init --recursive
-CXX=g++-13 CXXFLAGS=-g0 DG_FORCE_BUILD=1 uv pip install --no-build-isolation --no-deps ../DeepGEMM
+git submodule update --init third_party/cutlass
+python -m pip install --no-build-isolation .
 ```
+
+`weft` 默认独立运行。单机复现表中的 MegaMoE 对照时另外安装外部基线并加 `--compare-mega`，混合精度对照沿用 `--mega-mixed`。批量脚本用 `COMPARE_MEGAMOE=1` 开启该对照。
+
+前向的路由调度、TCGEN05 流水线和设备端通信代码沿用并改写了 MIT 授权的 MegaMoE 实现，源码与许可随 WeftMoE 发布。WeftMoE 自己管理对称显存、TMA 描述符、编译缓存和 kernel launch。BF16 和 NVFP4 的反向 grouped GEMM 使用 CUTLASS。
+
+### 独立 wheel 数值验证
+
+在屏蔽 `deep_gemm` 和 `deep_jit` 导入的环境中，`tests/torchrun_sm100_training_invariance.py` 使用动态 M 和 `batch_invariant=True` 跑了 95 组。EP8、EP16、EP32 分别为 30、35、30 组，EP16 包含跨通信窗口的 batch。对相同锚点 token，EP1 训练与分布式推理、EP1 推理与分布式训练的 BF16 输出均逐位相等。同一 EP 重跑 BWD，dX、dGate、dW1、dW2 均逐位相等。用例覆盖 BF16、NVFP4，以及 NVFP4 的 K128 和 K256。
+
+BF16 在 Qwen35B、2048 tokens/rank 的独立 PyTorch 参考上，输出和四个梯度的最大相对 L2 为 EP8 的 `9.50e-5` 和 EP16 的 `1.15e-4`（向上取整）。NVFP4 在 EP8 测了默认尺度和两组非二次幂尺度。独立参考按 E2M1 × E4M3 还原块，FP32 累加结束后乘两个操作数的 tensor scale 乘积。三组的输出、dX、dW1、dW2 相对 L2 均为 0，dGate 最大为 `1.48e-7`（向上取整）。
+
+### 独立 wheel 与框架基线
+
+Qwen35B，每个样本取最慢 rank 的耗时，再取 p50。每格为 WeftMoE / 框架基线。decode 为 64 tokens/rank，以 SGLang 为基线。prefill 与 BWD 均为名义 8192 tokens/rank 的变长 workload，取历史 Megatron 两种 dispatcher 中较快的一项。prefill 计时 WeftMoE 推理前向，Megatron 对应计时包含训练缓存写入。12 个测试点逐 rank 路由 SHA-256 均与基线一致。
+
+| EP | 精度 | decode（µs） | prefill（ms） | BWD（ms） |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | BF16 | 69.59 / 98.35 | 1.336 / 3.944 | 2.302 / 4.397 |
+| 8 | NVFP4 | 49.62 / 91.50 | 1.196 / 8.132 | 2.246 / 7.359 |
+| 16 | BF16 | 191.02 / 306.78 | 3.986 / 7.325 | 3.799 / 6.241 |
+| 16 | NVFP4 | 177.65 / 309.17 | 3.664 / 9.770 | 3.677 / 7.446 |
+
+与迁移前 WeftMoE 的记录比较，EP16 decode 的 BF16/NVFP4 延迟分别增加 11.0%/12.0%，EP8 BF16 BWD 增加 8.6%。EP8 NVFP4 BWD 为 2.246 ms，两版在该精度下相同。原始复测记录在 `benchmarks/results/sm100-b300/weft/routed-dist-perf-{8,16}.node0.log`。下文其他模型和 token 数的历史表保留原测量值。
+
+### EP8 与 MegaMoE 同轮对照
+
+Qwen35B 同精度、同路由。WeftMoE 的计时包含输入 staging 和路由排序，MegaMoE 从预先就绪的输入和权重开始。两者每一步的输出元素均相等。
+
+| 精度 | decode 64 tokens/rank，Weft / MegaMoE（µs） | prefill 8192 tokens/rank，Weft / MegaMoE（ms） |
+| --- | ---: | ---: |
+| BF16 | 69.26 / 66.77 | 1.319 / 1.219 |
+| NVFP4 | 49.35 / 46.03 | 1.183 / 1.084 |
+
+## Blackwell 单机 BF16（迁移前）
 
 ### EP8 前向延迟
 

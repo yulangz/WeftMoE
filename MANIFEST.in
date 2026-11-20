@@ -15,3 +15,7 @@ prune benchmarks/results
 prune docs
 prune artifacts
 prune build
+
+include src/cuda/blackwell/fused/LICENSE-DeepSeek
+graft third_party/cutlass/include
+include third_party/cutlass/LICENSE.txt

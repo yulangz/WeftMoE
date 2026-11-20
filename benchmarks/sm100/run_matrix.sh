@@ -37,8 +37,9 @@ for model in qwen35b qwen122b flash; do
   if [[ $frameworks == weft ]]; then
     for precision in bf16 fp4; do
       ref=()
-      if [[ $precision == fp4 && ${NNODES:-1} == 1 ]]; then
-        ref=(--mega-mixed)
+      if [[ ${COMPARE_MEGAMOE:-0} == 1 && ${NNODES:-1} == 1 ]]; then
+        ref=(--compare-mega)
+        if [[ $precision == fp4 ]]; then ref=(--mega-mixed); fi
       fi
       run weft "$model" "$precision" decode --mode decode "${ref[@]}"
       run weft "$model" "$precision" prefill --mode prefill "${ref[@]}"

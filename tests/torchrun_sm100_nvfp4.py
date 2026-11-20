@@ -10,11 +10,11 @@ from weftmoe.nvfp4 import _pack_rows, prepare_nvfp4_weights
 from weftmoe.runtime import TensorRuntime
 
 
-def round_nvfp4(x, tensor_scale):
+def round_nvfp4_blocks(x, tensor_scale):
     block = x.float().unflatten(-1, (-1, 16))
     sf = (block.abs().amax(-1, keepdim=True) / (6 * tensor_scale)).clamp(max=448)
-    sf = sf.to(torch.float8_e4m3fn).float() * tensor_scale
-    absolute = torch.where(sf > 0, block.abs() / sf, 0.0)
+    sf = sf.to(torch.float8_e4m3fn).float()
+    absolute = torch.where(sf > 0, block.abs() / (sf * tensor_scale), 0.0)
     midpoints = x.new_tensor(
         [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32
     )
@@ -27,19 +27,22 @@ def round_nvfp4(x, tensor_scale):
     return (magnitudes[code] * block.sign() * sf).flatten(-2)
 
 
+def reference_gemm(a, b, scale_a, scale_b):
+    # TCGEN05 consumes E2M1 values and block scales. The epilogue applies the
+    # layer scales once to the FP32 accumulator before the BF16 conversion.
+    return (round_nvfp4_blocks(a, scale_a) @ round_nvfp4_blocks(b, scale_b).T) * (scale_a * scale_b)
+
+
 def reference(x, routes, gates, w1, w2, scales):
     sx, s1, sm, s2 = scales
-    x = round_nvfp4(x, sx)
-    result = torch.zeros_like(x)
+    result = torch.zeros_like(x, dtype=torch.float32)
     for e in range(len(w1)):
         for slot in range(routes.shape[1]):
             rows = torch.where(routes[:, slot] == e)[0]
             if rows.numel():
-                a, b = (
-                    (x[rows] @ round_nvfp4(w1[e], s1).T).bfloat16().float().chunk(2, 1)
-                )
+                a, b = reference_gemm(x[rows], w1[e], sx, s1).bfloat16().float().chunk(2, 1)
                 u = torch.nn.functional.silu(a) * b * gates[rows, slot, None]
-                component = round_nvfp4(u, sm) @ round_nvfp4(w2[e], s2).T
+                component = reference_gemm(u, w2[e], sm, s2)
                 result[rows] += component.bfloat16().float()
     return result.bfloat16()
 

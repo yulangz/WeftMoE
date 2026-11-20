@@ -17,6 +17,12 @@ class SourceBuild(build_py):
         for name in ('include', 'src', 'configs/profiles'):
             shutil.copytree(ROOT / name, destination / name, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        cutlass = ROOT / 'third_party/cutlass'
+        if not (cutlass / 'include/cute/tensor.hpp').is_file():
+            raise RuntimeError('Initialize the CUTLASS submodule before building a wheel')
+        target = destination / 'third_party/cutlass'
+        shutil.copytree(cutlass / 'include', target / 'include', dirs_exist_ok=True)
+        shutil.copy2(cutlass / 'LICENSE.txt', target / 'LICENSE.txt')
         (destination / 'tools').mkdir(exist_ok=True)
         shutil.copy2(ROOT / 'tools/build_tensor_runtime.py', destination / 'tools/build_tensor_runtime.py')
 

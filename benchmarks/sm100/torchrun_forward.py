@@ -54,7 +54,8 @@ def pack_mega_mixed(w1, w2):
 
 
 def measure(args, n, w1, w2, packed, group, mixed_weights=None):
-    import deep_gemm as dg
+    if args.compare_mega:
+        import deep_gemm as dg
 
     rank, world = group.rank(), group.size()
     decode = args.mode == "decode"
@@ -94,7 +95,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             args.intermediate,
             mma_type="fp8xfp4" if mixed_weights else "nvfp4" if nvfp4 else "bf16xbf16",
         )
-        if packed is not None and group.size() == int(os.environ["LOCAL_WORLD_SIZE"])
+        if args.compare_mega and packed is not None and group.size() == int(os.environ["LOCAL_WORLD_SIZE"])
         else None
     )
     x = torch.empty(cap, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -242,7 +243,6 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
 
 @torch.no_grad()
 def main():
-    import deep_gemm as dg
 
     p = argparse.ArgumentParser(description=__doc__)
     add_model_arguments(p)
@@ -253,6 +253,7 @@ def main():
     p.add_argument("--samples", type=int)
     p.add_argument("--warmups", type=int)
     p.add_argument("--replays", type=int, default=50)
+    p.add_argument("--compare-mega", action="store_true", help="Also time the optional single-node DeepGEMM baseline")
     p.add_argument(
         "--mega-mixed", action="store_true", help="Compare NVFP4 latency to pre-staged upstream MXFP8 x MXFP4"
     )
@@ -261,6 +262,9 @@ def main():
     p.add_argument("--route-bias-std", type=float, default=0.5)
     p.add_argument("--token-std-fraction", type=float, default=0.1)
     args = p.parse_args()
+    args.compare_mega |= args.mega_mixed
+    if args.compare_mega:
+        import deep_gemm as dg
     resolve_model(args)
     decode = args.mode == "decode"
     for key, default in dict(
@@ -286,7 +290,7 @@ def main():
         w2 = torch.randn(owned, args.hidden, args.intermediate, device="cuda", dtype=torch.bfloat16) * 0.03
         packed = (
             dg.transform_weights_for_mega_moe(w1, w2)
-            if args.precision == "bf16" and group.size() == int(os.environ["LOCAL_WORLD_SIZE"])
+            if args.compare_mega and args.precision == "bf16" and group.size() == int(os.environ["LOCAL_WORLD_SIZE"])
             else None
         )
         if args.precision == "fp4":

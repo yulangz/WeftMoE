@@ -1,6 +1,7 @@
 # WeftMoE
 
 WeftMoE 在 Hopper/SM90a 上支持 BF16 和 blockwise FP8，在 Blackwell B300/SM103 上支持 BF16 和 NVFP4 routed MoE。
+B300 的前向和分组反向 GEMM 由 WeftMoE 直接编译 CUTLASS/CuTe 内核，wheel 随附固定版本的 CUTLASS 头文件。
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
 | Hopper 实现 | 用途 | 通信范围 | 训练缓存与反向 |

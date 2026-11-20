@@ -6,7 +6,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from torchrun_sm100_nvfp4 import round_nvfp4, reference
+from torchrun_sm100_nvfp4 import reference, reference_gemm
 from weftmoe.nvfp4 import NVFP4Scales, prepare_nvfp4_weights
 from weftmoe.runtime import TensorRuntime, moe
 
@@ -178,14 +178,10 @@ def main():
         gate = torch.zeros_like(eg)
         gate[live] = all_g[tokens, slots]
         assert torch.equal(xx, saved_x) and torch.equal(gate, eg)
-        aa = (round_nvfp4(xx, sx) @ round_nvfp4(w1[j], s1).T).bfloat16()
+        aa = reference_gemm(xx, w1[j], sx, s1).bfloat16()
         check(ab, aa, "ab")
         a, b = aa.float().chunk(2, 1)
-        du = (
-            (round_nvfp4(yy, sdy) @ round_nvfp4(w2[j].T.contiguous(), s2).T)
-            .bfloat16()
-            .float()
-        )
+        du = reference_gemm(yy, w2[j].T.contiguous(), sdy, s2).bfloat16().float()
         sig = torch.sigmoid(a)
         silu = a * sig
         u = (silu * b * gate[:, None]).bfloat16()
@@ -196,17 +192,11 @@ def main():
             ),
             1,
         ).bfloat16()
-        dxx = (
-            round_nvfp4(dab, sdab) @ round_nvfp4(w1[j].T.contiguous(), s1).T
-        ).bfloat16()
+        dxx = reference_gemm(dab, w1[j].T.contiguous(), sdab, s1).bfloat16()
         dx_slots[tokens, slots] = dxx[live]
         dg_slots[tokens, slots] = (du * silu * b).sum(1)[live]
-        ew1[j] = (
-            round_nvfp4(dab.T.contiguous(), sdab) @ round_nvfp4(xx.T.contiguous(), sx).T
-        )
-        ew2[j] = (
-            round_nvfp4(yy.T.contiguous(), sdy) @ round_nvfp4(u.T.contiguous(), su).T
-        )
+        ew1[j] = reference_gemm(dab.T.contiguous(), xx.T.contiguous(), sdab, sx)
+        ew2[j] = reference_gemm(yy.T.contiguous(), u.T.contiguous(), sdy, su)
     dist.all_reduce(dx_slots)
     dist.all_reduce(dg_slots)
     dx = dx_slots.view(world, n, k, h)[rank].float().sum(1).bfloat16()

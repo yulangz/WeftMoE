@@ -84,20 +84,20 @@ class TensorRuntime:
         # one node must report a collective error, not strand peers in bootstrap.
         requests = [None] * self.world
         capability = torch.cuda.get_device_capability()
-        companion_error = None
+        build_error = None
         if capability[0] == 10:
             try:
-                from .blackwell import check_companion
-                check_companion(self.precision, training)
+                from .blackwell_cutlass import native
+                native()
             except Exception as exc:
-                companion_error = str(exc)
+                build_error = str(exc)
         request = dict(
             key=key, precision=self.precision, nvfp4_scales=nvfp4_scales, capability=capability,
             max_tokens=max_tokens, max_saved=max_saved, batch_invariant=batch_invariant,
             fp8_workspace=fp8_workspace, decode_only=decode_only,
             allow_unvalidated_shape=allow_unvalidated_shape,
         )
-        dist.all_gather_object(requests, (request, companion_error), group=group)
+        dist.all_gather_object(requests, (request, build_error), group=group)
         if any(r != request for r, _ in requests):
             raise ValueError("EP ranks requested incompatible WeftMoE configurations")
         for _, error in requests:

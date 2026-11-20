@@ -3,10 +3,10 @@
 import argparse
 import os
 
-import deep_gemm
 import torch
 import torch.distributed as dist
 
+from weftmoe.blackwell_cutlass import tile_m as select_m
 from weftmoe.nvfp4 import prepare_nvfp4_weights
 from weftmoe.runtime import TensorRuntime
 
@@ -40,13 +40,11 @@ def forward(runtime, data, weights, packed):
 def tile_m(runtime, rows):
     window = getattr(runtime.native, "windows", [runtime.native])[0]
     buf = window.buffer
-    return deep_gemm.get_block_m_for_mega_moe(
+    return select_m(
         buf.group.size(),
         buf.num_experts,
-        buf.num_max_tokens_per_rank,
         len(window.dummy) if hasattr(window, "dummy") else rows,
         runtime.top_k,
-        buf.mma_type,
     )
 
 

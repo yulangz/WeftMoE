@@ -1,6 +1,5 @@
 """Single-node BF16 Blackwell PF, using canonical expert parameters and NVLink."""
 
-import inspect
 import weakref
 
 import torch
@@ -44,20 +43,11 @@ def _stage_inputs(
     tl.store(SG + indices, tl.gather(weights, ordered % BK, axis=1), valid)
 
 
-def check_companion(precision, training):
-    """Check the launch interface before any rank registers symmetric memory."""
-    import deep_gemm
-    launch = deep_gemm.nvfp4_mega_moe if precision == "nvfp4" else deep_gemm.bf16_mega_moe
-    params = inspect.signature(launch).parameters
-    if "compute_sms" not in params or (training and "saved" not in params):
-        raise ImportError("Build the companion DeepGEMM checkout described in docs/benchmarks-sm100.md")
-
-
 class BlackwellRuntime:
     """One symmetric workspace, serialized on the supplied CUDA stream."""
 
     def __init__(self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved):
-        import deep_gemm
+        from .blackwell_cutlass import ExpertWorkspace, launch
 
         # A legacy default stream cannot join a caller's CUDA Graph capture.
         self.stream = (
@@ -68,20 +58,18 @@ class BlackwellRuntime:
         self.training = training
         self.max_saved = max_saved
         self.tapes = weakref.WeakSet()
-        self.launch = deep_gemm.bf16_mega_moe
-        self.buffer = deep_gemm.SymmBuffer(
+        self.launch = launch
+        self.buffer = ExpertWorkspace(
             group,
             experts,
             max(1, capacity),
             top_k,
             hidden,
             intermediate,
-            mma_type="bf16xbf16",
-            canonical_l1=True,
         )
 
         if training:
-            self.alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+            self.alignment = 128
             self.peers = torch.tensor(self.buffer.handle.buffer_ptrs, dtype=torch.int64, device=stream.device)
 
     def _run(self, x, routes, gates, w1, w2, *, save=False):

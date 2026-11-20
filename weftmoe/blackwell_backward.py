@@ -24,7 +24,7 @@ def _ordinals(Sorted, Permutation, Bounds, Dest, n, BLOCK: tl.constexpr):
     tl.store(Dest + slot, j - start, j < n)
 
 
-def checkpoint(buffer, tokens, device, alignment, *, pad_empty=False):
+def checkpoint(buffer, tokens, device, alignment):
     # Stable source slots make both the rank-interleaved owner rows and the
     # K reduction for each expert weight gradient independent of CTA arrival.
     ids, permutation = buffer.topk_idx[:tokens].reshape(-1).int().sort(stable=True)
@@ -37,19 +37,17 @@ def checkpoint(buffer, tokens, device, alignment, *, pad_empty=False):
     dist.all_reduce(counts, group=buffer.group)
     local = counts.chunk(buffer.group.size())[buffer.group.rank()]
     padded = ((local + alignment - 1) // alignment) * alignment
-    if pad_empty:
-        # CUTLASS grouped NVFP4 requires positive K even for an idle expert.
-        padded = padded.clamp_min(alignment)
+    # Grouped CUTLASS wgrad uses a positive reduction extent for idle experts.
+    padded = padded.clamp_min(alignment)
     ends = padded.cumsum(0, dtype=torch.int32)
     starts = ends - padded
     rows = int(ends[-1])
-    logical_ends = starts + local
     # K-grouped GEMM may read the tail of its last K tile. Keep padding zero.
     x = torch.zeros(rows, buffer.hidden, device=device, dtype=torch.bfloat16)
     ab = torch.zeros(rows, 2 * buffer.intermediate_hidden, device=device, dtype=torch.bfloat16)
     gates = torch.zeros(rows, device=device)
     origins = torch.full((rows,), -1, device=device, dtype=torch.int32)
-    return (ordinals, starts, x, ab, gates, origins), ends if pad_empty else logical_ends
+    return (ordinals, starts, x, ab, gates, origins), ends
 
 
 @triton.jit
@@ -176,9 +174,21 @@ def _combine(
     tl.store(Out + row * H + col, acc, col < H)
 
 
+def grouped_bf16(a, b, out, ends, *, wgrad=False):
+    from .blackwell_cutlass import grouped_extension
+
+    device = out.device
+    ext = grouped_extension("bf16", *torch.cuda.get_device_capability(device))
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    size_fn, run = (ext.wgrad_bytes, ext.wgrad) if wgrad else (ext.dgrad_bytes, ext.dgrad)
+    size = size_fn(len(ends), device.index, sms)
+    workspace = torch.empty(size, dtype=torch.uint8, device=device)
+    run(a.data_ptr(), b.data_ptr(), out.data_ptr(), ends.data_ptr(), len(ends), a.size(1), out.size(-1),
+        device.index, sms, workspace.data_ptr(), size, torch.cuda.current_stream(device).cuda_stream)
+
+
 def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
     """Read staged dY, return dW and leave each dX/dGate in its source slot."""
-    import deep_gemm as dg
 
     b = runtime.buffer
     rows, h = x.shape
@@ -202,10 +212,10 @@ def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
         _gather_dy[grid](
             runtime.peers, origins, recv, rows, x_offset, cap, k, h, triton.next_power_of_2(h), 4
         )
-        dg.m_grouped_bf16_gemm_nn_contiguous(recv, w2, du, ends, use_psum_layout=True)
+        grouped_bf16(recv, w2, du, ends)
         _swiglu[grid](ab, du, gates, u, dab, eg, rows, i, triton.next_power_of_2(i), 4)
         local_dx = torch.empty_like(x)
-        dg.m_grouped_bf16_gemm_nn_contiguous(dab, w1, local_dx, ends, use_psum_layout=True)
+        grouped_bf16(dab, w1, local_dx, ends)
         _return[grid](
             runtime.peers,
             origins,
@@ -228,8 +238,8 @@ def expert_gradients(runtime, w1, w2, x, ab, gates, origins, ends):
             for tensor in (dab, x, dw1, recv, u, dw2, ends):
                 tensor.record_stream(compute)
         with torch.cuda.stream(compute):
-            dg.k_grouped_bf16_gemm_tn_contiguous(dab, x, dw1, None, ends, None, use_psum_layout=True)
-            dg.k_grouped_bf16_gemm_tn_contiguous(recv, u, dw2, None, ends, None, use_psum_layout=True)
+            grouped_bf16(dab, x, dw1, ends, wgrad=True)
+            grouped_bf16(recv, u, dw2, ends, wgrad=True)
     else:
         dw1.zero_()
         dw2.zero_()

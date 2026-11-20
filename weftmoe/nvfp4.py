@@ -152,6 +152,17 @@ def validate_prepared(b, device, x, routes, gates, weights, x_scale, intermediat
         b.intermediate_hidden // 2,
     ):
         raise ValueError("NVFP4 weights do not match the prepared experts")
+    for data, scales in (weights.fc1, weights.fc2):
+        groups, cols, packed = data.shape
+        if data.dtype != torch.int8 or not data.is_contiguous():
+            raise ValueError("Expected contiguous packed E2M1 expert weights")
+        if (scales.dtype != torch.int32 or scales.shape != (groups, cols, packed // 32)
+                or scales.stride(1) != 1 or scales.stride(2) < cols or scales.stride(2) % 4
+                or scales.stride(0) != scales.size(2) * scales.stride(2)):
+            raise ValueError("Expected MN-major packed block-16 expert scales")
+    if len(weights.tensor_scales) != 2:
+        raise ValueError("Expected one layer scale for each expert matrix")
+    _validate_scales(weights.tensor_scales)
     if any(t.device != device for t in (x, routes, gates, *weights.fc1, *weights.fc2)):
         raise ValueError("NVFP4 inputs and weights must share the workspace device")
     if x.ndim != 2 or x.shape[1] != b.hidden or x.dtype != torch.bfloat16 or not x.is_contiguous():
@@ -187,10 +198,11 @@ class NVFP4Runtime(BlackwellRuntime):
     def __init__(
         self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1,
     ):
-        import deep_gemm as dg
 
-        self.buffer = dg.SymmBuffer(
-            group, experts, max(1, capacity), top_k, hidden, intermediate, mma_type="nvfp4",
+        from .blackwell_cutlass import ExpertWorkspace, launch
+
+        self.buffer = ExpertWorkspace(
+            group, experts, max(1, capacity), top_k, hidden, intermediate, fp4=True,
         )
         self.stream = (
             stream
@@ -198,7 +210,7 @@ class NVFP4Runtime(BlackwellRuntime):
             else torch.cuda.Stream(device=stream.device)
         )
 
-        self.launch = dg.nvfp4_mega_moe
+        self.launch = launch
         self.training, self.max_saved = training, max_saved
         self.tapes = weakref.WeakSet()
         self.scales = NVFP4Scales()
@@ -218,7 +230,6 @@ class NVFP4Runtime(BlackwellRuntime):
             self.peers = torch.tensor(self.buffer.handle.buffer_ptrs, device=stream.device, dtype=torch.int64)
 
     def _run(self, x, routes, gates, w1, w2, *, save=False):
-        import deep_gemm as dg
         from .blackwell_backward import Tape, checkpoint
 
         sx, s1, sm, s2 = self.scales[:4]
@@ -230,9 +241,9 @@ class NVFP4Runtime(BlackwellRuntime):
         b = self.buffer
         stage_nvfp4(b, x, routes, gates, sx)
         self.dy_buffer[: len(x)].copy_(x)
-        buffers, ends = checkpoint(b, len(x), x.device, self.alignment, pad_empty=True)
+        buffers, ends = checkpoint(b, len(x), x.device, self.alignment)
         y = torch.empty_like(x)
-        dg.nvfp4_mega_moe(
+        self.launch(
             y, weights.fc1, weights.fc2, b, tensor_scales=(sx * s1, sm, sm * s2), saved=buffers
         )
         _, _, saved_x, ab, expert_gates, origins = buffers
@@ -242,8 +253,6 @@ class NVFP4Runtime(BlackwellRuntime):
         return tape
 
     def inference(self, x, routes, gates, weights, x_scale, intermediate_scale):
-        import deep_gemm as dg
-
         b = self.buffer
         validate_prepared(b, self.stream.device, x, routes, gates, weights, x_scale, intermediate_scale)
         caller = torch.cuda.current_stream(x.device)
@@ -252,7 +261,7 @@ class NVFP4Runtime(BlackwellRuntime):
         with torch.cuda.stream(self.stream):
             stage_nvfp4(b, x, routes, gates, x_scale)
             out = torch.empty_like(x)
-            dg.nvfp4_mega_moe(
+            self.launch(
                 out,
                 weights.fc1,
                 weights.fc2,

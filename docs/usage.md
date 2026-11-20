@@ -2,7 +2,7 @@
 
 ## B300 / Blackwell
 
-BF16 任务沿用下方的 `TensorRuntime` API。先安装配套 DeepGEMM，再按 compute capability 自动选择 Blackwell 实现。B300 支持 DP-sharded BF16 输入、原始布局专家权重、训练及推理。单机使用 NVLink，多机使用 NCCL device GIN 和节点内 NVLink。双路 400G RoCE 的 NCCL 设置需在创建 process group 前生效，`benchmarks/sm100/run.sh` 会为本集群的八个 bonded HCA 设置这些参数。安装命令和实测结果见 [B300 benchmark](benchmarks-sm100.md)。
+BF16 任务沿用下方的 `TensorRuntime` API。安装 WeftMoE 后，runtime 按 compute capability 自动选择仓库内的 CUTLASS/CuTe 实现。wheel 随附 CUTLASS 头文件，从源码安装时先执行 `git submodule update --init third_party/cutlass`。首次遇到新的前向特化时用 CUDA 13 的 NVCC 编译，后续复用 `$WEFTMOE_ROOT/blackwell` 下的 cubin。B300 支持 DP-sharded BF16 输入、原始布局专家权重、训练及推理。单机使用 NVLink，多机使用 NCCL device GIN 和节点内 NVLink。双路 400G RoCE 的 NCCL 设置需在创建 process group 前生效，`benchmarks/sm100/run.sh` 会为本集群的八个 bonded HCA 设置这些参数。安装命令和实测结果见 [B300 benchmark](benchmarks-sm100.md)。
 
 ### B300 前向的 batch invariance
 
@@ -43,6 +43,7 @@ PyTorch 和框架依赖由使用者安装，不由 WeftMoE 自动选择版本。
 安装方式与模型无关，wheel 包含编译所需的 native 源码。安装阶段不编译 CUDA；首次准备算子时需要本机工具链和上述开发头文件。路径按实际环境填写：
 
 ```bash
+git submodule update --init third_party/cutlass
 export CUDA_HOME=/usr/local/cuda
 export CUTLASS_INCLUDE_DIR=/path/to/cutlass/include
 export NCCL_INCLUDE_DIR=/path/to/nccl/include

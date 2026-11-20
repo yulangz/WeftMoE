@@ -1,32 +1,11 @@
 """Deterministic block-16 NVFP4 grouped gradients for Blackwell."""
 
-from functools import cache
-from pathlib import Path
 
 import torch
 import triton
 
 from .blackwell_backward import _gather_dy, _return, _swiglu
-from .jit import source_root
-
-
-@cache
-def _extension(major, minor):
-    import deep_gemm
-    from torch.utils.cpp_extension import load
-
-    arch = f"{major}{minor}a"
-    return load(
-        name=f"weftmoe_nvfp4_grouped_sm{major}{minor}",
-        sources=[str(source_root() / "src/cuda/blackwell/nvfp4_grouped.cu")],
-        extra_include_paths=[str(Path(deep_gemm.__file__).parent / "include")],
-        extra_cuda_cflags=[
-            "--expt-relaxed-constexpr",
-            "-std=c++17",
-            "-O3",
-            f"-gencode=arch=compute_{arch},code=sm_{arch}",
-        ],
-    )
+from .blackwell_cutlass import grouped_extension
 
 
 def quantize(value, ends, scale, *, row=False, regular=0):
@@ -42,7 +21,7 @@ def quantize(value, ends, scale, *, row=False, regular=0):
 
     d, s = allocate(row)
     dt, st = allocate(True)
-    ext = _extension(*torch.cuda.get_device_capability(value.device))
+    ext = grouped_extension("nvfp4", *torch.cuda.get_device_capability(value.device))
     ext.quantize_with_layer_scale(
         *(v.data_ptr() for v in (value, ends, d, s, dt, st)),
         rows,
@@ -58,7 +37,7 @@ def quantize(value, ends, scale, *, row=False, regular=0):
 
 def grouped(a, b, out, ends, outer, cols, k_grouped, scale):
     device = out.device.index
-    ext = _extension(*torch.cuda.get_device_capability(device))
+    ext = grouped_extension("nvfp4", *torch.cuda.get_device_capability(device))
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     size = ext.workspace_bytes(len(ends), device, sms)
     space = torch.empty(size, device=out.device, dtype=torch.uint8)
