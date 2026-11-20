@@ -9,6 +9,10 @@
 #if defined(WEFT_IN_CUDA_COMPILATION)
 namespace weftmoe::sm100::ptx {
 
+CUTLASS_DEVICE void fence_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 CUTLASS_DEVICE uint32_t get_sm_idx() {
     uint32_t sm_idx;
     asm ("mov.u32 %0, %%smid;" : "=r"(sm_idx));

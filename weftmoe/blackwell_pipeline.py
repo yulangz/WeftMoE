@@ -79,7 +79,7 @@ class PipelinedMultiNodeRuntime(BlackwellRuntime):
             else stream
         )
         self.compute = torch.cuda.Stream(device=stream.device)
-        self.compute_sms = (
+        compute_sms = (
             (torch.cuda.get_device_properties(stream.device).multi_processor_count - 4) // 4 * 4
         )
         self.split = (capacity + 1) // 2
@@ -90,6 +90,7 @@ class PipelinedMultiNodeRuntime(BlackwellRuntime):
             worker = torch.cuda.Stream(device=stream.device)
             window = child_type(
                 group, experts, top_k, hidden, intermediate, self.split, worker, training, max_saved, nodes,
+                compute_sms=compute_sms,
             )
             window.rail.compact = True
             window.launch = self._serialize_compute(window.launch)
@@ -103,13 +104,13 @@ class PipelinedMultiNodeRuntime(BlackwellRuntime):
             self.wgrad_stream = torch.cuda.Stream(device=stream.device)
 
     def _serialize_compute(self, launch):
-        compute, sms = self.compute, self.compute_sms
+        compute = self.compute
 
         def run(*args, **kwargs):
             transport = torch.cuda.current_stream()
             compute.wait_stream(transport)
             with torch.cuda.stream(compute):
-                launch(*args, **kwargs, compute_sms=sms)
+                launch(*args, **kwargs)
             transport.wait_stream(compute)
 
         return run

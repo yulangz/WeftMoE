@@ -11,10 +11,9 @@
 
 namespace weftmoe::sm100::layout {
 
-static constexpr int kNumCandidateBlockMs = 8;
-static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+static constexpr int kCandidateBlockM[] = {16, 32, 64, 128, 192, 240};
 static constexpr int kMaxCandidateBlockM = 240;
-static constexpr int kMinCandidateBlockM = 8;
+static constexpr int kMinCandidateBlockM = kCandidateBlockM[0];
 static constexpr int kLCMCandidateBlockM = 1920;
 
 // Allow for every source slot plus per-expert tail padding at any supported tile M.

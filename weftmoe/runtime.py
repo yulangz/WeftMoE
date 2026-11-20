@@ -110,6 +110,8 @@ class TensorRuntime:
                 raise ValueError("Blackwell requires DP-sharded BF16 or NVFP4")
             nvfp4 = self.precision == "nvfp4"
             team_experts = experts if nvfp4 else experts // self.nodes
+            if hidden > 4096 and hidden % 512:
+                raise ValueError("Blackwell combine requires hidden divisible by 512 when hidden > 4096")
             if (max_tokens < 0 or hidden < 256 or hidden % 256 or not 128 <= intermediate <= 4096 or intermediate % 128
                     or experts % self.world or not 1 <= top_k <= min(32, team_experts) or team_experts > 2048
                     or experts // self.world > 512):

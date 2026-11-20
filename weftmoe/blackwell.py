@@ -52,7 +52,7 @@ class BlackwellRuntime:
     """One symmetric workspace, serialized on the supplied CUDA stream."""
 
     def __init__(
-        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *, fp4=False,
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *, fp4=False, compute_sms=None,
     ):
         from .blackwell_cutlass import ExpertWorkspace, launch
 
@@ -73,7 +73,7 @@ class BlackwellRuntime:
             top_k,
             hidden,
             intermediate,
-            fp4=fp4,
+            fp4=fp4, compute_sms=compute_sms,
         )
 
         if training:

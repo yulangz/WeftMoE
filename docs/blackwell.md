@@ -44,6 +44,18 @@ y = infer.inference_nvfp4(0, x, routes, gates, weights, x_scale=1/32, intermedia
 infer.close()
 ```
 
+默认层级因子来自 benchmark。训练时应按实际模型、loss 归一化和梯度缩放方式标定，包括反向的 dY 和 dGateUp。对非零的块最大绝对值 `amax` 和层级因子 `s`，当 `amax ≤ 6s × 2⁻¹⁰` 时块尺度舍入为零，当 `amax > 6s × 448` 时幅值超出可表示范围。靠近下界的非零尺度可能是 E4M3 次正规数。
+
+| 操作数 | 默认 s | 整块清零阈值 | 幅值上限 |
+| --- | ---: | ---: | ---: |
+| x、dY | 1/32 | 0.0001831 | 84 |
+| w1、w2 | 1/64 | 0.00009155 | 42 |
+| intermediate、dGateUp | 1/512 | 0.00001144 | 5.25 |
+
+可用 `from weftmoe.nvfp4 import nvfp4_block_stats` 离线检查有限值样本。按对应 GEMM 的 K 维放在最后一维，调用 `stats = nvfp4_block_stats(dy, scales.dy)`。`nonzero_to_zero`、`subnormal_scale` 和 `above_range` 为块数，除以 `blocks` 得到各自比例。该检查按需运行。
+
+训练 tape 按本 rank 的实际接收行数和专家对齐填充后分配。Blackwell 的 `forward_async` 在确定 tape 大小时会读取一次 GPU 计数，CPU 可能等待之前排队的工作。NVFP4 训练每次前向重新打包权重，反向按转置方向重新量化，前向打包计入训练前向，转置量化计入反向。推理部署可用上面的显式预打包接口控制权重生命周期。
+
 ### Batch invariance 与 autotune
 
 `batch_invariant=True` 默认开启。在相同硬件、内核版本、精度、专家权重和量化因子下，保证两点。
@@ -59,12 +71,12 @@ Qwen35B，取每个样本最慢 rank 的耗时，再取 p50。下表每格为本
 
 | EP | 精度 | Decode（µs） | Prefill（ms） | 反向（ms） |
 | ---: | --- | ---: | ---: | ---: |
-| 8 | BF16 | 69.64 / 98.35 | 1.307 / 3.944 | 2.070 / 4.397 |
-| 8 | NVFP4 | 49.80 / 91.50 | 1.271 / 8.132 | 2.256 / 7.359 |
-| 16 | BF16 | 173.58 / 306.78 | 3.945 / 7.325 | 3.479 / 6.241 |
-| 16 | NVFP4 | 159.08 / 309.17 | 3.660 / 9.770 | 3.624 / 7.446 |
+| 8 | BF16 | 69.52 / 98.35 | 1.306 / 3.944 | 2.045 / 4.397 |
+| 8 | NVFP4 | 49.55 / 91.50 | 1.161 / 8.132 | 2.248 / 7.359 |
+| 16 | BF16 | 173.83 / 306.78 | 3.951 / 7.325 | 3.515 / 6.241 |
+| 16 | NVFP4 | 157.67 / 309.17 | 3.719 / 9.770 | 3.653 / 7.446 |
 
-单机另做了同轮 MegaMoE 对照。BF16 的 WeftMoE / MegaMoE 在 decode 为 70.14 / 67.90 µs，在 prefill 为 1.318 / 1.221 ms。NVFP4 分别为 49.61 / 47.23 µs 和 1.167 / 1.075 ms。WeftMoE 计入输入准备和路由排序，MegaMoE 从输入就绪后计时。
+单机在提交 `a249597` 另做了同轮 MegaMoE 对照。BF16 的 WeftMoE / MegaMoE 在 decode 为 70.14 / 67.90 µs，在 prefill 为 1.318 / 1.221 ms。NVFP4 分别为 49.61 / 47.23 µs 和 1.167 / 1.075 ms。WeftMoE 计入输入准备和路由排序，MegaMoE 从输入就绪后计时。
 
 ```bash
 benchmarks/sm100/run.sh weft --model qwen35b --precision fp4 --mode decode --tokens 64 --warmups 5 --samples 20 --replays 50

@@ -693,12 +693,15 @@ routed_nvfp4(void* y,
                 const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
+                ptx::fence_async_global();  // Dispatch wrote L1 scales through the generic proxy.
             }
 
             L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                if (task_info.block_phase == sched::BlockPhase::Linear2)
+                if (task_info.block_phase == sched::BlockPhase::Linear2) {
                     l2_k_block_dependency.wait(k_block_idx);
+                    ptx::fence_async_global();  // This K tile may have just published new scales.
+                }
 
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -1402,6 +1405,9 @@ routed_nvfp4(void* y,
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("WeftMoE combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            // Each lane acquires its peer. Order those stores before the elected TMA reader.
+            __syncwarp();
+            ptx::fence_async_global();
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 

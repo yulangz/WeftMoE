@@ -254,7 +254,7 @@ def _local_team(group, lanes, node):
 
 class MultiNodeRuntime(BlackwellRuntime):
     def __init__(
-        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, nodes,
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, nodes, *, compute_sms=None,
     ):
         self.nodes = nodes
         lanes = group.size() // nodes
@@ -272,6 +272,7 @@ class MultiNodeRuntime(BlackwellRuntime):
             stream,
             training,
             max_saved,
+            compute_sms=compute_sms,
         )
         self.nvfp4 = self.buffer.fp4
         self.compact_nvfp4 = self.nvfp4 and not training

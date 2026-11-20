@@ -65,12 +65,12 @@ def _gather_dy(
     BH: tl.constexpr,
     R: tl.constexpr,
 ):
-    row = tl.program_id(0) * R + tl.arange(0, R)
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     orig = tl.load(Origins + row, row < rows, -1)
     addr = tl.maximum(orig, 0)
     base = tl.multiple_of(tl.load(Peers + addr // (CAP * K)), 16) + X_OFFSET
     dy = base.to(tl.pointer_type(tl.bfloat16))
-    token = addr % (CAP * K) // K
+    token = (addr % (CAP * K) // K).to(tl.int64)
     col = tl.arange(0, BH)
     val = tl.load(
         dy[:, None] + token[:, None] * H + col[None, :], (orig[:, None] >= 0) & (col[None, :] < H), 0.0
@@ -92,7 +92,7 @@ def _swiglu(
     R: tl.constexpr,
     EXACT: tl.constexpr = False,
 ):
-    row = tl.program_id(0) * R + tl.arange(0, R)
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     col = tl.arange(0, BI)
     mask = (row[:, None] < rows) & (col[None, :] < I)
     offset = row[:, None] * I + col[None, :]
@@ -128,7 +128,7 @@ def _return(
     BH: tl.constexpr,
     R: tl.constexpr,
 ):
-    row = tl.program_id(0) * R + tl.arange(0, R)
+    row = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
     orig = tl.load(Origins + row, row < rows, -1)
     addr = tl.maximum(orig, 0)
     base = tl.multiple_of(tl.load(Peers + addr // (CAP * K)), 16)
@@ -159,7 +159,7 @@ def _combine(
     BK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     slots = tl.arange(0, BK)
     ids = tl.load(Routes + row * K + slots, slots < K, -1)

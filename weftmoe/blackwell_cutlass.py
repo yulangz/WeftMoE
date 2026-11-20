@@ -177,14 +177,15 @@ def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m,
 
 
 class ExpertWorkspace:
-    def __init__(self, group, experts, capacity, topk, hidden, intermediate, *, fp4=False):
+    def __init__(self, group, experts, capacity, topk, hidden, intermediate, *, fp4=False, compute_sms=None):
         import torch.distributed._symmetric_memory as symm
 
         self.group, self.num_experts, self.num_topk = group, experts, topk
         self.hidden, self.intermediate_hidden = hidden, intermediate
         self.fp4 = fp4
         self.device = torch.cuda.current_device()
-        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        device_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.sms = device_sms if compute_sms is None else compute_sms
         layout = self.layout = native().Workspace(
             group.size(), experts, capacity, topk, hidden, intermediate, self.sms, fp4
         )
@@ -198,7 +199,7 @@ class ExpertWorkspace:
         )
         self.buffer.zero_()
         # Non-localized weights use a balanced two-domain assignment per pair of SMs.
-        self.domains = ((torch.arange(self.sms, device=self.device) // 2) % 2).to(torch.uint8)
+        self.domains = ((torch.arange(device_sms, device=self.device) // 2) % 2).to(torch.uint8)
         group.barrier().wait()
         torch.cuda.synchronize(self.device)
 
@@ -217,7 +218,7 @@ class ExpertWorkspace:
         self.handle = self.buffer = self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
 
-def launch(y, first, second, workspace, *, saved=(), compute_sms=0, tensor_scales=(1.0, 1.0, 1.0)):
+def launch(y, first, second, workspace, *, saved=(), tensor_scales=(1.0, 1.0, 1.0)):
     b = workspace
     rows = y.size(0)
     m = tile_m(b.group.size(), b.num_experts, rows, b.num_topk)
@@ -232,7 +233,7 @@ def launch(y, first, second, workspace, *, saved=(), compute_sms=0, tensor_scale
         b.group.size(),
         b.layout.ring,
         b.layout.sf_ring,
-        compute_sms or b.sms,
+        b.sms,
         m,
         bool(saved),
         b.fp4 and math.frexp(tensor_scales[1])[0] != 0.5,

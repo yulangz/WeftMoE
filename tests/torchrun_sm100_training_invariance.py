@@ -73,7 +73,7 @@ def main():
     local_weights = tuple(w.chunk(ep)[rank] for w in weights)
 
     def runtime(group, capacity, training):
-        return TensorRuntime(
+        rt = TensorRuntime(
             group=group,
             experts=e,
             top_k=k,
@@ -85,6 +85,15 @@ def main():
             precision=args.precision,
             batch_invariant=True,
         )
+        windows = getattr(rt.native, "windows", ())
+        device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        for child in windows:
+            assert child.buffer.sms == (device_sms - 4) // 4 * 4
+            assert child.buffer.domains.numel() == device_sms
+        for child in windows or (rt.native,):
+            if child.buffer.fp4:
+                assert child.buffer.layout.sf_ring == 8 * child.buffer.layout.ring
+        return rt
 
     def pack(weights, training):
         if args.precision == "nvfp4" and not training:

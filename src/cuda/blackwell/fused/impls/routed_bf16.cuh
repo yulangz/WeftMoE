@@ -1222,6 +1222,9 @@ routed_bf16(void* y,
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("WeftMoE combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+            // Each lane acquires its peer. Order those stores before the elected TMA reader.
+            __syncwarp();
+            ptx::fence_async_global();
 
             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
 

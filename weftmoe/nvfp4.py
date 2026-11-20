@@ -99,6 +99,26 @@ def _validate_scales(scales):
         raise ValueError("NVFP4 tensor scales must be finite and positive")
 
 
+def nvfp4_block_stats(tensor, scale):
+    """Count finite-input block-16 scale range events along the last (reduction) axis.
+
+    Scalar counts stay on the input device. Inspect representative activations or
+    gradients outside the timed path, transposing to the GEMM orientation first.
+    """
+    _validate_scales((scale,))
+    if not tensor.is_floating_point() or tensor.ndim == 0 or tensor.shape[-1] % 16:
+        raise ValueError("Expected floating-point data with a last dimension divisible by 16")
+    amax = tensor.detach().unflatten(-1, (-1, 16)).abs().amax(dim=-1).float()
+    unrounded = amax / (6.0 * scale)
+    encoded = unrounded.clamp(max=448).to(torch.float8_e4m3fn).float()
+    return {
+        "blocks": amax.numel(),
+        "nonzero_to_zero": ((amax > 0) & (encoded == 0)).sum(),
+        "subnormal_scale": ((encoded > 0) & (encoded < 2**-6)).sum(),
+        "above_range": (unrounded > 448).sum(),
+    }
+
+
 def prepare_nvfp4_weights(w1, w2, *, weight_scales=(1 / 64, 1 / 64)):
     """Quantize canonical BF16 expert weights. Scales are layer-wide dequantization factors."""
     if w1.ndim != 3 or w2.ndim != 3 or w1.shape != (w2.shape[0], 2 * w2.shape[2], w2.shape[1]):
@@ -195,10 +215,10 @@ class NVFP4Runtime(BlackwellRuntime):
     """Persistent NVLink expert kernel on one Blackwell node."""
 
     def __init__(
-        self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1,
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1, *, compute_sms=None,
     ):
         super().__init__(
-            group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, fp4=True,
+            group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, fp4=True, compute_sms=compute_sms,
         )
         self.scales = NVFP4Scales()
         if training:
