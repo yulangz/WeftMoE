@@ -130,7 +130,7 @@ def build(target='lib', output=None, jobs=None):
                list(HOST_SOURCES) + (list(CUDA_SOURCES) if cuda else []))
     mains = {'cuda-test': TEST_SOURCE, 'host-test': 'tests/test_notify_dispatch.cpp',
              'metadata-dump': 'tests/metadata_dump.cpp',
-             'metadata-bench': 'benchmarks/notify_dispatch_bench.cpp'}
+             'metadata-bench': 'benchmarks/sm90/notify_dispatch_bench.cpp'}
     if testing:
         sources.append(mains[target])
     def compile_one(source):

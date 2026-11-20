@@ -4,6 +4,7 @@ The operator boundary starts with selected routes/probabilities, like WeftMoE;
 router projection/top-k and the optimizer are not part of either measurement.
 """
 
+from contextlib import nullcontext
 from functools import partial
 from importlib.metadata import version
 from types import SimpleNamespace
@@ -28,6 +29,19 @@ from benchmarks.nccl_library import loaded_nccl_libraries, nccl_runtime_version
 class MegatronTrainingBackend:
     def __init__(self, args, w1, w2):
         world, rank = dist.get_world_size(), dist.get_rank()
+        fp4 = getattr(args, "precision", "bf16") == "fp4"
+        self.expert_context = nullcontext
+        if fp4:
+            from megatron.core.fp4_utils import get_fp4_context
+            from transformer_engine.pytorch import is_nvfp4_available
+
+            supported, reason = is_nvfp4_available(return_reason=True)
+            if not supported:
+                raise RuntimeError(f"Transformer Engine NVFP4 unavailable: {reason}")
+        # Each sample represents a new training step, so TE quantizes the
+        # BF16 weights in forward instead of reusing the first step's cache.
+        precision = dict(fp4="e2m1", fp4_recipe="nvfp4",
+                         disable_parameter_transpose_cache=True) if fp4 else {}
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=1, expert_model_parallel_size=world,
             expert_tensor_parallel_size=1, create_gloo_process_groups=False)
@@ -45,7 +59,9 @@ class MegatronTrainingBackend:
             moe_permute_fusion=getattr(args, "moe_permute_fusion", True),
             bias_activation_fusion=getattr(args, "bias_activation_fusion", True),
             gradient_accumulation_fusion=getattr(args, "accumulate_main_grad", False),
-            recompute_granularity="selective", recompute_modules=["moe_act"])
+            recompute_granularity="selective", recompute_modules=["moe_act"], **precision)
+        if fp4:
+            self.expert_context = partial(get_fp4_context, config)
         owned = args.experts // world
         groups = get_default_pg_collection()
         dispatcher = (MoEFlexTokenDispatcher if args.dispatcher == "flex"
@@ -71,6 +87,7 @@ class MegatronTrainingBackend:
         self.num_experts = args.experts
         self.metadata = dict(
             dispatcher=args.dispatcher, deepep_num_sms=args.deepep_num_sms,
+            fp4_recipe="nvfp4" if fp4 else None,
             moe_permute_fusion=config.moe_permute_fusion,
             bias_activation_fusion=config.bias_activation_fusion,
             gradient_accumulation_fusion=config.gradient_accumulation_fusion,
@@ -91,7 +108,8 @@ class MegatronTrainingBackend:
         hidden, probs = d.dispatch_preprocess(x, routing, probabilities)
         hidden, probs = d.token_dispatch(hidden, probs)
         hidden, counts, probs = d.dispatch_postprocess(hidden, probs)
-        hidden, _ = self.experts(hidden, counts, probs)
+        with self.expert_context():
+            hidden, _ = self.experts(hidden, counts, probs)
         output = d.combine_postprocess(d.token_combine(d.combine_preprocess(hidden)))
         return SimpleNamespace(output=output, x=x, gates=gates)
 

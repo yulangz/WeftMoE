@@ -1,8 +1,12 @@
 """Single-node graph replay: identical routes/weights, source work included."""
 
 import json, os, statistics
+from pathlib import Path
+import sys
 import torch
 import torch.distributed as dist
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from weftmoe.runtime import TensorRuntime
 from benchmarks.fp8_validation import global_diff, passes, DIFF_LIMIT
 from weftmoe.fp8 import prepare_fp8_weights, quantize_fp8

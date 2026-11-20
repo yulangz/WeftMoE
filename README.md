@@ -1,9 +1,11 @@
 # WeftMoE
 
-面向 Hopper/SM90a 的 BF16 / blockwise FP8 routed MoE 算子，将专家计算与机内、跨机通信流水化。
+WeftMoE 在 Hopper/SM90a 上支持 BF16 和 blockwise FP8，在 Blackwell B300/SM103 上支持 BF16 和 NVFP4 routed MoE。
+B300 的前向和分组反向 GEMM 由 WeftMoE 直接编译 CUTLASS/CuTe 内核，wheel 随附固定版本的 CUTLASS 头文件。
+安装步骤、BF16/NVFP4 调用示例及单机和双机延迟见 [B300 使用与性能](docs/blackwell.md)。
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
-| 实现 | 用途 | 通信范围 | 训练缓存与反向 |
+| Hopper 实现 | 用途 | 通信范围 | 训练缓存与反向 |
 | --- | --- | --- | --- |
 | `weftmoe_pf` | Prefill、训练、长序列 | 单机 / 多机 EP | 支持 |
 | `weftmoe_dt` | 小 batch decode | 单机 EP | 不支持 |
@@ -12,10 +14,14 @@ PF 使用静态任务划分、有界计算/通信 ring 和逐槽代际同步。F
 训练按实际路由申请并保存 X、gate/up，推理跳过训练缓存。BWD 复用通信基础设施，
 计算输入、路由权重与专家权重梯度。训练保存的激活不是固定容量 ring。
 
-单机采用 CUDA IPC/NVLink；跨机采用 NCCL GIN/GDAKI。多机协议按同构节点组织，
+Hopper 单机采用 CUDA IPC/NVLink，跨机采用 NCCL GIN/GDAKI。多机协议按同构节点组织，
 已验证单机与双机，更多节点尚待硬件验证。
 
 ## 数值一致性与稳定性
+
+B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant` 时要求跨 EP 训推前向逐位一致、同 EP 反向重跑逐位一致。输入条件和选型规则见[B300 使用文档](docs/blackwell.md#batch-invariance-与-autotune)。
+
+### Hopper / SM90 数值约定
 
 - **训推一致 / batch-invariant 前向**：在同一硬件和编译环境、相同精度、权重、token 输入及其路由/概率下，PF 训练前向（实际保存反向缓存）与 PF 推理、M64 DT 推理前向保持逐位一致。同一 token 不因 batch 长度、位置或其他 token 的加入而改变输出；相同输入重复调用的前向也保持逐位一致。
 - **必要条件是算术路径一致**：不同长度桶、PF/DT 的 MMA M/N/K 分解、K 累加顺序、量化与 scale 处理、激活和归约策略必须兼容。PF 的 CTA M128 不等于 MMA 的 M64，不能只比较 CTA 外形。默认 autotune 固定这些算术选择，只搜索通过一致性检查的流水线、调度与通信参数。仅固定 M/N/K 还不足以容许任意数学优化。
@@ -26,6 +32,10 @@ PF 使用静态任务划分、有界计算/通信 ring 和逐槽代际同步。F
 安装方式与模型无关。首次准备算子时依次使用已编译缓存、精确 shape 与长度桶匹配的手动 tune 配置、默认配置；后两者按需编译。**运行时不做 autotune**。用法和缓存规则见[使用文档](docs/usage.md)。
 
 ## 性能
+
+B300 在单机 EP8、双机 EP16 上实测了 BF16 和 NVFP4 的推理、训练前向、反向及完整训练步。NVFP4 的两次前向 GEMM 和四次反向 GEMM 均使用 E2M1 操作数，每 16 个元素共享一个 E4M3 块尺度。双机推理通过 NCCL GIN 传输打包后的 FP4 输入，每张 GPU 使用两个 400G RoCE 端口。模型规模、基线与计时边界见 [B300 benchmark](docs/benchmarks-sm100.md)，各负载延迟见 [NVFP4 数据](benchmarks/sm100/nvfp4-results.csv)。
+
+### Hopper / SM90
 
 2026-11-05 在空闲单机 8× NVIDIA L20X（SM90，约 140 GiB/卡）上实测，EP8。
 以下为单层 routed MoE 的最慢 rank 延迟 p50；tokens 为每 rank 输入量，不是完整模型或 RL 训练吞吐。
@@ -69,7 +79,7 @@ DT decode 对比 SGLang 0.5.10.post1 的 Triton FusedMoE + DP all-gather/reduce-
 
 - [使用与 autotune](docs/usage.md)：依赖、编译、Tensor API、配置搜索。
 - [框架接入](docs/integration.md)：Megatron、SGLang、AReaL 与共卡切换。
-- [Benchmark](docs/benchmarks.md)：运行命令与计时口径。
+- [SM90 benchmark](docs/benchmarks.md) · [SM100 benchmark](docs/benchmarks-sm100.md)
 - [CUDA 实现结构](docs/cuda_structure.md)：资源、执行和验证模块的边界。
 
 ## 代码结构
@@ -86,7 +96,7 @@ DT decode 对比 SGLang 0.5.10.post1 的 Triton FusedMoE + DP all-gather/reduce-
 | `src/cuda/{forward,backward,communication,notify}/` | 共享 GEMM、搬运、同步与 notify 基础组件 |
 | `include/weftmoe/` | C++ API、配置、metadata 与资源接口 |
 | `configs/`、`tools/autotune.py` | 三种 shape 的初始 profile、统一搜索空间与离线调优 |
-| `benchmarks/`、`tests/` | 同口径性能比较、数值与生命周期回归 |
+| `benchmarks/sm90/`、`benchmarks/sm100/`、`tests/` | 分硬件 benchmark、数值与生命周期回归 |
 | `build_native.py`、`tools/build_tensor_runtime.py` | native 库与 Python 绑定构建 |
 
 ## 支持范围

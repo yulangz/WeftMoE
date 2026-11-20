@@ -1,0 +1,94 @@
+--- a/src/transport/net_ib/gdaki/gin_host_gdaki.cc
++++ b/src/transport/net_ib/gdaki/gin_host_gdaki.cc
+@@ -385,7 +385,7 @@
+ }
+
+ static ncclResult_t gdakiConnectQp(struct gdaki_context *ctx, struct doca_gpu_verbs_qp_hl *gqp,
+-                                   struct gdaki_exch_info *exch_info) {
++                                   struct gdaki_exch_info *exch_info, int contextIdx = -1) {
+   ncclResult_t status = ncclSuccess;
+   doca_error_t docaStatus = DOCA_SUCCESS;
+   struct doca_verbs_qp_attr *verbs_qp_attr = nullptr;
+@@ -393,6 +393,12 @@
+   DOCACHECK(doca_verbs_ah_attr_set_gid(ctx->ah, exch_info->vgid));
+   DOCACHECK(doca_verbs_ah_attr_set_dlid(ctx->ah, exch_info->lid));
+   DOCACHECK(doca_verbs_qp_attr_create(&verbs_qp_attr));
++  if (contextIdx >= 0) {
++    // All main QPs to a peer get consecutive UDP source ports across GIN
++    // contexts. Choose a per-communicator base for concurrent jobs.
++    uint32_t base = doca_verbs_qp_get_qpn(ctx->gqps[0]->qp) * 2654435761u;
++    doca_verbs_qp_attr_set_udp_entropy(verbs_qp_attr, (base & ~63u) + contextIdx);
++  }
+   DOCACHECKGOTO(
+     doca_verbs_qp_attr_set_path_mtu(verbs_qp_attr, DOCA_VERBS_MTU_SIZE_4K_BYTES),
+     docaStatus, status, destroy_verbs_qp_attr);
+@@ -659,7 +665,7 @@
+         gdakiFillExchInfo(&remote_exch_info[rank_idx], gdaki_ctx,
+                           gdaki_ctx->gqps[nqps_for_comm + ctx_idx]);
+
+-      NCCLCHECKGOTO(gdakiConnectQp(gdaki_ctx, gdaki_ctx->gqps[qp_idx], &remote_exch_info[rank_idx]),
++      NCCLCHECKGOTO(gdakiConnectQp(gdaki_ctx, gdaki_ctx->gqps[qp_idx], &remote_exch_info[rank_idx], ctx_idx),
+                     status, out);
+
+       INFO(NCCL_NET,
+--- a/src/transport/net_ib/gdaki/doca-gpunetio/include/host/doca_verbs.h
++++ b/src/transport/net_ib/gdaki/doca-gpunetio/include/host/doca_verbs.h
+@@ -1215,6 +1215,8 @@
+  * doca_error code - in case of failure:
+  * - DOCA_ERROR_INVALID_VALUE - received invalid input.
+  */
++void doca_verbs_qp_attr_set_udp_entropy(struct doca_verbs_qp_attr *attr, uint32_t entropy);
++
+ doca_error_t doca_verbs_qp_attr_set_port_num(struct doca_verbs_qp_attr *verbs_qp_attr,
+                                              uint16_t port_num);
+
+--- a/src/transport/net_ib/gdaki/doca-gpunetio/src/doca_verbs_qp.hpp
++++ b/src/transport/net_ib/gdaki/doca-gpunetio/src/doca_verbs_qp.hpp
+@@ -77,6 +77,8 @@
+ };
+
+ struct doca_verbs_qp_attr {
++    uint32_t udp_entropy;
++    bool has_udp_entropy;
+     enum doca_verbs_qp_state next_state { DOCA_VERBS_QP_STATE_RST };
+     enum doca_verbs_qp_state current_state { DOCA_VERBS_QP_STATE_RST };
+     enum doca_verbs_mtu_size path_mtu { DOCA_VERBS_MTU_SIZE_256_BYTES };
+--- a/src/transport/net_ib/gdaki/doca-gpunetio/src/doca_verbs_qp.cpp
++++ b/src/transport/net_ib/gdaki/doca-gpunetio/src/doca_verbs_qp.cpp
+@@ -442,8 +442,6 @@
+     return DOCA_SUCCESS;
+ }
+
+-int random_in_range(int min, int max) { return min + rand() % (max - min + 1); }
+-
+ doca_error_t resolve_remote_mac(ibv_pd *pd_handle, uint8_t local_port_num, uint32_t local_gid_index,
+                                 uint8_t remote_gid[PRIV_DOCA_GID_BYTE_LENGTH], uint8_t hop_limit,
+                                 uint8_t is_global,
+@@ -926,10 +924,11 @@
+         }
+
+         if (roce_version >= MLX5_ROCE_ADDR_LAYOUT_ROCE_VERSION_VERSION_2_0) {
+-            // generate a random udp_sport
+-            srand(time(NULL));
+-            uint16_t udp_sport = (uint16_t)random_in_range(m_verbs_device_attr->m_min_udp_sport,
+-                                                           m_verbs_device_attr->m_max_udp_sport);
++            const uint32_t low = m_verbs_device_attr->m_min_udp_sport;
++            const uint32_t count = 1u + m_verbs_device_attr->m_max_udp_sport - low;
++            const uint32_t entropy = verbs_qp_attr.has_udp_entropy ? verbs_qp_attr.udp_entropy
++                                                                   : m_qp_num * 2654435761u;
++            const uint16_t udp_sport = static_cast<uint16_t>(low + entropy % count);
+             DOCA_LOG(LOG_INFO, "Generated udp_sport = %d", udp_sport);
+
+             DEVX_SET(qpc, qpc, primary_address_path.udp_sport, udp_sport);
+@@ -2340,6 +2339,11 @@
+     }
+
+     return verbs_qp_attr->pkey_index;
++}
++
++void doca_verbs_qp_attr_set_udp_entropy(struct doca_verbs_qp_attr *attr, uint32_t entropy) {
++    attr->has_udp_entropy = true;
++    attr->udp_entropy = entropy;
+ }
+
+ doca_error_t doca_verbs_qp_attr_set_port_num(struct doca_verbs_qp_attr *verbs_qp_attr,

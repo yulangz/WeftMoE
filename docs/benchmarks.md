@@ -1,4 +1,6 @@
-# Benchmark
+# SM90 Benchmark
+
+B300 的 BF16 / NVFP4 基线见 [SM100 Benchmark](benchmarks-sm100.md)。
 
 ## 规模与口径
 
@@ -32,7 +34,7 @@ export WEFTMOE_PF_MIN_RING_DEPTH=2
 export WEFTMOE_PF_CREDIT_WINDOWS=2
 
 # 带训练缓存的 FWD。
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_training.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_training.py \
   --backend pf --model qwen35b --tokens 8192 20480 --forward-only \
   --stream-ordered --ring-tokens 2048 --ring-depth 2 \
   --prime-trace --warmups 4 --samples 20 --sample-pause-ms 50
@@ -49,11 +51,11 @@ BWD 读取 `backward_ready_slowest_rank_p50_us`，完整 cycle 读取 `wall_slow
 
 ```bash
 # 无缓存 prefill；固定权重已准备，不把重排计入每次推理。
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_inference.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_inference.py \
   --backend pf --model qwen35b --tokens 8192 20480 --prepared-weights
 
 # 小 batch，与 SGLang 的 DP=EP 路径同口径比较；改 dt 为 pf 可测 PF。
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_sglang_decode.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_sglang_decode.py \
   --model qwen35b --weft-backend dt --dp-attention \
   --tokens 1 8 64 128 512 --fresh-routes --route-bias-std 0.5 --samples 20
 ```
@@ -69,7 +71,7 @@ MegaMoE 单机对照用 `torchrun_inference.py --backend megamoe --deepgemm-pack
 ```bash
 torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port=29531 \
-  benchmarks/torchrun_training.py --backend pf --model qwen35b \
+  benchmarks/sm90/torchrun_training.py --backend pf --model qwen35b \
   --tokens 8192 20480 --forward-only --stream-ordered \
   --ring-tokens 2048 --ring-depth 2 --prime-trace --warmups 4 --samples 20
 ```
@@ -100,7 +102,7 @@ Megatron 开启 permute/activation fusion，并使用 `moe_act` selective recomp
 
 ```bash
 OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 \
-  benchmarks/torchrun_training.py --backend megatron --model qwen35b \
+  benchmarks/sm90/torchrun_training.py --backend megatron --model qwen35b \
   --dispatcher flex --deepep-num-sms 20 \
   --moe-permute-fusion --bias-activation-fusion \
   --tokens 8192 20480 --warmups 10 --samples 30 --prime-trace \
@@ -124,7 +126,7 @@ FP8 再追加 `--fp8 --weight-grad-dtype bf16`，并选择对应规模的扩展�
 
 ```bash
 WEFTMOE_FP8=0 OMP_NUM_THREADS=1 \
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_sglang_decode.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_sglang_decode.py \
   --model qwen35b --weft-backend dt --dp-attention \
   --tokens 64 512 --fresh-routes --route-bias-std 0.5 \
   --seed 1300 --samples 20 --replays 50
@@ -234,7 +236,7 @@ DT decode 收益不代表 PF 训练或完整 RL 的收益。
 TEST_HIDDEN=3072 TEST_INTERMEDIATE=1024 BENCH_EXPERTS=256 BENCH_TOPK=8 \
 BENCH_SIZES="64 512" BENCH_REPEATS=100 BENCH_SWEEPS=11 BENCH_SEED=1300 \
 OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  benchmarks/benchmark_dt_fp8.py
+  benchmarks/sm90/benchmark_dt_fp8.py
 ```
 
 再用 `BENCH_SEED=1700` 重复；其它规模使用表中 H/I/top-k 及对应构建。

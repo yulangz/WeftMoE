@@ -38,6 +38,8 @@ class TensorRuntime:
         interconnect: str | None = None,
         decode_only: bool = False,
         fp8_workspace: bool = False,
+        precision: str | None = None,
+        nvfp4_scales=None,
         session=None,
         batch_invariant: bool = True,
         allow_unvalidated_shape: bool = False,
@@ -63,6 +65,7 @@ class TensorRuntime:
         self.training = training
         self.decode_only = decode_only
         self.fp8_workspace = fp8_workspace
+        self.precision = precision or ("fp8" if fp8_workspace else "bf16")
         self.max_tokens = max_tokens
         self.stream = stream
         if self.stream is None:
@@ -80,12 +83,70 @@ class TensorRuntime:
         # Agree before compilation or native collectives. A bad shape/build on
         # one node must report a collective error, not strand peers in bootstrap.
         requests = [None] * self.world
-        request = dict(key=key, max_tokens=max_tokens, batch_invariant=batch_invariant,
-                       fp8_workspace=fp8_workspace, decode_only=decode_only,
-                       allow_unvalidated_shape=allow_unvalidated_shape)
-        dist.all_gather_object(requests, request, group=group)
-        if any(r != request for r in requests):
+        capability = torch.cuda.get_device_capability()
+        build_error = None
+        if capability[0] == 10:
+            try:
+                from .blackwell_cutlass import native
+                native()
+            except Exception as exc:
+                build_error = str(exc)
+        request = dict(
+            key=key, precision=self.precision, nvfp4_scales=nvfp4_scales, capability=capability,
+            max_tokens=max_tokens, max_saved=max_saved, batch_invariant=batch_invariant,
+            fp8_workspace=fp8_workspace, decode_only=decode_only,
+            allow_unvalidated_shape=allow_unvalidated_shape,
+        )
+        dist.all_gather_object(requests, (request, build_error), group=group)
+        if any(r != request for r, _ in requests):
             raise ValueError("EP ranks requested incompatible WeftMoE configurations")
+        for _, error in requests:
+            if error is not None:
+                raise ValueError(f"Blackwell preparation failed: {error}")
+        if nvfp4_scales is not None and self.precision != "nvfp4":
+            raise ValueError("nvfp4_scales requires NVFP4 precision")
+        if capability[0] == 10:
+            if self.precision not in ("bf16", "nvfp4") or fp8_workspace or input_layout != "dp":
+                raise ValueError("Blackwell requires DP-sharded BF16 or NVFP4")
+            nvfp4 = self.precision == "nvfp4"
+            team_experts = experts if nvfp4 else experts // self.nodes
+            if hidden > 4096 and hidden % 512:
+                raise ValueError("Blackwell combine requires hidden divisible by 512 when hidden > 4096")
+            if (max_tokens < 0 or hidden < 256 or hidden % 256 or not 128 <= intermediate <= 4096 or intermediate % 128
+                    or experts % self.world or not 1 <= top_k <= min(32, team_experts) or team_experts > 2048
+                    or experts // self.world > 512):
+                raise ValueError("Unsupported Blackwell expert shape or token capacity")
+            if nvfp4:
+                from .nvfp4 import NVFP4Scales, _validate_scales
+                self.nvfp4_scales = NVFP4Scales() if nvfp4_scales is None else NVFP4Scales(*nvfp4_scales)
+                _validate_scales(self.nvfp4_scales)
+                if training and nvfp4_scales is None and self.rank == 0:
+                    logging.getLogger(__name__).warning(
+                        "NVFP4 training is using default tensor scales. Small dY blocks can quantize "
+                        "entirely to zero. Pass calibrated nvfp4_scales for your loss normalization "
+                        "and gradient scaling."
+                    )
+            args = (group, experts, top_k, hidden, intermediate, max_tokens, self.stream, training, max_saved)
+            if self.nodes == 1:
+                from .blackwell import BlackwellRuntime
+                from .nvfp4 import NVFP4Runtime
+                backend = NVFP4Runtime if nvfp4 else BlackwellRuntime
+                self.native = backend(*args)
+            elif max_tokens >= 4096:
+                from .blackwell_pipeline import PipelinedMultiNodeRuntime
+                self.native = PipelinedMultiNodeRuntime(*args, nodes=self.nodes, nvfp4=nvfp4)
+            else:
+                from .blackwell_multinode import MultiNodeRuntime, NVFP4MultiNodeRuntime
+                backend = NVFP4MultiNodeRuntime if nvfp4 else MultiNodeRuntime
+                self.native = backend(*args, nodes=self.nodes)
+            self.compilation = None
+            if nvfp4:
+                self.native.scales = self.nvfp4_scales
+                for window in getattr(self.native, "windows", ()):
+                    window.scales = self.nvfp4_scales
+            return
+        if self.precision != ("fp8" if fp8_workspace else "bf16"):
+            raise ValueError("Unsupported runtime precision")
         native, tuning, entry = None, None, None
         decision = dict(error=None)
         try:
@@ -161,6 +222,23 @@ class TensorRuntime:
                 native.Runtime(*arguments, tuning) if tuning
                 else native.Runtime(*arguments)
             )
+
+    def inference_nvfp4(self, layer, x, routes, gates, weights, *, x_scale=None, intermediate_scale=None):
+        """Run prepared NVFP4 experts with online block-16 activation quantization."""
+        if self.precision != "nvfp4" or self.training:
+            raise ValueError("Prepare an NVFP4 inference runtime first")
+        if x.shape[0] > self.max_tokens:
+            raise ValueError("Activation shape exceeds prepared capacity")
+        if x_scale is None:
+            x_scale = self.nvfp4_scales.x
+        if intermediate_scale is None:
+            intermediate_scale = self.nvfp4_scales.intermediate
+        if self.nodes == 1:
+            return self.native.inference(x, routes, gates, weights, x_scale, intermediate_scale)
+        from .nvfp4 import validate_prepared
+        window = self.native.windows[0] if hasattr(self.native, "windows") else self.native
+        validate_prepared(window.buffer, self.stream.device, x, routes, gates, weights, x_scale, intermediate_scale)
+        return self.native._run(x, routes, gates, None, None, prepared=weights, scales=(x_scale, intermediate_scale))
 
     def _check(self, x, routes, gates, w1, w2):
         if self.fp8_workspace:

@@ -103,3 +103,10 @@ def test_invariance_runs_candidate_and_reference_ring_settings(tmp_path,monkeypa
                        ('--reference-ring-tokens',str(config['v4']['window_tokens'])),
                        ('--reference-ring-depth',str(config['v4']['contribution_windows']))]:
         assert command[command.index(flag)+1]==value
+
+
+@pytest.mark.parametrize("extra", [[], ["--dry-run", "--precision", "nvfp4"]])
+def test_blackwell_uses_dynamic_m(tmp_path, capsys, extra):
+    autotune.main(["--arch", "sm100", "--output", str(tmp_path), *extra])
+    assert "selects M dynamically" in capsys.readouterr().out
+    assert not list(tmp_path.iterdir())

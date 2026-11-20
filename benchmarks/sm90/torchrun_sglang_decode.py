@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 import triton
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import weftmoe.sglang as adapter
 from weftmoe._sglang_kernels import scatter_output, stage_inputs
 from weftmoe.runtime import TensorRuntime
@@ -363,7 +363,7 @@ def main():
                 for metric, value in metrics.items():
                     errors[name][metric] = max(errors[name][metric], value)
             if args.reference_check:
-                from benchmarks.torchrun_inference import reference
+                from benchmarks.sm90.torchrun_inference import reference
 
                 torch.backends.cuda.matmul.allow_tf32 = False
                 expected = reference(x.float(), topk.topk_ids, topk.topk_weights,

@@ -1,6 +1,10 @@
 # 使用与 autotune
 
-## 安装与自动编译
+## B300 / Blackwell
+
+B300 的安装、BF16/NVFP4 训练及推理示例、动态 M 和实测延迟见 [B300 使用与性能](blackwell.md)。
+
+## Hopper 安装与自动编译
 
 需要 Linux、Python ≥3.10、C++17、支持 SM90a 的 CUDA、CUTLASS/CUTE、NCCL，
 以及运行 Tensor API 所需的 PyTorch。多机还需要 NCCL device API 与 GIN/GDAKI；
@@ -10,6 +14,7 @@ PyTorch 和框架依赖由使用者安装，不由 WeftMoE 自动选择版本。
 安装方式与模型无关，wheel 包含编译所需的 native 源码。安装阶段不编译 CUDA；首次准备算子时需要本机工具链和上述开发头文件。路径按实际环境填写：
 
 ```bash
+git submodule update --init third_party/cutlass
 export CUDA_HOME=/usr/local/cuda
 export CUTLASS_INCLUDE_DIR=/path/to/cutlass/include
 export NCCL_INCLUDE_DIR=/path/to/nccl/include
@@ -274,7 +279,7 @@ kernel 同时输出 W、Wᵀ 及两份 scale；每个 128×128 block 只读取�
 FP8 benchmark 的权重量化与 W/Wᵀ 输出全部在计时外，源端激活在线量化仍计时；
 JSON 中以 `weight_preparation_in_timing=false` 和
 `fp8_weight_preparation="fused_quantize_transpose"` 标明。
-独立准备耗时诊断可运行 `benchmarks/torchrun_fp8_weight_preparation.py --output <json>`，
+独立准备耗时诊断可运行 `benchmarks/sm90/torchrun_fp8_weight_preparation.py --output <json>`，
 沿用 torchrun 和扩展环境变量。历史测试与原始数据见 [Benchmark](benchmarks.md)。
 
 实现参考 [DeepGEMM SM90 的 producer/math 流水线与 FP32 promotion](https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh)。
@@ -290,7 +295,7 @@ NCCL_DEBUG=WARN TEST_TOKENS=257 torchrun --standalone --nproc-per-node=2 tests/t
 # 可选：空输入 rank；TEST_HIDDEN/TEST_INTERMEDIATE 可指定其他构建 profile 的形状。
 TEST_TOKENS=1 TEST_ZERO_RANK=1 torchrun --standalone --nproc-per-node=2 tests/torchrun_fp8.py
 # 权重准备不计入计时；测试固定权重的前向+反向，不含 optimizer.step。
-torchrun --standalone --nproc-per-node=2 benchmarks/torchrun_training.py \
+torchrun --standalone --nproc-per-node=2 benchmarks/sm90/torchrun_training.py \
   --backend pf --fp8 --weight-grad-dtype bf16 --model qwen35b \
   --tokens 256 512 2048 8192 --stream-ordered --warmups 5 --samples 20
 ```
@@ -352,7 +357,7 @@ CLI 覆盖配置。`--token-buckets 8192 20480 65536` 设置长度上界；`--to
 
 ```bash
 python -m pytest -q
-torchrun --standalone --nproc-per-node=8 benchmarks/torchrun_training.py \
+torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_training.py \
   --backend pf --model qwen35b --tokens 129 --warmups 0 --samples 2 --verify
 ```
 

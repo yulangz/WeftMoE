@@ -12,7 +12,7 @@ RL 启动、调度、权重同步及共卡生命周期 hook 归 AReaL，不需�
 from weftmoe.megatron import MegatronAdapter
 
 # models：本 rank 的 Megatron model chunks，已初始化 EP group。
-adapter = MegatronAdapter(models, max_tokens=max_local_moe_tokens)
+adapter = MegatronAdapter(models, max_tokens=max_local_moe_tokens, batch_invariant=True)
 adapter.prepare()
 # 之后使用原有 model forward/backward、DDP 和 optimizer。
 # 共卡 offload 前：adapter.suspend()
@@ -82,8 +82,10 @@ notify 返回实际行数后申请训练缓存的同步边界仍然保留，并�
 
 ```python
 from weftmoe.sglang import install
-install()
+install(batch_invariant=True)
 ```
+
+Megatron 和 SGLang adapter 都默认传入 `batch_invariant=True`。在 B300 上保留默认值即可使用动态 M，所有 EP worker 使用相同设置。
 
 只在启动父进程调用不足以覆盖 spawn 出来的 worker。当前接入的是 BF16 权重的 `FusedMoE`，
 要求 `ep_size == tp_size`、expert TP=1，不直接接收 SGLang 的量化 checkpoint。

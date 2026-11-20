@@ -1,0 +1,53 @@
+diff --git a/csrc/kernels/configs.cuh b/csrc/kernels/configs.cuh
+index a7b960b..2bfbafe 100644
+--- a/csrc/kernels/configs.cuh
++++ b/csrc/kernels/configs.cuh
+@@ -26,6 +26,11 @@
+ #define __CUDACC_RDC__ // NOLINT(*-reserved-identifier)
+ #endif
+
++// Declare NVSHMEM device symbols as extern in host translation units.
++#if !defined(DISABLE_NVSHMEM) && !defined(__CUDACC_RDC__)
++#define __CUDACC_RDC__
++#endif
++
+ // Remove Torch restrictions
+ #ifdef __CUDA_NO_HALF_CONVERSIONS__
+ #undef __CUDA_NO_HALF_CONVERSIONS__
+diff --git a/csrc/kernels/ibgda_device.cuh b/csrc/kernels/ibgda_device.cuh
+index 7fab70c..c9f8d03 100644
+--- a/csrc/kernels/ibgda_device.cuh
++++ b/csrc/kernels/ibgda_device.cuh
+@@ -7,6 +7,8 @@
+ //  - nvshmem/src/include/non_abi/device/pt-to-pt/ibgda_device.cuh
+ #pragma once
+
++#include <type_traits>
++
+ #include "configs.cuh"
+ #include "exception.cuh"
+ #include "utils.cuh"
+@@ -73,11 +75,18 @@ nvshmemi_ibgda_device_state_t* ibgda_get_state() {
+     return &nvshmemi_ibgda_device_state_d;
+ }
+
+-__device__ static __forceinline__
+-nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
+-    auto state = ibgda_get_state();
+-    const auto num_rc_per_pe = ibgda_get_state()->num_rc_per_pe;
+-    return &state->globalmem.rcs[pe * num_rc_per_pe * state->num_devices_initialized + id % (num_rc_per_pe * state->num_devices_initialized)];
++template <typename State>
++__device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc_impl(State* state, int pe, int id) {
++    if constexpr (std::is_same_v<State, nvshmemi_ibgda_device_state_v1>) {
++        int num_rc = state->num_rc_per_pe * state->num_devices_initialized;
++        return &state->globalmem.rcs[pe * num_rc + id % num_rc];
++    } else {
++        return &state->globalmem.rcs[pe + nvshmemi_device_state_d.npes * id];
++    }
++}
++
++__device__ static __forceinline__ nvshmemi_ibgda_device_qp_t* ibgda_get_rc(int pe, int id) {
++    return ibgda_get_rc_impl(ibgda_get_state(), pe, id);
+ }
+
+ __device__ static __forceinline__

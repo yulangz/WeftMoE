@@ -12,34 +12,38 @@ its cache-ready measurement ends with gradients live, before external release.
 """
 
 import argparse
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import statistics
-import sys
 import time
 
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from weftmoe.runtime import TensorRuntime
 from benchmarks.models import add_model_arguments, resolve_model
-from benchmarks.workload import make_workload
+from benchmarks.workload import make_workload, workload_sha256
 
 
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
-    parser.add_argument("--prequantized-inputs", action="store_true",
-                        help="Supply rowwise FP8 X/dY; prepare before timing, include packet copy")
-    parser.add_argument("--fp8", action="store_true",
-                        help="PF block-wise FP8; quantize fixed weights and emit W/W.T outside timing")
-    parser.add_argument("--dispatcher", choices=("alltoall", "flex"), default="flex",
+def main(*, blackwell=False):
+    description = "Blackwell Megatron grouped expert training." if blackwell else __doc__
+    parser = argparse.ArgumentParser(description=description)
+    pf_parser = argparse.ArgumentParser(add_help=False) if blackwell else parser
+    if blackwell:
+        parser.add_argument("--batch-invariant", action=argparse.BooleanOptionalAction, default=True,
+                            help="Pin the WeftMoE forward arithmetic across token counts and EP sizes")
+        parser.add_argument("--backend", choices=("megatron", "weft"), default="megatron")
+        parser.add_argument("--precision", choices=("bf16", "fp4"), default="bf16")
+    else:
+        parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
+        parser.set_defaults(precision="bf16")
+    pf_parser.add_argument("--prequantized-inputs", action="store_true",
+                           help="Supply rowwise FP8 X/dY; prepare before timing, include packet copy")
+    pf_parser.add_argument("--fp8", action="store_true",
+                           help="PF block-wise FP8; prepare fixed weights outside timing")
+    parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
+                        default="alltoall" if blackwell else "flex",
                         help="Megatron communication backend: NCCL all-to-all or DeepEP")
     parser.add_argument("--deepep-num-sms", type=int, default=20)
     parser.add_argument("--moe-permute-fusion", action=argparse.BooleanOptionalAction, default=True)
@@ -52,43 +56,43 @@ def main():
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--sample-pause-ms", type=float, default=0,
                         help="Untimed pause before each sample, e.g. for clock stability checks")
-    parser.add_argument("--prime-trace", action="store_true",
+    parser.add_argument("--prime-trace", action=argparse.BooleanOptionalAction, default=blackwell,
                         help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
     parser.add_argument("--verify", action="store_true",
                         help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
-    parser.add_argument("--backward-identity", action="store_true",
-                        help="Verify the communication-only diagnostic, not a training kernel")
+    pf_parser.add_argument("--backward-identity", action="store_true",
+                           help="Verify the communication-only diagnostic, not a training kernel")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--forward-only", action="store_true",
                         help="Time training forward with saved X/GU, tape release and synchronize, without backward")
     mode.add_argument("--backward-only", action="store_true",
                       help="Time backward on a fresh, synchronized Forward tape; Forward is untimed")
-    parser.add_argument("--weight-grad-dtype", choices=("bf16", "float32"),
-                        help="FP8 dW output type; default float32. Use bf16 to match BF16 baseline output.")
-    parser.add_argument("--prepared-weights", action="store_true",
-                        help="Reuse immutable PF weights; default includes per-call packing as in training")
-    parser.add_argument("--stream-ordered", action="store_true",
-                        help="Use PF async training entrypoints, matching the Megatron adapter")
+    pf_parser.add_argument("--weight-grad-dtype", choices=("bf16", "float32"),
+                           help="FP8 dW output type; default float32. Use bf16 to match BF16 baseline output.")
+    pf_parser.add_argument("--prepared-weights", action="store_true",
+                           help="Reuse immutable PF weights; default includes per-call packing as in training")
+    pf_parser.add_argument("--stream-ordered", action="store_true",
+                           help="Use PF async training entrypoints, matching the Megatron adapter")
     parser.add_argument("--accumulate-main-grad", action="store_true",
                         help="Accumulate FP32 parameter gradients: TE fused wgrad, PF per-parameter add as in DDP")
     parser.add_argument("--trace-kernels", action="store_true",
                         help="Record CUDA entries during the first numerical check, outside performance runs")
-    parser.add_argument("--profile-stages", action="store_true",
-                        help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
-    parser.add_argument("--trace-stage-kernels", action="store_true",
-                        help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
-    parser.add_argument("--cuda-trace-dir", type=Path,
-                        help="Export CUPTI CPU/CUDA traces with FWD/BWD ranges after warmup; diagnostic only")
+    pf_parser.add_argument("--profile-stages", action="store_true",
+                           help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
+    pf_parser.add_argument("--trace-stage-kernels", action="store_true",
+                           help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
+    pf_parser.add_argument("--cuda-trace-dir", type=Path,
+                           help="Export CUPTI CPU/CUDA traces with FWD/BWD ranges after warmup; diagnostic only")
     parser.add_argument("--ncu-range", action="store_true",
                         help="Bracket one measured iteration with cudaProfilerStart/Stop for NCU app-range replay")
-    parser.add_argument("--report-window-padding", action="store_true",
-                        help="Compare hypothetical per-window and canonical M128 padding, outside timing")
+    pf_parser.add_argument("--report-window-padding", action="store_true",
+                           help="Compare hypothetical per-window and canonical M128 padding, outside timing")
     parser.add_argument("--report-communication", action="store_true",
                         help="Count route-derived dispatch/return payloads outside timing")
-    parser.add_argument("--timeline-dir", type=Path,
-                        help="Download the final FWD timeline, outside timing; requires a timeline build")
-    parser.add_argument("--ring-tokens", type=int, default=512)
-    parser.add_argument("--ring-depth", type=int, default=8)
+    pf_parser.add_argument("--timeline-dir", type=Path,
+                           help="Download the final FWD timeline, outside timing; requires a timeline build")
+    pf_parser.add_argument("--ring-tokens", type=int, default=512)
+    pf_parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--token-std-fraction", type=float, default=0.1,
                         help="Per-rank normal token std / nominal tokens; truncate at +/-3 std")
@@ -96,8 +100,11 @@ def main():
                         help="Std of per-step shared expert-logit bias; 0 gives uniform routing in expectation")
     parser.add_argument("--route-distribution", choices=("random", "balanced"), default="random",
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
-    args = parser.parse_args()
+    pf_defaults = pf_parser.parse_args([]) if blackwell else None
+    args = parser.parse_args(namespace=pf_defaults)
     resolve_model(args)
+    if args.precision == "fp4" and args.verify:
+        parser.error("--verify uses strict BF16 parity thresholds")
     if args.prequantized_inputs and not args.fp8:
         parser.error("--prequantized-inputs requires --fp8")
     if args.weight_grad_dtype is not None and not args.fp8:
@@ -135,6 +142,10 @@ def main():
     os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if blackwell:
+        from benchmarks.sm100.hardware import check_blackwell, check_finite
+
+        check_blackwell()
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     if args.experts % world:
@@ -150,13 +161,8 @@ def main():
     w2 = rand(owned, args.hidden, args.intermediate)
     for tokens in args.tokens:
         batches = make_workload(args, tokens, rank, "cuda", args.route_distribution)
-        digest = hashlib.sha256()
-        for routes, gates in batches:
-            digest.update(routes.shape[0].to_bytes(8, "little"))
-            digest.update(routes.numpy().tobytes())
-            digest.update(gates.numpy().tobytes())
         workload = dict(tokens=[routes.shape[0] for routes, _ in batches],
-                        sha256=digest.hexdigest())
+                        sha256=workload_sha256(batches))
         workloads = [None] * world
         dist.all_gather_object(workloads, workload)
         communication = None
@@ -227,10 +233,14 @@ def main():
             from benchmarks.megatron_training_backend import MegatronTrainingBackend
             runtime = MegatronTrainingBackend(args, w1, w2)
         else:
+            from weftmoe.runtime import TensorRuntime
+
             runtime = TensorRuntime(
                 group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
                 hidden=args.hidden, intermediate=args.intermediate, max_tokens=max_tokens,
                 max_rows=max_rows, training=True, max_saved=2,
+                precision="nvfp4" if args.precision == "fp4" else None,
+                batch_invariant=args.batch_invariant if blackwell else True,
                 fp8_workspace=args.fp8 and os.environ.get("TEST_FP8_COMPACT", "1") == "1")
             if args.stream_ordered:
                 runtime.forward = runtime.forward_async
@@ -306,6 +316,8 @@ def main():
         backward_ready_samples = []
         stage_profiles = []
         checkpoint_layout = "routed BF16 X + BF16 FC1 gate/up"
+        if args.precision == "fp4" and args.backend == "megatron":
+            checkpoint_layout = "Megatron TE NVFP4 grouped experts"
         measurement_intervals_ns = []
         priming_steps = len(batches) if args.prime_trace else 0
         input_rng_state = generator.get_state()
@@ -368,7 +380,12 @@ def main():
                 if args.backward_only:
                     torch.cuda.synchronize()
                     backward_ready_us = (time.perf_counter_ns() - start) / 1000
+                if blackwell and iteration == 0 and priming_steps + args.warmups:
+                    dx, dgates, dw1, dw2 = gradients
+                    check_finite(tape.output, dx, dgates, *dw1, *dw2)
                 del gradients
+            if blackwell and args.forward_only and iteration == 0 and priming_steps + args.warmups:
+                check_finite(tape.output)
             profile = tape.profile if args.profile_stages else None
             if not args.timeline_dir:
                 del tape
@@ -477,7 +494,10 @@ def main():
                 schema_version=3, workload=("captured_routes" if args.route_trace else
                                            f"variable_tokens_{args.route_distribution}_routes"),
                 route_trace=args.route_trace,
-                backend=args.backend, world=world, nominal_tokens_per_rank=tokens,
+                backend=args.backend, model=args.model, world=world,
+                **({"batch_invariant": args.batch_invariant} if args.backend == "weft" else {}),
+                local_world_size=int(os.environ.get("LOCAL_WORLD_SIZE", world)),
+                nominal_tokens_per_rank=tokens,
                 seed=args.seed, token_std_fraction=args.token_std_fraction,
                 token_truncation_std=3, route_bias_std=args.route_bias_std,
                 route_distribution=args.route_distribution,
@@ -500,10 +520,13 @@ def main():
                 input_dtype="fp8_e4m3fn" if args.prequantized_inputs else "bf16",
                 input_preparation_in_timing=not args.prequantized_inputs,
                 source_packet_copy_in_timing=args.prequantized_inputs,
-                compute_dtype="fp8_e4m3fn" if args.fp8 else "bf16",
+                compute_dtype=("fp8_e4m3fn" if args.fp8 else
+                               "nvfp4" if args.precision == "fp4" else "bf16"),
                 weight_grad_dtype=(args.weight_grad_dtype or "float32") if args.fp8 else "bf16",
                 weights_prepared_once=args.prepared_weights or args.fp8,
-                weight_preparation_in_timing=(False if args.fp8 or args.prepared_weights else None),
+                weight_preparation_in_timing=(False if args.fp8 or args.prepared_weights else
+                                              True if args.precision == "fp4" and not args.backward_only
+                                              else None),
                 fp8_weight_preparation=("fused_quantize_transpose" if args.fp8 else None),
                 cuda_trace_dir=str(args.cuda_trace_dir) if args.cuda_trace_dir else None,
                 stream_ordered=args.stream_ordered,
@@ -542,7 +565,9 @@ def main():
                 forward_timing_scope="host API boundary (not synchronized CUDA phase timing)",
                 checkpoint=checkpoint_layout + "; recompute gated SwiGLU in backward",
                 implementation=getattr(runtime, "metadata", {}),
-                gpu=torch.cuda.get_device_name(), per_rank_workspace=workspace,
+                gpu=torch.cuda.get_device_name(),
+                compute_capability=torch.cuda.get_device_capability(),
+                per_rank_workspace=workspace,
                 extension=os.environ.get("WEFTMOE_TENSOR_EXTENSION")
                           if args.backend != "megatron" else None)), flush=True)
         runtime.close()

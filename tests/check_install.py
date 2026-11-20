@@ -35,6 +35,9 @@ def main():
         assert native_source == expected_root or expected_root in native_source.parents, 'unexpected native source location'
         for name in ('build_native.py', 'tools/build_tensor_runtime.py', 'src/python/runtime.cpp',
                      'src/python/ops.cpp', 'src/cuda/activation_transport.cu',
+                     'src/cuda/blackwell/fused_host.cpp', 'src/cuda/blackwell/fused/impls/routed_bf16.cuh',
+                     'src/cuda/blackwell/fused/impls/routed_nvfp4.cuh', 'src/cuda/blackwell/bf16_grouped.cu',
+                     'third_party/cutlass/include/cute/tensor.hpp', 'third_party/cutlass/LICENSE.txt',
                      'configs/profiles/qwen35b/weftmoe_forward_tuning_generated.hpp'):
             assert (native_source / name).is_file(), name
         # Installation and public-header discovery do not need CUDA or torch.

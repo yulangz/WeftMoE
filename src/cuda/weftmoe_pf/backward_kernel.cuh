@@ -232,7 +232,7 @@ __global__ void prepare(ForwardKernelArgs f, BackwardKernelArgs a) {
 
 #include "cuda/weftmoe_pf/backward_network.cuh"
 #if defined(WEFTMOE_PF_BWD_IDENTITY_DIAGNOSTIC)
-#include "../../../benchmarks/pf_backward_identity.cuh"
+#include "../../../benchmarks/sm90/pf_backward_identity.cuh"
 #endif
 
 namespace weftmoe_pf::backward_stream {

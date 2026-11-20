@@ -61,24 +61,28 @@ def find_entry(path, key, tokens, *, source, canonical_header, batch_invariant=T
     table = json.loads(path.read_text())
     if table.get('schema') != 2:
         raise ValueError('automatic compilation requires autotune schema 2; rerun tools/autotune.py')
+    workload = {k: key[k] for k in KEY_FIELDS}
     matches = []
     for entry in table['entries']:
-        if entry['key'] != {k: key[k] for k in KEY_FIELDS} or entry['source'] != source:
+        if entry['key'] != workload or entry['source'] != source:
             continue
         lower, upper = entry['tokens']
         if not (type(lower) is int and type(upper) is int and 0 <= lower <= upper):
             raise ValueError('invalid autotune token interval')
         if not lower <= tokens <= upper:
             continue
-        if digest(entry['header']) != entry['header_digest']:
-            raise ValueError('autotune header digest mismatch')
-        if batch_invariant and (not entry.get('batch_invariant') or
-                                arithmetic(entry['header']) != arithmetic(canonical_header)):
-            continue
         matches.append(entry)
     if len(matches) > 1:
         raise ValueError('overlapping autotune token intervals for the same workload')
-    return matches[0] if matches else None
+    if not matches:
+        return None
+    entry = matches[0]
+    if digest(entry['header']) != entry['header_digest']:
+        raise ValueError('autotune header digest mismatch')
+    if batch_invariant and (not entry.get('batch_invariant') or
+                            arithmetic(entry['header']) != arithmetic(canonical_header)):
+        return None
+    return entry
 
 
 def publish_entry(path, entry):
