@@ -1,8 +1,7 @@
 # WeftMoE
 
 WeftMoE 在 Hopper/SM90a 上支持 BF16 和 blockwise FP8，在 Blackwell B300/SM103 上支持 BF16 和 NVFP4 routed MoE。
-B300 的前向和分组反向 GEMM 由 WeftMoE 直接编译 CUTLASS/CuTe 内核，wheel 随附固定版本的 CUTLASS 头文件。
-安装步骤、BF16/NVFP4 调用示例及单机和双机延迟见 [B300 使用与性能](docs/blackwell.md)。
+B300 的前向和分组反向 GEMM 使用 CUTLASS/CuTe 内核。[B300 安装与调用示例](docs/blackwell.md)
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
 | Hopper 实现 | 用途 | 通信范围 | 训练缓存与反向 |
@@ -35,16 +34,20 @@ B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant`
 
 ### Blackwell / SM103
 
-B300 单机 EP8、双机 EP16，Qwen3.5-35B-A3B 单层 routed MoE（256 experts，top-k=8）。每格为 WeftMoE / 同精度框架基线的最慢 rank 延迟 p50。
+每节点 8 张 B300，机内 NVLink，跨机每卡双 400 Gb/s RoCE。实测环境为 CUDA 13.0、PyTorch 2.13.0+cu130、NCCL 2.29.7。
 
-| EP | 精度 | Decode（µs） | Prefill（ms） | BWD（ms） |
-| ---: | --- | ---: | ---: | ---: |
-| 8 | BF16 | 68.72 / 98.35 | 1.308 / 3.944 | 2.055 / 4.397 |
-| 8 | NVFP4 | 49.63 / 91.50 | 1.225 / 8.132 | 2.258 / 7.359 |
-| 16 | BF16 | 172.46 / 306.78 | 3.967 / 7.325 | 3.500 / 6.241 |
-| 16 | NVFP4 | 159.55 / 309.17 | 3.687 / 9.770 | 3.666 / 7.446 |
+Qwen3.5-35B-A3B 单层 routed MoE（256 experts，top-k=8），取每个样本最慢 rank 的延迟 p50。
 
-Decode 为 64 tokens/rank，对照 SGLang。Prefill 和 BWD 使用名义 8192 tokens/rank 的变长输入，对照 Megatron 两种 dispatcher 中较快的一项。Prefill 取 WeftMoE 推理前向，Megatron 前向包含训练缓存写入。[完整基准与计时口径](docs/benchmarks-sm100.md#独立-wheel-与框架基线)
+| 部署 | 阶段 | 基线 | 基线 BF16 | WeftMoE BF16 | 基线 NVFP4 | WeftMoE NVFP4 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 单机 EP8 | Decode（µs） | SGLang | 98.37 | 69.52 | 91.48 | 49.55 |
+| 单机 EP8 | Prefill（ms） | Megatron | 3.944 | 1.306 | 8.132 | 1.161 |
+| 单机 EP8 | BWD（ms） | Megatron | 4.326 | 2.045 | 7.359 | 2.248 |
+| 双机 EP16 | Decode（µs） | SGLang | 306.78 | 173.83 | 309.17 | 157.67 |
+| 双机 EP16 | Prefill（ms） | Megatron | 7.325 | 3.951 | 9.770 | 3.719 |
+| 双机 EP16 | BWD（ms） | Megatron | 6.170 | 3.515 | 7.446 | 3.653 |
+
+Decode 为 64 tokens/rank，Prefill 和 BWD 为名义 8192 tokens/rank 的变长输入。Prefill 比较 WeftMoE 推理前向与 Megatron 保存反向缓存的训练前向。[基线配置与复现命令](docs/benchmarks-sm100.md)
 
 ### Hopper / SM90
 
