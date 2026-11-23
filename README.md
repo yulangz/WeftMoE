@@ -1,8 +1,7 @@
 # WeftMoE
 
 WeftMoE 在 Hopper/SM90a 上支持 BF16 和 blockwise FP8，在 Blackwell B300/SM103 上支持 BF16 和 NVFP4 routed MoE。
-B300 的前向和分组反向 GEMM 由 WeftMoE 直接编译 CUTLASS/CuTe 内核，wheel 随附固定版本的 CUTLASS 头文件。
-安装步骤、BF16/NVFP4 调用示例及单机和双机延迟见 [B300 使用与性能](docs/blackwell.md)。
+B300 的前向和分组反向 GEMM 使用 CUTLASS/CuTe 内核。[B300 安装与调用示例](docs/blackwell.md)
 只替换 routed experts；router、shared expert、attention 和 optimizer 仍由上层框架负责。
 
 | Hopper 实现 | 用途 | 通信范围 | 训练缓存与反向 |
@@ -35,16 +34,33 @@ B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant`
 
 ### Blackwell / SM103
 
-B300 单机 EP8、双机 EP16，Qwen3.5-35B-A3B 单层 routed MoE（256 experts，top-k=8）。每格为 WeftMoE / 同精度框架基线的最慢 rank 延迟 p50。
+每节点 8 张 B300，机内 NVLink，跨机每卡双 400 Gb/s RoCE。实测环境为 CUDA 13.0、PyTorch 2.13.0+cu130、NCCL 2.29.7。
 
-| EP | 精度 | Decode（µs） | Prefill（ms） | BWD（ms） |
-| ---: | --- | ---: | ---: | ---: |
-| 8 | BF16 | 68.72 / 98.35 | 1.308 / 3.944 | 2.055 / 4.397 |
-| 8 | NVFP4 | 49.63 / 91.50 | 1.225 / 8.132 | 2.258 / 7.359 |
-| 16 | BF16 | 172.46 / 306.78 | 3.967 / 7.325 | 3.500 / 6.241 |
-| 16 | NVFP4 | 159.55 / 309.17 | 3.687 / 9.770 | 3.666 / 7.446 |
+以下为单机 EP8 单层 routed MoE 的最慢 rank 延迟 p50。三个模型均为 256 experts，Qwen top-k=8，Flash top-k=6。
 
-Decode 为 64 tokens/rank，对照 SGLang。Prefill 和 BWD 使用名义 8192 tokens/rank 的变长输入，对照 Megatron 两种 dispatcher 中较快的一项。Prefill 取 WeftMoE 推理前向，Megatron 前向包含训练缓存写入。[完整基准与计时口径](docs/benchmarks-sm100.md#独立-wheel-与框架基线)
+**训练 FWD+BWD（ms）**。每个训练步包含保存反向缓存的前向和完整反向。
+
+| 模型 | tokens/rank | Megatron BF16 | WeftMoE BF16 | Megatron NVFP4 | WeftMoE NVFP4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B | 8192 | 7.951 | 3.934 | 15.064 | 4.629 |
+| Qwen3.5-35B-A3B | 20480 | 12.174 | 8.803 | 16.146 | 9.704 |
+| Qwen3.5-122B-A10B | 8192 | 10.147 | 6.551 | 15.357 | 6.604 |
+| Qwen3.5-122B-A10B | 20480 | 21.706 | 15.392 | 23.280 | 14.560 |
+| DeepSeek V4 Flash | 8192 | 13.094 | 9.281 | 15.526 | 8.997 |
+| DeepSeek V4 Flash | 20480 | 29.539 | 22.934 | 26.748 | 18.715 |
+
+**Decode（µs）**。WeftMoE 和 SGLang 均计入专家通信。
+
+| 模型 | tokens/rank | SGLang BF16 | WeftMoE BF16 | SGLang NVFP4 | WeftMoE NVFP4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B | 64 | 98.37 | 69.52 | 91.48 | 49.55 |
+| Qwen3.5-35B-A3B | 512 | 193.77 | 109.64 | 208.48 | 99.40 |
+| Qwen3.5-122B-A10B | 64 | 164.58 | 130.43 | 136.21 | 74.02 |
+| Qwen3.5-122B-A10B | 512 | 318.60 | 171.02 | 279.36 | 127.47 |
+| DeepSeek V4 Flash | 64 | 308.03 | 281.97 | 230.33 | 113.55 |
+| DeepSeek V4 Flash | 512 | 586.56 | 361.76 | 431.05 | 149.93 |
+
+完整训练步来自 DeepGEMM 后端实测。三个模型的完整对照及 CUTLASS 复测范围见[EP8 / EP16 逐项基准](docs/benchmarks-sm100.md#各模型实测)
 
 ### Hopper / SM90
 
