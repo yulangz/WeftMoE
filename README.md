@@ -33,7 +33,18 @@ B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant`
 
 ## 性能
 
-B300 在单机 EP8、双机 EP16 上实测了 BF16 和 NVFP4 的推理、训练前向、反向及完整训练步。NVFP4 的两次前向 GEMM 和四次反向 GEMM 均使用 E2M1 操作数，每 16 个元素共享一个 E4M3 块尺度。双机推理通过 NCCL GIN 传输打包后的 FP4 输入，每张 GPU 使用两个 400G RoCE 端口。模型规模、基线与计时边界见 [B300 benchmark](docs/benchmarks-sm100.md)，各负载延迟见 [NVFP4 数据](benchmarks/sm100/nvfp4-results.csv)。
+### Blackwell / SM103
+
+B300 单机 EP8、双机 EP16，Qwen3.5-35B-A3B 单层 routed MoE（256 experts，top-k=8）。每格为 WeftMoE / 同精度框架基线的最慢 rank 延迟 p50。
+
+| EP | 精度 | Decode（µs） | Prefill（ms） | BWD（ms） |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | BF16 | 68.72 / 98.35 | 1.308 / 3.944 | 2.055 / 4.397 |
+| 8 | NVFP4 | 49.63 / 91.50 | 1.225 / 8.132 | 2.258 / 7.359 |
+| 16 | BF16 | 172.46 / 306.78 | 3.967 / 7.325 | 3.500 / 6.241 |
+| 16 | NVFP4 | 159.55 / 309.17 | 3.687 / 9.770 | 3.666 / 7.446 |
+
+Decode 为 64 tokens/rank，对照 SGLang。Prefill 和 BWD 使用名义 8192 tokens/rank 的变长输入，对照 Megatron 两种 dispatcher 中较快的一项。Prefill 取 WeftMoE 推理前向，Megatron 前向包含训练缓存写入。[完整基准与计时口径](docs/benchmarks-sm100.md#独立-wheel-与框架基线)
 
 ### Hopper / SM90
 
@@ -79,7 +90,7 @@ DT decode 对比 SGLang 0.5.10.post1 的 Triton FusedMoE + DP all-gather/reduce-
 
 - [使用与 autotune](docs/usage.md)：依赖、编译、Tensor API、配置搜索。
 - [框架接入](docs/integration.md)：Megatron、SGLang、AReaL 与共卡切换。
-- [SM90 benchmark](docs/benchmarks.md) · [SM100 benchmark](docs/benchmarks-sm100.md)
+- [SM90 benchmark](docs/benchmarks.md) · [B300 / SM103 benchmark](docs/benchmarks-sm100.md)
 - [CUDA 实现结构](docs/cuda_structure.md)：资源、执行和验证模块的边界。
 
 ## 代码结构
