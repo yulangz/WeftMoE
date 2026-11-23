@@ -67,4 +67,4 @@ infer.close()
 
 ## 性能
 
-[单机 EP8、双机 EP16 延迟](../README.md#blackwell--sm103) · [测试环境与复现命令](benchmarks-sm100.md)
+[各模型 EP8 / EP16 延迟](benchmarks-sm100.md#各模型实测) · [测试环境与复现命令](benchmarks-sm100.md)

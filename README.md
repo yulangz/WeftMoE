@@ -36,18 +36,31 @@ B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant`
 
 每节点 8 张 B300，机内 NVLink，跨机每卡双 400 Gb/s RoCE。实测环境为 CUDA 13.0、PyTorch 2.13.0+cu130、NCCL 2.29.7。
 
-Qwen3.5-35B-A3B 单层 routed MoE（256 experts，top-k=8），取每个样本最慢 rank 的延迟 p50。
+以下为单机 EP8 单层 routed MoE 的最慢 rank 延迟 p50。三个模型均为 256 experts，Qwen top-k=8，Flash top-k=6。
 
-| 部署 | 阶段 | 基线 | 基线 BF16 | WeftMoE BF16 | 基线 NVFP4 | WeftMoE NVFP4 |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| 单机 EP8 | Decode（µs） | SGLang | 98.37 | 69.52 | 91.48 | 49.55 |
-| 单机 EP8 | Prefill（ms） | Megatron | 3.944 | 1.306 | 8.132 | 1.161 |
-| 单机 EP8 | BWD（ms） | Megatron | 4.326 | 2.045 | 7.359 | 2.248 |
-| 双机 EP16 | Decode（µs） | SGLang | 306.78 | 173.83 | 309.17 | 157.67 |
-| 双机 EP16 | Prefill（ms） | Megatron | 7.325 | 3.951 | 9.770 | 3.719 |
-| 双机 EP16 | BWD（ms） | Megatron | 6.170 | 3.515 | 7.446 | 3.653 |
+**训练 FWD+BWD（ms）**。每个训练步包含保存反向缓存的前向和完整反向。
 
-Decode 为 64 tokens/rank，Prefill 和 BWD 为名义 8192 tokens/rank 的变长输入。Prefill 比较 WeftMoE 推理前向与 Megatron 保存反向缓存的训练前向。[基线配置与复现命令](docs/benchmarks-sm100.md)
+| 模型 | tokens/rank | Megatron BF16 | WeftMoE BF16 | Megatron NVFP4 | WeftMoE NVFP4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B | 8192 | 7.951 | 3.934 | 15.064 | 4.629 |
+| Qwen3.5-35B-A3B | 20480 | 12.174 | 8.803 | 16.146 | 9.704 |
+| Qwen3.5-122B-A10B | 8192 | 10.147 | 6.551 | 15.357 | 6.604 |
+| Qwen3.5-122B-A10B | 20480 | 21.706 | 15.392 | 23.280 | 14.560 |
+| DeepSeek V4 Flash | 8192 | 13.094 | 9.281 | 15.526 | 8.997 |
+| DeepSeek V4 Flash | 20480 | 29.539 | 22.934 | 26.748 | 18.715 |
+
+**Decode（µs）**。WeftMoE 和 SGLang 均计入专家通信。
+
+| 模型 | tokens/rank | SGLang BF16 | WeftMoE BF16 | SGLang NVFP4 | WeftMoE NVFP4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B | 64 | 98.37 | 69.52 | 91.48 | 49.55 |
+| Qwen3.5-35B-A3B | 512 | 193.77 | 109.64 | 208.48 | 99.40 |
+| Qwen3.5-122B-A10B | 64 | 164.58 | 130.43 | 136.21 | 74.02 |
+| Qwen3.5-122B-A10B | 512 | 318.60 | 171.02 | 279.36 | 127.47 |
+| DeepSeek V4 Flash | 64 | 308.03 | 281.97 | 230.33 | 113.55 |
+| DeepSeek V4 Flash | 512 | 586.56 | 361.76 | 431.05 | 149.93 |
+
+完整训练步来自 DeepGEMM 后端实测。三个模型的完整对照及 CUTLASS 复测范围见[EP8 / EP16 逐项基准](docs/benchmarks-sm100.md#各模型实测)
 
 ### Hopper / SM90
 
