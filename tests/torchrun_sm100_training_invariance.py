@@ -6,6 +6,7 @@ import os
 import torch
 import torch.distributed as dist
 
+from weftmoe.blackwell import prepare_bf16_weights
 from weftmoe.blackwell_cutlass import tile_m as select_m
 from weftmoe.nvfp4 import prepare_nvfp4_weights
 from weftmoe.runtime import TensorRuntime
@@ -32,14 +33,16 @@ def forward(runtime, data, weights, packed):
     x, routes, gates, _ = data
     if runtime.training:
         return runtime.forward(x, routes, gates, *weights)
-    if packed is not None:
+    if runtime.precision == "nvfp4":
         return runtime.inference_nvfp4(0, x, routes, gates, packed)
-    return runtime.inference_eager(x, routes, gates, *weights)
+    return runtime.inference_eager(x, routes, gates, *(weights if packed is None else packed))
 
 
 def tile_m(runtime, rows):
     window = getattr(runtime.native, "windows", [runtime.native])[0]
     buf = window.buffer
+    if buf.decode_capacity and rows in buf.decode_tuning:
+        return buf.decode_tuning[rows][0]
     return select_m(
         buf.group.size(),
         buf.num_experts,
@@ -51,12 +54,16 @@ def tile_m(runtime, rows):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--decode-only", action="store_true", help="Compare single-node DT inference against training")
+    parser.add_argument("--tiled-weights", action="store_true", help="Use tiled weights for the distributed DT inference path")
     parser.add_argument("--precision", choices=["bf16", "nvfp4"], required=True)
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)
     parser.add_argument("--experts", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=4)
     args = parser.parse_args()
+    if args.tiled_weights and not args.decode_only:
+        parser.error("--tiled-weights requires --decode-only")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl", device_id=device)
@@ -84,7 +91,10 @@ def main():
             training=training,
             precision=args.precision,
             batch_invariant=True,
+            decode_only=args.decode_only and not training and group.size() > 1,
         )
+        if args.decode_only and not training and group.size() > 1:
+            assert rt.native.buffer.decode_capacity, "This test requires the single-node SM103 DT path"
         windows = getattr(rt.native, "windows", ())
         device_sms = torch.cuda.get_device_properties(device).multi_processor_count
         for child in windows:
@@ -95,9 +105,13 @@ def main():
                 assert child.buffer.layout.sf_ring == 8 * child.buffer.layout.ring
         return rt
 
-    def pack(weights, training):
-        if args.precision == "nvfp4" and not training:
-            return prepare_nvfp4_weights(*weights)
+    def pack(weights, training, tiled=False):
+        if training:
+            return None
+        if args.precision == "nvfp4":
+            return prepare_nvfp4_weights(*weights, tiled=tiled)
+        if tiled:
+            return prepare_bf16_weights(*weights)
 
     anchors = batch(128, h, e, k, device)
     anchors[1][0] = 3
@@ -129,7 +143,7 @@ def main():
         tiles = []
         for training in (False, True):
             rt = runtime(world, capacity, training)
-            packed = pack(local_weights, training)
+            packed = pack(local_weights, training, args.tiled_weights)
             for j, total in enumerate(lengths):
                 torch.manual_seed(3029 + total)
                 n = total // ep

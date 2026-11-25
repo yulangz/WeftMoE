@@ -163,7 +163,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumSMs, uint32_t kNumRanks,
-          uint32_t kNumRingBlocks, uint32_t kNumLocalityDomains,
+          uint32_t kNumRingBlocks, uint32_t kNumLocalityDomains, bool kDecode, bool kStaticRaster,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -228,7 +228,45 @@ struct MegaMoEScheduler {
         sched_phase ^= sched_stage_idx == 0;
     }
 
+    const uint32_t* decode_counts = nullptr;
+    uint32_t decode_idx = 0;
+    uint32_t decode_block_end = 0;
+
+    CUTLASS_DEVICE void init_decode_raster() {
+        fetch_expert_recv_count();
+        decode_idx = blockIdx.x / 2;
+        if constexpr (kNumExpertsPerLane == 1)
+            decode_block_end = math::warp_inclusive_sum(
+                math::ceil_div(stored_num_tokens_per_expert[0], BLOCK_M), ptx::get_lane_idx());
+    }
+
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {
+        if constexpr (kStaticRaster) {
+            // Every warp in both CTAs independently replays the same raster.
+            // Each FC2 tile depends only on FC1 tiles with lower linear indices.
+            const uint32_t fc1 = num_total_m_blocks * kNumL1Clusters;
+            if (decode_idx >= fc1 + num_total_m_blocks * kNumL2Clusters)
+                return false;
+            const bool first = decode_idx < fc1;
+            const uint32_t index = first ? decode_idx : decode_idx - fc1;
+            const uint32_t cols = first ? kNumL1Clusters : kNumL2Clusters;
+            const uint32_t block = index / cols;
+            const auto phase = first ? BlockPhase::Linear1 : BlockPhase::Linear2;
+            const uint32_t n = first ? L1_SHAPE_N : L2_SHAPE_N;
+            const uint32_t k = first ? L1_SHAPE_K : L2_SHAPE_K;
+            if constexpr (kNumExpertsPerLane == 1) {
+                const uint32_t expert = __ffs(__ballot_sync(0xffffffff, decode_block_end > block)) - 1;
+                const uint32_t rows = stored_num_tokens_per_expert[0];
+                const uint32_t begin = decode_block_end - math::ceil_div(rows, BLOCK_M);
+                const uint32_t local = block - ptx::exchange(begin, expert);
+                const uint32_t valid = cute::min(BLOCK_M, ptx::exchange(rows, expert) - local * BLOCK_M);
+                task_info = task_info_t(phase, expert, local, index % cols, block, valid, n, k);
+            } else {
+                task_info = create_task(phase, block, index % cols, n, k);
+            }
+            decode_idx += kNumSMs / 2;
+            return true;
+        }
         task_info_full_barriers[sched_stage_idx].wait(sched_phase);
         task_info = task_infos[sched_stage_idx];
         advance_sched_pipeline();
@@ -236,6 +274,7 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE void release_task_info() const {
+        if constexpr (kStaticRaster) return;
         // Complete metadata reads before the scheduler can overwrite this slot.
         ptx::fence_acq_rel_cta();
         task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);
@@ -273,9 +312,13 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                if constexpr (kDecode) {
+                    value = decode_counts[expert_idx];
+                } else {
+                    do {
+                        value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

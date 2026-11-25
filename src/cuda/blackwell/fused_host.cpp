@@ -5,6 +5,7 @@
 #include <cuda.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -34,17 +35,33 @@ struct Workspace {
     bool fp4;
     int64_t bytes;
     std::array<Ptr, 8> offsets;
-    Workspace(int ranks, int experts, int cap, int topk, int h, int i, int sms, bool fp4)
-        : ranks(ranks), experts(experts), capacity(align_up(cap, layout::kLCMCandidateBlockM)), topk(topk), h(h),
+    Workspace(int ranks, int experts, int cap, int topk, int h, int i, int sms, bool fp4, int decode_m)
+        : ranks(ranks), experts(experts), capacity(align_up(cap, decode_m ? 16 : layout::kLCMCandidateBlockM)), topk(topk), h(h),
           i(i), fp4(fp4) {
-        for (int m : layout::kCandidateBlockM) {
-            int blocks = math::ceil_div(capacity * ranks * topk, m) + experts / ranks;
-            ring = std::max(ring, m * sched::get_num_max_live_pool_blocks(blocks, sms, h, i));
-        }
-        ring = align_up(ring, layout::kLCMCandidateBlockM);
-        if (fp4)
+        if (decode_m) {
+            // Every source slot can land on this owner, including duplicates.
+            // Account for per-expert tail padding and every smaller tile the
+            // owner may select when fewer tokens are submitted on replay.
+            int alignment = 1;
             for (int m : layout::kCandidateBlockM)
-                sf_ring = std::max(sf_ring, layout::get_num_sf_ring_tokens(ring, m));
+                if (m <= decode_m)
+                    alignment = std::lcm(alignment, m);
+            const int64_t rows = int64_t(cap) * ranks * topk + experts / ranks * (decode_m - 1);
+            const int64_t aligned = math::ceil_div(rows, int64_t(alignment)) * alignment;
+            WEFT_HOST_ASSERT(aligned <= int64_t(layout::MegaMoESignals::kNumMaxRingBlocks) * layout::kMinCandidateBlockM);
+            ring = static_cast<int>(aligned);
+        } else {
+            for (int m : layout::kCandidateBlockM) {
+                int blocks = math::ceil_div(capacity * ranks * topk, m) + experts / ranks;
+                ring = std::max(ring, m * sched::get_num_max_live_pool_blocks(blocks, sms, h, i));
+            }
+            ring = align_up(ring, layout::kLCMCandidateBlockM);
+        }
+        if (fp4) {
+            for (int m : layout::kCandidateBlockM)
+                if (!decode_m || m <= decode_m)
+                    sf_ring = std::max(sf_ring, layout::get_num_sf_ring_tokens(ring, m));
+        }
         layout::MegaMoEBuffer b(nullptr, h, i, ranks, experts, capacity, topk, ring, sf_ring, fp4);
         bytes = b.get_num_bytes();
         offsets = {(Ptr)b.input_token_buffer.base,    (Ptr)b.input_sf_buffer.base,
@@ -72,7 +89,9 @@ struct Kernel {
     CUmodule module;
     CUfunction fn;
     int smem, sms;
-    Kernel(const std::string &path, int smem, int sms) : smem(smem), sms(sms) {
+    bool tiled_weights;
+    Kernel(const std::string &path, int smem, int sms, bool tiled_weights)
+        : smem(smem), sms(sms), tiled_weights(tiled_weights) {
         check(cuModuleLoad(&module, path.c_str()));
         try {
             unsigned count;
@@ -113,13 +132,16 @@ struct Kernel {
             return tensor_map(ptr, CU_TENSOR_MAP_DATA_TYPE_INT32, {n, cols / 64 * groups}, {stride * 4},
                               {block, B(k / 64)}, 0);
         };
+        auto packed_weight = [&](Ptr ptr, U n, U cols) {
+            return tensor_map(ptr, type, {tile, e * n * (cols / k)}, {tile * size}, {tile, 128}, swizzle);
+        };
         auto a1 = acts(4, h, tile, load, swizzle);
-        auto w1 = fp4 ? weight(weights[0], 2 * i, h)
+        auto w1 = tiled_weights ? packed_weight(weights[0], 2 * i, h) : fp4 ? weight(weights[0], 2 * i, h)
                       : tensor_map(weights[0], type, {h, 8, 2, i / 8, e},
                                    {h * 2, h * i * 2, 8 * h * 2, 2 * i * h * 2}, {64, 8, 2, 8, 1}, 128);
         auto mid = acts(6, i, B(64 / pack), sm, int(64 / pack * size));
         auto a2 = acts(6, i, tile, load, swizzle);
-        auto w2 = weight(weights[2], h, i);
+        auto w2 = tiled_weights ? packed_weight(weights[2], h, i) : weight(weights[2], h, i);
         CUtensorMap sa1{}, sw1{}, sa2{}, sw2{};
         std::vector<void *> maps;
         if (fp4) {
@@ -162,12 +184,15 @@ struct Kernel {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
     using namespace weftmoe::sm100;
     py::class_<Workspace>(mod, "Workspace")
-        .def(py::init<int, int, int, int, int, int, int, bool>())
+        .def(py::init<int, int, int, int, int, int, int, bool, int>())
         .def_readonly("capacity", &Workspace::capacity)
         .def_readonly("ring", &Workspace::ring)
         .def_readonly("sf_ring", &Workspace::sf_ring)
         .def_readonly("bytes", &Workspace::bytes)
         .def_readonly("offsets", &Workspace::offsets);
     mod.attr("task_bytes") = sizeof(sched::TaskInfo);
-    py::class_<Kernel>(mod, "Kernel").def(py::init<const std::string &, int, int>()).def("run", &Kernel::run);
+    py::class_<Kernel>(mod, "Kernel")
+        .def(py::init<const std::string &, int, int, bool>(), py::arg("path"), py::arg("smem"),
+             py::arg("sms"), py::arg("tiled_weights") = false)
+        .def("run", &Kernel::run);
 }

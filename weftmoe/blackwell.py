@@ -1,10 +1,44 @@
-"""Single-node BF16 Blackwell PF, using canonical expert parameters and NVLink."""
+"""Single-node BF16 Blackwell PF and DT, using canonical expert parameters and NVLink."""
 
 import weakref
 
 import torch
 import triton
 import triton.language as tl
+
+
+def _validate_expert_weights(w1, w2):
+    if w1.ndim != 3 or w2.ndim != 3 or w1.shape != (w2.size(0), 2 * w2.size(2), w2.size(1)):
+        raise ValueError("Expected canonical expert weights [E,2I,H] and [E,H,I]")
+    if w1.device != w2.device or any(
+        not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous() for w in (w1, w2)
+    ):
+        raise ValueError("Expected contiguous CUDA BF16 weights on the same device")
+    if min(w1.shape) <= 0 or w2.size(1) % 128 or w2.size(2) % 128:
+        raise ValueError("Expected positive expert dimensions and H and I divisible by 128")
+
+
+def _weight_tile_shape(experts, rows, columns, width):
+    # Columns and width are storage elements (packed bytes for E2M1).
+    if rows % 128 or columns % width:
+        raise ValueError(f"Expert matrix [{rows},{columns}] must contain whole 128x{width} weight tiles")
+    return experts, rows // 128, columns // width, 128, width
+
+
+def _bf16_weight_views(w1, w2):
+    e, h, i = w2.shape
+    # Each FC1 tile holds eight groups of eight gate rows and eight up rows.
+    gate_up = w1.view(e, 2, i // 64, 8, 8, h // 64, 64).permute(0, 2, 5, 3, 1, 4, 6)
+    down = w2.view(e, h // 128, 128, i // 64, 64).transpose(2, 3)
+    return gate_up, down
+
+
+@torch.no_grad()
+def prepare_bf16_weights(w1, w2):
+    """Snapshot canonical weights into contiguous 128x64 tiles for single-node SM103 inference."""
+    _validate_expert_weights(w1, w2)
+    gate_up, down = _bf16_weight_views(w1, w2)
+    return gate_up.contiguous().view(_weight_tile_shape(*w1.shape, 64)), down.contiguous()
 
 
 @triton.jit
@@ -52,7 +86,7 @@ class BlackwellRuntime:
     """One symmetric workspace, serialized on the supplied CUDA stream."""
 
     def __init__(
-        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *, fp4=False, compute_sms=None,
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, *, fp4=False, compute_sms=None, decode_only=False, decode_plan=None,
     ):
         from .blackwell_cutlass import ExpertWorkspace, launch
 
@@ -73,7 +107,7 @@ class BlackwellRuntime:
             top_k,
             hidden,
             intermediate,
-            fp4=fp4, compute_sms=compute_sms,
+            fp4=fp4, compute_sms=compute_sms, decode_only=decode_only, decode_plan=decode_plan,
         )
 
         if training:

@@ -50,7 +50,15 @@ def pack_mega_mixed(w1, w2):
     return dg.transform_weights_for_mega_moe(*matrices)
 
 
-def measure(args, n, w1, w2, packed, group, mixed_weights=None):
+def prepare_tiled_weights(w1, w2, nvfp4):
+    if nvfp4:
+        from weftmoe.nvfp4 import prepare_nvfp4_weights
+        return prepare_nvfp4_weights(w1, w2, tiled=True)
+    from weftmoe.blackwell import prepare_bf16_weights
+    return prepare_bf16_weights(w1, w2)
+
+
+def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=None):
     if args.compare_mega:
         import deep_gemm as dg
 
@@ -64,8 +72,8 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         digest = workload_sha256(trace)
     capacity = torch.tensor(max(len(ids) for ids, _ in trace), device="cuda")
     dist.all_reduce(capacity, op=dist.ReduceOp.MAX)
-    cap = int(capacity)
-    rt = TensorRuntime(
+    cap = args.decode_capacity if args.decode_capacity is not None else int(capacity)
+    config = dict(
         group=group,
         experts=args.experts,
         top_k=args.top_k,
@@ -77,6 +85,14 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         precision="nvfp4" if nvfp4 else "bf16",
         batch_invariant=args.batch_invariant,
     )
+    use_dt = decode and group.size() == int(os.environ["LOCAL_WORLD_SIZE"]) and torch.cuda.get_device_capability() == (10, 3)
+    if args.compare_pf and not use_dt:
+        raise ValueError("DT/PF comparison requires single-node SM103 decode")
+    rt = TensorRuntime(**config, decode_only=use_dt)
+    if tiled_weights is not None and not rt.supports_tiled_weights:
+        rt.close()
+        raise ValueError("Weight-layout comparison requires single-node SM103 inference")
+    pf = TensorRuntime(**config) if args.compare_pf else None
     ref = (
         dg.SymmBuffer(
             group,
@@ -119,10 +135,10 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             ref.topk_weights[:count].copy_(weights[:count].gather(1, perm))
         return count
 
-    def run_weft(count):
+    def run_weft(count, runtime=rt):
         if nvfp4:
-            return rt.inference_nvfp4(0, x[:count], routes[:count], weights[:count], packed)
-        return rt.inference(0, x[:count], routes[:count], weights[:count], w1, w2)
+            return runtime.inference_nvfp4(0, x[:count], routes[:count], weights[:count], packed)
+        return runtime.inference(0, x[:count], routes[:count], weights[:count], w1, w2)
 
     def run_mega(count):
         if mixed_weights:
@@ -140,6 +156,21 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         return expected[:count]
 
     runners = [run_weft, run_mega] if ref is not None else [run_weft]
+    names = ["weft"]
+    if ref is not None:
+        names.append("mega_mxfp8_mxfp4" if mixed_weights else "nvfp4_prestaged" if nvfp4 else "mega_prestaged")
+    if pf is not None:
+        runners.append(lambda count: run_weft(count, pf))
+        names.append("pf")
+    if tiled_weights is not None:
+        def run_tiled(count):
+            inputs = (0, x[:count], routes[:count], weights[:count])
+            if nvfp4:
+                return rt.inference_nvfp4(*inputs, tiled_weights)
+            return rt.inference(*inputs, *tiled_weights)
+
+        runners.append(run_tiled)
+        names.append("tiled_dt" if use_dt else "tiled_pf")
     count = prepare(*trace[0])
     for runner in runners:
         runner(count)
@@ -150,7 +181,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             with torch.cuda.graph(graph):
                 output = runner(count)
             graphs.append((graph, output))
-    times = [[], []]
+    times = [[] for _ in runners]
     start_event, stop_event = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     # Eager baseline primes the full trace before warmup and sampling.
     iterations = trace if decode else trace * 2
@@ -162,8 +193,9 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         before = counters.read()
     for step, sample in enumerate(iterations):
         count = prepare(*sample)
-        outputs = [None, None]
-        for backend in reversed(range(len(runners))) if step % 2 else range(len(runners)):
+        outputs = [None] * len(runners)
+        for position in range(len(runners)):
+            backend = (step + position) % len(runners)
             dist.barrier()
             torch.cuda.synchronize()
             if decode:
@@ -185,10 +217,13 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
         valid = torch.isfinite(outputs[0]).all()
         if ref is not None:
             valid &= torch.isfinite(outputs[1]).all() if mixed_weights else (outputs[0] == outputs[1]).all()
+        for backend in ("pf", "tiled_dt", "tiled_pf"):
+            if backend in names:
+                valid &= (outputs[0].view(torch.int16) == outputs[names.index(backend)].view(torch.int16)).all()
         valid = valid.int()
         dist.all_reduce(valid, op=dist.ReduceOp.MIN)
         if not valid.item():
-            raise RuntimeError(f"WeftMoE/pre-staged parity failed at step {step}")
+            raise RuntimeError(f"Non-finite or mismatched MoE output at step {step}")
     if counters is not None:
         after = counters.read()
         print(
@@ -210,7 +245,9 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             model=args.model,
             mode=args.mode,
             batch_invariant=args.batch_invariant,
+            weft_kernel="dt" if use_dt else "pf",
             tokens_per_rank=n,
+            capacity_per_rank=cap,
             ep=world,
             dtype="nvfp4" if nvfp4 else "bf16",
             samples=args.samples,
@@ -218,17 +255,14 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None):
             replays=args.replays if decode else 1,
             routing_sha256=[d for d, _ in gathered],
         )
-        for backend, name in enumerate(
-            (
-                "weft",
-                "mega_mxfp8_mxfp4" if mixed_weights else "nvfp4_prestaged" if nvfp4 else "mega_prestaged",
-            )[: len(runners)]
-        ):
+        for backend, name in enumerate(names):
             samples = list(map(max, zip(*(pair[backend] for _, pair in gathered))))
             result[name + "_us"] = samples
             result[name + "_p50_us"] = statistics.median(samples)
         print("BLACKWELL_FORWARD_JSON " + json.dumps(result), flush=True)
     rt.close()
+    if pf is not None:
+        pf.close()
     if ref is not None:
         ref.destroy()
 
@@ -242,9 +276,12 @@ def main():
     p.add_argument("--precision", choices=("bf16", "fp4"), default="bf16")
     p.add_argument("--batch-invariant", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--tokens", type=int, nargs="+")
+    p.add_argument("--decode-capacity", type=int, help="Prepare a fixed capacity shared by all decode buckets")
     p.add_argument("--samples", type=int)
     p.add_argument("--warmups", type=int)
     p.add_argument("--replays", type=int, default=50)
+    p.add_argument("--compare-weight-layouts", action="store_true", help="Compare standard and tiled inference weights on the same route trace")
+    p.add_argument("--compare-pf", action="store_true", help="Time the PF runtime on the same inputs and require exact output parity")
     p.add_argument("--compare-mega", action="store_true", help="Also time the optional single-node DeepGEMM baseline")
     p.add_argument(
         "--mega-mixed", action="store_true", help="Compare NVFP4 latency to pre-staged upstream MXFP8 x MXFP4"
@@ -254,6 +291,10 @@ def main():
     p.add_argument("--route-bias-std", type=float, default=0.5)
     p.add_argument("--token-std-fraction", type=float, default=0.1)
     args = p.parse_args()
+    if args.compare_pf and (
+        args.mode != "decode" or os.environ["WORLD_SIZE"] != os.environ["LOCAL_WORLD_SIZE"]
+    ):
+        p.error("--compare-pf requires single-node decode")
     args.compare_mega |= args.mega_mixed
     if args.compare_mega:
         import deep_gemm as dg
@@ -267,6 +308,8 @@ def main():
     ).items():
         if getattr(args, key) is None:
             setattr(args, key, default)
+    if args.decode_capacity is not None and (not decode or args.decode_capacity < max(args.tokens)):
+        p.error("--decode-capacity requires decode mode and must cover all token counts")
     if min(*args.tokens, args.samples, args.replays) < 1 or args.warmups < 0:
         p.error("Invalid token or iteration count")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -294,8 +337,9 @@ def main():
         ):
             p.error("--mega-mixed requires single-node NVFP4")
         mixed = pack_mega_mixed(w1, w2) if args.mega_mixed else None
+        tiled = prepare_tiled_weights(w1, w2, args.precision == "fp4") if args.compare_weight_layouts else None
         for n in args.tokens:
-            measure(args, n, w1, w2, packed, group, mixed)
+            measure(args, n, w1, w2, packed, group, mixed, tiled)
     finally:
         dist.destroy_process_group()
 

@@ -547,7 +547,7 @@ def main(argv=None):
     require(args.tokens and min(args.tokens) > 0 and len(set(args.tokens)) == len(args.tokens),
             "tokens must be distinct positive integers")
     if args.arch == "sm100":
-        print("Blackwell selects M dynamically at launch. No offline tuning is required.")
+        print("Blackwell selects M dynamically at launch. For optional SM103 decode tuning, run tools/autotune_sm103_decode.py under torchrun.")
         return
     groups = {}
     for tokens in args.tokens:

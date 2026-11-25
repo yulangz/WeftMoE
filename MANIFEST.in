@@ -9,6 +9,9 @@ include benchmarks/sm100/deepep-v1.2.1-nvshmem35.patch
 include benchmarks/sm100/bf16-results.csv
 include benchmarks/sm100/nvfp4-results.csv
 include benchmarks/sm100/tile-m-results.csv
+include benchmarks/sm100/decode-dt-results.csv
+include benchmarks/sm100/decode-autotune-results.csv
+include benchmarks/sm100/decode-pipeline-results.csv
 include benchmarks/sm100/strict-forward-results.csv
 include benchmarks/sm100/nccl-2.29.7-gdaki-roce-entropy.patch
 prune benchmarks/results

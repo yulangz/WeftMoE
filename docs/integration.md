@@ -91,13 +91,27 @@ Megatron 和 SGLang adapter 都默认传入 `batch_invariant=True`。在 B300 �
 要求 `ep_size == tp_size`、expert TP=1，不直接接收 SGLang 的量化 checkpoint。
 这里的 `tp_size` 是 SGLang 的进程组大小；开启 DP attention 后可形成 DP=EP 的布局。
 
-BF16 的 PF/DT 通过 5D TMA 直接读取原始 FC1 权重，在共享内存形成 gate/up 排列，
-不保存额外的显存重排副本。训练侧同样直接读取原始布局；Megatron 的跨 expert 参数拼接
-缓冲区仍按形状复用。SGLang 在计算 KV/Mamba 容量之前预热 PF/DT workspace，
-使其计入实际可用显存。否则按原始模型权重估算的 KV pool 会过大，
-后续长 prefill 的 attention 临时张量可能 OOM。`mem_fraction_static` 无需因此手动调低；
-可容纳的 KV token 数会按持久内存相应调整。FP8 同样在 KV 预算前完成量化、释放 BF16
-专家 storage，并预热 PF/DT workspace，避免预算仍按 BF16 权重或遗漏 workspace 计算。
+独立服务可用仓库里的启动脚本，它在每个 scheduler worker 初始化模型前安装 adapter。下例使用本地 Qwen3.5-35B-A3B-Base，TP=EP=DP=8。
+
+```bash
+python tools/launch_sglang.py \
+  --model-path /storage/models/Qwen__Qwen3.5-35B-A3B-Base \
+  --tp-size 8 --ep-size 8 --dp-size 8 --enable-dp-attention \
+  --disable-shared-experts-fusion --language-only
+```
+
+单机 B300 的私有 BF16 专家参数默认在 KV/Mamba 预算前转换成分块布局。PF 和 DT 的 5D 视图共享原 Parameter 的 GPU 地址，每层只保留一份 BF16 权重；转换时有一层临时空间。SGLang 使用权重共享 daemon 时继续读取常规布局。可在启动前设置 `WEFTMOE_SGLANG_TILED_BF16=0` 选择常规布局。脚本默认使用 triton MoE runner、none A2A 和未量化的 BF16 专家。独立 TensorRuntime 也支持 PF/DT 共用预打包 NVFP4，调用方式见[B300 接口](blackwell.md#单机-decode)。
+
+热更新或导出时，adapter 在相同地址上还原常规布局，操作完成后重新分块。SGLang 权重更新接口、expert weight loader、PyTorch state dict 及配套 AReaL 的 AWEX 接收路径都使用这一机制。自行通过 `.data`、已缓存的指针或外部流读写 BF16 专家时，在 worker 的请求调度已暂停期间使用以下上下文；异步传输需在退出前完成提交。所有 rank 在恢复推理前完成更新。
+
+```python
+from weftmoe.sglang import canonical_weights
+
+with canonical_weights():
+    update_expert_parameters(model)
+```
+
+SGLang 在计算 KV/Mamba 容量前也预热 PF/DT workspace。FP8 在同一阶段完成量化、释放 BF16 专家 storage，并将持久显存计入 KV 预算。
 
 FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
 FP8 权重字节（uint8 view）和 FP32 block scale，不恢复 BF16，不重新量化。
@@ -126,7 +140,7 @@ DT 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 �
 可使用下面已接入的 AReaL worker，或在自己的 worker 入口显式调用 `install()`。
 
 BF16 共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图，
-释放 prefill runtime；原地址的 BF16 权重更新完成后可直接回放，无需刷新权重副本或重新 capture。
+释放 prefill runtime。分块 BF16 在 suspend 时恢复为普通布局，resume 时在同一地址重新分块，已有 decode 图可直接回放。
 显存紧张可设 `WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS=0`，代价是释放后需要重新准备图。
 模型权重地址改变时不能继续回放旧图。最终退出使用 `close(model_runner)`。
 
@@ -155,6 +169,8 @@ WEFTMOE_STATIC_RING_TOKENS: "2048"
 WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS: "2"
 WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS: "1"
 ```
+
+分块 BF16 的在线 AWEX 更新需使用配套含 `canonical_weights` 更新上下文的 AReaL adapter。与更早的 AWEX 代码配合时可设置 `WEFTMOE_SGLANG_TILED_BF16=0` 使用常规布局。
 
 同时传递所需的 `PYTHONPATH`、`LD_LIBRARY_PATH`、开发依赖路径和网络环境。
 开启 autotune 表时分别核对 actor/rollout 的模式、精度、容量与图 bucket；

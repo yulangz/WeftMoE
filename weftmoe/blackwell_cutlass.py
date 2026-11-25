@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import json
 import math
 import os
 import subprocess
@@ -88,8 +89,36 @@ def tile_m(ranks, experts, rows, topk):
     return next(m for m in (64, 128, 192, 240) if blocks * m >= covered)
 
 
+DECODE_TILES = (16, 32, 64, 128, 192, 240)
+
+
+def decode_key(sms, ranks, experts, hidden, intermediate, topk, precision):
+    return f"sm103-{sms}-ep{ranks}-e{experts}-h{hidden}-i{intermediate}-k{topk}-{precision}"
+
+
+def load_decode_plan(key, override=None):
+    if override is None:
+        with (source_root() / "configs/profiles/sm103_decode.json").open() as file:
+            override = json.load(file).get(key, {})
+        extra = os.environ.get("WEFTMOE_SM103_DECODE_PROFILE")
+        if extra:
+            with open(extra) as file:
+                override.update(json.load(file).get(key, {}))
+    plan = {}
+    for rows, (m, static) in override.items():
+        if (str(int(rows)) != str(rows) or int(rows) < 1 or type(m) is not int
+                or m not in DECODE_TILES or type(static) is not bool):
+            raise ValueError(f"Invalid DT tuning for {rows} tokens: {(m, static)}")
+        plan[int(rows)] = (m, static)
+    return plan
+
+
+def decode_config(ranks, experts, rows, topk):
+    return tile_m(ranks, experts, rows, topk), rows * ranks * topk <= 24 * experts
+
+
 @cache
-def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m, save, exact):
+def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m, save, exact, decode_capacity, single_cta, static_raster, tiled_weights=False):
     src, cuda, include, version = _toolchain()
     arch = "".join(map(str, torch.cuda.get_device_capability(device))) + "a"
     k = (256 if i % 256 == 0 else 128) if fp4 else 64
@@ -138,6 +167,7 @@ def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m,
     args.append(int(save))
     if fp4:
         args.append(int(exact))
+    args.extend([decode_capacity, int(single_cta), int(static_raster), int(tiled_weights)])
     code = (
         f'#include "fused/impls/{name}.cuh"\n'
         f"void instantiate() {{ [[maybe_unused]] auto kernel = &weftmoe::sm100::{name}<{','.join(map(str, args))}>; }}\n"
@@ -173,11 +203,11 @@ def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m,
                         check=True,
                     )
                     os.replace(binary, target)
-    return native().Kernel(str(target), smem, sms), k, store
+    return native().Kernel(str(target), smem, sms, tiled_weights), k, store
 
 
 class ExpertWorkspace:
-    def __init__(self, group, experts, capacity, topk, hidden, intermediate, *, fp4=False, compute_sms=None):
+    def __init__(self, group, experts, capacity, topk, hidden, intermediate, *, fp4=False, compute_sms=None, decode_only=False, decode_plan=None):
         import torch.distributed._symmetric_memory as symm
 
         self.group, self.num_experts, self.num_topk = group, experts, topk
@@ -186,8 +216,18 @@ class ExpertWorkspace:
         self.device = torch.cuda.current_device()
         device_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.sms = device_sms if compute_sms is None else compute_sms
+        self.decode_capacity = capacity if decode_only else 0
+        self.decode_tuning = decode_plan or {}
+        self.max_decode_m = 0
+        if decode_only:
+            # All ranks allocate the same single-window layout. Each owner can
+            # select a smaller M on replay, even when the source lengths differ.
+            self.max_decode_m = max(
+                [tile_m(group.size(), experts, capacity, topk)]
+                + [m for n, (m, _) in self.decode_tuning.items() if n <= capacity]
+            )
         layout = self.layout = native().Workspace(
-            group.size(), experts, capacity, topk, hidden, intermediate, self.sms, fp4
+            group.size(), experts, capacity, topk, hidden, intermediate, self.sms, fp4, self.max_decode_m
         )
         cap = self.num_max_tokens_per_rank = layout.capacity
         allocator = torch if group.size() == 1 else symm
@@ -221,7 +261,14 @@ class ExpertWorkspace:
 def launch(y, first, second, workspace, *, saved=(), tensor_scales=(1.0, 1.0, 1.0)):
     b = workspace
     rows = y.size(0)
-    m = tile_m(b.group.size(), b.num_experts, rows, b.num_topk)
+    if b.decode_capacity:
+        config = b.decode_tuning.get(rows) or decode_config(b.group.size(), b.num_experts, rows, b.num_topk)
+        m, static_raster = config
+        m = min(m, b.max_decode_m)
+    else:
+        m = tile_m(b.group.size(), b.num_experts, rows, b.num_topk)
+        static_raster = False
+    tiled_weights = (first[0] if b.fp4 else first).ndim == 5
     kernel, k, store = _kernel(
         b.device,
         b.fp4,
@@ -237,6 +284,10 @@ def launch(y, first, second, workspace, *, saved=(), tensor_scales=(1.0, 1.0, 1.
         m,
         bool(saved),
         b.fp4 and math.frexp(tensor_scales[1])[0] != 0.5,
+        b.decode_capacity,
+        bool(b.decode_capacity and rows * b.num_topk <= 128),
+        static_raster,
+        tiled_weights,
     )
     weights = (
         [v.data_ptr() for v in (*first, *second)] if b.fp4 else [first.data_ptr(), 0, second.data_ptr(), 0]

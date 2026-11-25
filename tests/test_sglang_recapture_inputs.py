@@ -18,7 +18,11 @@ def test_recapture_without_optional_version_specific_buffers():
 
 def test_recapture_restores_sglang_constructor_inputs():
     pytest.importorskip("sglang")
-    from sglang.srt.model_executor.cuda_graph_runner import DecodeInputBuffers
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import DecodeInputBuffers
+    except ModuleNotFoundError:
+        # The split runner recreates its buffers when init_decode_cuda_graph runs.
+        from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
     from weftmoe.sglang import _reset_decode_inputs
 
     kwargs = dict(
@@ -28,6 +32,10 @@ def test_recapture_restores_sglang_constructor_inputs():
         seq_len_fill_value=2, encoder_len_fill_value=3, num_tokens_per_bs=1,
         cache_loc_dtype=torch.int64, enable_mamba_track=True,
     )
+    import inspect
+    if "num_tokens_per_req" in inspect.signature(DecodeInputBuffers.create).parameters:
+        kwargs["num_tokens_per_req"] = kwargs.pop("num_tokens_per_bs")
+        kwargs["next_token_logits_buffer"] = torch.zeros((4, kwargs.pop("vocab_size")))
     buffers = DecodeInputBuffers.create(**kwargs)
     reference = DecodeInputBuffers.create(**kwargs)
     addresses = {}

@@ -65,6 +65,47 @@ infer.close()
 
 开关的两种设置均按本次调用选择 M。单机根据本地 token 数估算每个专家的负载，多机按提交给节点内核的窗口行数估算。两次前向 GEMM 的 N 均为 128，BF16 的 K 为 64，NVFP4 在 I 可被 256 整除时用 K256，其余支持的形状用 K128。B300 无需预报负载。`tools/autotune.py` 识别 B300 后跳过 Hopper 的离线搜索。
 
+### 单机 decode
+
+在单机推理的 `TensorRuntime` 上设置 `training=False, decode_only=True` 可启用 DT。BF16 使用 `inference`，预打包的 NVFP4 使用 `inference_nvfp4`。按照每卡服务的最大 decode token 数设置 `max_tokens`。同一个 runtime 可以为多种 token 数捕获 CUDA Graph，每个 bucket 在捕获前先预热一次。
+
+DT 为一次调用预留足以容纳全部路由的本地行空间，包括所有 rank 的重复槽都发往同一专家的情况。小批次的 TMA、MMA 和 epilogue warp 根据专家计数独立遍历同一组 FC1、FC2 tiles。较大批次可使用动态任务分配。两种调度均使用 DT 的路由分发、跨卡就绪信号和分段 top-k 归约。一般推理及训练使用 PF。
+
+每个源 rank 把自己的计数向量写到各 owner 的独立位置，以 release/acquire 信号发布。各 CTA 在共享内存中汇总本地专家的接收行数，供 pull、调度和清理复用。NVFP4 激活量化与路由排序共用一次 Triton launch。两次 GEMM 的 K 累加顺序、量化尺度和按专家及原始槽号排序的 top-k 归约保持相同。
+
+DT 的离线搜索有两个参数，CTA 的 M 取 16、32、64、128、192、240，任务调度取静态或动态。表项按 SM 数、EP、专家数、H、I、top-k、精度及每卡 token 数匹配。未测过的形状或长度使用负载估计。下面的命令在 8 卡 B300 上搜索一个形状，可用 `--hidden`、`--intermediate`、`--experts` 和 `--top-k` 覆盖模型尺寸。
+
+```bash
+torchrun --standalone --nproc-per-node=8 tools/autotune_sm103_decode.py \
+  --model qwen35b --precision nvfp4 --capacity 512 --tokens 1 16 256 512 \
+  --output build/decode-profile.json
+export WEFTMOE_SM103_DECODE_PROFILE="$PWD/build/decode-profile.json"
+```
+
+搜索时每个候选都与保存反向状态的训练前向逐位比较，同输入也检查 PF 推理。候选在相同路由上交错计时，再用留出的路由复测原配置和排名靠前的候选。默认要求确认阶段的 p50 延迟至少降低 1.5% 才替换原配置。环境变量指定的文件覆盖内置表中的对应行。也可在创建 DT runtime 时传入 `decode_plan={16: (32, True)}` 指定本次 runtime 的表，布尔值 `True` 表示静态调度。EP 组在分配工作区前核对配置。
+
+PF 和 DT 各自用工作区中的调用序号标记跨卡 FC2 完成信号。DT 的源 rank 收到所有 owner 对本次调用的确认后，可在下一次调用中覆写输入和路由目录。这样也覆盖了空 rank、某个 owner 没有收到该源的 token，以及反复回放同一个 CUDA Graph 的情况。
+
+单机 SM103 的 BF16 和 NVFP4 推理可在每层加载时准备一次分块权重。分别建立 prefill runtime（`training=False`）和 decode runtime（另加 `decode_only=True`），然后把同一份权重传给二者。
+
+```python
+from weftmoe.blackwell import prepare_bf16_weights
+
+w1_tiles, w2_tiles = prepare_bf16_weights(w1, w2)
+y_prefill = bf16_pf.inference(0, x_prefill, ids_prefill, gates_prefill, w1_tiles, w2_tiles)
+y_decode = bf16_dt.inference(0, x_decode, ids_decode, gates_decode, w1_tiles, w2_tiles)
+```
+
+```python
+from weftmoe.nvfp4 import prepare_nvfp4_weights
+
+weights = prepare_nvfp4_weights(w1, w2, tiled=True)
+y_prefill = nvfp4_pf.inference_nvfp4(0, x_prefill, ids_prefill, gates_prefill, weights)
+y_decode = nvfp4_dt.inference_nvfp4(0, x_decode, ids_decode, gates_decode, weights)
+```
+
+BF16 分块副本的字节数和原参数相同。如果同时保留训练参数，两份都占显存。NVFP4 可以在量化时直接写出分块格式，两种打包方式的权重与尺度占用相同。更新专家参数后需要重新准备快照。传入原始 BF16 权重可直接使用当前参数。基准的 `--compare-weight-layouts` 配合 `--mode prefill` 或 `--mode decode` 可在相同路由上比较两种布局。部署分块权重时，可在上述 autotune 命令中加 `--tiled-weights` 搜索对应的 M 和调度，并用单独的 `--output` 保存该服务的配置。[权重准备耗时和各档延迟](benchmarks-sm100.md#单机-ep8-decode-专用-kernel)
+
 ## 性能
 
-[各模型 EP8 / EP16 延迟](benchmarks-sm100.md#各模型实测) · [测试环境与复现命令](benchmarks-sm100.md)
+[EP8 decode 的 DT / PF 对照](benchmarks-sm100.md#单机-ep8-decode-专用-kernel) · [各模型 EP8 / EP16 延迟](benchmarks-sm100.md#各模型实测) · [测试环境与复现命令](benchmarks-sm100.md)
