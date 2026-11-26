@@ -34,6 +34,8 @@ B300 默认用动态 M、按模型和精度固定 N/K。开启 `batch_invariant`
 
 ### Blackwell / SM103
 
+单机 decode 专用 kernel 支持 BF16 和 NVFP4。SGLang 接入默认以分块布局保存单机 B300 的私有 BF16 专家权重，prefill 和 decode 共用一份。设置 `WEFTMOE_SGLANG_TILED_BF16=0` 可使用常规布局。[启动与热更新](docs/integration.md) · [1、16、256、512 tokens/rank 的 DT / PF 延迟](docs/benchmarks-sm100.md#单机-ep8-decode-专用-kernel)
+
 每节点 8 张 B300，机内 NVLink，跨机每卡双 400 Gb/s RoCE。实测环境为 CUDA 13.0、PyTorch 2.13.0+cu130、NCCL 2.29.7。
 
 以下为单机 EP8 单层 routed MoE 的最慢 rank 延迟 p50。三个模型均为 256 experts，Qwen top-k=8，Flash top-k=6。

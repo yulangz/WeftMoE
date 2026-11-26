@@ -28,6 +28,16 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
         static_cast<T>(kLCMCandidateBlockM));
 }
 
+// DT owns a full invocation's rows. PF recycles physical blocks and
+// distinguishes successive users of a block by its ring generation.
+template <bool Decode, uint32_t M, uint32_t RingRows>
+struct RowPool {
+    static constexpr uint32_t Blocks = RingRows / M;
+    CUTLASS_DEVICE static uint32_t block(uint32_t idx) { return Decode ? idx : idx % Blocks; }
+    CUTLASS_DEVICE static uint32_t row(uint32_t idx) { return Decode ? idx : idx % RingRows; }
+    CUTLASS_DEVICE static uint32_t generation(uint32_t idx) { return Decode ? 0 : idx / Blocks; }
+};
+
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T block_m) {
@@ -60,11 +70,12 @@ struct alignas(128) MegaMoESignals {
     // Task scheduling
     uint32_t l1_task_count[kNumDeviceLocalityDomains];
     uint32_t l2_task_count[kNumDeviceLocalityDomains];
+    uint32_t launch_epoch;
 
-    // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
-    // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
+    // Each local stream advances launch_epoch once per collective. One owner
+    // acknowledgement per source is sufficient even across CUDA Graph replays.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
-    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
+    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];  // DT source-directory epochs
 
     // Expert token counts
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
@@ -156,6 +167,11 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_nvl_barrier_counter_ptr() const {
         return &signals->nvl_barrier_counter;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_launch_epoch_ptr() const {
+        return &signals->launch_epoch;
     }
 
     CUTLASS_DEVICE

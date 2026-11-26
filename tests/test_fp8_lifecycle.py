@@ -10,6 +10,12 @@ from weftmoe.megatron import MegatronAdapter
 from weftmoe._master_weights import MasterWeights
 
 
+requires_sm90_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="block-wise FP8 storage requires Hopper/SM90",
+)
+
+
 @torch.no_grad()
 def test_unbound_data_updates_do_not_reuse_quantized_weights(monkeypatch):
     import weftmoe.fp8 as fp8
@@ -94,7 +100,7 @@ def test_close_does_not_discard_materialized_parameters(monkeypatch):
     assert not hasattr(parameter, "_weftmoe_fp8_writer")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@requires_sm90_fp8
 def test_master_publish_waits_for_all_writer_streams(monkeypatch):
     import weftmoe._master_weights as module
     from weftmoe.fp8 import _storage
@@ -157,7 +163,7 @@ def test_master_publish_waits_for_all_writer_streams(monkeypatch):
     assert not master.writer_streams
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@requires_sm90_fp8
 @pytest.mark.parametrize("discard", [False, True])
 @pytest.mark.parametrize("already_offloaded", [False, True])
 def test_sglang_offload_preserves_or_requires_full_update(

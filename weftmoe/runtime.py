@@ -43,6 +43,7 @@ class TensorRuntime:
         session=None,
         batch_invariant: bool = True,
         allow_unvalidated_shape: bool = False,
+        decode_plan: dict | None = None,
     ):
         if group is None:
             raise ValueError("Pass the explicit expert process group")
@@ -84,10 +85,16 @@ class TensorRuntime:
         # one node must report a collective error, not strand peers in bootstrap.
         requests = [None] * self.world
         capability = torch.cuda.get_device_capability()
+        self.supports_tiled_weights = not training and self.nodes == 1 and capability == (10, 3)
+        use_dt = decode_only and self.supports_tiled_weights
         build_error = None
         if capability[0] == 10:
             try:
-                from .blackwell_cutlass import native
+                from .blackwell_cutlass import decode_key, load_decode_plan, native
+                if use_dt:
+                    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+                    profile_key = decode_key(sms, self.world, experts, hidden, intermediate, top_k, self.precision)
+                    decode_plan = load_decode_plan(profile_key, decode_plan)
                 native()
             except Exception as exc:
                 build_error = str(exc)
@@ -95,7 +102,7 @@ class TensorRuntime:
             key=key, precision=self.precision, nvfp4_scales=nvfp4_scales, capability=capability,
             max_tokens=max_tokens, max_saved=max_saved, batch_invariant=batch_invariant,
             fp8_workspace=fp8_workspace, decode_only=decode_only,
-            allow_unvalidated_shape=allow_unvalidated_shape,
+            allow_unvalidated_shape=allow_unvalidated_shape, decode_plan=decode_plan,
         )
         dist.all_gather_object(requests, (request, build_error), group=group)
         if any(r != request for r, _ in requests):
@@ -103,6 +110,8 @@ class TensorRuntime:
         for _, error in requests:
             if error is not None:
                 raise ValueError(f"Blackwell preparation failed: {error}")
+        if decode_plan is not None and not use_dt:
+            raise ValueError("decode_plan requires single-node SM103 decode inference")
         if nvfp4_scales is not None and self.precision != "nvfp4":
             raise ValueError("nvfp4_scales requires NVFP4 precision")
         if capability[0] == 10:
@@ -131,7 +140,7 @@ class TensorRuntime:
                 from .blackwell import BlackwellRuntime
                 from .nvfp4 import NVFP4Runtime
                 backend = NVFP4Runtime if nvfp4 else BlackwellRuntime
-                self.native = backend(*args)
+                self.native = backend(*args, decode_only=use_dt, decode_plan=decode_plan)
             elif max_tokens >= 4096:
                 from .blackwell_pipeline import PipelinedMultiNodeRuntime
                 self.native = PipelinedMultiNodeRuntime(*args, nodes=self.nodes, nvfp4=nvfp4)
@@ -234,7 +243,8 @@ class TensorRuntime:
         if intermediate_scale is None:
             intermediate_scale = self.nvfp4_scales.intermediate
         if self.nodes == 1:
-            return self.native.inference(x, routes, gates, weights, x_scale, intermediate_scale)
+            return self.native.inference(x, routes, gates, weights, x_scale, intermediate_scale,
+                                         allow_tiled=self.supports_tiled_weights)
         from .nvfp4 import validate_prepared
         window = self.native.windows[0] if hasattr(self.native, "windows") else self.native
         validate_prepared(window.buffer, self.stream.device, x, routes, gates, weights, x_scale, intermediate_scale)
@@ -247,12 +257,14 @@ class TensorRuntime:
             raise RuntimeError("Runtime must be invoked on its preparation stream")
         if x.ndim != 2 or x.shape[1] != self.hidden or x.shape[0] > self.max_tokens:
             raise ValueError("Activation shape exceeds prepared capacity")
-        shapes = (
-            (x.shape[0], self.top_k),
-            (x.shape[0], self.top_k),
-            (self.experts // self.world, 2 * self.intermediate, self.hidden),
-            (self.experts // self.world, self.hidden, self.intermediate),
-        )
+        owned = self.experts // self.world
+        w1_shape = (owned, 2 * self.intermediate, self.hidden)
+        w2_shape = (owned, self.hidden, self.intermediate)
+        if w1.ndim == 5 and self.supports_tiled_weights and self.precision == "bf16":
+            from .blackwell import _weight_tile_shape
+            w1_shape = _weight_tile_shape(*w1_shape, 64)
+            w2_shape = _weight_tile_shape(*w2_shape, 64)
+        shapes = ((len(x), self.top_k), (len(x), self.top_k), w1_shape, w2_shape)
         for tensor, shape in zip((routes, gates, w1, w2), shapes):
             if tensor.shape != shape:
                 raise ValueError(f"Expected {shape}, got {tuple(tensor.shape)}")

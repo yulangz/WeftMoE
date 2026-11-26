@@ -15,6 +15,7 @@
 #include "fused/layout/mega_moe.cuh"
 #include "fused/mma/sm100.cuh"
 #include "fused/scheduler/mega_moe.cuh"
+#include "fused/scheduler/decode.cuh"
 #include "fused/ptx/tcgen05.cuh"
 #include "fused/ptx/tma.cuh"
 #include "fused/ptx/utils.cuh"
@@ -39,6 +40,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kSave, bool kExactHiddenScale,
+    uint32_t kDecodeCapacity = 0, bool kSingleDispatchCTA = false, bool kStaticRaster = false, bool kTiledWeights = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -48,7 +50,6 @@ template <
     uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
     uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4,
     uint32_t kNumThreads = kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
-    uint32_t kNumTokensPerWarp = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
     typename task_info_t = sched::TaskInfo
@@ -117,6 +118,7 @@ routed_nvfp4(void* y,
     );
     const auto workspace = buffer.workspace;
 
+    using Pool = layout::RowPool<(kDecodeCapacity != 0), BLOCK_M, kNumRingTokens>;
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
     // SF and its buffer configs
@@ -275,13 +277,15 @@ routed_nvfp4(void* y,
     cudaGridDependencySynchronize();
 
     // Task scheduler
+    static_assert(!kDecodeCapacity || kNumRingTokens >=
+        uint64_t(kDecodeCapacity) * kNumRanks * kNumTopk + kNumExpertsPerRank * (BLOCK_M - 1));
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks, kNumLocalityDomains>(
+        kNumRingBlocks, kNumLocalityDomains, (kDecodeCapacity != 0), kStaticRaster>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -323,94 +327,36 @@ routed_nvfp4(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+    // A captured CUDA Graph reuses its grid ID. Read the workspace generation
+    // before the CTA joins dispatch; all CTAs pass this point before FC2 retires.
+    const uint32_t epoch = ptx::ld_acq(workspace.get_launch_epoch_ptr()) + 1u;
+    if constexpr (kDecodeCapacity) {
+        if (warp_idx < kNumDispatchWarps)
+            dt::dispatch<kSingleDispatchCTA, kNumExperts, kNumTopk, kNumRanks, kNumSMs,
+                         kNumDispatchThreads, kDispatchBarrierIdx, kDispatchGridSyncIndex>(
+                buffer, sym_buffer, num_tokens, shared_storage.expert_token_count, epoch);
+        // Compute warps can already be waiting here while dispatch uses barrier 0.
+        __barrier_sync(15);
+        scheduler.decode_counts = shared_storage.expert_token_count;
+        if constexpr (kStaticRaster)
+            scheduler.init_decode_raster();
+    }
+
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
         // Dispatch warps
-        WEFT_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-        constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-        const auto read_topk_idx = [&](const auto& process) {
-            // TODO: figure out better unrolling
-            // Now, `unroll` is better than `unroll 8`
-            #pragma unroll
-            for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
-                 i < num_tokens;
-                 i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
-                // Allocate slots for each token-topk
-                int expert_idx = -1;
-                if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-                    expert_idx = static_cast<int>(
-                        buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[i * kNumTopk + lane_idx]);
-                    if (expert_idx >= 0)
-                        process(i * kNumTopk + lane_idx, expert_idx);
-                }
-                __syncwarp();
-            }
-        };
-
-        // Count experts' tokens
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-           atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-        });
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-        // Get SM offset (~6.5 us)
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+        if constexpr (!kDecodeCapacity) {
+            comm::dispatch_pf<kNumExperts, kNumTopk, kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchBarrierIdx, kDispatchGridSyncIndex, kSave>(
+                buffer, sym_buffer, num_tokens, shared_storage.expert_token_count, checkpoint);
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, false, true);
         }
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-        // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = kSave ? checkpoint.source_ordinals[token_topk_idx] : atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
-
-        // Grid sync
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
-
-        // Write expert count
-        if (sm_idx == 0) {
-            // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
-            WEFT_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
-            __syncwarp();
-
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
-            }
-        }
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-        // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -420,101 +366,20 @@ routed_nvfp4(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
 
-        // Per-rank counts for current expert (re-loaded when expert changes)
-        constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
-        int current_expert_idx = -1;
-        uint32_t stored_rank_count[kNumRanksPerLane] = {};
-        uint32_t expert_start_idx = 0, expert_end_idx = 0;
-        uint32_t expert_pool_block_offset = 0;
-
+        comm::PullCursor<kNumRanks> cursor;
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
-            // Advance expert until within the range
-            int old_expert_idx = current_expert_idx;
-            while (token_idx >= expert_end_idx) {
-                if (++ current_expert_idx >= kNumExpertsPerRank)
-                    break;
-
-                // Update pool block offset for the new expert
-                expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-
-                // Move start and end to the next expert
-                expert_start_idx = expert_end_idx;
-                expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
+            if constexpr (kDecodeCapacity && kNumExpertsPerRank <= 32 && kNumRanks <= 32) {
+                if (!dt::locate(scheduler, token_idx, cursor)) break;
+            } else {
+                if (!cursor.template locate_round_robin<BLOCK_M, kNumExpertsPerRank>(scheduler, token_idx)) break;
             }
-
-            // Finish all tokens
-            if (current_expert_idx >= kNumExpertsPerRank)
-                break;
-
-            // Load per-rank counts when expert changes
-            if (old_expert_idx != current_expert_idx) {
-                old_expert_idx = current_expert_idx;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    // TODO: this is not coalesced
-                    stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
-                }
-            }
-
-            // Round-robin rank selection via iterative min-peeling
-            uint32_t current_rank_in_expert_idx;
-            uint32_t remaining[kNumRanksPerLane];
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                remaining[i] = stored_rank_count[i];
-            uint32_t offset = 0;
-            uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-            uint32_t slot_idx = token_idx_in_expert;
-            uint32_t token_idx_in_rank;
-            while (true) {
-                // Compute active count and min across all ranks
-                // NOTES: reduce within each lane first, then warp-reduce once
-                uint32_t num_actives_in_lane = 0;
-                uint32_t min_in_lane = 0xffffffff;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    num_actives_in_lane += remaining[i] > 0;
-                    if (remaining[i] > 0)
-                        min_in_lane = cute::min(min_in_lane, remaining[i]);
-                }
-                const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
-                const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
-
-                // Hit in the current round
-                const uint32_t num_round_tokens = length * num_active_ranks;
-                if (slot_idx < num_round_tokens) {
-                    const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
-                    uint32_t num_seen_ranks = 0;
-                    current_rank_in_expert_idx = 0;
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                        const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
-                        const uint32_t num_active_lanes = __popc(mask);
-                        if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
-                            current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
-                        num_seen_ranks += num_active_lanes;
-                    }
-                    token_idx_in_rank = offset + (slot_idx / num_active_ranks);
-                    break;
-                }
-
-                // Move into the next round
-                slot_idx -= num_round_tokens;
-                offset += length;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
-                    remaining[i] -= cute::min(remaining[i], length);
-            }
-
             // Read source token-topk index (written by remote dispatch via NVLink)
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
-                current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);
+                cursor.current_expert_idx, cursor.current_rank_in_expert_idx, cursor.token_idx_in_rank);
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
@@ -523,20 +388,20 @@ routed_nvfp4(void* y,
             WEFT_STATIC_ASSERT(kNumChunks * kNumBytesPerPull == kHidden / kPack, "kNumBytesPerPull must divide hidden");
 
             // TMA load token from remote rank and store into local
-            const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+            const uint32_t pool_token_idx = cursor.expert_pool_block_offset * BLOCK_M + cursor.token_idx_in_expert;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-            const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
-            if (l1_empty_count_target > 0) {
-                const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
+            const auto l1_empty_count_target = Pool::generation(pool_block_idx) * kNumL1BlockNs;
+            if (!kDecodeCapacity && l1_empty_count_target > 0) {
+                const auto empty_ptr = workspace.get_l1_empty_count_ptr(Pool::block(pool_block_idx));
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
             const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), cursor.current_rank_in_expert_idx);
+            const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(Pool::row(pool_token_idx)).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -563,17 +428,17 @@ routed_nvfp4(void* y,
             // Load the weight first, so that its remote latency overlaps with the SF copy below
             const auto weight = *sym_buffer.map(
                 buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+                cursor.current_rank_in_expert_idx);
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / kSFGroupK;
             WEFT_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
                 buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
+                cursor.current_rank_in_expert_idx);
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
-            const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+            const uint32_t ring_block_idx = Pool::block(pool_block_idx);
+            const uint32_t token_idx_in_block = cursor.token_idx_in_expert % BLOCK_M;
             const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
                 transform_sf_token_idx(token_idx_in_block);
             #pragma unroll
@@ -586,25 +451,25 @@ routed_nvfp4(void* y,
 
             // Store weights and metadata
             if (cute::elect_one_sync()) {
-                *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                *buffer.l1_topk_weights_buffer.get_data_buffer(Pool::row(pool_token_idx)).template get_base_ptr<float>() = weight;
 
-                const auto checkpoint_row = kSave ? checkpoint.expert_starts[current_expert_idx] + token_idx_in_expert : 0;
+                const auto checkpoint_row = kSave ? checkpoint.expert_starts[cursor.current_expert_idx] + cursor.token_idx_in_expert : 0;
                 if constexpr (kSave) {
                     checkpoint.weights[checkpoint_row] = weight;
                     checkpoint.origins[checkpoint_row] =
-                        current_rank_in_expert_idx * kNumMaxTokensPerRank * kNumTopk + src_token_topk_idx;
+                        cursor.current_rank_in_expert_idx * kNumMaxTokensPerRank * kNumTopk + src_token_topk_idx;
                 }
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
-                    {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                    {cursor.current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
                 // Complete last chunk's store
                 issue_and_wait_pull_store(kNumChunks - 1);
-                const bool is_last_token = (token_idx == expert_end_idx - 1);
+                const bool is_last_token = (token_idx == cursor.expert_end_idx - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
-                    is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+                    workspace.get_l1_full_count_ptr(Pool::block(pool_block_idx)),
+                    is_last_token ? BLOCK_M - (cursor.token_idx_in_expert % BLOCK_M) : 1u
                 );
             }
             __syncwarp();
@@ -631,46 +496,58 @@ routed_nvfp4(void* y,
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 // Read expert token count before clearing
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    *workspace.get_expert_recv_count_sum_ptr(i));
+                const auto num_recv_tokens = kDecodeCapacity ? scheduler.decode_counts[i] :
+                    static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
-                expert_pool_block_offset = scheduler.get_pool_block_offset(i);
+                const auto expert_pool_block_offset = scheduler.get_pool_block_offset(i);
 
-                // Wait read count ready
-                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                if constexpr (!kDecodeCapacity) {
+                    // Wait read count ready
+                    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                // Clear the expert token count
-                WEFT_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
-                if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    // Clear the expert token count
+                    WEFT_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
+                    if (warp_idx == 0) {
+                        *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    }
+
+                    // Clean per-rank token count
+                    for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
+                        *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                    __syncwarp();
                 }
-
-                // Clean per-rank token count
-                for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                    *workspace.get_expert_recv_count_ptr(j, i) = 0;
-                __syncwarp();
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    *workspace.get_l1_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_full_mask_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    const auto block = Pool::block(expert_pool_block_offset + j);
+                    *workspace.get_l1_full_count_ptr(block) = 0;
+                    *workspace.get_l2_full_mask_ptr(block) = 0;
+                    if constexpr (!kDecodeCapacity) {
+                        *workspace.get_l1_empty_count_ptr(block) = 0;
+                        *workspace.get_l2_empty_count_ptr(block) = 0;
+                    }
                 }
                 __syncwarp();
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        if constexpr (kDecodeCapacity) {
+            // A peer may reuse its input/directory after all owners finish FC2
+            // and acknowledge this epoch. The remaining cleanup writes are local.
+            if (sm_idx == 0 && warp_idx == 0)
+                dt::wait_for_owners<kNumRanks>(workspace, epoch);
+        } else {
+            // Wait for all ranks to finish cleaning
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Before the NVLink barrier, there is a grid sync */ true,
+                /* At the end of kernel does not need to sync */ false
+            );
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -686,17 +563,17 @@ routed_nvfp4(void* y,
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = Pool::block(pool_block_idx);
 
             // Wait the entire token arrival
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
-                const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
+                const auto num_expected_tokens = BLOCK_M * (Pool::generation(pool_block_idx) + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
                 ptx::fence_async_global();  // Dispatch wrote L1 scales through the generic proxy.
             }
 
-            L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), pool_block_idx / kNumRingBlocks);
+            L2KBlockDependency l2_k_block_dependency(workspace.get_l2_full_mask_ptr(ring_block_idx), Pool::generation(pool_block_idx));
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 if (task_info.block_phase == sched::BlockPhase::Linear2) {
                     l2_k_block_dependency.wait(k_block_idx);
@@ -763,8 +640,15 @@ routed_nvfp4(void* y,
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    tma::copy_nd<BLOCK_K / kPack, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t, 4>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx / kPack, half_n_idx, half_idx, expert_idx);
+                    if constexpr (kTiledWeights) {
+                        const uint32_t tile = (expert_idx * (shape_n / BLOCK_N) + n_block_idx) * num_k_blocks + k_block_idx;
+                        tma::copy<BLOCK_K / kPack, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx],
+                            0, tile * BLOCK_N, 2);
+                    } else {
+                        tma::copy_nd<BLOCK_K / kPack, LOAD_BLOCK_N, kSwizzleBMode, weight_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx / kPack, half_n_idx, half_idx, expert_idx);
+                    }
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
@@ -903,7 +787,7 @@ routed_nvfp4(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // Do mainloop by the leader CTA
-        if (is_leader_cta)
+        if (!kStaticRaster && is_leader_cta)
             scheduler.mainloop(sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
@@ -957,7 +841,7 @@ routed_nvfp4(void* y,
             const uint32_t wg_start_m = epilogue_wg_idx * WG_BLOCK_M;
             const uint32_t num_valid_wg_rows = valid_m <= wg_start_m ? 0u : cute::min(valid_m - wg_start_m, WG_BLOCK_M);
             const uint32_t pool_block_idx = task_info.pool_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = Pool::block(pool_block_idx);
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;  // Full-pool offset for non-ring metadata
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
@@ -1018,8 +902,8 @@ routed_nvfp4(void* y,
             if (task_info.block_phase == sched::BlockPhase::Linear1) {
                 // Wait L2 block empty
                 const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * Pool::generation(pool_block_idx);
+                while (!kDecodeCapacity && ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -1215,13 +1099,13 @@ routed_nvfp4(void* y,
                     L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
 
                     // Increment L1 empty count for this physical slot (one per N block)
-                    ptx::red_add(
-                        workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    if constexpr (!kDecodeCapacity)
+                        ptx::red_add(workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
                 }
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                if (!kDecodeCapacity && epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                     ptx::red_add(
                         workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
                 }
@@ -1368,11 +1252,7 @@ routed_nvfp4(void* y,
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
 
-        // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         WEFT_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
-        uint64_t peer_grid_idx = 0;
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1380,15 +1260,23 @@ routed_nvfp4(void* y,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-        // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
+        // All CTAs consumed their inputs and computed FC2. The next local
+        // launch reads the incremented counter after this kernel completes.
+        if (sm_idx == 0 && epilogue_thread_idx == 0)
+            *workspace.get_launch_epoch_ptr() = epoch;
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), epoch);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        if constexpr (kDecodeCapacity) {
+            dt::combine<kHidden, kNumTopk, kNumExpertsPerRank, kNumSMs, kNumEpilogueWarps>(
+                buffer, y, num_tokens, epilogue_warp_idx, epoch);
+            return;
+        }
+
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-        const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1403,7 +1291,7 @@ routed_nvfp4(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
-            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+            comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == epoch); },
                              [&]() { printf("WeftMoE combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
             // Each lane acquires its peer. Order those stores before the elected TMA reader.
             __syncwarp();

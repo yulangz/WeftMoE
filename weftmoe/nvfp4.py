@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .blackwell import BlackwellRuntime, _sorted_route_keys
+from .blackwell import BlackwellRuntime, _sorted_route_keys, _validate_expert_weights, _weight_tile_shape
 
 
 @triton.jit
@@ -42,6 +42,7 @@ def _pack_rows(
     COLS: tl.constexpr,
     WEIGHT: tl.constexpr,
     INTERLEAVE: tl.constexpr,
+    TILE_BYTES: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
     start = tl.program_id(1) * COLS
@@ -62,7 +63,12 @@ def _pack_rows(
         sf_dest = row.to(tl.int64) * (K // 16) + start // 16 + group
     tl.store(Scale + sf_dest, sf, start // 16 + group < K // 16)
     col = start // 2 + tl.arange(0, COLS // 2)
-    tl.store(Data + dest.to(tl.int64) * (K // 2) + col, packed, col < K // 2)
+    if TILE_BYTES:
+        tile = (dest // 128).to(tl.int64) * (K // (2 * TILE_BYTES)) + col // TILE_BYTES
+        offset = (tile * 128 + dest % 128) * TILE_BYTES + col % TILE_BYTES
+    else:
+        offset = dest.to(tl.int64) * (K // 2) + col
+    tl.store(Data + offset, packed, col < K // 2)
 
 
 @triton.jit
@@ -74,6 +80,14 @@ def _route(R, G, SR, SG, E: tl.constexpr, K: tl.constexpr, BK: tl.constexpr):
     keys = _sorted_route_keys(ids, slot, E, BK)
     tl.store(SR + row * K + slot, tl.where(keys // BK < E, keys // BK, -1), slot < K)
     tl.store(SG + row * K + slot, tl.gather(gates, keys % BK, 0), slot < K)
+
+
+@triton.jit
+def _stage_nvfp4(X, Data, Scale, R, G, SR, SG, tensor_scale, H: tl.constexpr,
+                 E: tl.constexpr, K: tl.constexpr, BK: tl.constexpr, COLS: tl.constexpr):
+    _pack_rows(X, Data, Scale, tensor_scale, 1, H, COLS, False, False)
+    if tl.program_id(1) == 0:
+        _route(R, G, SR, SG, E, K, BK)
 
 
 class NVFP4Scales(NamedTuple):
@@ -119,24 +133,21 @@ def nvfp4_block_stats(tensor, scale):
     }
 
 
-def prepare_nvfp4_weights(w1, w2, *, weight_scales=(1 / 64, 1 / 64)):
-    """Quantize canonical BF16 expert weights. Scales are layer-wide dequantization factors."""
-    if w1.ndim != 3 or w2.ndim != 3 or w1.shape != (w2.shape[0], 2 * w2.shape[2], w2.shape[1]):
-        raise ValueError("Expected canonical expert weights [E,2I,H] and [E,H,I]")
-    if w1.device != w2.device or any(
-        not w.is_cuda or w.dtype != torch.bfloat16 or not w.is_contiguous() for w in (w1, w2)
-    ):
-        raise ValueError("Expected contiguous CUDA BF16 weights on the same device")
-    if min(w1.shape) <= 0 or len(weight_scales) != 2 or w1.shape[1] % 256 or w1.shape[2] % 128:
-        raise ValueError("NVFP4 requires H and I divisible by 128 and two weight scales")
+def prepare_nvfp4_weights(w1, w2, *, weight_scales=(1 / 64, 1 / 64), tiled=False):
+    """Quantize canonical BF16 experts. tiled=True prepares the single-node SM103 inference layout."""
+    _validate_expert_weights(w1, w2)
+    if len(weight_scales) != 2:
+        raise ValueError("Expected two weight scales")
     _validate_scales(weight_scales)
+    tile_bytes = (128 if w2.size(2) % 256 == 0 else 64) if tiled else 0
     matrices = []
     for idx, (w, scale) in enumerate(zip((w1, w2), weight_scales)):
         e, n, k = w.shape
-        data = torch.empty((e, n, k // 2), dtype=torch.int8, device=w.device)
+        shape = _weight_tile_shape(e, n, k // 2, tile_bytes) if tiled else (e, n, k // 2)
+        data = torch.empty(shape, dtype=torch.int8, device=w.device)
         sf = torch.empty((e, k // 64, n), dtype=torch.int, device=w.device)
         _pack_rows[(e * n, triton.cdiv(k, 512))](
-            w, data, sf.view(torch.uint8), scale, n, k, 512, True, idx == 0
+            w, data, sf.view(torch.uint8), scale, n, k, 512, True, idx == 0, tile_bytes
         )
         matrices.append((data, sf.transpose(1, 2)))
     return NVFP4Weights(*matrices, tuple(weight_scales))
@@ -145,37 +156,31 @@ def prepare_nvfp4_weights(w1, w2, *, weight_scales=(1 / 64, 1 / 64)):
 def stage_nvfp4(buffer, x, routes, gates, scale):
     n, k = x.shape
     if n:
-        _pack_rows[(n, triton.cdiv(k, 512))](
-            x, buffer.x, buffer.x_sf.view(torch.uint8), scale, 1, k, 512, False, False
-        )
-        _route[(n,)](
-            routes,
-            gates,
-            buffer.topk_idx,
-            buffer.topk_weights,
-            buffer.num_experts,
-            buffer.num_topk,
-            triton.next_power_of_2(buffer.num_topk),
+        _stage_nvfp4[(n, triton.cdiv(k, 512))](
+            x, buffer.x, buffer.x_sf.view(torch.uint8), routes, gates,
+            buffer.topk_idx, buffer.topk_weights, scale, k, buffer.num_experts,
+            buffer.num_topk, triton.next_power_of_2(buffer.num_topk), 512,
         )
 
 
-def validate_prepared(b, device, x, routes, gates, weights, x_scale, intermediate_scale):
+def validate_prepared(b, device, x, routes, gates, weights, x_scale, intermediate_scale, *, allow_tiled=False):
     _validate_scales((x_scale, intermediate_scale))
     if not isinstance(weights, NVFP4Weights):
         raise TypeError("Expected prepared NVFP4 expert weights")
     e = b.num_experts // b.group.size()
-    w1, w2 = (weights.fc1[0], weights.fc2[0])
-    if w1.shape != (e, 2 * b.intermediate_hidden, b.hidden // 2) or w2.shape != (
-        e,
-        b.hidden,
-        b.intermediate_hidden // 2,
-    ):
-        raise ValueError("NVFP4 weights do not match the prepared experts")
-    for data, scales in (weights.fc1, weights.fc2):
-        groups, cols, packed = data.shape
+    tiled = weights.fc1[0].ndim == 5
+    if tiled and not allow_tiled:
+        raise ValueError("Tiled NVFP4 weights require a single-node SM103 inference runtime")
+    width = 128 if b.intermediate_hidden % 256 == 0 else 64
+    matrices = ((weights.fc1, 2 * b.intermediate_hidden, b.hidden // 2),
+                (weights.fc2, b.hidden, b.intermediate_hidden // 2))
+    for (data, scales), cols, packed in matrices:
+        shape = _weight_tile_shape(e, cols, packed, width) if tiled else (e, cols, packed)
+        if data.shape != shape:
+            raise ValueError("NVFP4 weights do not match the prepared experts")
         if data.dtype != torch.int8 or not data.is_contiguous():
             raise ValueError("Expected contiguous packed E2M1 expert weights")
-        if (scales.dtype != torch.int32 or scales.shape != (groups, cols, packed // 32)
+        if (scales.dtype != torch.int32 or scales.shape != (e, cols, packed // 32)
                 or scales.stride(1) != 1 or scales.stride(2) < cols or scales.stride(2) % 4
                 or scales.stride(0) != scales.size(2) * scales.stride(2)):
             raise ValueError("Expected MN-major packed block-16 expert scales")
@@ -215,10 +220,10 @@ class NVFP4Runtime(BlackwellRuntime):
     """Persistent NVLink expert kernel on one Blackwell node."""
 
     def __init__(
-        self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1, *, compute_sms=None,
+        self, group, experts, top_k, hidden, intermediate, capacity, stream, training=False, max_saved=1, *, compute_sms=None, decode_only=False, decode_plan=None,
     ):
         super().__init__(
-            group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, fp4=True, compute_sms=compute_sms,
+            group, experts, top_k, hidden, intermediate, capacity, stream, training, max_saved, fp4=True, compute_sms=compute_sms, decode_only=decode_only, decode_plan=decode_plan,
         )
         self.scales = NVFP4Scales()
         if training:
@@ -257,9 +262,10 @@ class NVFP4Runtime(BlackwellRuntime):
         self.tapes.add(tape)
         return tape
 
-    def inference(self, x, routes, gates, weights, x_scale, intermediate_scale):
+    def inference(self, x, routes, gates, weights, x_scale, intermediate_scale, *, allow_tiled=False):
         b = self.buffer
-        validate_prepared(b, self.stream.device, x, routes, gates, weights, x_scale, intermediate_scale)
+        validate_prepared(b, self.stream.device, x, routes, gates, weights, x_scale, intermediate_scale,
+                          allow_tiled=allow_tiled)
         caller = torch.cuda.current_stream(x.device)
         if caller != self.stream:
             self.stream.wait_stream(caller)

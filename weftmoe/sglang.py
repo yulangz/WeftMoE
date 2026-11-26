@@ -6,18 +6,23 @@ import os
 import functools
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 
 import torch
 import torch.distributed as dist
 import triton
 
+from . import _sglang_bf16
+from ._sglang_api import worker_api
+from ._sglang_bf16 import canonical_weights as canonical_weights
 from ._sglang_kernels import sanitize_routes, scatter_output, stage_inputs
 from .runtime import TensorRuntime
 
 _runtime = None
 _decode_runtime = None
 _recapture = False
+_recapture_prefill = False
 _stream = None
 _dp_layout_patched = False
 # True once patch_dp_attention_layout() converted the layout so the MoE block
@@ -25,13 +30,28 @@ _dp_layout_patched = False
 # every rank's rows, so the transport must shard them itself.
 _rows_are_dp_sharded = False
 _eager_pending = None
-_decode_batch = False
+_decode_batch = None
 _graph_inputs = {}
 _fp8_weights = {}
 _fp8_devices = {}
 _fp8_offloaded = False
 _fp8_needs_update = False
 _fp8_initial_pool = None
+
+
+@contextmanager
+def _batch_phase(decode):
+    global _decode_batch
+    previous, _decode_batch = _decode_batch, decode
+    try:
+        yield
+    finally:
+        _decode_batch = previous
+
+
+def _is_decode_batch(batch):
+    mode = batch.global_forward_mode or batch.forward_mode
+    return not batch.is_extend_in_batch and (mode.is_decode() or mode.is_idle())
 
 
 def _use_fp8():
@@ -118,7 +138,7 @@ def _prepare_runtime(layer, group, top_k, max_tokens, *, batch_invariant, decode
     global _stream
     if _stream is None:
         _stream = torch.cuda.Stream()
-    return TensorRuntime(
+    runtime = TensorRuntime(
         group=group,
         experts=layer.num_experts,
         top_k=top_k,
@@ -132,6 +152,10 @@ def _prepare_runtime(layer, group, top_k, max_tokens, *, batch_invariant, decode
         fp8_workspace=_use_fp8(),
         batch_invariant=batch_invariant,
     )
+    runtime._sglang_tiled_bf16 = (runtime.supports_tiled_weights and not _use_fp8()
+                                  and os.environ.get("WEFTMOE_SGLANG_TILED_BF16", "1") == "1"
+                                  and worker_api().private_weights())
+    return runtime
 
 
 def participate_idle_layers(model):
@@ -219,7 +243,7 @@ def install(*, batch_invariant=True):
     os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "0"
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+    api = worker_api()
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -233,15 +257,46 @@ def install(*, batch_invariant=True):
             raise ValueError("SGLang adapter already installed with a different batch_invariant setting")
         return
 
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import ModelRunnerKVCacheMixin
-    original_init_memory_pool = ModelRunnerKVCacheMixin.init_memory_pool
+    original_runner_forward = api.model_runner.forward
+
+    @functools.wraps(original_runner_forward)
+    def runner_forward(self, forward_batch, *args, **kwargs):
+        with _batch_phase(_is_decode_batch(forward_batch)):
+            return original_runner_forward(self, forward_batch, *args, **kwargs)
+
+    api.model_runner.forward = runner_forward
+    if api.prefill_capture is not None:
+        original_prefill_capture = api.prefill_capture.capture
+
+        @functools.wraps(original_prefill_capture)
+        def prefill_capture(self, *args, **kwargs):
+            with _batch_phase(False):
+                return original_prefill_capture(self, *args, **kwargs)
+
+        api.prefill_capture.capture = prefill_capture
+
+    pool_cls, pool_method = api.pool
+    original_init_memory_pool = getattr(pool_cls, pool_method)
 
     @functools.wraps(original_init_memory_pool)
     def init_memory_pool(self, *args, **kwargs):
         _prepare_memory_budget(self.model)
         return original_init_memory_pool(self, *args, **kwargs)
 
-    ModelRunnerKVCacheMixin.init_memory_pool = init_memory_pool
+    setattr(pool_cls, pool_method, init_memory_pool)
+
+    for name in ("weight_loader", "weight_loader_fused"):
+        loader = getattr(FusedMoE, name, None)
+        if loader is not None:
+            setattr(FusedMoE, name, _sglang_bf16.checkpoint_loader(loader))
+
+    for cls in api.weight_apis:
+        for name in ("update_weights_from_disk", "update_weights_from_tensor", "update_weights_from_distributed",
+                     "update_weights_from_ipc", "save_remote_model", "save_sharded_model",
+                     "get_weights_by_name", "send_weights_to_remote_instance"):
+            method = getattr(cls, name, None)
+            if method is not None:
+                setattr(cls, name, _sglang_bf16.weight_api(method, writes=name.startswith("update_weights_from_")))
 
     original_moe_init = FusedMoE.__init__
 
@@ -305,27 +360,24 @@ def install(*, batch_invariant=True):
     # workspace on every residency transition.
     GroupCoordinator.graph_capture = graph_capture
 
-    original_graph_replay = CudaGraphRunner.replay
+    def guard_replay(method):
+        @functools.wraps(method)
+        def graph_replay(self, *args, **kwargs):
+            global _eager_pending
+            _sglang_bf16.prepare_for_replay()
+            if _eager_pending is not None:
+                _eager_pending.native.drain_eager_inference()
+                _eager_pending = None
+            return method(self, *args, **kwargs)
+        return graph_replay
 
-    @functools.wraps(original_graph_replay)
-    def graph_replay(self, *args, **kwargs):
-        # A captured decode graph reuses the same serialized native workspace
-        # without invoking FusedMoE.forward in Python.  Finalize the last eager
-        # generation once at the eager->graph boundary, before graph replay can
-        # overwrite its status/diagnostic records.  Subsequent decode replays
-        # pay only this Python branch.
-        global _eager_pending
-        if _eager_pending is not None:
-            _eager_pending.native.drain_eager_inference()
-            _eager_pending = None
-        return original_graph_replay(self, *args, **kwargs)
-
-    CudaGraphRunner.replay = graph_replay
+    replay_cls, replay_method = api.replay
+    setattr(replay_cls, replay_method, guard_replay(getattr(replay_cls, replay_method)))
+    if api.prefill_capture is not None:
+        api.prefill_capture.execute = guard_replay(api.prefill_capture.execute)
 
     def forward(layer, hidden_states, topk_output):
         from sglang.srt.distributed import get_tp_group
-        from sglang.srt.server_args import get_global_server_args
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         global _runtime, _decode_runtime, _eager_pending
         group = get_tp_group().device_group
@@ -340,14 +392,13 @@ def install(*, batch_invariant=True):
         tokens, hidden = hidden_states.shape
         if tokens == 0:
             return torch.empty_like(hidden_states)
-        args = get_global_server_args()
-        capturing = get_is_capture_mode()
-        rows_are_dp_sharded = _rows_are_dp_sharded and args.enable_dp_attention
+        capturing = api.capturing()
+        rows_are_dp_sharded = _rows_are_dp_sharded and api.dp()
         if _runtime is None:
             max_tokens = max(
-                args.chunked_prefill_size or 8192,
-                args.max_prefill_tokens or 16384,
-                args.cuda_graph_max_bs or 1,
+                api.schedule().chunked_prefill_size or 8192,
+                api.schedule().max_prefill_tokens or 16384,
+                api.graph_bs(),
             )
             if not rows_are_dp_sharded:
                 max_tokens = (max_tokens + world - 1) // world
@@ -422,21 +473,15 @@ def install(*, batch_invariant=True):
                 *topk_output.topk_ids.stride(), *topk_output.topk_weights.stride(),
                 start, valid_tokens, hidden, k,
                 triton.next_power_of_2(hidden), triton.next_power_of_2(k))
-        inputs = (
-            x,
-            routes,
-            gates,
-            layer.w13_weight,
-            layer.w2_weight,
-        )
         runtime = _runtime
         # Select by collective phase, never by a rank's actual token count.
         # Decode uses the same DT implementation for every captured bucket;
         # dynamic prefill and training retain the tuned PF specialization.
-        if capturing or _decode_batch:
+        decode = capturing if _decode_batch is None else _decode_batch
+        if decode:
             if _decode_runtime is None:
                 capacity = max(
-                    args.cuda_graph_max_bs or 1, args.max_running_requests or 1
+                    api.graph_bs(), api.schedule().max_running_requests or 1
                 )
                 if not rows_are_dp_sharded:
                     capacity = (capacity + world - 1) // world
@@ -444,6 +489,11 @@ def install(*, batch_invariant=True):
                     layer, group, k, capacity, batch_invariant=batch_invariant, decode_only=True
                 )
             runtime = _decode_runtime
+        if runtime._sglang_tiled_bf16:
+            expert_weights = _sglang_bf16.serving_weights(layer)
+        else:
+            expert_weights = (layer.w13_weight, layer.w2_weight)
+        inputs = (x, routes, gates, *expert_weights)
         if _use_fp8():
             prepared = _prepare_fp8_layer(layer)
             if _eager_pending is not None:
@@ -506,7 +556,6 @@ def patch_dp_attention_layout():
     """
     from sglang.srt.layers.communicator import LayerScatterModes, ScatterMode
     from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-    from sglang.srt.server_args import get_global_server_args
 
     global _rows_are_dp_sharded
     _rows_are_dp_sharded = True
@@ -518,7 +567,7 @@ def patch_dp_attention_layout():
         if (
             context.is_layer_sparse
             and original == ScatterMode.FULL
-            and get_global_server_args().enable_dp_attention
+            and worker_api().dp()
         ):
             return ScatterMode.SCATTERED
         return original
@@ -528,7 +577,7 @@ def patch_dp_attention_layout():
     original_init = Qwen2MoeSparseMoeBlock.__init__
 
     def block_init(self, layer_id, config, quant_config=None, alt_stream=None,
-                   prefix="", is_nextn=False):
+                   prefix="", is_nextn=False, **kwargs):
         original_init(
             self,
             layer_id=layer_id,
@@ -537,8 +586,9 @@ def patch_dp_attention_layout():
             alt_stream=alt_stream,
             prefix=prefix,
             is_nextn=is_nextn,
+            **kwargs,
         )
-        if not get_global_server_args().enable_dp_attention:
+        if not worker_api().dp():
             return
         # The routed path already returns complete DP-local rows, so the
         # block's own tensor-parallel reduce would sum unrelated tokens.
@@ -586,29 +636,19 @@ def patch_dp_attention_layout():
         pp_proxy_tensors=None,
         input_deepstack_embeds=None,
     ):
-        global _decode_batch
-        previous_decode = _decode_batch
-        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
-        # global_forward_mode is populated only by some SGLang schedules.
-        # is_extend_in_batch is the existing DP-wide phase agreement even
-        # when local ranks mix decode, prefill and idle work.
-        _decode_batch = not forward_batch.is_extend_in_batch and (
-            mode.is_decode() or mode.is_idle()
-        )
-        try:
+        # Capture can invoke the model directly without ModelRunner.forward.
+        with _batch_phase(_is_decode_batch(forward_batch)):
             return run_lm_forward(
                 self, input_ids, positions, forward_batch, input_embeds,
                 pp_proxy_tensors, input_deepstack_embeds,
             )
-        finally:
-            _decode_batch = previous_decode
 
     def run_lm_forward(
         self, input_ids, positions, forward_batch, input_embeds,
         pp_proxy_tensors, input_deepstack_embeds,
     ):
         if (
-            get_global_server_args().enable_dp_attention
+            worker_api().dp()
             and forward_batch is not None
             and forward_batch.forward_mode.is_idle()
             and (input_ids is None or input_ids.numel() == 0)
@@ -662,34 +702,48 @@ def _release_prefill():
     torch.cuda.empty_cache()
 
 
+def _decode_graph_runner(model_runner):
+    return getattr(model_runner, "decode_cuda_graph_runner", None) or getattr(model_runner, "graph_runner", None)
+
+
 def suspend(model_runner, *, discard_fp8=False):
     """FP8 releases weight addresses; BF16 can retain its decode graphs."""
-    global _recapture
+    global _recapture, _recapture_prefill
+    torch.cuda.synchronize()
+    prefill = getattr(model_runner, "prefill_cuda_graph_runner", None)
+    if prefill is not None:
+        prefill.backend.cleanup()
+        model_runner.prefill_cuda_graph_runner = None
+        _recapture_prefill = True
     if _use_fp8() or os.environ.get("WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS", "1") == "0":
         # Prepared FP8 versions are immutable. Rebuild plans after AWEX rather
         # than leaving captured graphs pointing at the previous weight version.
-        _recapture = getattr(model_runner, "graph_runner", None) is not None
-        close(model_runner, keep_fp8=_use_fp8(), discard_fp8=discard_fp8)
+        _recapture = _recapture or _decode_graph_runner(model_runner) is not None
+        close(model_runner, keep_fp8=_use_fp8(), discard_fp8=discard_fp8, keep_bf16_bindings=True)
     else:
         _release_prefill()
+    _sglang_bf16.restore_all()
 
 
 def resume(model_runner):
-    global _recapture
+    global _recapture, _recapture_prefill
+    _sglang_bf16.prepare_all()
     resume_fp8_weights()
     if _recapture:
-        from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
-
         started = time.perf_counter()
-        with torch.no_grad(), model_capture_mode():
-            _reset_decode_inputs(model_runner.graph_runner)
-            model_runner.graph_runner.capture()
+        if hasattr(model_runner, "init_decode_cuda_graph"):
+            model_runner.init_decode_cuda_graph()
+        else:
+            with torch.no_grad(), worker_api().capture_mode():
+                _reset_decode_inputs(model_runner.graph_runner)
+                model_runner.graph_runner.capture()
         _recapture = False
         logging.getLogger(__name__).info(
             "WeftMoE decode graph recapture wall time: %.3f s (outside weight transfer)",
             time.perf_counter() - started)
-    # AWEX has completed the update at the same addresses. BF16 graphs read
-    # the original weights directly, so no weight refresh or recapture is needed.
+    if _recapture_prefill:
+        model_runner.init_prefill_cuda_graph()
+        _recapture_prefill = False
 
 
 def _reset_decode_inputs(runner):
@@ -726,10 +780,15 @@ def _reset_decode_inputs(runner):
         info.out_req_lens.fill_(1)
 
 
-def close(model_runner, *, keep_fp8=False, discard_fp8=False):
+def close(model_runner, *, keep_fp8=False, discard_fp8=False, keep_bf16_bindings=False):
     """Final teardown: discard outer graphs before freeing native addresses."""
-    global _decode_runtime, _fp8_offloaded, _fp8_needs_update
+    global _decode_runtime, _fp8_offloaded, _fp8_needs_update, _recapture, _recapture_prefill
     torch.cuda.synchronize()
+    for name in ("decode_cuda_graph_runner", "prefill_cuda_graph_runner"):
+        modern = getattr(model_runner, name, None)
+        if modern is not None:
+            modern.backend.cleanup()
+            setattr(model_runner, name, None)
     runner = getattr(model_runner, "graph_runner", None)
     if runner is not None:
         runner.graphs.clear()
@@ -739,6 +798,9 @@ def close(model_runner, *, keep_fp8=False, discard_fp8=False):
         _decode_runtime.close()
         _decode_runtime = None
     _graph_inputs.clear()
+    if not keep_bf16_bindings:
+        _sglang_bf16.close()
+        _recapture = _recapture_prefill = False
     if keep_fp8 and not _fp8_offloaded:
         for weights in _fp8_weights.values():
             for tensor in weights._tensors():
