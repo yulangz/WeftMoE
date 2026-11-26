@@ -2,6 +2,8 @@
 
 import os
 from contextlib import nullcontext
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace, MethodType
 
 import pytest
@@ -218,6 +220,16 @@ def main():
         snapshot = layer.state_dict()
         assert torch.equal(snapshot["w13_weight"], reference_layer.w13_weight)
         assert torch.equal(snapshot["w2_weight"], reference_layer.w2_weight)
+        if modern:
+            from safetensors.torch import load_file
+
+            exporter = api.weight_apis[-1]
+            with TemporaryDirectory() as path:
+                exporter.save_sharded_model(SimpleNamespace(get_model=lambda: layer), path)
+                exported = load_file(str(next(Path(path).glob("*.safetensors"))))
+                for key in ("w13_weight", "w2_weight"):
+                    assert torch.equal(exported[key], snapshot[key].cpu())
+            print(rank, "SGLANG_SHARDED_EXPORT_PASS", flush=True)
         # Partial loads leave the other matrix intact and preserve graph addresses.
         layer.load_state_dict({"w13_weight": snapshot["w13_weight"]}, strict=False)
         assert torch.equal(layer.state_dict()["w2_weight"], reference_layer.w2_weight)

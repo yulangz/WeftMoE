@@ -270,3 +270,115 @@ def test_async_transfer_error_is_not_committed(layer, monkeypatch):
     assert update(["w2_weight"])[0]
     resident.prepare_for_replay()
     assert torch.all(layer.state_dict()["w2_weight"] == 2)
+
+
+@pytest.mark.parametrize("failure", ["shape", "copy", "missing", "unexpected", "late_hook"])
+def test_root_load_outcome_guards_every_expert(layer, failure):
+    other = torch.nn.Module()
+    for key, value in layer.state_dict().items():
+        setattr(other, key, torch.nn.Parameter(value, requires_grad=False))
+    resident.serving_weights(other)
+    root = torch.nn.ModuleList([layer, other])
+    inputs = root.state_dict()
+    inputs["0.w13_weight"].fill_(5)
+    bad = dict(inputs)
+    hook = None
+    if failure == "shape":
+        bad["1.w2_weight"] = bad["1.w2_weight"][:1]
+    elif failure == "copy":
+        bad["1.w2_weight"] = torch.empty_like(bad["1.w2_weight"], device="meta")
+    elif failure == "missing":
+        del bad["1.w2_weight"]
+    elif failure == "unexpected":
+        bad["unused"] = torch.empty(0)
+    else:
+        def reject(*args):
+            raise RuntimeError("reject at end of load")
+        hook = root.register_load_state_dict_post_hook(reject)
+    with pytest.raises(RuntimeError):
+        root.load_state_dict(bad, strict=failure != "copy")
+    if hook is not None:
+        hook.remove()
+    for owner in root:
+        with pytest.raises(RuntimeError):
+            resident.serving_weights(owner)
+    with pytest.raises(RuntimeError):
+        resident.prepare_for_replay()
+    missing = root.load_state_dict({"0.w13_weight": inputs["0.w13_weight"]}, strict=False)
+    assert "1.w2_weight" in missing.missing_keys
+    with pytest.raises(RuntimeError):
+        resident.prepare_for_replay()
+    root.load_state_dict(inputs)
+    resident.prepare_for_replay()
+    assert all(torch.equal(v, inputs[k]) for k, v in root.state_dict().items())
+    # Healthy non-strict partial loads retain PyTorch semantics.
+    root.load_state_dict({"1.w2_weight": inputs["1.w2_weight"] + 1}, strict=False)
+    resident.prepare_for_replay()
+    assert torch.equal(root.state_dict()["1.w2_weight"], inputs["1.w2_weight"] + 1)
+
+
+@pytest.mark.parametrize("method_name", ["save_sharded_model", "save_remote_model"])
+def test_sync_export_borrows_only_until_save_returns(layer, method_name):
+    expected = layer.state_dict()
+
+    def save():
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        state = layer.state_dict()
+        assert torch.cuda.max_memory_allocated() == before
+        for key, value in state.items():
+            assert value.data_ptr() == getattr(layer, key).data_ptr()
+            assert torch.equal(value, expected[key])
+        raise OSError("writer failed")
+
+    save.__name__ = method_name
+    with resident.canonical_weights():
+        with pytest.raises(OSError):
+            resident.weight_api(save, writes=False)()
+        snapshot = layer.state_dict()
+        for key, value in snapshot.items():
+            assert value.data_ptr() != getattr(layer, key).data_ptr()
+    resident.prepare_for_replay()
+    assert all(torch.equal(v, expected[k]) for k, v in snapshot.items())
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_consecutive_weight_buckets_convert_once(layer, monkeypatch, replay):
+    weights = resident._layers[layer]
+    calls = []
+    for method in ["restore", "pack"]:
+        original = getattr(weights, method)
+        def count(*args, method=method, original=original):
+            calls.append(method)
+            return original(*args)
+        monkeypatch.setattr(weights, method, count)
+
+    def update_weights_from_tensor(named_tensors):
+        for name, val in named_tensors:
+            layer.w2_weight[int(name)].fill_(val)
+        return True, "OK"
+
+    update = resident.weight_api(update_weights_from_tensor, writes=True)
+    for bucket in range(5):
+        assert update([(str(bucket), bucket)])[0]
+    assert calls == ["restore"]
+    if replay:
+        resident.prepare_for_replay()
+    resident.serving_weights(layer)
+    assert calls == ["restore", "pack"]
+    for bucket in range(5):
+        assert torch.all(layer.state_dict()["w2_weight"][bucket] == bucket)
+
+
+def test_state_load_repack_allocation_can_retry(layer, monkeypatch):
+    weights = resident._layers[layer]
+    inputs = layer.state_dict()
+    inputs["w2_weight"].fill_(3)
+    with monkeypatch.context() as patch:
+        def oom(_):
+            raise torch.OutOfMemoryError("repack scratch")
+        patch.setattr(weights, "pack", oom)
+        with pytest.raises(torch.OutOfMemoryError, match="repack scratch"):
+            layer.load_state_dict(inputs)
+    resident.prepare_for_replay()
+    assert torch.equal(layer.state_dict()["w2_weight"], inputs["w2_weight"])

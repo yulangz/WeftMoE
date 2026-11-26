@@ -102,7 +102,7 @@ python tools/launch_sglang.py \
 
 单机 B300 的私有 BF16 专家参数默认在 KV/Mamba 预算前转换成分块布局。PF 和 DT 的 5D 视图共享原 Parameter 的 GPU 地址，每层只保留一份 BF16 权重。原址转换复用单个本地专家的 FC1 大小的临时空间（Qwen35B 为 4 MiB、Qwen122B 为 12 MiB、Flash 为 32 MiB）。SGLang 使用权重共享 daemon 时继续读取常规布局。可在启动前设置 `WEFTMOE_SGLANG_TILED_BF16=0` 选择常规布局。脚本默认使用 triton MoE runner、none A2A 和未量化的 BF16 专家。独立 TensorRuntime 也支持 PF/DT 共用预打包 NVFP4，调用方式见[B300 接口](blackwell.md#单机-decode)。
 
-热更新时，adapter 在相同地址上还原常规布局，更新完成后重新分块。直接连续调用 expert weight loader 时，一层在首个分片还原，在下次推理前统一分块。如果独立加载分片失败，须成功重试所有失败的分片，再恢复推理。首次分块申请临时显存失败时，释放显存后可直接重试。挂起或更新期间，图回放会报错。PyTorch state dict 在两种布局下都返回独立的常规布局专家权重，可以在恢复服务后保存。SGLang 权重更新接口、expert weight loader、PyTorch state dict 及配套 AReaL 的 AWEX 接收路径都使用这一机制。自行通过 `.data`、已缓存的指针或外部流读写 BF16 专家时，在 worker 的请求调度已暂停期间使用以下上下文；异步传输需在退出前完成提交。所有 rank 在恢复推理前完成更新。
+SGLang 连续更新多个 bucket 时，首个 bucket 在原地址还原常规布局。后续 bucket 复用这份权重，下一次 eager 推理或图回放前再统一分块。直接连续调用 expert weight loader 时，一层在首个分片还原，在下次推理前统一分块。如果独立加载分片失败，须成功重试所有失败的分片，再恢复推理。首次分块申请临时显存失败时，释放显存后可直接重试。挂起或更新期间，图回放会报错。普通 PyTorch `state_dict()` 在两种布局下都返回独立的常规布局专家权重，可以在恢复服务后保存。SGLang 的同步 `save_sharded_model` 和 `save_remote_model` 在保存期间直接读取常规布局的原存储，避免额外分配全模型的 GPU 权重副本。SGLang 权重更新接口、expert weight loader、PyTorch state dict 及配套 AReaL 的 AWEX 接收路径都使用这一机制。自行通过 `.data`、已缓存的指针或外部流读写 BF16 专家时，在 worker 的请求调度已暂停期间使用以下上下文；异步传输需在退出前完成提交。所有 rank 在恢复推理前完成更新。
 
 ```python
 from weftmoe.sglang import canonical_weights
@@ -111,7 +111,9 @@ with canonical_weights():
     update_expert_parameters(model)
 ```
 
-如果 SGLang 的批量更新抛异常或返回失败，worker 会阻止 eager 推理和 CUDA Graph 回放。按原参数名集合重试 tensor/distributed 更新，或重新加载同一路径的完整磁盘 checkpoint，成功后可恢复服务。单独重试其中一个分片或导出权重都不会解除整批保护。
+PyTorch 的 `load_state_dict` 在整个根模块加载成功后才提交专家权重。严格加载报错后，重新完整加载专家权重即可恢复；健康模型仍支持 `strict=False` 部分加载。
+
+如果 SGLang 批量更新抛异常或返回失败，后续 eager 推理或 CUDA Graph 回放会抛出异常。这是 worker 内的 fail-fast 保护。SGLang 0.5.20 的 scheduler 如果在事件循环中收到未捕获的异常，会向父进程发送 SIGQUIT，服务可能退出。应在更新前暂停生成并排空在途请求，所有 rank 确认更新或恢复成功后再开放请求。服务已退出时，需要从一致的权重重启。按原参数名集合重试 tensor/distributed 更新，或重新加载同一路径的完整磁盘 checkpoint，成功后可恢复服务。单独重试其中一个分片或导出权重都不会解除整批保护。
 
 直接写入、IPC 等无法从调用参数确定覆盖范围的更新，失败后应在 worker 中用 `canonical_weights(recover=True)` 包住一次完整重载或回滚。只在覆盖范围内的全部专家权重都已恢复一致后正常退出；写入器返回失败状态时须抛出异常。恢复先前挂起的 worker 仍需调用 `resume()`。例如：
 

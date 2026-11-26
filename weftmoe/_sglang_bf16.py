@@ -1,6 +1,7 @@
 """Single-copy BF16 residency for SGLang's serialized serving and weight-update phases."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
 from threading import RLock
@@ -13,6 +14,9 @@ from .blackwell import _bf16_weight_views, _validate_expert_weights, _weight_til
 _layers = WeakKeyDictionary()
 _inactive = WeakSet()
 _OPAQUE_UPDATE = object()
+_STATE_DICT_LOAD = object()
+_load_wrapper = None
+_export_views = ContextVar("weftmoe_sglang_export_views", default=False)
 
 
 def _copy_experts(destination, source, scratch):
@@ -103,9 +107,8 @@ def serving_weights(layer):
             _layers[layer] = weights
             if not getattr(layer, "_weftmoe_state_hooks", False):
                 layer.register_state_dict_post_hook(_save_state)
-                layer.register_load_state_dict_pre_hook(_before_load)
-                layer.register_load_state_dict_post_hook(_after_load)
                 layer._weftmoe_state_hooks = True
+            _install_state_loader()
         elif weights.pending_shards:
             torch.cuda.synchronize()
             weights.pack(layer)
@@ -121,7 +124,7 @@ def _save_state(layer, state, prefix, metadata):
     keys = (prefix + "w13_weight", prefix + "w2_weight")
     if weights.active:
         state[keys[0]], state[keys[1]] = weights.canonical_copy()
-    else:
+    elif not _export_views.get():
         for key in keys:
             state[key] = state[key].clone()
 
@@ -172,20 +175,39 @@ def prepare_for_replay():
         prepare_all()
 
 
-def _before_load(layer, *args):
-    weights = _layers.get(layer)
-    if weights is not None and (weights.active or weights.shards_ready):
-        torch.cuda.synchronize()
-        weights.restore()
-        torch.cuda.synchronize()
-        layer._weftmoe_repack_after_load = True
+def _install_state_loader():
+    # PyTorch passes strict=True to every recursive pre-hook, even when the
+    # caller passed strict=False. Only the root call sees the final outcome.
+    global _load_wrapper
+    if _load_wrapper is not None:
+        return
+    original = torch.nn.Module.load_state_dict
 
+    @wraps(original)
+    def load(root, state_dict, *args, **kwargs):
+        if not _layers:
+            return original(root, state_dict, *args, **kwargs)
+        owners = []
+        repairs = []
+        for name, layer in root.named_modules():
+            weights = _layers.get(layer)
+            if weights is not None:
+                owners.append((layer, weights))
+                if _STATE_DICT_LOAD in weights.failed_updates:
+                    prefix = name + "." if name else ""
+                    repairs.append((weights, (prefix + "w13_weight", prefix + "w2_weight")))
+        if not owners:
+            return original(root, state_dict, *args, **kwargs)
+        with _canonical_access(owners, _STATE_DICT_LOAD):
+            result = original(root, state_dict, *args, **kwargs)
+            # A non-strict partial load is valid, but cannot certify that a
+            # previously failed layer has both of its expert matrices back.
+            for weights, keys in repairs:
+                if any(key not in state_dict or key in result.missing_keys for key in keys):
+                    weights.failed_updates.add(_STATE_DICT_LOAD)
+            return result
 
-def _after_load(layer, incompatible_keys):
-    if getattr(layer, "_weftmoe_repack_after_load", False):
-        torch.cuda.synchronize()
-        _layers[layer].pack(layer)
-        layer._weftmoe_repack_after_load = False
+    _load_wrapper = torch.nn.Module.load_state_dict = load
 
 
 @torch.no_grad()
@@ -225,13 +247,20 @@ def _update_key(name, arguments):
 
 def weight_api(method, *, writes):
     method_signature = signature(method)
+    synchronous_save = method.__name__ in ("save_remote_model", "save_sharded_model")
 
     @wraps(method)
     def call(*args, **kwargs):
         if not _layers:
             return method(*args, **kwargs)
         key = _update_key(method.__name__, method_signature.bind(*args, **kwargs).arguments) if writes else None
-        with _canonical_access(None, key) as reject:
+        with _canonical_access(list(_layers.items()), key, defer_pack=writes) as reject:
+            if synchronous_save:
+                token = _export_views.set(True)
+                try:
+                    return method(*args, **kwargs)
+                finally:
+                    _export_views.reset(token)
             result = method(*args, **kwargs)
             if writes and (result is False or (isinstance(result, tuple) and result and result[0] is False)):
                 reject()
@@ -241,10 +270,9 @@ def weight_api(method, *, writes):
 
 
 @contextmanager
-def _canonical_access(layer, key, recover=False):
-    candidates = _layers.items() if layer is None else ((layer, _layers.get(layer)),)
-    owners = [(owner, w) for owner, w in candidates if w is not None]
-    repack = [(owner, w) for owner, w in owners if w.active or w.pending_shards]
+def _canonical_access(owners, key, recover=False, defer_pack=False):
+    serving = [(owner, w) for owner, w in owners if w.active or w.pending_shards]
+    packed_on_entry = [(owner, w) for owner, w in serving if w.active]
     # Track suspended layers too. A failed write during offload must still
     # prevent resume from packing a mixture of old and new parameters.
     previous = {}
@@ -257,9 +285,12 @@ def _canonical_access(layer, key, recover=False):
     try:
         if owners:
             torch.cuda.synchronize()
-            for _, w in repack:
-                w.restore()
-            torch.cuda.synchronize()
+            for _, w in serving:
+                w.pending_shards = False
+            if packed_on_entry:
+                for _, w in packed_on_entry:
+                    w.restore()
+                torch.cuda.synchronize()
         for _, w in owners:
             w.canonical_depth += 1
             if recover:
@@ -288,29 +319,34 @@ def _canonical_access(layer, key, recover=False):
                         w.failed_updates.update(old_updates)
                         w.failed_shards.update(old_shards)
     finally:
-        if repack:
-            # Restore serving eligibility only on a clean commit. Keep failed
-            # layers canonical and preserve the updater's original error/status.
-            for _, w in repack:
-                if not w.active:
-                    w.pending_shards = True
-            if not rejected or key is None:
-                if key is None:
-                    torch.cuda.synchronize()
-                for owner, w in repack:
-                    if w.shards_ready:
-                        w.pack(owner)
+        # Preserve suspended layers and the outer scope's layout. Consecutive
+        # SGLang update buckets share one canonical interval until serving resumes.
+        for _, w in serving:
+            if not w.active:
+                w.pending_shards = True
+        if packed_on_entry and not defer_pack and (not rejected or key is None):
+            if key is None:
                 torch.cuda.synchronize()
+            for owner, w in packed_on_entry:
+                if w.shards_ready:
+                    w.pack(owner)
+            torch.cuda.synchronize()
 
 
 @contextmanager
 def canonical_weights(layer=None, *, recover=False):
     """Expose canonical weights. recover=True certifies a complete reload or rollback on successful exit."""
-    with _canonical_access(layer, _OPAQUE_UPDATE, recover):
+    candidates = _layers.items() if layer is None else ((layer, _layers.get(layer)),)
+    owners = [(owner, w) for owner, w in candidates if w is not None]
+    with _canonical_access(owners, _OPAQUE_UPDATE, recover):
         yield
 
 
 def close():
+    global _load_wrapper
     restore_all()
     _layers.clear()
     _inactive.clear()
+    if torch.nn.Module.load_state_dict is _load_wrapper:
+        torch.nn.Module.load_state_dict = _load_wrapper.__wrapped__
+        _load_wrapper = None
