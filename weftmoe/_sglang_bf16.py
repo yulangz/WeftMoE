@@ -1,6 +1,8 @@
 """Single-copy BF16 residency for SGLang's serialized serving and weight-update phases."""
 
 from contextlib import contextmanager
+from functools import wraps
+from inspect import signature
 from threading import RLock
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -28,8 +30,12 @@ class _ExpertWeights:
         self.tiles = tuple(p.view(_weight_tile_shape(*p.shape, 64)) for p in self.storage)
         self.active = False
         self.pending_shards = False
+        self.failed_shards = set()
         self.loader_lock = RLock()
-        _inactive.add(self)
+
+    @property
+    def shards_ready(self):
+        return self.pending_shards and not self.failed_shards
 
     def scratch(self):
         return self.storage[0].new_empty(self.storage[0][0].numel())
@@ -44,6 +50,8 @@ class _ExpertWeights:
     def pack(self, layer):
         if self.active:
             return
+        if self.failed_shards:
+            raise RuntimeError("Retry the failed BF16 expert shards before inference")
         params = (layer.w13_weight, layer.w2_weight)
         _validate_expert_weights(*params)
         if any(p.shape != buf.shape or p.device != buf.device for p, buf in zip(params, self.storage)):
@@ -87,17 +95,19 @@ def serving_weights(layer):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Prepare SGLang BF16 experts before CUDA Graph capture")
         if weights is None:
-            weights = _layers[layer] = _ExpertWeights(layer)
+            weights = _ExpertWeights(layer)
+            weights.pack(layer)
+            _layers[layer] = weights
             if not getattr(layer, "_weftmoe_state_hooks", False):
                 layer.register_state_dict_post_hook(_save_state)
                 layer.register_load_state_dict_pre_hook(_before_load)
                 layer.register_load_state_dict_post_hook(_after_load)
                 layer._weftmoe_state_hooks = True
-        elif not weights.pending_shards:
-            raise RuntimeError("BF16 experts are unavailable during a weight update or suspension")
-        if weights.pending_shards:
+        elif weights.pending_shards:
             torch.cuda.synchronize()
-        weights.pack(layer)
+            weights.pack(layer)
+        else:
+            raise RuntimeError("BF16 experts are unavailable during a weight update or suspension")
     return weights.tiles
 
 
@@ -113,36 +123,56 @@ def _save_state(layer, state, prefix, metadata):
             state[key] = state[key].clone()
 
 
-@contextmanager
-def loading_shard(layer):
-    weights = _layers.get(layer)
-    if weights is None:
-        yield
-        return
-    # Parallel checkpoint readers can invoke multiple loaders on one layer.
-    # A fused loader may also delegate to another loader on the same thread.
-    with weights.loader_lock:
-        standalone = weights.active or weights.pending_shards
-        if weights.active:
-            device = weights.storage[0].device
-            torch.cuda.synchronize(device)
-            weights.restore()
-            torch.cuda.synchronize(device)
-        weights.pending_shards = False
-        yield
-        weights.pending_shards = standalone
+def checkpoint_loader(method):
+    loader_signature = signature(method)
+
+    def shard_key(layer, args, kwargs):
+        bound = loader_signature.bind(layer, *args, **kwargs)
+        bound.apply_defaults()
+        call = bound.arguments
+        return call["weight_name"], call["shard_id"], call.get("expert_id")
+
+    @wraps(method)
+    def load(layer, *args, **kwargs):
+        weights = _layers.get(layer)
+        if weights is None:
+            return method(layer, *args, **kwargs)
+        # Parallel readers can load one layer, and fused loaders can delegate
+        # to another loader on the same thread.
+        with weights.loader_lock:
+            standalone = weights.active or weights.pending_shards
+            if weights.active:
+                device = weights.storage[0].device
+                torch.cuda.synchronize(device)
+                weights.restore()
+                torch.cuda.synchronize(device)
+            weights.pending_shards = False
+            try:
+                result = method(layer, *args, **kwargs)
+            except BaseException:
+                if standalone:
+                    weights.failed_shards.add(shard_key(layer, args, kwargs))
+                raise
+            else:
+                if weights.failed_shards:
+                    weights.failed_shards.discard(shard_key(layer, args, kwargs))
+                return result
+            finally:
+                weights.pending_shards = standalone
+
+    return load
 
 
 def prepare_for_replay():
     if _inactive:
-        if not all(w.pending_shards for w in _inactive):
+        if not all(w.shards_ready for w in _inactive):
             raise RuntimeError("BF16 experts are unavailable during a weight update or suspension")
         prepare_all()
 
 
 def _before_load(layer, *args):
     weights = _layers.get(layer)
-    if weights is not None and (weights.active or weights.pending_shards):
+    if weights is not None and (weights.active or weights.shards_ready):
         torch.cuda.synchronize()
         weights.restore()
         torch.cuda.synchronize()
@@ -179,7 +209,7 @@ def prepare_all():
 def canonical_weights(layer=None):
     """Expose canonical BF16 parameters for a serialized read or update, then repack."""
     candidates = _layers.items() if layer is None else ((layer, _layers.get(layer)),)
-    active = [(owner, w) for owner, w in candidates if w is not None and (w.active or w.pending_shards)]
+    active = [(owner, w) for owner, w in candidates if w is not None and (w.active or w.shards_ready)]
     try:
         if active:
             torch.cuda.synchronize()

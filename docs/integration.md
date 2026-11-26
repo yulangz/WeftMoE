@@ -102,7 +102,7 @@ python tools/launch_sglang.py \
 
 单机 B300 的私有 BF16 专家参数默认在 KV/Mamba 预算前转换成分块布局。PF 和 DT 的 5D 视图共享原 Parameter 的 GPU 地址，每层只保留一份 BF16 权重。原址转换复用单个本地专家的 FC1 大小的临时空间（Qwen35B 为 4 MiB、Qwen122B 为 12 MiB、Flash 为 32 MiB）。SGLang 使用权重共享 daemon 时继续读取常规布局。可在启动前设置 `WEFTMOE_SGLANG_TILED_BF16=0` 选择常规布局。脚本默认使用 triton MoE runner、none A2A 和未量化的 BF16 专家。独立 TensorRuntime 也支持 PF/DT 共用预打包 NVFP4，调用方式见[B300 接口](blackwell.md#单机-decode)。
 
-热更新时，adapter 在相同地址上还原常规布局，更新完成后重新分块。直接连续调用 expert weight loader 时，一层在首个分片还原，在下次推理前统一分块。挂起或更新期间，图回放会报错。PyTorch state dict 在两种布局下都返回独立的常规布局专家权重，可以在恢复服务后保存。SGLang 权重更新接口、expert weight loader、PyTorch state dict 及配套 AReaL 的 AWEX 接收路径都使用这一机制。自行通过 `.data`、已缓存的指针或外部流读写 BF16 专家时，在 worker 的请求调度已暂停期间使用以下上下文；异步传输需在退出前完成提交。所有 rank 在恢复推理前完成更新。
+热更新时，adapter 在相同地址上还原常规布局，更新完成后重新分块。直接连续调用 expert weight loader 时，一层在首个分片还原，在下次推理前统一分块。如果独立加载分片失败，须成功重试所有失败的分片，再恢复推理。首次分块申请临时显存失败时，释放显存后可直接重试。挂起或更新期间，图回放会报错。PyTorch state dict 在两种布局下都返回独立的常规布局专家权重，可以在恢复服务后保存。SGLang 权重更新接口、expert weight loader、PyTorch state dict 及配套 AReaL 的 AWEX 接收路径都使用这一机制。自行通过 `.data`、已缓存的指针或外部流读写 BF16 专家时，在 worker 的请求调度已暂停期间使用以下上下文；异步传输需在退出前完成提交。所有 rank 在恢复推理前完成更新。
 
 ```python
 from weftmoe.sglang import canonical_weights

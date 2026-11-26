@@ -4,6 +4,7 @@ import os
 from contextlib import nullcontext
 from types import SimpleNamespace, MethodType
 
+import pytest
 import torch
 import torch.distributed as dist
 from sglang.srt.distributed import (
@@ -200,6 +201,13 @@ def main():
         assert all(p.data_ptr() == v.data_ptr() and v.ndim == 5 for p, v in zip(storage, views))
         # The SGLang checkpoint loader can also update just one expert shard.
         gate = reference_layer.w13_weight[0, :intermediate].clone()
+        # A bad tensor from the checkpoint reader leaves this expert unavailable
+        # until a valid copy of the same shard arrives.
+        with pytest.raises(RuntimeError):
+            layer.w13_weight.weight_loader(layer.w13_weight, gate.unsqueeze(0).expand(2, -1, -1),
+                                           "w13_weight", "w1", rank * layer.num_local_experts)
+        with pytest.raises(RuntimeError):
+            adapter._sglang_bf16.prepare_for_replay()
         layer.w13_weight.weight_loader(layer.w13_weight, gate, weight_name="w13_weight",
                                        shard_id="w1", expert_id=rank * layer.num_local_experts)
         weights = adapter._sglang_bf16._layers[layer]

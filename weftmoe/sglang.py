@@ -285,17 +285,10 @@ def install(*, batch_invariant=True):
 
     setattr(pool_cls, pool_method, init_memory_pool)
 
-    def canonical_loader(method):
-        @functools.wraps(method)
-        def load(layer, *args, **kwargs):
-            with _sglang_bf16.loading_shard(layer):
-                return method(layer, *args, **kwargs)
-        return load
-
     for name in ("weight_loader", "weight_loader_fused"):
         loader = getattr(FusedMoE, name, None)
         if loader is not None:
-            setattr(FusedMoE, name, canonical_loader(loader))
+            setattr(FusedMoE, name, _sglang_bf16.checkpoint_loader(loader))
 
     for cls in api.weight_apis:
         for name in ("update_weights_from_disk", "update_weights_from_tensor", "update_weights_from_distributed",
