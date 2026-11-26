@@ -382,3 +382,79 @@ def test_state_load_repack_allocation_can_retry(layer, monkeypatch):
             layer.load_state_dict(inputs)
     resident.prepare_for_replay()
     assert torch.equal(layer.state_dict()["w2_weight"], inputs["w2_weight"])
+
+
+@pytest.mark.parametrize("strict_failure", [True, False])
+def test_failed_root_retry_must_cover_nonexpert_weights(layer, strict_failure):
+    linear = torch.nn.Linear(4, 4, bias=True, device="cuda")
+    root = torch.nn.ModuleDict({"experts": layer, "linear": linear})
+    inputs = root.state_dict()
+    inputs["linear.weight"] = torch.full_like(linear.weight, 9)
+    inputs["experts.w13_weight"].fill_(3)
+    # The non-strict variant deliberately targets only part of the root.
+    batch = inputs if strict_failure else {k: inputs[k] for k in ("experts.w13_weight", "linear.weight")}
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        root.load_state_dict({**batch, "linear.weight": linear.weight[:1]}, strict=strict_failure)
+    with pytest.raises(RuntimeError):
+        resident.prepare_for_replay()
+
+    experts = {k: inputs["experts." + k] for k in ("w13_weight", "w2_weight")}
+    layer.load_state_dict(experts)
+    with pytest.raises(RuntimeError):
+        resident.serving_weights(layer)
+    status = root.load_state_dict({"experts." + k: v for k, v in experts.items()}, strict=False)
+    assert "linear.weight" in status.missing_keys
+    with pytest.raises(RuntimeError):
+        resident.prepare_for_replay()
+    with pytest.raises(RuntimeError):
+        with resident.canonical_weights(layer, recover=True):
+            layer.load_state_dict(experts)
+    root.load_state_dict(batch, strict=strict_failure)
+    resident.prepare_for_replay()
+    assert torch.equal(layer.state_dict()["w13_weight"], inputs["experts.w13_weight"])
+    assert torch.equal(linear.weight, inputs["linear.weight"])
+
+
+def test_unregistered_runner_replays_captured_tiled_weights(layer):
+    tiles = resident.serving_weights(layer)
+    output = torch.empty_like(tiles[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.copy_(tiles[0])
+
+    def update_weights_from_tensor(named_tensors):
+        for name, value in named_tensors:
+            getattr(layer, name).copy_(value)
+        return True, "OK"
+
+    new_weight = torch.randn_like(layer.w13_weight)
+    update = resident.weight_api(update_weights_from_tensor, writes=True)
+    assert update([("w13_weight", new_weight)])[0]
+    assert not resident._layers[layer].active
+    # This caller bypasses both SGLang runner.execute hooks.
+    graph.replay()
+    expected, _ = prepare_bf16_weights(new_weight, layer.state_dict()["w2_weight"])
+    assert torch.equal(output, expected)
+    with resident.canonical_weights(layer):
+        with pytest.raises(RuntimeError, match="weight update"):
+            graph.replay()
+
+
+def test_shared_expert_keeps_each_failed_root_until_repaired(layer):
+    roots = [
+        torch.nn.ModuleDict({"experts": layer, "linear": torch.nn.Linear(4, 4, device="cuda")})
+        for _ in range(2)
+    ]
+    states = [root.state_dict() for root in roots]
+    for root, state in zip(roots, states):
+        with pytest.raises(RuntimeError, match="size mismatch"):
+            root.load_state_dict({**state, "linear.weight": state["linear.weight"][:1]})
+    roots[0].load_state_dict(states[0])
+    with pytest.raises(RuntimeError, match="weight update"):
+        resident.prepare_for_replay()
+    with pytest.raises(RuntimeError, match="entire root"):
+        with resident.canonical_weights(roots[0], recover=True):
+            pytest.fail("the other root still requires recovery")
+    with resident.canonical_weights(roots[1], recover=True):
+        roots[1].load_state_dict(states[1])
+    resident.prepare_for_replay()

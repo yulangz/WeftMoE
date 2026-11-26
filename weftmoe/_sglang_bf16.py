@@ -1,11 +1,13 @@
 """Single-copy BF16 residency for SGLang's serialized serving and weight-update phases."""
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import wraps
 from inspect import signature
 from threading import RLock
-from weakref import WeakKeyDictionary, WeakSet
+from weakref import ReferenceType, WeakKeyDictionary, WeakSet, ref
 
 import torch
 
@@ -14,9 +16,17 @@ from .blackwell import _bf16_weight_views, _validate_expert_weights, _weight_til
 _layers = WeakKeyDictionary()
 _inactive = WeakSet()
 _OPAQUE_UPDATE = object()
-_STATE_DICT_LOAD = object()
 _load_wrapper = None
+_replay_wrapper = None
 _export_views = ContextVar("weftmoe_sglang_export_views", default=False)
+
+
+@dataclass(frozen=True)
+class _StateLoad:
+    # A strict load is responsible for the whole root, including ordinary
+    # parameters and buffers. Non-strict updates can target a named subset.
+    root: ReferenceType
+    keys: frozenset[str] | None
 
 
 def _copy_experts(destination, source, scratch):
@@ -109,6 +119,7 @@ def serving_weights(layer):
                 layer.register_state_dict_post_hook(_save_state)
                 layer._weftmoe_state_hooks = True
             _install_state_loader()
+            _install_graph_replay()
         elif weights.pending_shards:
             torch.cuda.synchronize()
             weights.pack(layer)
@@ -175,6 +186,23 @@ def prepare_for_replay():
         prepare_all()
 
 
+def _install_graph_replay():
+    # Draft and piecewise runners can replay CUDAGraph directly without going
+    # through ModelRunner or the decode/prefill executor.
+    global _replay_wrapper
+    if _replay_wrapper is not None:
+        return
+    original = torch.cuda.CUDAGraph.replay
+
+    @wraps(original)
+    def replay(graph, *args, **kwargs):
+        if _inactive:
+            prepare_for_replay()
+        return original(graph, *args, **kwargs)
+
+    _replay_wrapper = torch.cuda.CUDAGraph.replay = replay
+
+
 def _install_state_loader():
     # PyTorch passes strict=True to every recursive pre-hook, even when the
     # caller passed strict=False. Only the root call sees the final outcome.
@@ -184,28 +212,29 @@ def _install_state_loader():
     original = torch.nn.Module.load_state_dict
 
     @wraps(original)
-    def load(root, state_dict, *args, **kwargs):
-        if not _layers:
-            return original(root, state_dict, *args, **kwargs)
-        owners = []
-        repairs = []
-        for name, layer in root.named_modules():
-            weights = _layers.get(layer)
-            if weights is not None:
-                owners.append((layer, weights))
-                if _STATE_DICT_LOAD in weights.failed_updates:
-                    prefix = name + "." if name else ""
-                    repairs.append((weights, (prefix + "w13_weight", prefix + "w2_weight")))
+    def load(root, state_dict, strict=True, *args, **kwargs):
+        if not _layers or not isinstance(state_dict, Mapping):
+            return original(root, state_dict, strict, *args, **kwargs)
+        owners = [(layer, _layers[layer]) for layer in root.modules() if layer in _layers]
         if not owners:
-            return original(root, state_dict, *args, **kwargs)
-        with _canonical_access(owners, _STATE_DICT_LOAD):
-            result = original(root, state_dict, *args, **kwargs)
-            # A non-strict partial load is valid, but cannot certify that a
-            # previously failed layer has both of its expert matrices back.
-            for weights, keys in repairs:
-                if any(key not in state_dict or key in result.missing_keys for key in keys):
-                    weights.failed_updates.add(_STATE_DICT_LOAD)
-            return result
+            return original(root, state_dict, strict, *args, **kwargs)
+        key = _StateLoad(ref(root), None if strict else frozenset(state_dict))
+        repairs = [
+            (weights, failure)
+            for _, weights in owners
+            for failure in weights.failed_updates
+            if isinstance(failure, _StateLoad) and failure.root() is root
+        ]
+        with _canonical_access(owners, key):
+            result = original(root, state_dict, strict, *args, **kwargs)
+        # The root and its CUDA copies have committed. A child or sibling can
+        # never certify this load. A complete retry also repairs partial loads.
+        if repairs:
+            loaded = state_dict.keys() - set(result.missing_keys) - set(result.unexpected_keys)
+            for weights, failure in repairs:
+                if not result.missing_keys or (failure.keys is not None and failure.keys <= loaded):
+                    weights.failed_updates.discard(failure)
+        return result
 
     _load_wrapper = torch.nn.Module.load_state_dict = load
 
@@ -296,7 +325,7 @@ def _canonical_access(owners, key, recover=False, defer_pack=False):
             if recover:
                 previous[w] = w.failed_updates, w.failed_shards
                 w.failed_updates, w.failed_shards = set(), set()
-            elif key is not None and key is not _OPAQUE_UPDATE:
+            elif key is not None and key is not _OPAQUE_UPDATE and not isinstance(key, _StateLoad):
                 w.failed_updates.discard(key)
         try:
             yield reject
@@ -336,17 +365,28 @@ def _canonical_access(owners, key, recover=False, defer_pack=False):
 @contextmanager
 def canonical_weights(layer=None, *, recover=False):
     """Expose canonical weights. recover=True certifies a complete reload or rollback on successful exit."""
-    candidates = _layers.items() if layer is None else ((layer, _layers.get(layer)),)
-    owners = [(owner, w) for owner, w in candidates if w is not None]
+    if layer is None:
+        owners = list(_layers.items())
+    else:
+        scope = set(layer.modules())
+        owners = [(owner, w) for owner, w in _layers.items() if owner in scope]
+        if recover and any(
+            isinstance(failure, _StateLoad) and failure.root() not in scope
+            for _, weights in owners for failure in weights.failed_updates
+        ):
+            raise RuntimeError("Recover the entire root module whose checkpoint load failed")
     with _canonical_access(owners, _OPAQUE_UPDATE, recover):
         yield
 
 
 def close():
-    global _load_wrapper
+    global _load_wrapper, _replay_wrapper
     restore_all()
     _layers.clear()
     _inactive.clear()
     if torch.nn.Module.load_state_dict is _load_wrapper:
         torch.nn.Module.load_state_dict = _load_wrapper.__wrapped__
         _load_wrapper = None
+    if torch.cuda.CUDAGraph.replay is _replay_wrapper:
+        torch.cuda.CUDAGraph.replay = _replay_wrapper.__wrapped__
+        _replay_wrapper = None

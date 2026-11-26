@@ -297,9 +297,23 @@ def main():
             with pytest.raises(RuntimeError, match="weight update"):
                 getattr(*api.replay)(None)
             with pytest.raises(RuntimeError, match="weight update"):
+                graph.replay()
+            with pytest.raises(RuntimeError, match="weight update"):
                 adapter._sglang_bf16.serving_weights(layer)
             assert update(updater, [("w1", gate), ("w3", up)])[0]
+            assert not adapter._sglang_bf16._layers[layer].active
+            # A runner can replay this DT graph without calling the SGLang hooks.
+            graph.replay()
+            torch.cuda.synchronize()
+            after_replay = captured.clone()
+            eager = layer(x, topk)
+            assert torch.equal(after_replay.view(torch.int16), eager.view(torch.int16))
             reference_layer.w13_weight[0, :intermediate].copy_(gate)
+            actual = after_replay.clone()
+            if not dp_attention:
+                dist.all_reduce(actual)
+            check_output(actual, reference())
+            print(rank, "SGLANG_RAW_REPLAY_UPDATE_PASS", flush=True)
             print(rank, "SGLANG_PARTIAL_UPDATE_RETRY_PASS", flush=True)
         with adapter.canonical_weights():
             reference_layer.w13_weight[:, :intermediate].mul_(0.5)
