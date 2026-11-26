@@ -63,13 +63,13 @@ namespace {
 
 #include "cuda/forward/kernels/primitives.cuh"
 
-#include "cuda/weftmoe_dt/kernel.cuh"
-#include "cuda/weftmoe_pf/local_kernel.cuh"
-#include "cuda/weftmoe_pf/network_kernel.cuh"
-#include "cuda/weftmoe_pf/split_notify.cuh"
+#include "cuda/weftmoe_decode/kernel.cuh"
+#include "cuda/weftmoe_training/local_kernel.cuh"
+#include "cuda/weftmoe_training/network_kernel.cuh"
+#include "cuda/weftmoe_training/split_notify.cuh"
 
 #include "cuda/backward/device_kernels.cuh"
-#include "cuda/weftmoe_pf/backward_kernel.cuh"
+#include "cuda/weftmoe_training/backward_kernel.cuh"
 
 #if defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
 __global__ void fill_transport_benchmark_output(transport::BFloat16 *output,
@@ -596,10 +596,10 @@ struct ForwardWeightLease::Impl {
   void initialize_decode_maps() {
     decode_w1_map = make_gate_up_w1_tma_map(
         const_cast<transport::BFloat16 *>(w1), hidden, intermediate,
-        owned_experts, weftmoe_dt::kN, weftmoe_dt::kK, "decode gate/up TMA W1");
+        owned_experts, weftmoe_decode::kN, weftmoe_decode::kK, "decode gate/up TMA W1");
     decode_w2_map = make_bf16_tma_map(
         const_cast<transport::BFloat16 *>(w2), intermediate,
-        owned_experts * hidden, weftmoe_dt::kN, "decode W2", weftmoe_dt::kK);
+        owned_experts * hidden, weftmoe_decode::kN, "decode W2", weftmoe_decode::kK);
   }
 };
 
@@ -697,7 +697,7 @@ struct OperatorCompletion {
 };
 
 struct DeviceForwardHandle::Impl {
-  ForwardKernelArgs pf_args{};
+  ForwardKernelArgs training_args{};
   mutable std::shared_ptr<SlotLease> slot;
   std::shared_ptr<ActivationPoolState> pool;
   std::shared_ptr<ActivationMegaKernelBackendState> backend;
@@ -1040,9 +1040,9 @@ ForwardWeightLease ExternalCudaProducer::publish_fp8_weights(
   impl->w2_map = make_fp8_tma_map(buffers.w2.data, intermediate_size,
       std::uint64_t(owned_experts) * hidden_size, forward_tuning::kFc2TileN, "FP8 W2");
   impl->decode_w1_map = make_gate_up_w1_tma_map(buffers.w1.data, hidden_size, intermediate_size,
-      owned_experts, 256U, 128U, "DT FP8 W1", true);
+      owned_experts, 256U, 128U, "decode FP8 W1", true);
   impl->decode_w2_map = make_fp8_tma_map(buffers.w2.data, intermediate_size,
-      std::uint64_t(owned_experts) * hidden_size, 256U, "DT FP8 W2");
+      std::uint64_t(owned_experts) * hidden_size, 256U, "decode FP8 W2");
   if (transposed) {
     impl->backward_w1_map = make_fp8_tma_map(buffers.w1_t.data, 2U * intermediate_size,
         std::uint64_t(owned_experts) * hidden_size, backward_tuning::kDxTileN, "FP8 W1 transposed");
@@ -1867,7 +1867,7 @@ create_gin_backend(const NcclSession &session, const CudaExecution &execution,
         const auto stream =
             internal::checked_execution_state(execution)->stream;
         if (pool->gin_layout.static_forward.rings.depth) {
-          weftmoe_pf::netring::
+          weftmoe_training::netring::
               initialize<<<allocated_context_count, 1, 0, stream>>>(
                   resources.dev_comm, window, pool->gin_layout.static_forward);
         }
@@ -2012,7 +2012,7 @@ make_activation_pool_state(const CollectiveSession &session,
       !WEFTMOE_FP8_PACKED_RING || (!config.decode_only &&
       (forward_tuning::kFc1TileN != 256U ||
        (!local_prefill_streaming(config) && !network_prefill_streaming(config)))) || config.enable_socket_fallback))
-    throw std::invalid_argument("Compact FP8 workspace requires PF N256 with source quantization");
+    throw std::invalid_argument("Compact FP8 workspace requires training N256 with source quantization");
   auto state = std::make_shared<ActivationPoolState>();
   state->config = config;
   state->layout = make_layout(config);
@@ -2175,22 +2175,22 @@ make_activation_pool_state(const CollectiveSession &session,
             activation_rows, 128U, "FP8 ring S", config.fp8_workspace ? fp8::source_pitch(config.max_intermediate_size) : config.max_intermediate_size * 2U,
             WEFTMOE_FP8_PACKED_RING && forward_tuning::kFc1TileN == 256U &&
             state->layout.static_ring.depth != 0U);
-        if (weftmoe_dt::eligible(config, state->layout.static_ring)) {
-          const auto rows = weftmoe_dt::kM;
+        if (weftmoe_decode::eligible(config, state->layout.static_ring)) {
+          const auto rows = weftmoe_decode::kM;
           slot.decode_fp8_x_map = make_fp8_tma_map(
               at<void>(slot.device, state->layout.canonical_rows), config.max_hidden_size,
-              activation_rows, rows, "DT FP8 X", config.fp8_workspace ? fp8::source_pitch(config.max_hidden_size) : config.max_hidden_size * 2U, true);
+              activation_rows, rows, "decode FP8 X", config.fp8_workspace ? fp8::source_pitch(config.max_hidden_size) : config.max_hidden_size * 2U, true);
           slot.decode_fp8_s_map = make_fp8_tma_map(
               at<void>(slot.device, state->layout.forward_s), config.max_intermediate_size,
-              activation_rows, rows, "DT FP8 S", config.fp8_workspace ? fp8::source_pitch(config.max_intermediate_size) : config.max_intermediate_size * 2U, true);
+              activation_rows, rows, "decode FP8 S", config.fp8_workspace ? fp8::source_pitch(config.max_intermediate_size) : config.max_intermediate_size * 2U, true);
           slot.decode_x_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.canonical_rows),
               config.max_hidden_size, activation_rows, rows, "decode X",
-              weftmoe_dt::kK);
+              weftmoe_decode::kK);
           slot.decode_s_map = make_bf16_tma_map(
               at<void>(slot.device, state->layout.forward_s),
               config.max_intermediate_size, activation_rows, rows, "decode S",
-              weftmoe_dt::kK);
+              weftmoe_decode::kK);
         }
         // Ring FC2 writes contribution/Return TX directly. Reuse its unused
         // epilogue descriptor for FC1 S; arena entries still describe C.
@@ -3098,7 +3098,7 @@ LocalCudaP2pForwardMegaKernel::LocalCudaP2pForwardMegaKernel(
             session, execution, local_world, capacity);
         // Reserve IPC storage before application activations fill the Torch
         // caching allocator. cudaMalloc cannot reclaim its unused segments.
-        if (!use_gin || !weftmoe_pf::kNetworkPrivateDr) {
+        if (!use_gin || !weftmoe_training::kNetworkPrivateDr) {
           auto &workspace = *slot.backward_peer_workspace;
           workspace.prepare(0, workspace.initial_rows, workspace.max_routes,
                             capacity.max_hidden_size, !capacity.fp8_workspace);

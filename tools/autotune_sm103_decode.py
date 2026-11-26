@@ -1,4 +1,4 @@
-"""Offline SM103 DT tile/raster search with bitwise training and PF references."""
+"""Offline SM103 decode tile/raster search with bitwise checks against training and prefill."""
 
 import argparse
 import fcntl
@@ -81,7 +81,7 @@ def benchmark_candidates(configs, traces, input_buffers, graphs, replays, seed):
 
 
 def tune_bucket(args, n, configs, incumbent, runtimes, weights, packed, group, *, tiled_weights=None):
-    dt, pf, train = runtimes
+    decode, prefill, train = runtimes
     rank, world = group.rank(), group.size()
     h, e = args.hidden, args.experts
     rng = torch.Generator(device="cuda").manual_seed(args.seed + n * world + rank)
@@ -89,7 +89,7 @@ def tune_bucket(args, n, configs, incumbent, runtimes, weights, packed, group, *
 
     def inference(rt, inputs):
         params = packed if packed is not None else weights
-        if rt is dt and tiled_weights is not None:
+        if rt is decode and tiled_weights is not None:
             params = tiled_weights
         if packed is not None:
             return rt.inference_nvfp4(0, *inputs, params)
@@ -110,17 +110,17 @@ def tune_bucket(args, n, configs, incumbent, runtimes, weights, packed, group, *
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         if not finite.item():
             raise RuntimeError("Non-finite training reference")
-        check_bits(inference(pf, inputs), ref, "PF")
+        check_bits(inference(prefill, inputs), ref, "prefill (training kernel)")
         traces.append((inputs, ref))
 
     buffers = tuple(value.clone() for value in traces[0][0])
     graphs = {}
     for config in configs:
-        dt.native.buffer.decode_tuning[n] = config
-        inference(dt, buffers)
+        decode.native.buffer.decode_tuning[n] = config
+        inference(decode, buffers)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = inference(dt, buffers)
+            out = inference(decode, buffers)
         # Consecutive replays of the same node must see the new generation,
         # including the first output after switching owners.
         for inputs, reference in (traces[0], traces[1], traces[0]):
@@ -175,7 +175,7 @@ def tune(args, group):
     if torch.cuda.get_device_capability() != (10, 3) or ranks != int(
         os.environ["LOCAL_WORLD_SIZE"]
     ):
-        raise ValueError("SM103 DT tuning requires a single-node SM103 group")
+        raise ValueError("SM103 decode tuning requires a single-node SM103 group")
     e, h, i, k = args.experts, args.hidden, args.intermediate, args.top_k
     key = decode_key(
         torch.cuda.get_device_properties(
@@ -204,10 +204,10 @@ def tune(args, group):
     incumbents = {n: plan.get(n, decode_config(ranks, e, n, k)) for n in args.tokens}
     # Size one symmetric window for all candidates before capturing any graphs.
     max_m = max(*args.tiles, *(m for m, _ in incumbents.values()))
-    dt = TensorRuntime(
+    decode = TensorRuntime(
         **base, training=False, decode_only=True, decode_plan={cap: (max_m, False)}
     )
-    pf = TensorRuntime(**base, training=False)
+    prefill = TensorRuntime(**base, training=False)
     train = TensorRuntime(
         **base,
         training=True,
@@ -233,12 +233,12 @@ def tune(args, group):
                 )
             )
             winners[n] = tune_bucket(
-                args, n, configs, incumbent, (dt, pf, train), weights, packed, group, tiled_weights=tiled_weights
+                args, n, configs, incumbent, (decode, prefill, train), weights, packed, group, tiled_weights=tiled_weights
             )
         if rank == 0:
             publish(args.output, key, winners)
     finally:
-        for rt in (train, pf, dt):
+        for rt in (train, prefill, decode):
             rt.close()
 
 
@@ -248,7 +248,7 @@ def main():
     parser.add_argument("--precision", choices=["bf16", "nvfp4"], required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 16, 256, 512])
     parser.add_argument("--capacity", type=int, default=512)
-    parser.add_argument("--tiled-weights", action="store_true", help="Tune DT with prepared tiled weights")
+    parser.add_argument("--tiled-weights", action="store_true", help="Tune decode with prepared tiled weights")
     parser.add_argument(
         "--tiles", type=int, nargs="+", choices=DECODE_TILES, default=DECODE_TILES
     )

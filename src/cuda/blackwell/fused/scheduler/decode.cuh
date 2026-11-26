@@ -3,7 +3,7 @@
 #include "fused/comm/dispatch.cuh"
 #include "fused/ptx/utils.cuh"
 
-namespace weftmoe::sm100::dt {
+namespace weftmoe::sm100::decode {
 
 // Slot ordinals are private to a source rank and support repeated expert IDs.
 template <bool SingleCTA, uint32_t Experts, uint32_t TopK, uint32_t Ranks,
@@ -64,7 +64,7 @@ CUTLASS_DEVICE void dispatch(const layout::MegaMoEBuffer& buffer,
         const uint32_t peer = first + lane;
         comm::wait_until([&] {
             return __all_sync(0xffffffff, peer >= Ranks || ptx::ld_acq_sys(ws.get_peer_grid_idx_ptr(peer)) == epoch);
-        }, [&] { printf("WeftMoE DT source readiness timeout: rank=%u\n", sym.rank_idx); });
+        }, [&] { printf("WeftMoE decode source readiness timeout: rank=%u\n", sym.rank_idx); });
     }
     __syncwarp();
     // Reuse the source histogram as the CTA-local receive directory. Every
@@ -109,7 +109,7 @@ CUTLASS_DEVICE void wait_for_owners(const layout::Workspace& ws, uint32_t epoch)
         comm::wait_until([&] {
             return __all_sync(0xffffffff, peer >= Ranks ||
                 ptx::ld_acq_sys(ws.get_combine_ready_grid_idx_ptr(peer)) == epoch);
-        }, [&] { printf("WeftMoE DT owner acknowledgement timeout\n"); });
+        }, [&] { printf("WeftMoE decode owner acknowledgement timeout\n"); });
     }
 }
 
@@ -129,7 +129,7 @@ CUTLASS_DEVICE void combine(const layout::MegaMoEBuffer& buffer, void* output,
         const uint32_t mask = __ballot_sync(0xffffffff, e >= 0);
         const auto* ready = buffer.workspace.get_combine_ready_grid_idx_ptr(e >= 0 ? e / Owned : 0);
         comm::wait_until([&] { return __all_sync(0xffffffff, e < 0 || ptx::ld_acq_sys(ready) == epoch); },
-                         [&] { printf("WeftMoE DT combine timeout: token=%u\n", token); });
+                         [&] { printf("WeftMoE decode combine timeout: token=%u\n", token); });
         __syncwarp();
         float2 acc[4] = {};
         #pragma unroll
@@ -152,4 +152,4 @@ CUTLASS_DEVICE void combine(const layout::MegaMoEBuffer& buffer, void* output,
     }
 }
 
-} // namespace weftmoe::sm100::dt
+} // namespace weftmoe::sm100::decode

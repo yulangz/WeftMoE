@@ -1,4 +1,4 @@
-"""Compare single-node DT with PF under changing rank sizes and adversarial routes."""
+"""Compare single-node decode with training under changing rank sizes and adversarial routes."""
 
 import os
 
@@ -17,8 +17,8 @@ def check(group, owned, capacity, precision, intermediate=256):
     experts = owned * world
     config = dict(group=group, experts=experts, hidden=h, intermediate=i, top_k=k,
                   max_tokens=capacity, max_rows=capacity * world * k, training=False, precision=precision)
-    pf = TensorRuntime(**config)
-    dt = TensorRuntime(**config, decode_only=True)
+    prefill = TensorRuntime(**config)
+    decode = TensorRuntime(**config, decode_only=True)
     torch.manual_seed(1234 + rank)
     w1 = torch.randn(owned, 2 * i, h, device="cuda", dtype=torch.bfloat16) * 0.03
     w2 = torch.randn(owned, h, i, device="cuda", dtype=torch.bfloat16) * 0.03
@@ -47,14 +47,14 @@ def check(group, owned, capacity, precision, intermediate=256):
                 ids[1::2, 0] = experts
             else:
                 ids.fill_(-1)
-            reference = forward(pf, x, ids, gates)
+            reference = forward(prefill, x, ids, gates)
             samples.append((x, ids, gates, reference))
-            actual = forward(dt, x, ids, gates)
+            actual = forward(decode, x, ids, gates)
             same = torch.isfinite(actual).all() & (reference.view(torch.int16) == actual.view(torch.int16)).all()
-            tiled_out = forward(dt, x, ids, gates, use_tiles=True)
-            shared_pf = forward(pf, x, ids, gates, use_tiles=True)
+            tiled_out = forward(decode, x, ids, gates, use_tiles=True)
+            shared_training = forward(prefill, x, ids, gates, use_tiles=True)
             same &= (reference.view(torch.int16) == tiled_out.view(torch.int16)).all()
-            same &= (reference.view(torch.int16) == shared_pf.view(torch.int16)).all()
+            same &= (reference.view(torch.int16) == shared_training.view(torch.int16)).all()
             dist.all_reduce(same, op=dist.ReduceOp.MIN, group=group)
             assert same.item(), (precision, owned, capacity, step)
         # Queue generations without host/collective synchronization. Delay a
@@ -64,7 +64,7 @@ def check(group, owned, capacity, precision, intermediate=256):
             x, ids, gates, reference = samples[step % len(samples)]
             if step % world == rank:
                 torch.cuda._sleep(300_000)
-            actual = forward(dt, x, ids, gates, use_tiles=bool(step % 2))
+            actual = forward(decode, x, ids, gates, use_tiles=bool(step % 2))
             comparisons.append((reference.view(torch.int16) == actual.view(torch.int16)).all())
         equal = torch.stack(comparisons).all().int()
         dist.all_reduce(equal, op=dist.ReduceOp.MIN, group=group)
@@ -86,7 +86,7 @@ def check(group, owned, capacity, precision, intermediate=256):
                         ids[::3, 0] = -1
                     gates = torch.rand_like(fixed[2])
                     references.append(((x, ids, gates), train.forward(x, ids, gates, w1, w2).output))
-                for runtime in (pf, dt):
+                for runtime in (prefill, decode):
                     forward(runtime, *fixed, use_tiles=True)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
@@ -102,12 +102,12 @@ def check(group, owned, capacity, precision, intermediate=256):
                         comparisons.append((out.view(torch.int16) == reference.view(torch.int16)).all())
                     equal = torch.stack(comparisons).all().int()
                     dist.all_reduce(equal, op=dist.ReduceOp.MIN, group=group)
-                    assert equal.item(), (precision, capacity, "DT" if runtime is dt else "PF", "same graph, new inputs")
+                    assert equal.item(), (precision, capacity, "decode" if runtime is decode else "training", "same graph, new inputs")
             finally:
                 train.close()
     finally:
-        dt.close()
-        pf.close()
+        decode.close()
+        prefill.close()
 
 
 def main():
@@ -122,7 +122,7 @@ def main():
         # Intermediate divisible by 128 only uses 64-byte NVFP4 K tiles.
         check(group, 8, 16, "nvfp4", intermediate=384)
         if group.rank() == 0:
-            print(f"DT/PF bitwise route and workspace reuse checks passed on EP{group.size()}", flush=True)
+            print(f"decode/training bitwise route and workspace reuse checks passed on EP{group.size()}", flush=True)
     finally:
         dist.destroy_process_group()
 

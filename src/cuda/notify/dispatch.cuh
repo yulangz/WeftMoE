@@ -1201,7 +1201,7 @@ void ActivationTransportBridge::finish_training_notify(
   const auto exec = internal::checked_execution_state(impl.execution);
   DeviceDispatchRuntime runtime{};
   internal::throw_cuda(
-      "split-pf-notify",
+      "split-training-notify",
       cudaMemcpyAsync(
           &runtime,
           at<void>(state.allocation->device_ptr, state.device_layout.runtime),
@@ -1209,13 +1209,13 @@ void ActivationTransportBridge::finish_training_notify(
       impl.identity.calling_rank, impl.identity.world_size,
       impl.context.session().identity(), impl.identity.generation,
       ExchangeKind::ExpertCounts, "download planned tape extent");
-  internal::throw_cuda("split-pf-notify", cudaStreamSynchronize(exec->stream),
+  internal::throw_cuda("split-training-notify", cudaStreamSynchronize(exec->stream),
                        impl.identity.calling_rank, impl.identity.world_size,
                        impl.context.session().identity(),
                        impl.identity.generation, ExchangeKind::ExpertCounts,
-                       "finish standalone PF planning");
+                       "finish standalone training planning");
   if (runtime.error)
-    throw std::runtime_error("standalone PF notify rejected routes");
+    throw std::runtime_error("standalone training notify rejected routes");
   impl.sizes = runtime.sizes;
   impl.padded_compute_rows = runtime.sizes.mtile_count * 128U;
   impl.fused_forward_notify = false;

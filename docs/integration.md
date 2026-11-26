@@ -100,7 +100,7 @@ python tools/launch_sglang.py \
   --disable-shared-experts-fusion --language-only
 ```
 
-单机 B300 的私有 BF16 专家参数默认在 KV/Mamba 预算前转换成分块布局。PF 和 DT 的 5D 视图共享原 Parameter 的 GPU 地址，每层只保留一份 BF16 权重。原址转换复用单个本地专家的 FC1 大小的临时空间（Qwen35B 为 4 MiB、Qwen122B 为 12 MiB、Flash 为 32 MiB）。SGLang 使用权重共享 daemon 时继续读取常规布局。可在启动前设置 `WEFTMOE_SGLANG_TILED_BF16=0` 选择常规布局。脚本默认使用 triton MoE runner、none A2A 和未量化的 BF16 专家。独立 TensorRuntime 也支持 PF/DT 共用预打包 NVFP4，调用方式见[B300 接口](blackwell.md#单机-decode)。
+单机 B300 的私有 BF16 专家参数默认在 KV/Mamba 预算前转换成分块布局。training 和 decode 的 5D 视图共享原 Parameter 的 GPU 地址，每层只保留一份 BF16 权重。原址转换复用单个本地专家的 FC1 大小的临时空间（Qwen35B 为 4 MiB、Qwen122B 为 12 MiB、Flash 为 32 MiB）。SGLang 使用权重共享 daemon 时继续读取常规布局。可在启动前设置 `WEFTMOE_SGLANG_TILED_BF16=0` 选择常规布局。脚本默认使用 triton MoE runner、none A2A 和未量化的 BF16 专家。独立 TensorRuntime 也支持 training/decode 共用预打包 NVFP4，调用方式见[B300 接口](blackwell.md#单机-decode)。
 
 SGLang 连续更新多个 bucket 时，首个 bucket 在原地址还原常规布局。后续 bucket 复用这份权重，下一次 eager 推理或图回放前再统一分块。直接连续调用 expert weight loader 时，一层在首个分片还原，在下次推理前统一分块。如果独立加载分片失败，须成功重试所有失败的分片，再恢复推理。首次分块申请临时显存失败时，释放显存后可直接重试。
 
@@ -126,7 +126,7 @@ with canonical_weights(recover=True):
     model.load_state_dict(last_good_state, strict=True)
 ```
 
-SGLang 在计算 KV/Mamba 容量前也预热 PF/DT workspace。FP8 在同一阶段完成量化、释放 BF16 专家 storage，并将持久显存计入 KV 预算。
+SGLang 在计算 KV/Mamba 容量前也预热 training/decode workspace。FP8 在同一阶段完成量化、释放 BF16 专家 storage，并将持久显存计入 KV 预算。
 
 FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
 FP8 权重字节（uint8 view）和 FP32 block scale，不恢复 BF16，不重新量化。
@@ -139,22 +139,22 @@ AWEX 确定下一次完整覆盖权重时调用 `suspend(..., discard_fp8=True)`
 升级依赖时需重跑包含 TMS、权重更新和图重捕获的 8 卡生命周期测试。
 重新捕获前重置 decode 的 dummy request、KV 和 Mamba 输入，避免使用上一批请求的索引。
 
-`WEFTMOE_FP8=1` 可从 BF16 模型权重准备 FP8 专家缓存，prefill PF 和 decode DT 都使用
+`WEFTMOE_FP8=1` 可从 BF16 模型权重准备 FP8 专家缓存，`training` 和 `decode` 两个内核都使用
 FP8。suspend 会释放权重和 workspace 地址，因此即使 KV-only 恢复也必须重新捕获图；
 完整更新走上面的 discard 路径，普通恢复保留原权重。日志单独输出
 `WeftMoE decode graph recapture wall time`，不把它混入权重传输耗时。
 AWEX 包和协议不变，兼容代码位于 AReaL 的 adapter 层。
 
-- Prefill 使用 PF，decode/CUDA Graph 使用 DT；按集体执行阶段选择，不按各 rank 的局部 token 数独立切换。
+- 各 EP rank 按同一执行阶段选择内核。Prefill 使用 `training`，decode 图回放使用 `decode`。
 - TP attention 输入先按行分片，结果按模型原有 TP 布局合并。
 - DP attention 保持 DP-local 输入/输出，避免额外的 MoE all-gather/reduce-scatter；
   Qwen3.5 shared expert 在推理侧复制，AWEX 的 sharding 元数据必须与之匹配。
 
-DT 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 不要求 rollout 也使用跨机 EP16。
+decode 是机内协议，因此 rollout EP group 应留在单节点；训练 EP16 不要求 rollout 也使用跨机 EP16。
 不能只设置 `AREAL_USE_WEFTMOE=1` 就让原版 `python -m sglang.launch_server` 自动安装 hook；
 可使用下面已接入的 AReaL worker，或在自己的 worker 入口显式调用 `install()`。
 
-BF16 共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 DT 图，
+BF16 共卡切换由 `suspend(model_runner)` / `resume(model_runner)` 管理：默认保留 decode 图，
 释放 prefill runtime。分块 BF16 在 suspend 时恢复为普通布局，resume 时在同一地址重新分块，已有 decode 图可直接回放。
 显存紧张可设 `WEFTMOE_SGLANG_KEEP_DECODE_GRAPHS=0`，代价是释放后需要重新准备图。
 模型权重地址改变时不能继续回放旧图。最终退出使用 `close(model_runner)`。

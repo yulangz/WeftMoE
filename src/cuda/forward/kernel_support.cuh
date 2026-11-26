@@ -1,4 +1,4 @@
-#include "cuda/weftmoe_pf/network_layout.hpp"
+#include "cuda/weftmoe_training/network_layout.hpp"
 
 constexpr std::size_t kAlign = 256;
 
@@ -50,7 +50,7 @@ std::size_t checked_size(std::uint64_t value, const char *field) {
 // Round the allocation extent, not the tensor layout. Legacy CUDA IPC can
 // otherwise restrict the whole peer mapping to 4 KiB pages. Base/offset and
 // physical allocation alignment still determine the actual mapping page size.
-// 64 KiB removed the measured PF bottleneck; a 2 MiB comparison did not improve
+// 64 KiB removed the measured training bottleneck; a 2 MiB comparison did not improve
 // it materially and would impose larger padding on small Backward payloads.
 std::size_t ipc_allocation_bytes(std::uint64_t bytes) {
   constexpr std::uint64_t alignment = 64ULL * 1024ULL;
@@ -650,7 +650,7 @@ struct Layout {
 // weights, canonical rows, and local-P2P storage stay in ordinary CUDA
 // allocations so enabling the network backend does not change their allocator.
 struct GinWindowLayout {
-  weftmoe_pf::NetworkLayout static_forward;
+  weftmoe_training::NetworkLayout static_forward;
   communication::ChunkRingLayout rings;
   std::size_t send_dispatch_directory = 0;
   std::size_t receive_dispatch_directory = 0;
@@ -862,10 +862,10 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
             0U);
     unsigned minimum_depth = WEFTMOE_FWD_STATIC_V4_NETWORK_MIN_DEPTH;
     if (network_prefill_streaming(config))
-      if (const auto *value = std::getenv("WEFTMOE_PF_MIN_RING_DEPTH")) {
+      if (const auto *value = std::getenv("WEFTMOE_TRAINING_MIN_RING_DEPTH")) {
         minimum_depth = static_cast<unsigned>(std::stoul(value));
         if (!minimum_depth)
-          throw std::invalid_argument("PF minimum ring depth must be positive");
+          throw std::invalid_argument("training minimum ring depth must be positive");
       }
     // This is a capacity heuristic, not a per-window FC2 admission condition.
     const auto depth = static_cast<unsigned>(
@@ -875,14 +875,14 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
         network.rings.channels(), WEFTMOE_FWD_STATIC_V4_NETWORK_MAX_WORKERS));
     network.contexts = 3U * network.ring_workers;
     if (network_prefill_streaming(config)) {
-      unsigned long windows = weftmoe_pf::kNetworkCreditWindows;
-      if (const auto *value = std::getenv("WEFTMOE_PF_CREDIT_WINDOWS")) {
+      unsigned long windows = weftmoe_training::kNetworkCreditWindows;
+      if (const auto *value = std::getenv("WEFTMOE_TRAINING_CREDIT_WINDOWS")) {
         windows = std::stoul(value);
         if (!windows || windows > 8U)
-          throw std::invalid_argument("PF credit windows must be in [1, 8]");
+          throw std::invalid_argument("training credit windows must be in [1, 8]");
       }
       network.rings.depth *= static_cast<unsigned>(windows);
-      network.contexts = weftmoe_pf::kNetworkOwners - 1U;
+      network.contexts = weftmoe_training::kNetworkOwners - 1U;
       network.input =
           append(cursor,
                  config.max_tokens_per_rank,
@@ -911,10 +911,10 @@ make_gin_window_layout(const ActivationTransportPoolConfig &config) {
     network.gradient_tx = append(
         cursor,
         network.return_rows,
-        sizeof(float), "PF Backward router-gradient TX ring");
+        sizeof(float), "training Backward router-gradient TX ring");
     network.gradient_contribution =
         append(cursor, contribution_rows, sizeof(float),
-               "PF Backward router-gradient contributions");
+               "training Backward router-gradient contributions");
   }
   const auto dense_return_row_bytes =
       checked_mul(config.max_hidden_size, sizeof(transport::BFloat16),
@@ -1135,7 +1135,7 @@ Layout make_layout(const ActivationTransportPoolConfig &config) {
                    config.max_top_k,
                sizeof(std::uint64_t), "contribution route generations");
     if (config.max_nodes > 1U
-#if defined(WEFTMOE_PF_LOCAL_COMPACT_RETURN) && WEFTMOE_PF_LOCAL_COMPACT_RETURN
+#if defined(WEFTMOE_TRAINING_LOCAL_COMPACT_RETURN) && WEFTMOE_TRAINING_LOCAL_COMPACT_RETURN
         || (config.enable_backward_state &&
             forward_tuning::local_compact_return_capacity_supported(
                 config.max_tokens_per_rank))
@@ -1565,7 +1565,7 @@ struct PoolSlot {
   unsigned long long backward_capture_id = 0;
   cudaEvent_t forward_output_ready = nullptr;
   cudaEvent_t forward_complete = nullptr;
-  // PF backward uses a communication stream and a completion join stream.
+  // training backward uses a communication stream and a completion join stream.
   // These streams belong to the reusable workspace, not individual calls.
   cudaStream_t backward_transport_stream = nullptr;
   cudaEvent_t backward_roles_ready = nullptr;

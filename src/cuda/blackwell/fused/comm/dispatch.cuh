@@ -9,7 +9,7 @@ namespace weftmoe::sm100::comm {
 template <uint32_t kNumExperts, uint32_t kNumTopk, uint32_t kNumRanks, uint32_t kNumSMs,
           uint32_t kNumDispatchThreads, uint32_t kDispatchBarrierIdx, uint32_t kDispatchGridSyncIndex,
           bool kSave>
-CUTLASS_DEVICE void dispatch_pf(const layout::MegaMoEBuffer& buffer, const layout::SymBuffer<kNumRanks>& sym_buffer,
+CUTLASS_DEVICE void dispatch_training(const layout::MegaMoEBuffer& buffer, const layout::SymBuffer<kNumRanks>& sym_buffer,
                                 uint32_t num_tokens, uint32_t* counts, const layout::BF16Checkpoint& checkpoint) {
     constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
     constexpr uint32_t kNumDispatchWarps = kNumDispatchThreads / 32;

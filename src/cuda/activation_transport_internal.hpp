@@ -3,12 +3,12 @@
 #include "cuda/device_notify_internal.hpp"
 #include "cuda/backward/peer_payload.hpp"
 #include "cuda/profiling/device_timeline_types.hpp"
-#include "cuda/weftmoe_pf/plan.hpp"
-#include "cuda/weftmoe_pf/compute_ring.hpp"
-#include "cuda/weftmoe_pf/ring_layout.hpp"
+#include "cuda/weftmoe_training/plan.hpp"
+#include "cuda/weftmoe_training/compute_ring.hpp"
+#include "cuda/weftmoe_training/ring_layout.hpp"
 #if defined(__CUDACC__)
-#include "cuda/weftmoe_pf/packet_plan.cuh"
-#include "cuda/weftmoe_pf/window_geometry.cuh"
+#include "cuda/weftmoe_training/packet_plan.cuh"
+#include "cuda/weftmoe_training/window_geometry.cuh"
 #endif
 #include "transport/activation_protocol_testing.hpp"
 #define private public

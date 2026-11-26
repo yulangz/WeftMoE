@@ -30,12 +30,12 @@ B300 的 BF16 / NVFP4 基线见 [SM100 Benchmark](benchmarks-sm100.md)。
 
 ```bash
 unset WEFTMOE_AUTOTUNE_TABLE  # 使用显式 ring 参数；若用表，容量必须精确匹配。
-export WEFTMOE_PF_MIN_RING_DEPTH=2
-export WEFTMOE_PF_CREDIT_WINDOWS=2
+export WEFTMOE_TRAINING_MIN_RING_DEPTH=2
+export WEFTMOE_TRAINING_CREDIT_WINDOWS=2
 
 # 带训练缓存的 FWD。
 torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_training.py \
-  --backend pf --model qwen35b --tokens 8192 20480 --forward-only \
+  --backend training --model qwen35b --tokens 8192 20480 --forward-only \
   --stream-ordered --ring-tokens 2048 --ring-depth 2 \
   --prime-trace --warmups 4 --samples 20 --sample-pause-ms 50
 ```
@@ -52,11 +52,11 @@ BWD 读取 `backward_ready_slowest_rank_p50_us`，完整 cycle 读取 `wall_slow
 ```bash
 # 无缓存 prefill；固定权重已准备，不把重排计入每次推理。
 torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_inference.py \
-  --backend pf --model qwen35b --tokens 8192 20480 --prepared-weights
+  --backend training --model qwen35b --tokens 8192 20480 --prepared-weights
 
-# 小 batch，与 SGLang 的 DP=EP 路径同口径比较；改 dt 为 pf 可测 PF。
+# 小 batch，与 SGLang 的 DP=EP 路径同口径比较；设置 --weft-backend training 可对比 prefill 使用的内核。
 torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_sglang_decode.py \
-  --model qwen35b --weft-backend dt --dp-attention \
+  --model qwen35b --weft-backend decode --dp-attention \
   --tokens 1 8 64 128 512 --fresh-routes --route-bias-std 0.5 --samples 20
 ```
 
@@ -64,14 +64,14 @@ SGLang 测试含输入 staging、dispatch、GEMM、return/reduce，不含 router
 权重重排和 graph 准备。默认不加 `--dp-attention` 时是 TP 复制输入，tokens 口径不同，不能混比。
 Flash 等较大 shape 的 BF16 检查可显式使用 `--atol 1e-4`，仍保留相对误差检查。
 MegaMoE 单机对照用 `torchrun_inference.py --backend megamoe --deepgemm-package /path/to/DeepGEMM`；
-其它 shape、trace 和采样参数需与 PF 一致。
+其它 shape、trace 和采样参数需与 training 一致。
 
-双机 PF/Megatron 在**两台机器同时**启动同一命令，将 torchrun 前缀替换为：
+双机 training/Megatron 在**两台机器同时**启动同一命令，将 torchrun 前缀替换为：
 
 ```bash
 torchrun --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port=29531 \
-  benchmarks/sm90/torchrun_training.py --backend pf --model qwen35b \
+  benchmarks/sm90/torchrun_training.py --backend training --model qwen35b \
   --tokens 8192 20480 --forward-only --stream-ordered \
   --ring-tokens 2048 --ring-depth 2 --prime-trace --warmups 4 --samples 20
 ```
@@ -87,8 +87,8 @@ EP8 指单机八卡，EP16 指双机十六卡；固定每 rank tokens 时，EP16
 
 | 场景 | 基线实现 | 精度和通信 | 计时边界 |
 | --- | --- | --- | --- |
-| PF 训练 | Megatron-Core `MoEFlexTokenDispatcher` + Transformer Engine grouped experts | BF16，DeepEP normal dispatch/combine，20 SM；TP=ETP=1，EP=world size | 路由格式转换、dispatch、FC1/SwiGLU/FC2、combine；BWD 包含 dX、dprob、dW |
-| DT decode | SGLang `FusedMoE`，`moe_runner_backend=triton`、`moe_a2a_backend=none` | BF16，DP=EP=world size；输入 all-gather、输出 reduce-scatter | DP 通信、两次 GEMM 和激活；WeftMoE 对照包含输入 staging 和结果返回 |
+| training | Megatron-Core `MoEFlexTokenDispatcher` + Transformer Engine grouped experts | BF16，DeepEP normal dispatch/combine，20 SM；TP=ETP=1，EP=world size | 路由格式转换、dispatch、FC1/SwiGLU/FC2、combine；BWD 包含 dX、dprob、dW |
+| decode | SGLang `FusedMoE`，`moe_runner_backend=triton`、`moe_a2a_backend=none` | BF16，DP=EP=world size；输入 all-gather、输出 reduce-scatter | DP 通信、两次 GEMM 和激活；WeftMoE 对照包含输入 staging 和结果返回 |
 
 SGLang 这里测的是 Triton FusedMoE 加 DP 通信路径，不是 SGLang 的 DeepEP 或原生 FP8 路径。
 两种框架基线均排除 router projection/top-k、shared expert、权重初始化和编译。
@@ -98,7 +98,7 @@ Megatron 开启 permute/activation fusion，并使用 `moe_act` selective recomp
 
 ### Megatron 复现与结果读取
 
-与下方 PF 表一致的单机 EP8 workload，先测完整 cycle：
+与下方 training 表一致的单机 EP8 workload，先测完整 cycle：
 
 ```bash
 OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 \
@@ -110,8 +110,8 @@ OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 \
 ```
 
 分别追加 `--forward-only`、`--backward-only` 测独立 FWD/BWD；将 `--model` 换为
-`qwen122b`、`flash` 覆盖另两种规模。PF 对照使用相同 workload、seed、warmup/sample 数，
-BF16 使用 `--backend pf --stream-ordered --ring-tokens 512 --ring-depth 8`，
+`qwen122b`、`flash` 覆盖另两种规模。training 对照使用相同 workload、seed、warmup/sample 数，
+BF16 使用 `--backend training --stream-ordered --ring-tokens 512 --ring-depth 8`，
 FP8 再追加 `--fp8 --weight-grad-dtype bf16`，并选择对应规模的扩展。
 
 读取 `TRAINING_CYCLE_JSON` 中的 `wall_slowest_rank_p50_us`（cycle）、
@@ -122,25 +122,25 @@ FP8 再追加 `--fp8 --weight-grad-dtype bf16`，并选择对应规模的扩展�
 
 ### SGLang 复现与结果读取
 
-以下命令在同一进程中交错测量 SGLang BF16 和 WeftMoE DT BF16，输入、权重、路由共享：
+以下命令在同一进程中交错测量 SGLang BF16 和 WeftMoE decode BF16，输入、权重、路由共享：
 
 ```bash
 WEFTMOE_FP8=0 OMP_NUM_THREADS=1 \
 torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_sglang_decode.py \
-  --model qwen35b --weft-backend dt --dp-attention \
+  --model qwen35b --weft-backend decode --dp-attention \
   --tokens 64 512 --fresh-routes --route-bias-std 0.5 \
   --seed 1300 --samples 20 --replays 50
 ```
 
 将 `--model` 换为 `qwen122b`、`flash` 并切换对应扩展；Flash BF16 校验追加 `--atol 1e-4`。
 再用 `--seed 1700` 重复，合并两组样本。
-读取 `SGLANG_DECODE_COMPARE.rank_max_p50_us`：`baseline` 为 SGLang，`dt` 为 WeftMoE，
-加速比为 `baseline / dt`。结果应记录 `tokens_scope=dp_local`、`dp_size=8`、
+读取 `SGLANG_DECODE_COMPARE.rank_max_p50_us`：`baseline` 为 SGLang，`decode` 为 WeftMoE，
+加速比为 `baseline / decode`。结果应记录 `tokens_scope=dp_local`、`dp_size=8`、
 `baseline_communication=all_gather+reduce_scatter`，以及 `routing_sha256`、软件版本和扩展 hash。
 每种实现均先捕获 CUDA graph，计时交错 replay；取逐样本最慢 rank 后的 p50。
 
-此脚本的显式 DT 对照路径目前为 BF16；设置 `WEFTMOE_FP8=1` 不会把它变成 FP8 三方比较。
-它与下方 `benchmark_dt_fp8.py` 的静态均匀路由、输入 staging 和采样方式不同，
+此脚本的显式 decode 对照路径目前为 BF16；设置 `WEFTMOE_FP8=1` 不会把它变成 FP8 三方比较。
+它与下方 `benchmark_decode_fp8.py` 的静态均匀路由、输入 staging 和采样方式不同，
 不能把这里单独测得的 SGLang 耗时拼入下方 FP8 表计算加速比。
 FP8 对 SGLang 的数值结果需在相同输入、路由和计时边界下联合测量。
 
@@ -158,12 +158,12 @@ FP8 对 SGLang 的数值结果需在相同输入、路由和计时边界下联�
 
 依赖版本：torch `2.9.1+cu129`，sglang `0.5.10.post1`，flashinfer-python `0.6.18`，megatron-core `0.19.0`，transformer-engine `2.14.1+27de67e1`，deep-ep `1.2.1+567632d`，triton `3.5.1`。
 
-### PF 训练：Megatron BF16 与 WeftMoE
+### training：Megatron BF16 与 WeftMoE
 
 E=256；Qwen top-k=8，Flash top-k=6；每 rank 名义 8K/20K tokens，长度 std=10%，路由 bias std=0.5，seed=123。
 每个规模、模式使用 Megatron→WeftMoE BF16→WeftMoE FP8→FP8→BF16→Megatron 的顺序，
 每轮完整预热路由后做 10 次 warmup、30 次采样。所有实现的逐 rank workload hash 相同，Megatron 计时期间没有新编译图。
-PF ring tokens=512、depth=8，使用异步训练 API；FP8 源端量化计时，权重预量化不计时，dW 为 BF16。
+training ring tokens=512、depth=8，使用异步训练 API；FP8 源端量化计时，权重预量化不计时，dW 为 BF16。
 数据是两轮合计 60 个逐样本最慢 rank 耗时的 p50；加速比为 Megatron BF16 / WeftMoE，低于 1× 表示较慢。
 FWD、BWD、cycle 分别测量，不把独立 p50 相加作为 cycle。BF16/Megatron 数值预检使用每 rank 名义 16 tokens；FP8 使用现有正确性测试（名义 65 tokens、top-k=2）。这些预检不是对大规模计时输入的逐项验收。
 
@@ -197,13 +197,13 @@ FWD、BWD、cycle 分别测量，不把独立 p50 相加作为 cycle。BF16/Mega
 | flash | 20480 | FWD | 21.599 | 15.505 | 12.789 |
 | flash | 20480 | BWD | 33.625 | 30.227 | 29.449 |
 
-### DT decode：SGLang BF16 与 WeftMoE BF16
+### decode：SGLang BF16 与 WeftMoE BF16
 
 使用上文 SGLang 对照脚本，DP=EP=8，64/512 tokens/rank，固定 M64；路由 bias std=0.5，每次样本更新输入和路由。
 两个 seed=1300/1700，各 5 次预热、20 次样本、每样本 50 次 graph replay，同一进程交错执行两种实现。
 下表合并 40 个逐样本最慢 rank 耗时取 p50（µs），括号为两个 seed 各自 p50 的范围；所有样本均通过脚本的 BF16 数值检查。
 
-| 规模 | tokens/rank | SGLang BF16 | WeftMoE DT BF16 | 加速比 |
+| 规模 | tokens/rank | SGLang BF16 | WeftMoE decode BF16 | 加速比 |
 | --- | --- | --- | --- | --- |
 | qwen35b | 64 | 175.42（172.71–177.65） | 120.16（109.69–123.45） | 1.46× |
 | qwen35b | 512 | 486.10（484.25–489.66） | 234.93（223.50–237.79） | 2.07× |
@@ -212,9 +212,9 @@ FWD、BWD、cycle 分别测量，不把独立 p50 相加作为 cycle。BF16/Mega
 | flash | 64 | 748.34（739.79–749.84） | 440.07（435.79–441.00） | 1.70× |
 | flash | 512 | 1599.08（1581.23–1613.36） | 972.72（930.65–1004.64） | 1.64× |
 
-### DT decode：WeftMoE BF16/FP8 精度对照
+### decode：WeftMoE BF16/FP8 精度对照
 
-单独运行 `benchmark_dt_fp8.py`；两个 seed=1300/1700，静态均匀路由，每个 graph 捕获 100 次调用，
+单独运行 `benchmark_decode_fp8.py`；两个 seed=1300/1700，静态均匀路由，每个 graph 捕获 100 次调用，
 11 轮交替 replay 并丢弃首轮，合并 20 个逐样本最慢 rank 耗时取 p50（µs）。
 FP8/BF16 全局 diff < 5e-3（各 rank 最大值 0.002847），在线量化与预量化输入输出逐位一致。
 
@@ -228,15 +228,15 @@ FP8/BF16 全局 diff < 5e-3（各 rank 最大值 0.002847），在线量化与�
 | flash | 512 | 792.87 | 529.93 | 527.15 | -33.2% |
 
 预量化输入排除上游量化成本。这一表与 SGLang 表的路由、staging 和采样方法不同，不能交叉计算加速比。
-DT decode 收益不代表 PF 训练或完整 RL 的收益。
+decode 收益不代表 training或完整 RL 的收益。
 
-复现 Qwen122B 的内部 DT 精度对照（设置对应扩展路径）：
+复现 Qwen122B 的内部 decode 精度对照（设置对应扩展路径）：
 
 ```bash
 TEST_HIDDEN=3072 TEST_INTERMEDIATE=1024 BENCH_EXPERTS=256 BENCH_TOPK=8 \
 BENCH_SIZES="64 512" BENCH_REPEATS=100 BENCH_SWEEPS=11 BENCH_SEED=1300 \
 OMP_NUM_THREADS=1 python -m torch.distributed.run --standalone --nproc-per-node=8 \
-  benchmarks/sm90/benchmark_dt_fp8.py
+  benchmarks/sm90/benchmark_decode_fp8.py
 ```
 
 再用 `BENCH_SEED=1700` 重复；其它规模使用表中 H/I/top-k 及对应构建。

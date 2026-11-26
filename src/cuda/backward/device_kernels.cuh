@@ -116,4 +116,4 @@ __device__ __forceinline__ void backward_swiglu_epilogue_warp_row(
 }
 
 #include "cuda/backward/pipeline_kernels.cuh"
-#include "cuda/weftmoe_pf/backward_weights.cuh"
+#include "cuda/weftmoe_training/backward_weights.cuh"

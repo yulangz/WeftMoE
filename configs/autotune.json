@@ -1,7 +1,7 @@
 {
   "environment": {
-    "WEFTMOE_PF_MIN_RING_DEPTH": "2",
-    "WEFTMOE_PF_CREDIT_WINDOWS": "2"
+    "WEFTMOE_TRAINING_MIN_RING_DEPTH": "2",
+    "WEFTMOE_TRAINING_CREDIT_WINDOWS": "2"
   },
   "stream_ordered": true,
   "sample_pause_ms": 50,

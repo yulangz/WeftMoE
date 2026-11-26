@@ -58,7 +58,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--edge-cases", action="store_true")
     parser.add_argument("--decode", action="store_true",
-                        help="Select DT explicitly and check batch invariance")
+                        help="Select decode explicitly and check batch invariance")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(seconds=300))
@@ -210,7 +210,7 @@ def main():
             return output
 
         x, routes, gates = inputs(max_tokens)
-        baseline = selected_inference(runtime, "weftmoe_dt::kernel")
+        baseline = selected_inference(runtime, "weftmoe_decode::kernel")
         for tokens in sorted({1, min(7, max_tokens), min(32, max_tokens), max_tokens}):
             exact(runtime.inference_eager(x[:tokens], routes[:tokens], gates[:tokens],
                                           w1, w2), baseline[:tokens],
@@ -235,18 +235,18 @@ def main():
         exact(runtime.inference_eager(x, hot_routes, gates, w1, w2)[:1],
               hot_baseline, "batch-invariant-hot-expert")
 
-        # An ordinary pool selects PF even for short actual inputs.
-        # PF and DT have distinct arithmetic paths: require numerical parity
-        # across backends, while retaining bitwise DT batch checks above.
+        # An ordinary pool selects training even for short actual inputs.
+        # training and decode have distinct arithmetic paths: require numerical parity
+        # across backends, while retaining bitwise decode batch checks above.
         general = TensorRuntime(
             group=dist.group.WORLD, experts=args.experts, top_k=args.top_k,
             hidden=hidden, intermediate=intermediate, max_tokens=max_tokens,
             max_rows=world * max_tokens * args.top_k + (args.experts // world) * 128,
             training=False,
         )
-        actual = selected_inference(general, "weftmoe_pf::local::kernel")
-        check(actual, reference(x, routes, gates, all_w1, all_w2), "pf-reference")
-        check(actual, baseline, "decode-pf-numerical-parity")
+        actual = selected_inference(general, "weftmoe_training::local::kernel")
+        check(actual, reference(x, routes, gates, all_w1, all_w2), "training-reference")
+        check(actual, baseline, "decode-training-numerical-parity")
         general.close()
     runtime.close()
     dist.destroy_process_group()

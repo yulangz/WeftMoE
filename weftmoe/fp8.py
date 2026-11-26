@@ -130,7 +130,7 @@ def fp8_gemm(a: FP8Tensor, b: FP8Tensor, *, dtype=torch.bfloat16,
              out: torch.Tensor | None = None, accumulate: bool = False) -> torch.Tensor:
     """Reference/diagnostic A @ B.T using FP8 WGMMA and K128 FP32 sums.
 
-    This standalone kernel is not pipelined; use PF/DT for production MoE.
+    This standalone kernel is not pipelined; use training/decode for production MoE.
     """
     if (len(a.shape) != 2 or len(b.shape) != 2 or a.shape[1] != b.shape[1]
             or a.data.device != b.data.device):

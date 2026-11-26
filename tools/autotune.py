@@ -25,7 +25,7 @@ import forward_tuning as forward
 from autotune_common import (PlanError, candidate_digest, choose_confirmed_candidate,
                              compile_in_parallel, confirmation_finalists, git_revision,
                              require, write_result)
-import pf_tuning as ring
+import training_tuning as ring
 import unified_tuning
 
 
@@ -45,7 +45,7 @@ INVARIANT_FORWARD = frozenset({
 INVARIANT_BACKWARD = frozenset({
     "dab_stages", "dx_stages", "dw1_stages", "dw2_stages", "dw1_claim_tiles", "dw2_claim_tiles",
 })
-INVARIANT_V4 = frozenset({"window_tokens", "contribution_windows", "decode_stages", "decode_cta_multiplier", "dt_fp8_stages", "dt_fp8_ctas"})
+INVARIANT_V4 = frozenset({"window_tokens", "contribution_windows", "decode_stages", "decode_cta_multiplier", "decode_fp8_stages", "decode_fp8_ctas"})
 
 
 def invariant_changes(config, reference):
@@ -80,11 +80,11 @@ def load_incumbent(spec, args):
     source = default_header(args.hidden, args.intermediate) if not spec.get("base_header") else header.read_text()
     source += '\n#include "cuda/forward/tuning_config.hpp"\n#include "cuda/backward/tuning_config.hpp"\n'
     for phase, module in PHASES.items():
-        source += "".join(f"PF_VALUE {phase} {key} {macro}\n"
+        source += "".join(f"TRAINING_VALUE {phase} {key} {macro}\n"
                           for key, macro in module.PARAMETER_MACROS.items())
     for key, macro in ring.MACROS.items():
         source += (f"#ifndef {macro}\n#define {macro} {ring.DEFAULTS[key]}\n#endif\n"
-                   f"PF_VALUE v4 {key} {macro}\n")
+                   f"TRAINING_VALUE v4 {key} {macro}\n")
     output = subprocess.check_output([
         spec.get("environment", {}).get("CXX", os.environ.get("CXX", "c++")),
         "-E", "-P", "-x", "c++", "-",
@@ -92,7 +92,7 @@ def load_incumbent(spec, args):
         ], input=source, text=True)
     config = {phase: {} for phase in (*PHASES, "v4")}
     for line in output.splitlines():
-        if line.startswith("PF_VALUE "):
+        if line.startswith("TRAINING_VALUE "):
             _, phase, key, value = line.split()
             config[phase][key] = int(value)
     for key in forward.BOOLEAN_PARAMETERS:
@@ -275,7 +275,7 @@ class Benchmark:
             cli += [f"--{role}-ring-tokens", str(item["config"]["v4"]["window_tokens"]),
                     f"--{role}-ring-depth", str(item["config"]["v4"]["contribution_windows"])]
         if args.remotes:
-            cli.append("--skip-dt")
+            cli.append("--skip-decode")
         env = {k:v for k,v in os.environ.items() if k.startswith(("NCCL_", "UCX_", "CUDA_")) or k == "LD_LIBRARY_PATH"}
         env.update(spec.get("environment", {}))
         env.update(PYTHONPATH=str(ROOT), OMP_NUM_THREADS="1")
@@ -288,7 +288,7 @@ class Benchmark:
         training = args.mode == "training"
         settings = spec["final" if final else "screen"]
         tokens = args.tokens if final or not verify else spec["verify_tokens"]
-        cli = ["--backend", "dt" if args.mode == "decode" else "pf", "--tokens", *map(str, tokens),
+        cli = ["--backend", "decode" if args.mode == "decode" else "training", "--tokens", *map(str, tokens),
                "--hidden", str(args.hidden), "--intermediate", str(args.intermediate),
                "--experts", str(args.experts), "--top-k", str(args.top_k),
                "--warmups", "0" if verify else str(settings["warmups"]),
@@ -408,7 +408,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     spec["batch_invariant"] = args.batch_invariant
     if args.fp8 and args.mode == "decode":
-        spec["decode"] = {"axes": {"v4.dt_fp8_stages": [1, 2, 3], "v4.dt_fp8_ctas": [0, 32, 64, 96, 132]}}
+        spec["decode"] = {"axes": {"v4.decode_fp8_stages": [1, 2, 3], "v4.decode_fp8_ctas": [0, 32, 64, 96, 132]}}
     args.config = args.config.resolve()
     resolve_model(args)
     fields = vars(args) | dict(nodes=1 + len(args.remotes),
@@ -421,7 +421,7 @@ def parse_args(argv=None):
 
 def run_search(args, spec):
     require(not args.remotes or args.master_addr != "127.0.0.1", "multi-node requires --master-addr")
-    require(args.mode != "decode" or not args.remotes, "DT uses node-local communication")
+    require(args.mode != "decode" or not args.remotes, "decode uses node-local communication")
     require(args.jobs > 0 and args.gpus_per_node > 0 and min(args.tokens) > 0,
             "jobs, GPUs and tokens must be positive")
     require(args.experts % ((1 + len(args.remotes)) * args.gpus_per_node) == 0,

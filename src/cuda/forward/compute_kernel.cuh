@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared Hopper fragment layout and epilogues for PF and DT.
+// Shared Hopper fragment layout and epilogues for training and decode.
 // Keep the WGMMA roles separate from transport so math and TMA retain their
 // independent register quotas without GIN/relay live ranges in the GEMM loop.
 
@@ -99,9 +99,9 @@ __device__ __forceinline__ auto physical_barrier(unsigned id) {
       Unified ? (id == kTaskReadyBarrier ? 4U : id) : id + 8U);
 }
 
-#include "cuda/weftmoe_pf/checkpoint_copy.cuh"
-#include "cuda/weftmoe_pf/fc1_epilogue.cuh"
-#include "cuda/weftmoe_pf/fc2_epilogue.cuh"
+#include "cuda/weftmoe_training/checkpoint_copy.cuh"
+#include "cuda/weftmoe_training/fc1_epilogue.cuh"
+#include "cuda/weftmoe_training/fc2_epilogue.cuh"
 
 } // namespace forward_compute_detail
 #endif

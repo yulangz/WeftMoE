@@ -168,15 +168,15 @@ struct BackwardTensorStorage::Impl {
   bool fp8_compute = false;
   bool streamed_fp8_wgrad = false;
   std::size_t fp8_wgrad_offset = 0, fp8_scales_offset = 0, fp8_ready_offset = 0;
-  unsigned pf_depth = 0;
-  std::size_t pf_dab_offset = 0;
+  unsigned training_depth = 0;
+  std::size_t training_dab_offset = 0;
   CUtensorMap dab_map{}, u_mn_map{}, dab_mn_map{};
   std::uint32_t top_k, experts;
   explicit Impl(const CudaExecution &execution) : completion(execution) {}
   static std::shared_ptr<Impl>
   make(const DeviceDispatchHandle &, const CudaExecution &,
        const BackwardMegaKernelConfig &, const BackwardTensorBuffers &,
-       const CudaTensorAllocator &, unsigned pf_depth, bool private_dr, bool fp8_compute,
+       const CudaTensorAllocator &, unsigned training_depth, bool private_dr, bool fp8_compute,
        bool streamed_fp8_wgrad);
 };
 
@@ -252,14 +252,14 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
     const DeviceDispatchHandle &dispatch, const CudaExecution &execution,
     const BackwardMegaKernelConfig &config,
     const BackwardTensorBuffers &bindings, const CudaTensorAllocator &allocator,
-    unsigned pf_depth, bool private_dr, bool fp8_compute, bool streamed_fp8_wgrad) {
+    unsigned training_depth, bool private_dr, bool fp8_compute, bool streamed_fp8_wgrad) {
   using namespace tensor_storage_detail;
   if (!dispatch || !execution || !config.hidden_size ||
       !config.intermediate_size)
     throw std::runtime_error(
         "prepare Backward tensors requires Notify and a model shape");
   auto state = std::make_shared<BackwardTensorStorage::Impl>(execution);
-  state->pf_depth = pf_depth;
+  state->training_depth = training_depth;
   state->private_dr = private_dr;
   state->fp32_weight_gradients = config.fp32_weight_gradients;
   state->fp8_compute = fp8_compute;
@@ -301,12 +301,12 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   state->dw1 = make(checked_mul(weight, 2ULL * weight_element_bytes, "dW1 bytes"), bindings.dw1);
   state->dw2 = make(checked_mul(weight, weight_element_bytes, "dW2 bytes"), bindings.dw2);
   // Notify already carries exact R/P. Local IPC dR belongs to the execution
-  // slot. Network PF can keep dR private: only this GPU forwards into it.
+  // slot. Network training can keep dR private: only this GPU forwards into it.
   std::size_t cursor = 0;
   const auto intermediate_elements = checked_mul(
       state->padded_rows, state->intermediate, "Backward workspace elements");
   const auto du_elements = streamed_fp8_wgrad
-      ? std::uint64_t(pf_depth) * backward_tuning::kTileM * state->intermediate
+      ? std::uint64_t(training_depth) * backward_tuning::kTileM * state->intermediate
       : intermediate_elements;
   state->u_offset = append(cursor, du_elements, 2U, "Backward dU");
   state->dab_offset = streamed_fp8_wgrad
@@ -320,11 +320,11 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
                streamed_fp8_wgrad ? std::max<std::uint64_t>(128U, state->padded_rows) : std::max(state->rows, std::uint64_t{1}),
                streamed_fp8_wgrad ? fp8::source_pitch(unsigned(state->hidden)) : 2U * state->hidden,
                "private Backward dR");
-  if (pf_depth && 2U * state->intermediate > state->hidden)
-    state->pf_dab_offset = append(
-        cursor, std::uint64_t(pf_depth) * backward_tuning::kTileM *
+  if (training_depth && 2U * state->intermediate > state->hidden)
+    state->training_dab_offset = append(
+        cursor, std::uint64_t(training_depth) * backward_tuning::kTileM *
                     state->intermediate,
-        4U, "PF Backward dAB ring");
+        4U, "training Backward dAB ring");
   if (fp8_compute) {
     const auto elements = checked_mul(state->padded_rows,
         (streamed_fp8_wgrad ? state->hidden : 2U * state->hidden) +
@@ -336,11 +336,11 @@ std::shared_ptr<BackwardTensorStorage::Impl> BackwardTensorStorage::Impl::make(
   state->workspace = make(cursor);
 #if !defined(WEFTMOE_BENCH_TRANSPORT_ONLY)
   auto *base = state->workspace->data;
-  if (!streamed_fp8_wgrad && pf_depth && 2U * state->intermediate > state->hidden)
+  if (!streamed_fp8_wgrad && training_depth && 2U * state->intermediate > state->hidden)
     state->dab_map = make_bf16_tma_map(
-        at<void>(base, state->pf_dab_offset), 2ULL * state->intermediate,
-        std::uint64_t(pf_depth) * backward_tuning::kTileM,
-        backward_tuning::kTileM, "PF Backward dAB ring", 64U);
+        at<void>(base, state->training_dab_offset), 2ULL * state->intermediate,
+        std::uint64_t(training_depth) * backward_tuning::kTileM,
+        backward_tuning::kTileM, "training Backward dAB ring", 64U);
   if (!streamed_fp8_wgrad) {
     state->u_mn_map =
       make_bf16_tma_map_mn(at<void>(base, state->u_offset), state->intermediate,

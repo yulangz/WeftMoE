@@ -16,8 +16,8 @@ struct ForwardKernelArgs {
     } sizes;
   } dispatch;
 };
-#include "cuda/weftmoe_pf/source_row_decoder.cuh"
-using namespace weftmoe_pf;
+#include "cuda/weftmoe_training/source_row_decoder.cuh"
+using namespace weftmoe_training;
 
 __global__ void test_cursor(ForwardKernelArgs a, const unsigned *prefix,
                             unsigned total, unsigned *result) {

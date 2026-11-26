@@ -11,7 +11,7 @@ __device__ __forceinline__ unsigned swizzle(unsigned row, unsigned col) {
   return row * 128U + (col ^ ((row & 7U) * 16U));
 }
 
-// This small standalone mainloop is also the numerical baseline for the PF
+// This small standalone mainloop is also the numerical baseline for the training
 // pipelined implementation. It executes actual FP8 WGMMA, promoting each
 // K128 partial sum into a separately scaled FP32 accumulator.
 template <bool FloatOutput, bool Accumulate>

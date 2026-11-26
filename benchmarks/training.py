@@ -4,7 +4,7 @@
 Input preparation is untimed. This exercises changing communication sizes, not
 a full training step: expert weights are fixed and there is no optimizer.
 Forward-only retains X/GU until device completion and reports both cache-ready
-and release-inclusive wall time. Default PF timing includes weight packing.
+and release-inclusive wall time. Default training timing includes weight packing.
 FP8 prepares fixed weights (fused quantization plus W/W.T output) before timing;
 source activation quantization remains inside the measured FWD/BWD calls.
 Backward-only prepares and synchronizes a fresh Forward tape outside timing;
@@ -29,19 +29,19 @@ from benchmarks.workload import make_workload, workload_sha256
 def main(*, blackwell=False):
     description = "Blackwell Megatron grouped expert training." if blackwell else __doc__
     parser = argparse.ArgumentParser(description=description)
-    pf_parser = argparse.ArgumentParser(add_help=False) if blackwell else parser
+    training_parser = argparse.ArgumentParser(add_help=False) if blackwell else parser
     if blackwell:
         parser.add_argument("--batch-invariant", action=argparse.BooleanOptionalAction, default=True,
                             help="Pin the WeftMoE forward arithmetic across token counts and EP sizes")
         parser.add_argument("--backend", choices=("megatron", "weft"), default="megatron")
         parser.add_argument("--precision", choices=("bf16", "fp4"), default="bf16")
     else:
-        parser.add_argument("--backend", choices=("pf", "megatron"), required=True)
+        parser.add_argument("--backend", choices=("training", "megatron"), required=True)
         parser.set_defaults(precision="bf16")
-    pf_parser.add_argument("--prequantized-inputs", action="store_true",
+    training_parser.add_argument("--prequantized-inputs", action="store_true",
                            help="Supply rowwise FP8 X/dY; prepare before timing, include packet copy")
-    pf_parser.add_argument("--fp8", action="store_true",
-                           help="PF block-wise FP8; prepare fixed weights outside timing")
+    training_parser.add_argument("--fp8", action="store_true",
+                           help="training block-wise FP8; prepare fixed weights outside timing")
     parser.add_argument("--dispatcher", choices=("alltoall", "flex"),
                         default="alltoall" if blackwell else "flex",
                         help="Megatron communication backend: NCCL all-to-all or DeepEP")
@@ -60,39 +60,39 @@ def main(*, blackwell=False):
                         help="Replay the trace once untimed to warm dynamic compiler/allocator variants")
     parser.add_argument("--verify", action="store_true",
                         help="Check output/dX/dGate/dW1/dW2 against Torch instead of timing")
-    pf_parser.add_argument("--backward-identity", action="store_true",
+    training_parser.add_argument("--backward-identity", action="store_true",
                            help="Verify the communication-only diagnostic, not a training kernel")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--forward-only", action="store_true",
                         help="Time training forward with saved X/GU, tape release and synchronize, without backward")
     mode.add_argument("--backward-only", action="store_true",
                       help="Time backward on a fresh, synchronized Forward tape; Forward is untimed")
-    pf_parser.add_argument("--weight-grad-dtype", choices=("bf16", "float32"),
+    training_parser.add_argument("--weight-grad-dtype", choices=("bf16", "float32"),
                            help="FP8 dW output type; default float32. Use bf16 to match BF16 baseline output.")
-    pf_parser.add_argument("--prepared-weights", action="store_true",
-                           help="Reuse immutable PF weights; default includes per-call packing as in training")
-    pf_parser.add_argument("--stream-ordered", action="store_true",
-                           help="Use PF async training entrypoints, matching the Megatron adapter")
+    training_parser.add_argument("--prepared-weights", action="store_true",
+                           help="Reuse immutable training weights; default includes per-call packing as in training")
+    training_parser.add_argument("--stream-ordered", action="store_true",
+                           help="Use training async training entrypoints, matching the Megatron adapter")
     parser.add_argument("--accumulate-main-grad", action="store_true",
-                        help="Accumulate FP32 parameter gradients: TE fused wgrad, PF per-parameter add as in DDP")
+                        help="Accumulate FP32 parameter gradients: TE fused wgrad, training per-parameter add as in DDP")
     parser.add_argument("--trace-kernels", action="store_true",
                         help="Record CUDA entries during the first numerical check, outside performance runs")
-    pf_parser.add_argument("--profile-stages", action="store_true",
+    training_parser.add_argument("--profile-stages", action="store_true",
                            help="Collect cached-FWD stage counters from the diagnostic tensor adapter")
-    pf_parser.add_argument("--trace-stage-kernels", action="store_true",
+    training_parser.add_argument("--trace-stage-kernels", action="store_true",
                            help="Separate CUPTI diagnostic run for notify/repack/main GPU durations")
-    pf_parser.add_argument("--cuda-trace-dir", type=Path,
+    training_parser.add_argument("--cuda-trace-dir", type=Path,
                            help="Export CUPTI CPU/CUDA traces with FWD/BWD ranges after warmup; diagnostic only")
     parser.add_argument("--ncu-range", action="store_true",
                         help="Bracket one measured iteration with cudaProfilerStart/Stop for NCU app-range replay")
-    pf_parser.add_argument("--report-window-padding", action="store_true",
+    training_parser.add_argument("--report-window-padding", action="store_true",
                            help="Compare hypothetical per-window and canonical M128 padding, outside timing")
     parser.add_argument("--report-communication", action="store_true",
                         help="Count route-derived dispatch/return payloads outside timing")
-    pf_parser.add_argument("--timeline-dir", type=Path,
+    training_parser.add_argument("--timeline-dir", type=Path,
                            help="Download the final FWD timeline, outside timing; requires a timeline build")
-    pf_parser.add_argument("--ring-tokens", type=int, default=512)
-    pf_parser.add_argument("--ring-depth", type=int, default=8)
+    training_parser.add_argument("--ring-tokens", type=int, default=512)
+    training_parser.add_argument("--ring-depth", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--token-std-fraction", type=float, default=0.1,
                         help="Per-rank normal token std / nominal tokens; truncate at +/-3 std")
@@ -100,8 +100,8 @@ def main(*, blackwell=False):
                         help="Std of per-step shared expert-logit bias; 0 gives uniform routing in expectation")
     parser.add_argument("--route-distribution", choices=("random", "balanced"), default="random",
                         help="Balance expert counts in complete periods, keeping token lengths and gate scores")
-    pf_defaults = pf_parser.parse_args([]) if blackwell else None
-    args = parser.parse_args(namespace=pf_defaults)
+    training_defaults = training_parser.parse_args([]) if blackwell else None
+    args = parser.parse_args(namespace=training_defaults)
     resolve_model(args)
     if args.precision == "fp4" and args.verify:
         parser.error("--verify uses strict BF16 parity thresholds")
@@ -109,28 +109,28 @@ def main(*, blackwell=False):
         parser.error("--prequantized-inputs requires --fp8")
     if args.weight_grad_dtype is not None and not args.fp8:
         parser.error("--weight-grad-dtype is an FP8 option; BF16 already returns BF16 dW")
-    if args.fp8 and (args.backend != "pf" or args.prepared_weights):
-        parser.error("--fp8 requires PF without --prepared-weights")
-    if args.backward_identity and (args.backend != "pf" or not args.verify):
-        parser.error("--backward-identity requires PF --verify and an identity diagnostic build")
-    if args.prepared_weights and (args.backend != "pf" or not args.forward_only):
-        parser.error("--prepared-weights requires --backend pf --forward-only")
+    if args.fp8 and (args.backend != "training" or args.prepared_weights):
+        parser.error("--fp8 requires training without --prepared-weights")
+    if args.backward_identity and (args.backend != "training" or not args.verify):
+        parser.error("--backward-identity requires training --verify and an identity diagnostic build")
+    if args.prepared_weights and (args.backend != "training" or not args.forward_only):
+        parser.error("--prepared-weights requires --backend training --forward-only")
     if args.trace_kernels and not args.verify:
         parser.error("--trace-kernels requires --verify")
     if args.accumulate_main_grad and args.verify:
         parser.error("--accumulate-main-grad is a cumulative timing mode, not per-call parity")
-    if args.profile_stages and (args.backend != "pf" or not args.forward_only):
-        parser.error("--profile-stages requires --backend pf --forward-only")
-    if args.trace_stage_kernels and (args.backend != "pf" or not args.forward_only):
-        parser.error("--trace-stage-kernels requires --backend pf --forward-only")
-    if args.cuda_trace_dir and (args.backend != "pf" or args.verify or args.trace_stage_kernels):
-        parser.error("--cuda-trace-dir requires PF timing without --verify/--trace-stage-kernels")
+    if args.profile_stages and (args.backend != "training" or not args.forward_only):
+        parser.error("--profile-stages requires --backend training --forward-only")
+    if args.trace_stage_kernels and (args.backend != "training" or not args.forward_only):
+        parser.error("--trace-stage-kernels requires --backend training --forward-only")
+    if args.cuda_trace_dir and (args.backend != "training" or args.verify or args.trace_stage_kernels):
+        parser.error("--cuda-trace-dir requires training timing without --verify/--trace-stage-kernels")
     if args.cuda_trace_dir and args.prepared_weights:
         parser.error("--cuda-trace-dir does not support the direct --prepared-weights inference entrypoint")
     if args.ncu_range and (args.samples != 1 or args.verify or args.cuda_trace_dir or args.trace_stage_kernels):
         parser.error("--ncu-range requires --samples 1 and no other tracing/verification mode")
-    if args.timeline_dir and (args.backend != "pf" or not args.forward_only or args.verify):
-        parser.error("--timeline-dir requires PF forward-only diagnostics without --verify")
+    if args.timeline_dir and (args.backend != "training" or not args.forward_only or args.verify):
+        parser.error("--timeline-dir requires training forward-only diagnostics without --verify")
     if min(args.tokens) < 1 or args.samples < 1 or args.warmups < 0:
         parser.error("tokens and samples must be positive; warmups must be nonnegative")
     if not 1 <= args.top_k <= args.experts:
@@ -222,7 +222,7 @@ def main(*, blackwell=False):
                     len(batches), nodes, windows, world, owned).sum((1, 2, 4))
                 assert torch.equal(counts.sum((1, 2)).cpu(), expert_rows)
             window_padding = dict(actual_rows=incoming[args.warmups:].tolist(),
-                                  scope="Route-derived estimates, not kernel counters: m128_rows is the former per-window policy; canonical_m128_rows is current PF FWD/BWD",
+                                  scope="Route-derived estimates, not kernel counters: m128_rows is the former per-window policy; canonical_m128_rows is current training FWD/BWD",
                                   m128_rows=padded[args.warmups:].tolist(),
                                   canonical_m128_rows=(
                                       ((expert_rows + 127) // 128 * 128)
@@ -422,12 +422,12 @@ def main(*, blackwell=False):
             stage_kernels = {}
             local = world == int(os.environ.get("LOCAL_WORLD_SIZE", world))
             split_notify = runtime.native.usage().get("separate_forward_notify",
-                bool(os.environ.get("WEFTMOE_PF_SPLIT_NOTIFY")))
+                bool(os.environ.get("WEFTMOE_TRAINING_SPLIT_NOTIFY")))
             for label, name in (("mini_notify", "training_count_notify_kernel"),
-                                ("standalone_notify", "weftmoe_pf::notify_kernel"),
+                                ("standalone_notify", "weftmoe_training::notify_kernel"),
                                 ("weight_repack", "interleave_forward_w1_kernel"),
-                                ("main", "weftmoe_pf::local::kernel" if local
-                                 else "weftmoe_pf::network::kernel")):
+                                ("main", "weftmoe_training::local::kernel" if local
+                                 else "weftmoe_training::network::kernel")):
                 events = sorted((event for event in kernel_probe.events()
                                  if event.device_type == torch.autograd.DeviceType.CUDA
                                  and name in event.name), key=lambda event: event.time_range.start)
@@ -447,7 +447,7 @@ def main(*, blackwell=False):
                 assert len(quant_events) == args.samples
                 notify_events = sorted((event for event in kernel_probe.events()
                                         if event.device_type == torch.autograd.DeviceType.CUDA
-                                        and "weftmoe_pf::notify_kernel" in event.name),
+                                        and "weftmoe_training::notify_kernel" in event.name),
                                        key=lambda event: event.time_range.start)
                 assert len(notify_events) == len(quant_events)
                 stage_kernels["quant_notify_overlap"] = [

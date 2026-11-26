@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PF/DT/MegaMoE inference on a shared route trace (MegaMoE/DT: one node).
+"""training/decode/MegaMoE inference on a shared route trace (MegaMoE/decode: one node).
 
 Measures eager forward + device synchronize, including MegaMoE input staging.
-MegaMoE packs immutable weights once. PF eager packs on each call by default;
+MegaMoE packs immutable weights once. training eager packs on each call by default;
 --prepared-weights reuses its layer weight cache for a matched comparison.
 No saved training activations, backward, or optimizer are included.
-Fixed-token PF/DT comparisons can use CUDA graphs; runtime capacity and kernel
+Fixed-token training/decode comparisons can use CUDA graphs; runtime capacity and kernel
 tracing are explicit so small batches cannot silently benchmark a fallback.
 """
 
@@ -89,7 +89,7 @@ def reference(x, routes, gates, w1, w2):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("pf", "dt", "megamoe"), required=True)
+    parser.add_argument("--backend", choices=("training", "decode", "megamoe"), required=True)
     parser.add_argument("--deepgemm-package", type=Path)
     capacity = parser.add_mutually_exclusive_group()
     capacity.add_argument("--megamoe-buffer-mib", type=float,
@@ -109,33 +109,33 @@ def main():
     parser.add_argument("--route-bias-std", type=float, default=0.5)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--verify-kernel", action="store_true",
-                        help="During verification, trace the first call and require the selected PF/DT entry")
+                        help="During verification, trace the first call and require the selected training/decode entry")
     parser.add_argument("--trace-stage-kernels", action="store_true",
-                        help="Separately profile single-node PF inference notify/main CUDA durations")
+                        help="Separately profile single-node training inference notify/main CUDA durations")
     parser.add_argument("--profile-device", action="store_true",
-                        help="Also report PF's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
+                        help="Also report training's native kernel clock / MegaMoE's staged CUDA interval; excludes weight repack")
     parser.add_argument("--graph-replays", type=int, default=0,
-                        help="Measure a PF/DT CUDA graph with this many calls; requires fixed token counts")
+                        help="Measure a training/decode CUDA graph with this many calls; requires fixed token counts")
     parser.add_argument("--prepared-weights", action="store_true",
-                        help="Reuse PF's immutable layer weights across changing token counts/routes")
+                        help="Reuse training's immutable layer weights across changing token counts/routes")
     parser.add_argument("--forward-cache", choices=("off", "on"),
-                        help="PF forward-only cache experiment; both modes use the same native tape API")
+                        help="training forward-only cache experiment; both modes use the same native tape API")
     parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
     if args.fp8 and (args.backend == "megamoe" or args.forward_cache or args.profile_device):
-        parser.error("--fp8 requires PF/DT without forward-cache/profile-device")
+        parser.error("--fp8 requires training/decode without forward-cache/profile-device")
     resolve_model(args)
-    if args.trace_stage_kernels and (args.backend != "pf" or args.verify or
+    if args.trace_stage_kernels and (args.backend != "training" or args.verify or
                                     args.forward_cache or args.graph_replays):
-        parser.error("--trace-stage-kernels requires eager PF inference without verification")
-    if args.forward_cache and (args.backend != "pf" or args.profile_device):
-        parser.error("--forward-cache requires PF without --profile-device")
-    if args.verify_kernel and (not args.verify or args.backend not in ("pf", "dt")):
-        parser.error("--verify-kernel requires --verify and --backend pf/dt")
-    if args.graph_replays and (args.backend not in ("pf", "dt") or args.token_std_fraction
+        parser.error("--trace-stage-kernels requires eager training inference without verification")
+    if args.forward_cache and (args.backend != "training" or args.profile_device):
+        parser.error("--forward-cache requires training without --profile-device")
+    if args.verify_kernel and (not args.verify or args.backend not in ("training", "decode")):
+        parser.error("--verify-kernel requires --verify and --backend training/decode")
+    if args.graph_replays and (args.backend not in ("training", "decode") or args.token_std_fraction
                               or args.forward_cache or args.profile_device):
-        parser.error("--graph-replays requires PF/DT, --token-std-fraction 0, no cache/profile flags")
-    if args.backend in ("pf", "dt"):
+        parser.error("--graph-replays requires training/decode, --token-std-fraction 0, no cache/profile flags")
+    if args.backend in ("training", "decode"):
         os.environ["WEFTMOE_STATIC_RING_TOKENS"] = str(args.ring_tokens)
         os.environ["WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"] = str(args.ring_depth)
     else:
@@ -146,8 +146,8 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     if args.experts % world:
         parser.error("requires an equal expert split")
-    if args.backend in ("dt", "megamoe") and world != int(os.environ["LOCAL_WORLD_SIZE"]):
-        parser.error("DT/MegaMoE require single-node EP")
+    if args.backend in ("decode", "megamoe") and world != int(os.environ["LOCAL_WORLD_SIZE"]):
+        parser.error("decode/MegaMoE require single-node EP")
     if args.backend == "megamoe":
         if args.deepgemm_package is None:
             parser.error("MegaMoE requires --deepgemm-package")
@@ -184,7 +184,7 @@ def main():
                                     top_k=args.top_k, hidden=args.hidden,
                                     intermediate=args.intermediate, max_tokens=capacity,
                                     max_rows=max_rows, training=args.forward_cache == "on",
-                                    decode_only=args.backend == "dt", fp8_workspace=args.fp8,
+                                    decode_only=args.backend == "decode", fp8_workspace=args.fp8,
                                     **({"stream": torch.cuda.current_stream()}
                                        if args.forward_cache else {}))
         else:
@@ -276,11 +276,11 @@ def main():
                 probe.stop()
                 kernel_names = sorted({event.name for event in probe.events()
                                        if event.device_type == torch.autograd.DeviceType.CUDA})
-                expected_entry = (("weftmoe_pf::local::kernel" if runtime.nodes == 1
-                                   else "weftmoe_pf::network::kernel") if args.backend == "pf"
-                                  else "weftmoe_dt::kernel")
+                expected_entry = (("weftmoe_training::local::kernel" if runtime.nodes == 1
+                                   else "weftmoe_training::network::kernel") if args.backend == "training"
+                                  else "weftmoe_decode::kernel")
                 assert any(expected_entry in name for name in kernel_names), kernel_names
-                if os.environ.get("WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY"):
+                if os.environ.get("WEFTMOE_TRAINING_SPLIT_INFERENCE_NOTIFY"):
                     assert any("local::inference_notify_kernel" in name for name in kernel_names), kernel_names
             if args.verify:
                 expected = reference(x, routes, gates, w1, w2).float()
@@ -316,11 +316,11 @@ def main():
         if stage_probe is not None:
             stage_probe.stop()
             production_split = runtime.native.usage().get("separate_forward_notify", False)
-            split = production_split or "WEFTMOE_PF_SPLIT_INFERENCE_NOTIFY" in os.environ
+            split = production_split or "WEFTMOE_TRAINING_SPLIT_INFERENCE_NOTIFY" in os.environ
             for label, name, count in (
-                ("notify", "weftmoe_pf::notify_kernel" if production_split else
+                ("notify", "weftmoe_training::notify_kernel" if production_split else
                  "local::inference_notify_kernel", args.samples if split else 0),
-                ("main", "weftmoe_pf::local::kernel", args.samples),
+                ("main", "weftmoe_training::local::kernel", args.samples),
                 ("mini_notify", "training_count_notify_kernel", 0),
             ):
                 events = sorted((event for event in stage_probe.events()
@@ -365,7 +365,7 @@ def main():
                     if device_samples else None),
                 device_scope=("CUDA graph events divided by graph_replays; includes fused source staging; excludes external input updates and preparation"
                               if args.graph_replays else
-                              "PF/DT: native device envelope (split PF includes notify and launch gap); MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
+                              "training/decode: native device envelope (split training includes notify and launch gap); MegaMoE: CUDA interval including input staging and enqueue gaps; excludes weight repack"
                               if args.profile_device else None),
                 megamoe_buffer_mib=args.megamoe_buffer_mib,
                 megamoe_minimum_ring=args.megamoe_minimum_ring,

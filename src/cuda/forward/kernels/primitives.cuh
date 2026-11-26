@@ -1,5 +1,5 @@
 #include "cuda/forward/kernel_support.cuh"
-#include "cuda/weftmoe_pf/memory_order.cuh"
+#include "cuda/weftmoe_training/memory_order.cuh"
 #include "cuda/communication/activation_ring.cuh"
 
 #if defined(CUTE_ARCH_MMA_SM90A_ENABLED) // compiled production MMA path only
@@ -36,19 +36,19 @@ __device__ __forceinline__ bool remote_backend_enabled(bool enabled) {
 }
 
 // Include order follows the device helpers' dependencies.
-#include "cuda/weftmoe_pf/network_access.cuh"
-#include "cuda/weftmoe_pf/ring_access.cuh"
-#include "cuda/weftmoe_pf/network_ring.cuh"
+#include "cuda/weftmoe_training/network_access.cuh"
+#include "cuda/weftmoe_training/ring_access.cuh"
+#include "cuda/weftmoe_training/network_ring.cuh"
 #include "cuda/forward/compute_kernel.cuh"
 
-#include "cuda/weftmoe_pf/initialize.cuh"
-#include "cuda/weftmoe_pf/collective.cuh"
-#include "cuda/weftmoe_pf/route_plan.cuh"
-#include "cuda/weftmoe_pf/network_collective.cuh"
-#include "cuda/weftmoe_pf/single_node_route_exchange.cuh"
-#include "cuda/weftmoe_pf/training_plan.cuh"
-#include "cuda/weftmoe_pf/ring_plan.cuh"
-#include "cuda/weftmoe_pf/ring_admission.cuh"
+#include "cuda/weftmoe_training/initialize.cuh"
+#include "cuda/weftmoe_training/collective.cuh"
+#include "cuda/weftmoe_training/route_plan.cuh"
+#include "cuda/weftmoe_training/network_collective.cuh"
+#include "cuda/weftmoe_training/single_node_route_exchange.cuh"
+#include "cuda/weftmoe_training/training_plan.cuh"
+#include "cuda/weftmoe_training/ring_plan.cuh"
+#include "cuda/weftmoe_training/ring_admission.cuh"
 
 #include "cuda/communication/worker_pipeline.cuh"
-#include "cuda/weftmoe_pf/network_transport.cuh"
+#include "cuda/weftmoe_training/network_transport.cuh"

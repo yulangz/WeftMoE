@@ -109,7 +109,7 @@ EVENTS = {
 }
 
 PAIRS = {
-    "pf_main": (108, 22),
+    "training_main": (108, 22),
     "input_ready_wait": (111, 112),
     "dispatch_get_submit": (115, 116),
     "dispatch_get_complete": (115, 4),

@@ -68,12 +68,12 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
     unified_tuning.require_resources(
         config["main_intermediate"] % (2 * config["dab_tile_n"]) == 0 and
         config["main_hidden"] % (2 * config["dx_tile_n"]) == 0,
-        "PF stream requires cluster-N2 tiles; select N128 for odd N256 extents")
+        "training stream requires cluster-N2 tiles; select N128 for odd N256 extents")
     require(config["unified_workers"] == 1 and
             config["unified_threads"] == 384 and
             config["unified_comm_base"] == 288 and
             config["unified_comm_threads"] == 96,
-            "PF stream uses 384 threads with a 288/96 compute/communication split")
+            "training stream uses 384 threads with a 288/96 compute/communication split")
     require(config["dx_claim_tiles"] > 0, "dx_claim_tiles must be positive")
     require(config["return_window_scale"] > 0, "return_window_scale must be positive")
     require_choice(config, "dw_tile_m", (128, 256))

@@ -22,7 +22,7 @@ DeviceActivationTransport::run_device_simulation_synthetic(
     throw std::invalid_argument("static ring workspace supports Forward only");
   const auto &activation = *activations.impl_;
   if (activation.prequantized)
-    throw std::invalid_argument("Prequantized inputs require the FP8 PF consumer");
+    throw std::invalid_argument("Prequantized inputs require the FP8 training consumer");
   if (activation.pool.get() != state.get() ||
       activation.generation != id.generation ||
       activation.tokens != id.num_tokens ||
@@ -243,7 +243,7 @@ LocalCudaP2pActivationTransport::run_transport_slice(
   auto state = backend->pool;
   const auto &activation = *activations.impl_;
   if (activation.prequantized)
-    throw std::invalid_argument("Prequantized inputs require the FP8 PF consumer");
+    throw std::invalid_argument("Prequantized inputs require the FP8 training consumer");
   if (state->config.static_forward_window_tokens)
     throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes != 1 || id.world_size != backend->nccl->world ||
@@ -749,7 +749,7 @@ NcclSocketFallbackActivationTransport::run_transport_slice(
   auto state = backend->pool;
   const auto &activation = *activations.impl_;
   if (activation.prequantized)
-    throw std::invalid_argument("Prequantized inputs require the FP8 PF consumer");
+    throw std::invalid_argument("Prequantized inputs require the FP8 training consumer");
   if (state->config.static_forward_window_tokens)
     throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes < 2 || id.world_size != backend->nccl->world ||
@@ -1188,7 +1188,7 @@ DeviceActivationTransportHandle GinRdmaActivationTransport::run_transport_slice(
   const auto &id = dispatch.identity();
   const auto &activation = *activations.impl_;
   if (activation.prequantized)
-    throw std::invalid_argument("Prequantized inputs require the FP8 PF consumer");
+    throw std::invalid_argument("Prequantized inputs require the FP8 training consumer");
   if (state->config.static_forward_window_tokens)
     throw std::invalid_argument("static ring workspace supports Forward only");
   if (id.num_nodes != backend->num_nodes ||

@@ -11,7 +11,7 @@ from weftmoe.runtime import TensorRuntime, moe
 
 
 def reference_moe(x, route, gate, w1, w2):
-    # PF sums BF16 expert contributions in FP32, then casts once at combine.
+    # training sums BF16 expert contributions in FP32, then casts once at combine.
     output = torch.zeros_like(x, dtype=torch.float32)
     # Accumulate expert dX contributions in FP32 too; GEMM inputs remain BF16.
     gathered_x = x.float()
