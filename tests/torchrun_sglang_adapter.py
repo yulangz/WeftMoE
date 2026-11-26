@@ -202,6 +202,11 @@ def main():
         gate = reference_layer.w13_weight[0, :intermediate].clone()
         layer.w13_weight.weight_loader(layer.w13_weight, gate, weight_name="w13_weight",
                                        shard_id="w1", expert_id=rank * layer.num_local_experts)
+        weights = adapter._sglang_bf16._layers[layer]
+        assert not weights.active and weights.pending_shards
+        layer.w13_weight.weight_loader(layer.w13_weight, gate, weight_name="w13_weight",
+                                       shard_id="w1", expert_id=rank * layer.num_local_experts)
+        assert not weights.active and weights.pending_shards
         snapshot = layer.state_dict()
         assert torch.equal(snapshot["w13_weight"], reference_layer.w13_weight)
         assert torch.equal(snapshot["w2_weight"], reference_layer.w2_weight)
@@ -282,6 +287,21 @@ def main():
     if discard_graphs:
         del graph, captured
     adapter.suspend(model_runner, discard_fp8=adapter._use_fp8())
+    if tiled:
+        suspended_state = layer.state_dict()
+        before_update = (reference_layer.w13_weight.clone(), reference_layer.w2_weight.clone())
+        # Call the installed runner methods. The guard must fire before any
+        # backend access, even when the retained graph bypasses Python forward.
+        replay_methods = [getattr(*api.replay)]
+        if api.prefill_capture is not None:
+            replay_methods.append(api.prefill_capture.execute)
+        for replay in replay_methods:
+            try:
+                replay(None)
+            except RuntimeError as exc:
+                assert "weight update or suspension" in str(exc)
+            else:
+                raise AssertionError("Replayed with canonical BF16 experts")
     if adapter._use_fp8():
         assert all(t.untyped_storage().nbytes() == 0
                    for weights in adapter._fp8_weights.values() for t in weights._tensors())
@@ -297,6 +317,9 @@ def main():
     expected = reference()
     adapter.resume(model_runner)
     if not adapter._use_fp8():
+        if tiled:
+            assert torch.equal(suspended_state["w13_weight"], before_update[0])
+            assert torch.equal(suspended_state["w2_weight"], before_update[1])
         resumed_eager = layer(x, topk)
         if not dp_attention:
             dist.all_reduce(resumed_eager)

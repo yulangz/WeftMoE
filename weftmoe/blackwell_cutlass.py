@@ -117,6 +117,16 @@ def decode_config(ranks, experts, rows, topk):
     return tile_m(ranks, experts, rows, topk), rows * ranks * topk <= 24 * experts
 
 
+def max_decode_tile(ranks, experts, capacity, topk, plan):
+    # tile_m may decrease when an additional block becomes necessary.
+    largest = max((m for n, (m, _) in plan.items() if n <= capacity), default=0)
+    for rows in range(1, capacity + 1):
+        largest = max(largest, tile_m(ranks, experts, rows, topk))
+        if largest == DECODE_TILES[-1]:
+            break
+    return largest
+
+
 @cache
 def _kernel(device, fp4, cap, h, i, experts, topk, ranks, ring, sf_ring, sms, m, save, exact, decode_capacity, single_cta, static_raster, tiled_weights=False):
     src, cuda, include, version = _toolchain()
@@ -222,10 +232,7 @@ class ExpertWorkspace:
         if decode_only:
             # All ranks allocate the same single-window layout. Each owner can
             # select a smaller M on replay, even when the source lengths differ.
-            self.max_decode_m = max(
-                [tile_m(group.size(), experts, capacity, topk)]
-                + [m for n, (m, _) in self.decode_tuning.items() if n <= capacity]
-            )
+            self.max_decode_m = max_decode_tile(group.size(), experts, capacity, topk, self.decode_tuning)
         layout = self.layout = native().Workspace(
             group.size(), experts, capacity, topk, hidden, intermediate, self.sms, fp4, self.max_decode_m
         )
@@ -264,7 +271,8 @@ def launch(y, first, second, workspace, *, saved=(), tensor_scales=(1.0, 1.0, 1.
     if b.decode_capacity:
         config = b.decode_tuning.get(rows) or decode_config(b.group.size(), b.num_experts, rows, b.num_topk)
         m, static_raster = config
-        m = min(m, b.max_decode_m)
+        if m > b.max_decode_m:
+            raise ValueError(f"Decode tile {m} exceeds the allocated workspace bound {b.max_decode_m}")
     else:
         m = tile_m(b.group.size(), b.num_experts, rows, b.num_topk)
         static_raster = False

@@ -288,7 +288,7 @@ def install(*, batch_invariant=True):
     def canonical_loader(method):
         @functools.wraps(method)
         def load(layer, *args, **kwargs):
-            with canonical_weights(layer):
+            with _sglang_bf16.loading_shard(layer):
                 return method(layer, *args, **kwargs)
         return load
 
@@ -367,23 +367,21 @@ def install(*, batch_invariant=True):
     # workspace on every residency transition.
     GroupCoordinator.graph_capture = graph_capture
 
+    def guard_replay(method):
+        @functools.wraps(method)
+        def graph_replay(self, *args, **kwargs):
+            global _eager_pending
+            _sglang_bf16.prepare_for_replay()
+            if _eager_pending is not None:
+                _eager_pending.native.drain_eager_inference()
+                _eager_pending = None
+            return method(self, *args, **kwargs)
+        return graph_replay
+
     replay_cls, replay_method = api.replay
-    original_graph_replay = getattr(replay_cls, replay_method)
-
-    @functools.wraps(original_graph_replay)
-    def graph_replay(self, *args, **kwargs):
-        # A captured decode graph reuses the same serialized native workspace
-        # without invoking FusedMoE.forward in Python.  Finalize the last eager
-        # generation once at the eager->graph boundary, before graph replay can
-        # overwrite its status/diagnostic records.  Subsequent decode replays
-        # pay only this Python branch.
-        global _eager_pending
-        if _eager_pending is not None:
-            _eager_pending.native.drain_eager_inference()
-            _eager_pending = None
-        return original_graph_replay(self, *args, **kwargs)
-
-    setattr(replay_cls, replay_method, graph_replay)
+    setattr(replay_cls, replay_method, guard_replay(getattr(replay_cls, replay_method)))
+    if api.prefill_capture is not None:
+        api.prefill_capture.execute = guard_replay(api.prefill_capture.execute)
 
     def forward(layer, hidden_states, topk_output):
         from sglang.srt.distributed import get_tp_group
@@ -718,7 +716,7 @@ def _decode_graph_runner(model_runner):
 def suspend(model_runner, *, discard_fp8=False):
     """FP8 releases weight addresses; BF16 can retain its decode graphs."""
     global _recapture, _recapture_prefill
-    _sglang_bf16.restore_all()
+    torch.cuda.synchronize()
     prefill = getattr(model_runner, "prefill_cuda_graph_runner", None)
     if prefill is not None:
         prefill.backend.cleanup()
@@ -731,6 +729,7 @@ def suspend(model_runner, *, discard_fp8=False):
         close(model_runner, keep_fp8=_use_fp8(), discard_fp8=discard_fp8, keep_bf16_bindings=True)
     else:
         _release_prefill()
+    _sglang_bf16.restore_all()
 
 
 def resume(model_runner):
