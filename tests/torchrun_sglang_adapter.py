@@ -266,6 +266,29 @@ def main():
         # The stock Triton reference below expects valid expert IDs.
         ids.clamp_min_(0)
         previous = layer(x, topk).clone()
+        if modern:
+            # Exercise the installed SGLang updater with the real expert loader.
+            # The first tensor is written before the second tensor fails.
+            def load_checkpoint(named_tensors):
+                for shard, tensor in named_tensors:
+                    layer.w13_weight.weight_loader(layer.w13_weight, tensor, "w13_weight",
+                                                   shard, rank * layer.num_local_experts)
+
+            updater = SimpleNamespace(device="cuda", tp_rank=rank, custom_weight_loaders=(),
+                                      _assert_weight_cache_inactive=lambda _: None,
+                                      get_model=lambda: SimpleNamespace(load_weights=load_checkpoint))
+            update = api.weight_apis[0].update_weights_from_tensor
+            gate, up = reference_layer.w13_weight[0].chunk(2)
+            gate = gate * 0.5
+            with pytest.raises(RuntimeError):
+                update(updater, [("w1", gate), ("w3", up.unsqueeze(0).expand(2, -1, -1))])
+            with pytest.raises(RuntimeError, match="weight update"):
+                getattr(*api.replay)(None)
+            with pytest.raises(RuntimeError, match="weight update"):
+                adapter._sglang_bf16.serving_weights(layer)
+            assert update(updater, [("w1", gate), ("w3", up)])[0]
+            reference_layer.w13_weight[0, :intermediate].copy_(gate)
+            print(rank, "SGLANG_PARTIAL_UPDATE_RETRY_PASS", flush=True)
         with adapter.canonical_weights():
             reference_layer.w13_weight[:, :intermediate].mul_(0.5)
             layer.w13_weight[:, :intermediate].copy_(reference_layer.w13_weight[:, :intermediate])

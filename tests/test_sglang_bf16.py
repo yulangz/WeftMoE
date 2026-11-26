@@ -157,3 +157,116 @@ def test_retry_failed_shards_before_serving(layer, replay):
     for expert in range(3):
         original["w13_weight"][expert].fill_(expert + 1)
     assert all(torch.equal(w, v) for w, v in zip(layer.state_dict().values(), original.values()))
+
+
+@pytest.mark.parametrize("return_status", [False, True])
+def test_failed_weight_update_blocks_all_layers_until_batch_retry(layer, return_status):
+    other = torch.nn.Module()
+    for name, value in layer.state_dict().items():
+        setattr(other, name, torch.nn.Parameter(value, requires_grad=False))
+    resident.serving_weights(other)
+    layers = (layer, other)
+    addresses = [owner.w13_weight.data_ptr() for owner in layers]
+
+    @resident.checkpoint_loader
+    def load(owner, weight_name, shard_id, expert_id, value):
+        if value < 0:
+            raise ValueError("checkpoint read failed")
+        owner.w13_weight[expert_id].fill_(value)
+
+    def update_weights_from_tensor(named_tensors):
+        try:
+            for name, value in named_tensors:
+                load(layers[int(name)], "w13_weight", "w1", 0, value)
+        except ValueError as exc:
+            if return_status:
+                return False, str(exc)
+            raise
+        return True, "OK"
+
+    update = resident.weight_api(update_weights_from_tensor, writes=True)
+    export = resident.weight_api(lambda: layer.state_dict(), writes=False)
+    if return_status:
+        assert update([("0", 5), ("1", -1)]) == (False, "checkpoint read failed")
+    else:
+        with pytest.raises(ValueError, match="checkpoint read failed"):
+            update([("0", 5), ("1", -1)])
+    assert torch.all(export()["w13_weight"][0] == 5)
+    # Repairing the individual failed shard alone does not finish the original batch.
+    assert update([("1", 6)])[0]
+    for op in (resident.prepare_for_replay, resident.prepare_all):
+        with pytest.raises(RuntimeError):
+            op()
+    for owner in layers:
+        with pytest.raises(RuntimeError):
+            resident.serving_weights(owner)
+    assert update([("1", 8), ("0", 7)])[0]
+    resident.prepare_for_replay()
+    for owner, address, value in zip(layers, addresses, (7, 8)):
+        assert resident.serving_weights(owner)[0].data_ptr() == address
+        assert torch.all(owner.state_dict()["w13_weight"][0] == value)
+
+
+def test_partial_raw_update_requires_committed_recovery(layer):
+    original = layer.state_dict()
+
+    def assert_blocked():
+        for op in (resident.prepare_for_replay, resident.prepare_all, lambda: resident.serving_weights(layer)):
+            with pytest.raises(RuntimeError):
+                op()
+
+    resident.restore_all()  # An update can also run while graph addresses are suspended.
+    with pytest.raises(ValueError, match="incomplete"):
+        with resident.canonical_weights():
+            layer.w13_weight.fill_(0)
+            raise ValueError("incomplete transfer")
+    with resident.canonical_weights():
+        layer.state_dict()
+    assert_blocked()
+    with pytest.raises(ValueError, match="rollback"):
+        with resident.canonical_weights(recover=True):
+            layer.w13_weight.copy_(original["w13_weight"])
+            raise ValueError("rollback interrupted")
+    assert_blocked()
+    def update_weights_from_tensor(named_tensors):
+        return False, "failed"
+
+    update = resident.weight_api(update_weights_from_tensor, writes=True)
+    with pytest.raises(RuntimeError, match="incomplete weight update"):
+        with resident.canonical_weights(recover=True):
+            assert not update([("w13_weight", None)])[0]
+    assert_blocked()
+    with resident.canonical_weights(recover=True):
+        layer.load_state_dict(original)
+        assert_blocked()
+    resident.prepare_all()  # Resume the suspended worker.
+    resident.prepare_for_replay()
+    assert all(torch.equal(x, y) for x, y in zip(layer.state_dict().values(), original.values()))
+
+
+def test_async_transfer_error_is_not_committed(layer, monkeypatch):
+    pending_error = False
+    sync = torch.cuda.synchronize
+
+    def synchronize(*args):
+        nonlocal pending_error
+        if pending_error:
+            pending_error = False
+            raise RuntimeError("deferred transfer error")
+        sync(*args)
+
+    def update_weights_from_distributed(names, fail=False):
+        nonlocal pending_error
+        layer.w2_weight.fill_(2)
+        pending_error = fail
+        return True, "OK"
+
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    update = resident.weight_api(update_weights_from_distributed, writes=True)
+    with pytest.raises(RuntimeError, match="deferred transfer error"):
+        update(["w2_weight"], fail=True)
+    with pytest.raises(RuntimeError, match="weight update"):
+        resident.prepare_for_replay()
+    assert update(["w2_weight"])[0]
+    resident.prepare_for_replay()
+    assert torch.all(layer.state_dict()["w2_weight"] == 2)

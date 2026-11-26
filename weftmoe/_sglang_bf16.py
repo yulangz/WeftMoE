@@ -12,6 +12,7 @@ from .blackwell import _bf16_weight_views, _validate_expert_weights, _weight_til
 
 _layers = WeakKeyDictionary()
 _inactive = WeakSet()
+_OPAQUE_UPDATE = object()
 
 
 def _copy_experts(destination, source, scratch):
@@ -31,11 +32,13 @@ class _ExpertWeights:
         self.active = False
         self.pending_shards = False
         self.failed_shards = set()
+        self.failed_updates = set()
+        self.canonical_depth = 0
         self.loader_lock = RLock()
 
     @property
     def shards_ready(self):
-        return self.pending_shards and not self.failed_shards
+        return self.pending_shards and not (self.failed_shards or self.failed_updates or self.canonical_depth)
 
     def scratch(self):
         return self.storage[0].new_empty(self.storage[0][0].numel())
@@ -50,8 +53,8 @@ class _ExpertWeights:
     def pack(self, layer):
         if self.active:
             return
-        if self.failed_shards:
-            raise RuntimeError("Retry the failed BF16 expert shards before inference")
+        if self.canonical_depth or self.failed_updates or self.failed_shards:
+            raise RuntimeError("Complete or retry the BF16 weight update before inference")
         params = (layer.w13_weight, layer.w2_weight)
         _validate_expert_weights(*params)
         if any(p.shape != buf.shape or p.device != buf.device for p, buf in zip(params, self.storage)):
@@ -150,8 +153,7 @@ def checkpoint_loader(method):
             try:
                 result = method(layer, *args, **kwargs)
             except BaseException:
-                if standalone:
-                    weights.failed_shards.add(shard_key(layer, args, kwargs))
+                weights.failed_shards.add(shard_key(layer, args, kwargs))
                 raise
             else:
                 if weights.failed_shards:
@@ -205,25 +207,107 @@ def prepare_all():
         torch.cuda.synchronize()
 
 
+def _update_key(name, arguments):
+    # Use only declared destinations. Never retain uploaded tensors in a failed
+    # batch key or consume a one-shot iterator to identify a retry.
+    names = arguments.get("names")
+    tensors = arguments.get("named_tensors")
+    if isinstance(tensors, (tuple, list)):
+        names = [n for n, _ in tensors]
+    elif isinstance(tensors, dict) and isinstance(tensors.get("metadata"), (tuple, list)):
+        names = [entry["name"] if isinstance(entry, dict) else entry.name for entry in tensors["metadata"]]
+    if isinstance(names, (tuple, list)):
+        return name, arguments.get("load_format"), tuple(sorted(names))
+    if name == "update_weights_from_disk" and arguments.get("weight_name_filter") is None:
+        return name, arguments.get("model_path")
+    return _OPAQUE_UPDATE
+
+
+def weight_api(method, *, writes):
+    method_signature = signature(method)
+
+    @wraps(method)
+    def call(*args, **kwargs):
+        if not _layers:
+            return method(*args, **kwargs)
+        key = _update_key(method.__name__, method_signature.bind(*args, **kwargs).arguments) if writes else None
+        with _canonical_access(None, key) as reject:
+            result = method(*args, **kwargs)
+            if writes and (result is False or (isinstance(result, tuple) and result and result[0] is False)):
+                reject()
+            return result
+
+    return call
+
+
 @contextmanager
-def canonical_weights(layer=None):
-    """Expose canonical BF16 parameters for a serialized read or update, then repack."""
+def _canonical_access(layer, key, recover=False):
     candidates = _layers.items() if layer is None else ((layer, _layers.get(layer)),)
-    active = [(owner, w) for owner, w in candidates if w is not None and (w.active or w.shards_ready)]
+    owners = [(owner, w) for owner, w in candidates if w is not None]
+    repack = [(owner, w) for owner, w in owners if w.active or w.pending_shards]
+    # Track suspended layers too. A failed write during offload must still
+    # prevent resume from packing a mixture of old and new parameters.
+    previous = {}
+    rejected = False
+
+    def reject():
+        nonlocal rejected
+        rejected = True
+
     try:
-        if active:
+        if owners:
             torch.cuda.synchronize()
-            for _, weights in active:
-                weights.restore()
+            for _, w in repack:
+                w.restore()
             torch.cuda.synchronize()
-        yield
-    finally:
-        if active:
-            torch.cuda.synchronize()
-            with torch.no_grad():
-                for layer, weights in active:
-                    weights.pack(layer)
+        for _, w in owners:
+            w.canonical_depth += 1
+            if recover:
+                previous[w] = w.failed_updates, w.failed_shards
+                w.failed_updates, w.failed_shards = set(), set()
+            elif key is not None and key is not _OPAQUE_UPDATE:
+                w.failed_updates.discard(key)
+        try:
+            yield reject
+            if recover and any(w.failed_updates or w.failed_shards for _, w in owners):
+                raise RuntimeError("BF16 recovery contains an incomplete weight update")
+            if owners and key is not None and not rejected:
+                # A transfer can report its CUDA error only at synchronization.
+                # Wait before committing its version, including during offload.
                 torch.cuda.synchronize()
+        except BaseException:
+            reject()
+            raise
+        finally:
+            for _, w in owners:
+                w.canonical_depth -= 1
+                if rejected and key is not None:
+                    w.failed_updates.add(key)
+                    if recover:
+                        old_updates, old_shards = previous[w]
+                        w.failed_updates.update(old_updates)
+                        w.failed_shards.update(old_shards)
+    finally:
+        if repack:
+            # Restore serving eligibility only on a clean commit. Keep failed
+            # layers canonical and preserve the updater's original error/status.
+            for _, w in repack:
+                if not w.active:
+                    w.pending_shards = True
+            if not rejected or key is None:
+                if key is None:
+                    torch.cuda.synchronize()
+                for owner, w in repack:
+                    if w.shards_ready:
+                        w.pack(owner)
+                torch.cuda.synchronize()
+
+
+@contextmanager
+def canonical_weights(layer=None, *, recover=False):
+    """Expose canonical weights. recover=True certifies a complete reload or rollback on successful exit."""
+    with _canonical_access(layer, _OPAQUE_UPDATE, recover):
+        yield
 
 
 def close():

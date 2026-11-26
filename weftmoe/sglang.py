@@ -296,7 +296,7 @@ def install(*, batch_invariant=True):
                      "get_weights_by_name", "send_weights_to_remote_instance"):
             method = getattr(cls, name, None)
             if method is not None:
-                setattr(cls, name, canonical_weights()(method))
+                setattr(cls, name, _sglang_bf16.weight_api(method, writes=name.startswith("update_weights_from_")))
 
     original_moe_init = FusedMoE.__init__
 

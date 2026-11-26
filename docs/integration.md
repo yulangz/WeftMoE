@@ -111,6 +111,15 @@ with canonical_weights():
     update_expert_parameters(model)
 ```
 
+如果 SGLang 的批量更新抛异常或返回失败，worker 会阻止 eager 推理和 CUDA Graph 回放。按原参数名集合重试 tensor/distributed 更新，或重新加载同一路径的完整磁盘 checkpoint，成功后可恢复服务。单独重试其中一个分片或导出权重都不会解除整批保护。
+
+直接写入、IPC 等无法从调用参数确定覆盖范围的更新，失败后应在 worker 中用 `canonical_weights(recover=True)` 包住一次完整重载或回滚。只在覆盖范围内的全部专家权重都已恢复一致后正常退出；写入器返回失败状态时须抛出异常。恢复先前挂起的 worker 仍需调用 `resume()`。例如：
+
+```python
+with canonical_weights(recover=True):
+    model.load_state_dict(last_good_state, strict=True)
+```
+
 SGLang 在计算 KV/Mamba 容量前也预热 PF/DT workspace。FP8 在同一阶段完成量化、释放 BF16 专家 storage，并将持久显存计入 KV 预算。
 
 FP8 rollout 在初次加载后量化并释放该层 BF16 GPU storage。后续 AWEX 更新直接接收训练侧
