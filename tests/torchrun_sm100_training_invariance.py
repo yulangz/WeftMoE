@@ -54,8 +54,8 @@ def tile_m(runtime, rows):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--decode-only", action="store_true", help="Compare single-node DT inference against training")
-    parser.add_argument("--tiled-weights", action="store_true", help="Use tiled weights for the distributed DT inference path")
+    parser.add_argument("--decode-only", action="store_true", help="Compare single-node decode inference against training")
+    parser.add_argument("--tiled-weights", action="store_true", help="Use tiled weights for the distributed decode inference path")
     parser.add_argument("--precision", choices=["bf16", "nvfp4"], required=True)
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--intermediate", type=int, default=256)
@@ -94,7 +94,7 @@ def main():
             decode_only=args.decode_only and not training and group.size() > 1,
         )
         if args.decode_only and not training and group.size() > 1:
-            assert rt.native.buffer.decode_capacity, "This test requires the single-node SM103 DT path"
+            assert rt.native.buffer.decode_capacity, "This test requires the single-node SM103 decode path"
         windows = getattr(rt.native, "windows", ())
         device_sms = torch.cuda.get_device_properties(device).multi_processor_count
         for child in windows:

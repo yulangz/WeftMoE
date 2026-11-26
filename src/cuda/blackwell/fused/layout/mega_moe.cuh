@@ -28,7 +28,7 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
         static_cast<T>(kLCMCandidateBlockM));
 }
 
-// DT owns a full invocation's rows. PF recycles physical blocks and
+// decode owns a full invocation's rows. training recycles physical blocks and
 // distinguishes successive users of a block by its ring generation.
 template <bool Decode, uint32_t M, uint32_t RingRows>
 struct RowPool {
@@ -75,7 +75,7 @@ struct alignas(128) MegaMoESignals {
     // Each local stream advances launch_epoch once per collective. One owner
     // acknowledgement per source is sufficient even across CUDA Graph replays.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
-    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];  // DT source-directory epochs
+    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];  // decode source-directory epochs
 
     // Expert token counts
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];

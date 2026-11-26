@@ -150,9 +150,9 @@ def test_default_shape_is_independent_of_model_name():
 
 @pytest.mark.parametrize('macro,default', [
     ('WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH','0'),
-    ('WEFTMOE_DT_FP8_SLICE_SCHEDULE','1'),
+    ('WEFTMOE_DECODE_FP8_SLICE_SCHEDULE','1'),
     ('WEFTMOE_FWD_LOCAL_PREFILL_STREAMING','1'),
-    ('WEFTMOE_DT_SLICE_SCHEDULE','0'),
+    ('WEFTMOE_DECODE_SLICE_SCHEDULE','0'),
     ('WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS','0'),
 ])
 def test_runtime_rejects_changed_arithmetic_and_path_selectors(tmp_path,macro,default):

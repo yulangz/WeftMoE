@@ -10,16 +10,16 @@ import re
 
 KEY_FIELDS = ('gpu', 'interconnect', 'dtype', 'hidden', 'intermediate', 'experts',
               'top_k', 'nodes', 'gpus_per_node', 'input_layout', 'mode')
-# Arithmetic, not CTA scheduling. These stay equal across every length bucket,
-# training PF and DT. DT continues to use its fixed M64 MMA path.
+# The training and decode kernels use the same arithmetic across length buckets.
+# The decode MMA tile is fixed at M64.
 ARITHMETIC_MACROS = (
     'WEFTMOE_FWD_MAIN_HIDDEN', 'WEFTMOE_FWD_MAIN_INTERMEDIATE',
     'WEFTMOE_FWD_TILE_M', 'WEFTMOE_FWD_FC1_TILE_N', 'WEFTMOE_FWD_FC2_TILE_N',
     'WEFTMOE_FWD_TILE_K', 'WEFTMOE_FWD_MATH_WARPGROUPS',
     'WEFTMOE_FWD_PRODUCER_WARPGROUPS', 'WEFTMOE_WGMMA_N256_ATOM_N',
     'WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS',
-    'WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH', 'WEFTMOE_DT_FP8_SLICE_SCHEDULE',
-    'WEFTMOE_FWD_LOCAL_PREFILL_STREAMING', 'WEFTMOE_DT_SLICE_SCHEDULE',
+    'WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH', 'WEFTMOE_DECODE_FP8_SLICE_SCHEDULE',
+    'WEFTMOE_FWD_LOCAL_PREFILL_STREAMING', 'WEFTMOE_DECODE_SLICE_SCHEDULE',
     'WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS',
 )
 
@@ -37,9 +37,9 @@ def arithmetic(header):
     defaults = {'WEFTMOE_WGMMA_N256_ATOM_N': '256',
                 'WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS': '0',
                 'WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH': '0',
-                'WEFTMOE_DT_FP8_SLICE_SCHEDULE': '1',
+                'WEFTMOE_DECODE_FP8_SLICE_SCHEDULE': '1',
                 'WEFTMOE_FWD_LOCAL_PREFILL_STREAMING': '1',
-                'WEFTMOE_DT_SLICE_SCHEDULE': '0',
+                'WEFTMOE_DECODE_SLICE_SCHEDULE': '0',
                 'WEFTMOE_FWD_STATIC_V4_NETWORK_PREFILL_MIN_TOKENS':
                     values.get('WEFTMOE_FWD_STATIC_V4_PREFILL_MIN_TOKENS', '0')}
     return {name: values.get(name, defaults.get(name)) for name in ARITHMETIC_MACROS}

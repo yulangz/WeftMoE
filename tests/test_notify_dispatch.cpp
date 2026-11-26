@@ -28,7 +28,7 @@
 
 #include "cuda/backward/cluster_task.cuh"
 #include "cuda/nccl_protocol_internal.hpp"
-#include "cuda/weftmoe_pf/ring_layout.hpp"
+#include "cuda/weftmoe_training/ring_layout.hpp"
 #include "metadata/notify_corruption_hook.hpp"
 #include "transport/activation_protocol_testing.hpp"
 #include "weftmoe/api/errors.hpp"

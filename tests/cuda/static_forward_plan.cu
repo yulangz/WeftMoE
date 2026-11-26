@@ -1,5 +1,5 @@
-#include "cuda/weftmoe_pf/packet_plan.cuh"
-#include "cuda/weftmoe_pf/window_geometry.cuh"
+#include "cuda/weftmoe_training/packet_plan.cuh"
+#include "cuda/weftmoe_training/window_geometry.cuh"
 
 #include <algorithm>
 #include <array>

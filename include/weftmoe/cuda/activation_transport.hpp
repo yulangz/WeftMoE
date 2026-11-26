@@ -93,10 +93,10 @@ struct ActivationTransportPoolConfig {
   // reserves twice the source-route capacity. Payloads grow only on overflow;
   // changing the actual row count never shrinks their allocation or IPC maps.
   std::uint64_t backward_peer_capacity_rows = 0;
-  // Select DT explicitly for single-node inference. False keeps the PF path;
-  // a small pool never opts into DT. The complete capacity must fit one window.
+  // Select decode explicitly for single-node inference. False keeps the training path;
+  // a small pool never opts into decode. The complete capacity must fit one window.
   bool decode_only = false;
-  // Compact source packets and packed compute rings; single-node PF FP8 only.
+  // Compact source packets and packed compute rings; single-node training FP8 only.
   bool fp8_workspace = false;
   // Eager training submits successive uses of a workspace on its execution
   // stream. Handles retain tensors independently until GPU completion.
@@ -119,7 +119,7 @@ class ActivationTransportResourcePool {
 public:
   ActivationTransportResourcePool() = default;
   ActivationTransportPoolUsage usage() const;
-  // Whether this compiled PF entry plans in a separate Forward kernel.
+  // Whether this compiled training entry plans in a separate Forward kernel.
   bool separates_forward_notify() const;
   // Terminal phase boundary: first quiesce all users and discard captured
   // graphs on every rank, then retire imports, then collectively agree before
@@ -188,7 +188,7 @@ struct ForwardMegaKernelConfig {
   // Preserve X and A/B for Backward (BF16 or row-scaled FP8). Forward
   // consumes the same represented A/B values. Requires enable_backward_state.
   bool retain_backward_state = false;
-  // Internal preparation policy selected by the FP8 PF backend. X is retained
+  // Internal preparation policy selected by the FP8 training backend. X is retained
   // as a row-scaled FP8 checkpoint; fc1_input is absent.
   bool fp8_x_checkpoint = false;
   // The FP8 checkpoint omits the BF16 fc1_output binding too.

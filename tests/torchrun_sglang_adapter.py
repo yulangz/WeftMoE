@@ -254,11 +254,11 @@ def main():
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as probe:
         graph.replay()
         torch.cuda.synchronize()
-    symbol = "routed_bf16" if adapter._decode_runtime.supports_tiled_weights else "weftmoe_dt"
+    symbol = "routed_bf16" if adapter._decode_runtime.supports_tiled_weights else "weftmoe_decode"
     kernels = [event.name for event in probe.events() if symbol in event.name]
     if adapter._decode_runtime.supports_tiled_weights:
         assert adapter._decode_runtime.native.buffer.decode_capacity > 0
-    assert kernels, "decode capture did not use DT"
+    assert kernels, "decode capture did not use decode"
     for iteration in range(3):
         x.mul_(0.9)
         ids.add_(1).remainder_(experts)
@@ -302,7 +302,7 @@ def main():
                 adapter._sglang_bf16.serving_weights(layer)
             assert update(updater, [("w1", gate), ("w3", up)])[0]
             assert not adapter._sglang_bf16._layers[layer].active
-            # A runner can replay this DT graph without calling the SGLang hooks.
+            # A runner can replay this decode graph without calling the SGLang hooks.
             graph.replay()
             torch.cuda.synchronize()
             after_replay = captured.clone()
@@ -328,7 +328,7 @@ def main():
         check_output(actual, reference())
         print(rank, "SGLANG_SHARED_BF16_UPDATE_PASS", flush=True)
     # Keep the existing BF16 graph while AWEX updates weights in place.
-    # Both PF and DT must observe the new weights at their captured addresses.
+    # Both training and decode must observe the new weights at their captured addresses.
     # Exercise resume's recapture callback, not just a manual capture afterwards.
     runner = SimpleNamespace(
         graphs={0: graph}, output_buffers={0: captured}, seq_len_fill_value=1,
@@ -416,7 +416,7 @@ def main():
     graph, captured = capture()
     graph.replay()
     torch.cuda.synchronize()
-    # Eager prefill uses PF; decode uses DT with a different GEMM reduction.
+    # Compare eager prefill (training kernel) with captured decode.
     check_output(captured, restored)
     previous = captured.clone()
     graph.replay()

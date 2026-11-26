@@ -22,13 +22,13 @@
 
 #include "cuda/unified_worker_tuning.hpp"
 
-#ifndef WEFTMOE_PF_RETURN_RAILS
-#define WEFTMOE_PF_RETURN_RAILS 1
+#ifndef WEFTMOE_TRAINING_RETURN_RAILS
+#define WEFTMOE_TRAINING_RETURN_RAILS 1
 #endif
 // Direct TX keeps compute-slot addresses but retires independently of X/S.
 // Set INDEPENDENT_TX=0 with RETURN_RAILS=1 to compare the bound lifetime.
-#ifndef WEFTMOE_PF_RETURN_INDEPENDENT_TX
-#define WEFTMOE_PF_RETURN_INDEPENDENT_TX 1
+#ifndef WEFTMOE_TRAINING_RETURN_INDEPENDENT_TX
+#define WEFTMOE_TRAINING_RETURN_INDEPENDENT_TX 1
 #endif
 
 #ifndef WEFTMOE_FWD_MAIN_HIDDEN
@@ -193,7 +193,7 @@ inline constexpr std::uint32_t kRemoteRelayCtas = 24;
 inline constexpr std::uint32_t kRemoteRelayCtas = WEFTMOE_FWD_RELAY_CTAS;
 #endif
 
-// PF and DT both use static unified workers.
+// training and decode both use static unified workers.
 #ifndef WEFTMOE_FWD_UNIFIED_WORKERS
 #define WEFTMOE_FWD_UNIFIED_WORKERS 1
 #endif
@@ -288,12 +288,12 @@ inline constexpr bool kUnifiedWorkers = WEFTMOE_FWD_UNIFIED_WORKERS != 0;
 #ifndef WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH
 #define WEFTMOE_FWD_LOCAL_PREFILL_FAST_MATH 0
 #endif
-#ifndef WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS
+#ifndef WEFTMOE_TRAINING_LOCAL_COMPACT_RETURN_MAX_TOKENS
 // Zero preserves the existing unbounded compact-return policy.
-#define WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS 0
+#define WEFTMOE_TRAINING_LOCAL_COMPACT_RETURN_MAX_TOKENS 0
 #endif
 inline constexpr std::uint64_t kLocalCompactReturnMaxTokens =
-    WEFTMOE_PF_LOCAL_COMPACT_RETURN_MAX_TOKENS;
+    WEFTMOE_TRAINING_LOCAL_COMPACT_RETURN_MAX_TOKENS;
 inline constexpr bool local_compact_return_capacity_supported(
     std::uint64_t max_tokens_per_rank) {
   return !kLocalCompactReturnMaxTokens ||

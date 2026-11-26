@@ -1,4 +1,4 @@
-"""PF FP8 FWD/BWD against original BF16 math with one global diff policy."""
+"""training FP8 FWD/BWD against original BF16 math with one global diff policy."""
 import os
 
 import torch

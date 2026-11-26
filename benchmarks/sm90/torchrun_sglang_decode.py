@@ -8,7 +8,7 @@ with the same fused input staging and layout conversion as WeftMoE. Weight
 packing and graph/JIT preparation are excluded for all backends.
 With --dp-attention, --tokens is per DP rank: baseline includes SGLang's
 all-gather/reduce-scatter, while WeftMoE/MegaMoE return DP-local rows directly.
---weft-backend pf/dt uses the explicitly compiled native profile with the same
+--weft-backend training/decode uses the explicitly compiled native profile with the same
 fused staging, and rejects fallback by profiling its captured kernel. Native
 capacity is the largest requested local bucket. --fresh-routes changes routing
 and X between samples outside timing; all backends share each sample's inputs.
@@ -137,7 +137,7 @@ def main():
     parser.add_argument("--replays", type=int, default=50,
                         help="Graph replays per sample; reduce for long prefill buckets")
     add_model_arguments(parser)
-    parser.add_argument("--weft-backend", choices=("auto", "pf", "dt"), default="auto",
+    parser.add_argument("--weft-backend", choices=("auto", "training", "decode"), default="auto",
                         help="Use an explicit native profile and verify its captured kernel")
     parser.add_argument("--fresh-routes", action="store_true",
                         help="Change inputs and routes between timed samples, outside timing")
@@ -237,7 +237,7 @@ def main():
             intermediate=i, max_tokens=max_local_tokens,
             max_rows=max_local_tokens * world * k + (e // world) * 128,
             training=False,
-            decode_only=args.weft_backend == "dt",
+            decode_only=args.weft_backend == "decode",
         )
     mega_buffer = None
     if args.deepgemm_package:
@@ -319,8 +319,8 @@ def main():
             kernel_names = sorted({event.name for event in probe.events()
                                    if event.device_type == torch.autograd.DeviceType.CUDA})
             locality = "local" if runtime.nodes == 1 else "network"
-            expected = (f"weftmoe_pf::{locality}::kernel" if args.weft_backend == "pf"
-                        else "weftmoe_dt::kernel")
+            expected = (f"weftmoe_training::{locality}::kernel" if args.weft_backend == "training"
+                        else "weftmoe_decode::kernel")
             assert any(expected in name for name in kernel_names), kernel_names
         samples = {name: [] for name in calls}
         workload = hashlib.sha256()

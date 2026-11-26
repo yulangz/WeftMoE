@@ -332,7 +332,7 @@ routed_nvfp4(void* y,
     const uint32_t epoch = ptx::ld_acq(workspace.get_launch_epoch_ptr()) + 1u;
     if constexpr (kDecodeCapacity) {
         if (warp_idx < kNumDispatchWarps)
-            dt::dispatch<kSingleDispatchCTA, kNumExperts, kNumTopk, kNumRanks, kNumSMs,
+            decode::dispatch<kSingleDispatchCTA, kNumExperts, kNumTopk, kNumRanks, kNumSMs,
                          kNumDispatchThreads, kDispatchBarrierIdx, kDispatchGridSyncIndex>(
                 buffer, sym_buffer, num_tokens, shared_storage.expert_token_count, epoch);
         // Compute warps can already be waiting here while dispatch uses barrier 0.
@@ -349,7 +349,7 @@ routed_nvfp4(void* y,
 
         // Dispatch warps
         if constexpr (!kDecodeCapacity) {
-            comm::dispatch_pf<kNumExperts, kNumTopk, kNumRanks, kNumSMs, kNumDispatchThreads,
+            comm::dispatch_training<kNumExperts, kNumTopk, kNumRanks, kNumSMs, kNumDispatchThreads,
                               kDispatchBarrierIdx, kDispatchGridSyncIndex, kSave>(
                 buffer, sym_buffer, num_tokens, shared_storage.expert_token_count, checkpoint);
             comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -373,7 +373,7 @@ routed_nvfp4(void* y,
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             if constexpr (kDecodeCapacity && kNumExpertsPerRank <= 32 && kNumRanks <= 32) {
-                if (!dt::locate(scheduler, token_idx, cursor)) break;
+                if (!decode::locate(scheduler, token_idx, cursor)) break;
             } else {
                 if (!cursor.template locate_round_robin<BLOCK_M, kNumExpertsPerRank>(scheduler, token_idx)) break;
             }
@@ -537,7 +537,7 @@ routed_nvfp4(void* y,
             // A peer may reuse its input/directory after all owners finish FC2
             // and acknowledge this epoch. The remaining cleanup writes are local.
             if (sm_idx == 0 && warp_idx == 0)
-                dt::wait_for_owners<kNumRanks>(workspace, epoch);
+                decode::wait_for_owners<kNumRanks>(workspace, epoch);
         } else {
             // Wait for all ranks to finish cleaning
             comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -1271,7 +1271,7 @@ routed_nvfp4(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         if constexpr (kDecodeCapacity) {
-            dt::combine<kHidden, kNumTopk, kNumExpertsPerRank, kNumSMs, kNumEpilogueWarps>(
+            decode::combine<kHidden, kNumTopk, kNumExpertsPerRank, kNumSMs, kNumEpilogueWarps>(
                 buffer, y, num_tokens, epilogue_warp_idx, epoch);
             return;
         }

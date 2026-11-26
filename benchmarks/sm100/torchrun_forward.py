@@ -85,14 +85,14 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
         precision="nvfp4" if nvfp4 else "bf16",
         batch_invariant=args.batch_invariant,
     )
-    use_dt = decode and group.size() == int(os.environ["LOCAL_WORLD_SIZE"]) and torch.cuda.get_device_capability() == (10, 3)
-    if args.compare_pf and not use_dt:
-        raise ValueError("DT/PF comparison requires single-node SM103 decode")
-    rt = TensorRuntime(**config, decode_only=use_dt)
+    use_decode = decode and group.size() == int(os.environ["LOCAL_WORLD_SIZE"]) and torch.cuda.get_device_capability() == (10, 3)
+    if args.compare_training and not use_decode:
+        raise ValueError("decode/training comparison requires single-node SM103 decode")
+    rt = TensorRuntime(**config, decode_only=use_decode)
     if tiled_weights is not None and not rt.supports_tiled_weights:
         rt.close()
         raise ValueError("Weight-layout comparison requires single-node SM103 inference")
-    pf = TensorRuntime(**config) if args.compare_pf else None
+    training = TensorRuntime(**config) if args.compare_training else None
     ref = (
         dg.SymmBuffer(
             group,
@@ -159,9 +159,9 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
     names = ["weft"]
     if ref is not None:
         names.append("mega_mxfp8_mxfp4" if mixed_weights else "nvfp4_prestaged" if nvfp4 else "mega_prestaged")
-    if pf is not None:
-        runners.append(lambda count: run_weft(count, pf))
-        names.append("pf")
+    if training is not None:
+        runners.append(lambda count: run_weft(count, training))
+        names.append("training")
     if tiled_weights is not None:
         def run_tiled(count):
             inputs = (0, x[:count], routes[:count], weights[:count])
@@ -170,7 +170,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
             return rt.inference(*inputs, *tiled_weights)
 
         runners.append(run_tiled)
-        names.append("tiled_dt" if use_dt else "tiled_pf")
+        names.append("tiled_decode" if use_decode else "tiled_training")
     count = prepare(*trace[0])
     for runner in runners:
         runner(count)
@@ -217,7 +217,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
         valid = torch.isfinite(outputs[0]).all()
         if ref is not None:
             valid &= torch.isfinite(outputs[1]).all() if mixed_weights else (outputs[0] == outputs[1]).all()
-        for backend in ("pf", "tiled_dt", "tiled_pf"):
+        for backend in ("training", "tiled_decode", "tiled_training"):
             if backend in names:
                 valid &= (outputs[0].view(torch.int16) == outputs[names.index(backend)].view(torch.int16)).all()
         valid = valid.int()
@@ -245,7 +245,7 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
             model=args.model,
             mode=args.mode,
             batch_invariant=args.batch_invariant,
-            weft_kernel="dt" if use_dt else "pf",
+            weft_kernel="decode" if use_decode else "training",
             tokens_per_rank=n,
             capacity_per_rank=cap,
             ep=world,
@@ -261,8 +261,8 @@ def measure(args, n, w1, w2, packed, group, mixed_weights=None, tiled_weights=No
             result[name + "_p50_us"] = statistics.median(samples)
         print("BLACKWELL_FORWARD_JSON " + json.dumps(result), flush=True)
     rt.close()
-    if pf is not None:
-        pf.close()
+    if training is not None:
+        training.close()
     if ref is not None:
         ref.destroy()
 
@@ -281,7 +281,7 @@ def main():
     p.add_argument("--warmups", type=int)
     p.add_argument("--replays", type=int, default=50)
     p.add_argument("--compare-weight-layouts", action="store_true", help="Compare standard and tiled inference weights on the same route trace")
-    p.add_argument("--compare-pf", action="store_true", help="Time the PF runtime on the same inputs and require exact output parity")
+    p.add_argument("--compare-training", action="store_true", help="Compare decode with the training kernel on the same inputs and require bitwise parity")
     p.add_argument("--compare-mega", action="store_true", help="Also time the optional single-node DeepGEMM baseline")
     p.add_argument(
         "--mega-mixed", action="store_true", help="Compare NVFP4 latency to pre-staged upstream MXFP8 x MXFP4"
@@ -291,10 +291,10 @@ def main():
     p.add_argument("--route-bias-std", type=float, default=0.5)
     p.add_argument("--token-std-fraction", type=float, default=0.1)
     args = p.parse_args()
-    if args.compare_pf and (
+    if args.compare_training and (
         args.mode != "decode" or os.environ["WORLD_SIZE"] != os.environ["LOCAL_WORLD_SIZE"]
     ):
-        p.error("--compare-pf requires single-node decode")
+        p.error("--compare-training requires single-node decode")
     args.compare_mega |= args.mega_mixed
     if args.compare_mega:
         import deep_gemm as dg

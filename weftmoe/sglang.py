@@ -187,7 +187,7 @@ def participate_idle_layers(model):
 
 @torch.no_grad()
 def _prepare_memory_budget(model):
-    """Prepare compute weights and PF/DT storage before SGLang sizes KV."""
+    """Prepare compute weights and training/decode storage before SGLang sizes KV."""
     global _decode_batch, _eager_pending
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -216,7 +216,7 @@ def _prepare_memory_budget(model):
         torch.cuda.empty_cache()
         logging.getLogger(__name__).info(
             "Prepared %s WeftMoE before KV sizing: %d layers; "
-            "PF/DT workspaces included in available-memory measurement",
+            "training/decode workspaces included in available-memory measurement",
             "FP8" if _use_fp8() else "BF16", len(layers),
         )
     finally:
@@ -475,8 +475,8 @@ def install(*, batch_invariant=True):
                 triton.next_power_of_2(hidden), triton.next_power_of_2(k))
         runtime = _runtime
         # Select by collective phase, never by a rank's actual token count.
-        # Decode uses the same DT implementation for every captured bucket;
-        # dynamic prefill and training retain the tuned PF specialization.
+        # All captured decode buckets use the decode kernel;
+        # dynamic prefill and training retain the tuned training specialization.
         decode = capturing if _decode_batch is None else _decode_batch
         if decode:
             if _decode_runtime is None:

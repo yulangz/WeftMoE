@@ -1,6 +1,6 @@
-"""Strict FWD batch/PF/DT parity and repeated BWD stability for tuning finalists.
+"""Strict FWD batch/training/decode parity and repeated BWD stability for tuning finalists.
 
-Every PF training invocation retains a real tape and consumes it with backward. The
+Every training invocation retains a real tape and consumes it with backward. The
 canonical reference uses the same anchor tokens independently of surrounding rows.
 """
 import argparse
@@ -41,7 +41,7 @@ def main():
     p.add_argument('--tokens', type=int, nargs='+', default=[17, 63, 64, 65, 129])
     p.add_argument('--candidate', required=True)
     p.add_argument('--reference', required=True)
-    p.add_argument('--skip-dt', action='store_true')
+    p.add_argument('--skip-decode', action='store_true')
     for role in ('candidate', 'reference'):
         p.add_argument(f'--{role}-ring-tokens', type=int, default=2048)
         p.add_argument(f'--{role}-ring-depth', type=int, default=2)
@@ -100,7 +100,7 @@ def main():
                 for fp8 in (False, True) for size in sorted(anchor_sizes)}
     reference.close()
     torch.cuda.empty_cache()
-    modes = ['training', 'inference'] + ([] if args.skip_dt else ['decode'])
+    modes = ['training', 'inference'] + ([] if args.skip_decode else ['decode'])
     for mode in modes:
         rt = runtime(args.candidate, mode, args.candidate_ring_tokens, args.candidate_ring_depth)
         for n in sorted(set(args.tokens)):
@@ -114,7 +114,7 @@ def main():
                 x[pos], routes[pos], gates[pos] = anchor[:size], anchor_routes[:size], anchor_gates[:size]
                 for fp8 in (False, True):
                     y, grads = run(rt,x,routes,gates,fp8)
-                    agree(same(y[pos],expected[fp8,size]), (n,mode,fp8,at_end,'batch/PF/DT mismatch'))
+                    agree(same(y[pos],expected[fp8,size]), (n,mode,fp8,at_end,'batch/training/decode mismatch'))
                     repeated, grads2 = run(rt,x,routes,gates,fp8)
                     agree(same(y,repeated), (n,mode,fp8,'FWD repeat mismatch'))
                     if grads is not None:

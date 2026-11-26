@@ -101,10 +101,10 @@ GIN 注册窗口使用 `ncclMemAlloc` 的 VMM 分配与 NCCL window 映射，
 或直接使用 [Megatron adapter](integration.md)；训练提交必须使用 runtime 的准备流。
 异步执行不等于取消依赖：stream/event 负责 workspace 复用，调用持有者保留输入与缓存。
 
-推理创建 `training=False` 的 runtime，默认使用 PF；设置 `decode_only=True` 显式选择 DT。
-DT 要求单机、纯推理、编译形状匹配、EP world 不超过 32，整个 pool 容量可由单个 source
+推理时创建 `training=False` 的 runtime。默认使用 `training` 内核执行 prefill，设置 `decode_only=True` 可显式选择 `decode` 内核。
+decode 要求单机、纯推理、编译形状匹配、EP world 不超过 32，整个 pool 容量可由单个 source
 window 容纳。Python 接口会将窗口设为 `max_tokens`，没有固定的 64-token 上限；各 EP rank
-必须使用一致配置。BF16 和 FP8 DT 的所有 token shape 固定使用 M64，
+必须使用一致配置。BF16 和 FP8 decode 的所有 token shape 固定使用 M64，
 不再提供 M16 路径、切换阈值或 M 维度调参。使用 `inference_eager(..., layer=layer_id)` 执行 eager 推理。
 CUDA Graph 接口为 `inference(layer_id, ...)`，
 先在 capture 外预热，并保持图使用的地址不变。设置 `layer` 会缓存权重 descriptor 并保留原张量：
@@ -113,7 +113,7 @@ BF16 原地更新完成后可直接继续推理，无需重排或刷新副本；
 
 ## Block-wise FP8
 
-SM90 PF 路径支持 E4M3FN 前向、输入梯度和权重梯度；单机 DT 支持 FP8 推理前向。
+SM90 training 路径支持 E4M3FN 前向、输入梯度和权重梯度；单机 decode 支持 FP8 推理前向。
 权重采用每个专家独立的
 `128×128` block scale；激活和反向梯度在线采用 `1×128` scale。每个 K128
 片段的 FP8 WGMMA 结果乘对应 scale 后累加到 FP32。单机及多机 GIN 的 N256
@@ -129,9 +129,9 @@ FP8 相对原始 BF16 的验收采用全局指标
 要求 `diff < 5e-3`，每个 rank 单独检查，dW 再逐 expert 检查；dprob 仅要求有限。
 GEMM 对反量化后精确参考的算术检查单独使用 `diff < 1e-6`，不包含 FP8 量化误差。
 不使用逐元素相对容差。布局、图回放、预量化输入等数学等价路径仍要求精确一致。
-训练 PF 与固定 M64 DT 的前向另设严格逐位回归，入口为 `tests/torchrun_pf_dt.py`，
-每份训练 tape 均实际执行反向。`tests/torchrun_dt_fp8.py` 的
-`TEST_DT_ALLOW_KNOWN_ONE_TOKEN=1` 只允许 Qwen35B 单 token 的已知误差豁免；
+训练前向与固定 M64 decode 的输出另设严格逐位回归，入口为 `tests/torchrun_training_decode.py`，
+每份训练 tape 均实际执行反向。`tests/torchrun_decode_fp8.py` 的
+`TEST_DECODE_ALLOW_KNOWN_ONE_TOKEN=1` 只允许 Qwen35B 单 token 的已知误差豁免；
 该豁免不适用于训推逐位一致性测试。本轮性能测量使用 64/512 tokens，没有使用该豁免。
 当前测量范围、计时口径与结果见 [Benchmark](benchmarks.md)。
 
@@ -178,7 +178,7 @@ W1 仍使用 `[gate, up]` 规范行序，禁止先交错 gate/up 再划量化块
 布局和对齐会在入口检查；scale 内容是外部生产者的契约，热路径不做需要设备同步的
 逐值检查。违反该契约可能产生非有限输出或反向列转换的额外舍入误差。
 推荐使用 `quantize_fp8` 生成正常有限输入的表示；非有限输入通过 NaN scale 传播。
-PF/DT 的 `forward_fp8` 均接受此格式；FP8 tape 的 `backward` 和
+training/decode 的 `forward_fp8` 均接受此格式；FP8 tape 的 `backward` 和
 `backward_async` 也接受相同格式的 dY。源端直接复制数据和 scale 到通信 packet，
 跳过 amax 和重新量化；量化器及输入准备耗时由调用者决定是否计入端到端测量。
 
@@ -199,16 +199,16 @@ dx, dgates, dw1, dw2 = runtime.backward(tape, qdy)
 地址不变。更换权重或输入地址时，先丢弃外部图并 `invalidate_inference_layer()`，
 然后重新预热和 capture。Megatron/SGLang adapter 可通过 `WEFTMOE_FP8=1` 启用，
 生命周期要求见 [框架接入](integration.md)。
-PF FP8 使用 N256 和源端量化配置；原来的多机 BF16 通信 + 目的端 FP8 量化路径已删除。
-DT 在同一个 kernel 中让 math warps 量化或复制源输入，control warps 执行 mini notify，
+training FP8 使用 N256 和源端量化配置；原来的多机 BF16 通信 + 目的端 FP8 量化路径已删除。
+decode 在同一个 kernel 中让 math warps 量化或复制源输入，control warps 执行 mini notify，
 现有跨 rank barrier 等待两者完成后发布数据。FP8 M64 使用两个 math warpgroup，
 各自计算 N128；每个 K128 块的四次 WGMMA 后做 scale 累加。
 
-PF N256 的 X 由独立 `prepare_source_x` kernel 按源 token 量化，结果跨 top-k
+training N256 的 X 由独立 `prepare_source_x` kernel 按源 token 量化，结果跨 top-k
 路由和 N tile 复用。每行 packet 包含 `FP8[H] + FP32[H/128]`，pitch 向上对齐
 到 16 字节。`TensorRuntime(..., fp8_workspace=True)` 按此大小分配源输入区；
 默认 runtime 保留 BF16 容量以支持混用。Notify 不再拷贝 BF16 X。
-单机 PF 的源端量化/复制与 planner 分别在两个 stream 执行；本地 event 汇合后，
+单机 training 的源端量化/复制与 planner 分别在两个 stream 执行；本地 event 汇合后，
 `source_ready_kernel` 通过跨 rank barrier 发布所有源 packet，再允许主 kernel Pull。
 多机 GIN 保持同一 transport/preparation stream 上的有序执行。
 Pull 只搬运数据和 scale，并写入现有 ring 布局。源 packet 的复用受已有 Forward
@@ -216,7 +216,7 @@ Pull 只搬运数据和 scale，并写入现有 ring 布局。源 packet 的复�
 反向对 dY 使用同样的量化或直接复制方案：单机源准备与路由计划恢复并行，汇合并发布后
 执行 BWD；多机 GIN 顺序恢复计划及准备源数据。反向 Pull 只搬运 FP8 + scale。
 Z/dAB 的量化仍在 SwiGLU epilogue 中。
-PF N256 路径在每个 M128 ring slot 内紧凑存放 `FP8[M128,C]` 与 `FP32 scale[C/128,M128]`。
+training N256 路径在每个 M128 ring slot 内紧凑存放 `FP8[M128,C]` 与 `FP32 scale[C/128,M128]`。
 启用 `fp8_workspace=True` 时，slot 跨度为 `128 * align16(C + 4*C/128)` 字节，
 否则沿用 BF16 容量。每个 K128 的 128 个行 scale 连续，可以和操作数一起用 TMA 异步搬运。
 X/dR 与 dAB 的通道数即使不同，写入也只覆盖当前 slot；不能把整个 ring 全局压紧，
@@ -296,7 +296,7 @@ NCCL_DEBUG=WARN TEST_TOKENS=257 torchrun --standalone --nproc-per-node=2 tests/t
 TEST_TOKENS=1 TEST_ZERO_RANK=1 torchrun --standalone --nproc-per-node=2 tests/torchrun_fp8.py
 # 权重准备不计入计时；测试固定权重的前向+反向，不含 optimizer.step。
 torchrun --standalone --nproc-per-node=2 benchmarks/sm90/torchrun_training.py \
-  --backend pf --fp8 --weight-grad-dtype bf16 --model qwen35b \
+  --backend training --fp8 --weight-grad-dtype bf16 --model qwen35b \
   --tokens 256 512 2048 8192 --stream-ordered --warmups 5 --samples 20
 ```
 
@@ -310,6 +310,8 @@ torchrun --standalone --nproc-per-node=2 benchmarks/sm90/torchrun_training.py \
 
 ## 手动 Autotune
 
+自定义 Hopper 配置请使用 `WEFTMOE_TRAINING_*` 和 `WEFTMOE_DECODE_*` 宏及环境变量。decode FP8 的搜索轴使用 `v4.decode_fp8_stages`、`v4.decode_fp8_slices` 和 `v4.decode_fp8_ctas`。升级后，新的 FP8 搜索请使用新的输出目录，已经开始的搜索可用其源码快照中的驱动继续运行。
+
 [统一脚本](../tools/autotune.py)由用户显式运行，配置见 [autotune.json](../configs/autotune.json)。以 shape 默认配置为起点，离线编译候选、筛选、反序确认、检查正确性并导出配置；不承诺全空间最优。
 
 ```bash
@@ -322,7 +324,7 @@ python tools/autotune.py --model qwen122b --mode inference
 python tools/autotune.py --model qwen35b --mode decode --fp8
 # 也可覆盖 --hidden/--intermediate/--experts/--top-k；不按模型名称模糊匹配。
 
-# 双机 PF：共享仓库/缓存绝对路径、相同 Python 环境、免密 SSH。
+# 双机 training：共享仓库/缓存绝对路径、相同 Python 环境、免密 SSH。
 python tools/autotune.py --model flash --mode training --gpus-per-node 8 \
   --remotes user@node1 --master-addr node0-address --ssh-port 22
 ```
@@ -341,24 +343,24 @@ python tools/autotune.py --model flash --mode training --gpus-per-node 8 \
 | `workspace_limit_bytes` | native workspace 限额，不含全部权重、训练缓存和框架显存 |
 | `environment`、`run` | 编译/网络环境、并发编译数、输出与缓存路径 |
 
-CLI 覆盖配置。`--token-buckets 8192 20480 65536` 设置长度上界；`--tokens` 提供各桶用于计时的代表负载。同桶多个代表负载共同选择一个实现，不同桶独立搜索。DT 仅支持单机。
+CLI 覆盖配置。`--token-buckets 8192 20480 65536` 设置长度上界；`--tokens` 提供各桶用于计时的代表负载。同桶多个代表负载共同选择一个实现，不同桶独立搜索。decode 仅支持单机。
 
-默认 `--batch-invariant` 不仅固定算术参数，还对最终候选执行严格 PF 训练（保留真实反向缓存）/PF 推理/DT、不同 batch 长度与 token 位置、重复前向的逐位比较，并检查重复反向的有限值与 `diff ≤ 1e-6`。覆盖小 M 边界和桶端点；候选与参考各自使用对应的 ring 参数，PF 推理与 DT 通过 graph 接口验证，重复调用保留输入地址。多机不运行 DT。所有桶对照同一 shape 的默认算术路径，避免各桶独立通过却互不一致。普通 FP8 对 BF16 的误差检查另行保留。
+默认 `--batch-invariant` 不仅固定算术参数，还对最终候选执行逐位比较训练前向（保留真实反向缓存）、prefill 和 decode 的输出，并覆盖不同 batch 长度、token 位置和重复前向，并检查重复反向的有限值与 `diff ≤ 1e-6`。覆盖小 M 边界和桶端点；候选与参考各自使用对应的 ring 参数，prefill 与 decode 通过 graph 接口验证，重复调用保留输入地址。多机不运行 decode。所有桶对照同一 shape 的默认算术路径，避免各桶独立通过却互不一致。普通 FP8 对 BF16 的误差检查另行保留。
 
 显式 `--no-batch-invariant` 可扩大搜索，但结果标为非一致性配置。部署时还需显式传入 `TensorRuntime(..., batch_invariant=False)` 才会采用它；默认加载器忽略该配置。直接设置自定义二进制不受此保护。
 
 输出按 shape、模式、EP、长度桶分目录。`result.json` 保留候选/测量/验证，`table.json` 保存该桶的生成 header、源码标识和 ring 配置，`runtime.json` 给出部署环境。脚本还将结果原子合并到 `--table` 指定的共享表，默认 `$WEFTMOE_ROOT/tuning.json`。
 
-查表 **精确匹配 GPU、dtype、H/I/E/K、节点拓扑、模式、输入布局**；只有 tokens 使用区间匹配，拒绝重叠区间。源码过期、无精确 shape、未覆盖容量或一致性不兼容时，仅已验证 shape 回退默认配置，不寻找相近模型。未知 shape 的查表结果还必须带有调优脚本在通过数值校验后写出的 `validated` 标记；不匹配时默认报错。BF16/FP8、训练/PF 推理/DT 分别记录性能选择，但默认共享前向算术约束。编译时 ABI、工具链及依赖变化还会使二进制缓存失效。
+查表 **精确匹配 GPU、dtype、H/I/E/K、节点拓扑、模式、输入布局**；只有 tokens 使用区间匹配，拒绝重叠区间。源码过期、无精确 shape、未覆盖容量或一致性不兼容时，仅已验证 shape 回退默认配置，不寻找相近模型。未知 shape 的查表结果还必须带有调优脚本在通过数值校验后写出的 `validated` 标记；不匹配时默认报错。BF16 和 FP8 分别记录训练、prefill 推理和 decode 的性能选择，但默认共享前向算术约束。编译时 ABI、工具链及依赖变化还会使二进制缓存失效。
 
-不使用 tune 表时也可显式设置 `WEFTMOE_STATIC_RING_TOKENS` 和 `WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS`。新调优建议使用统一脚本；`autotune_dt_fp8.py` 是独立的诊断 sweep，不发布自动加载表。
+不使用 tune 表时也可显式设置 `WEFTMOE_STATIC_RING_TOKENS` 和 `WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS`。新调优建议使用统一脚本；`autotune_decode_fp8.py` 是独立的诊断 sweep，不发布自动加载表。
 
 ## 快速验证
 
 ```bash
 python -m pytest -q
 torchrun --standalone --nproc-per-node=8 benchmarks/sm90/torchrun_training.py \
-  --backend pf --model qwen35b --tokens 129 --warmups 0 --samples 2 --verify
+  --backend training --model qwen35b --tokens 129 --warmups 0 --samples 2 --verify
 ```
 
 GPU 命令在首次准备时自动构建匹配扩展。完整计时与多机启动方式见 [Benchmark](benchmarks.md)。

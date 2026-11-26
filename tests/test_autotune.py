@@ -66,7 +66,7 @@ def test_invariant_initial_override_cannot_bypass_filter():
     with pytest.raises(autotune.PlanError,match='batch-invariant'):
         autotune.load_incumbent(spec,args)
     args,spec=autotune.parse_args([])
-    spec['v4']={'dt_fp8_slices':0}
+    spec['v4']={'decode_fp8_slices':0}
     with pytest.raises(autotune.PlanError,match='batch-invariant'):
         autotune.load_incumbent(spec,args)
 
@@ -78,7 +78,7 @@ def test_bucket_endpoints_and_fp8_decode():
     assert autotune.length_bucket(8193,bounds)==[8193,20480]
     assert autotune.length_bucket(65537,bounds)==[65537,131072]
     args,spec=autotune.parse_args(['--mode','decode','--fp8','--no-batch-invariant'])
-    assert not spec['batch_invariant'] and 'v4.dt_fp8_stages' in spec['decode']['axes']
+    assert not spec['batch_invariant'] and 'v4.decode_fp8_stages' in spec['decode']['axes']
 
 
 def test_invariance_runs_candidate_and_reference_ring_settings(tmp_path,monkeypatch):

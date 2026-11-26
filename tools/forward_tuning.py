@@ -4,7 +4,7 @@ from typing import Any, Mapping
 
 from autotune_common import require as _require, require_choice as _require_choice
 import unified_tuning
-import pf_tuning as v4_tuning
+import training_tuning as v4_tuning
 
 
 PARAMETER_MACROS = {
@@ -157,10 +157,10 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
             config["fc1_tile_n"] == config["fc2_tile_n"] and
             config["fc1_tile_n"] in (128, 256) and config["tile_k"] == 64 and
             config["static_v4_fc1_stages"] == config["static_v4_fc2_stages"],
-            "PF requires equal N128/256, K64 and a shared FC1/FC2 stage ring")
+            "training requires equal N128/256, K64 and a shared FC1/FC2 stage ring")
     unified_tuning.require_resources(
         dynamic_shared_memory(config, 16)["compute_bytes"] + 1024 <= 227 * 1024,
-        "PF/DT shared memory exceeds Hopper CTA capacity")
+        "training/decode shared memory exceeds Hopper CTA capacity")
 
     # Two-host GIN owns eight physical contexts. One-node NVLink has no RDMA
     # owner and tunes Relay independently in small four-CTA increments.
@@ -212,7 +212,7 @@ def validate_tuning(config: Mapping[str, Any]) -> None:
 
 def dynamic_shared_memory(config: Mapping[str, Any], world: int) -> dict[str, int]:
     if config["static_v4_prefill_min_tokens"]:
-        # DT uses a fixed M64 tile.
+        # decode uses a fixed M64 tile.
         stages = config.get("v4", {}).get("decode_stages", 3)
         payload = 3 * 1024 + stages * (64 + 128) * 64 * 2 + 64 * 128 * 2 + 3 * 4096
         size = (payload + (2 * stages + 3) * 8 + 1023) // 1024 * 1024

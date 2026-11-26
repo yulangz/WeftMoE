@@ -108,7 +108,7 @@ def load_decode_plan(key, override=None):
     for rows, (m, static) in override.items():
         if (str(int(rows)) != str(rows) or int(rows) < 1 or type(m) is not int
                 or m not in DECODE_TILES or type(static) is not bool):
-            raise ValueError(f"Invalid DT tuning for {rows} tokens: {(m, static)}")
+            raise ValueError(f"Invalid decode tuning for {rows} tokens: {(m, static)}")
         plan[int(rows)] = (m, static)
     return plan
 

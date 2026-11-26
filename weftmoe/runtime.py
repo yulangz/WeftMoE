@@ -86,12 +86,12 @@ class TensorRuntime:
         requests = [None] * self.world
         capability = torch.cuda.get_device_capability()
         self.supports_tiled_weights = not training and self.nodes == 1 and capability == (10, 3)
-        use_dt = decode_only and self.supports_tiled_weights
+        use_decode = decode_only and self.supports_tiled_weights
         build_error = None
         if capability[0] == 10:
             try:
                 from .blackwell_cutlass import decode_key, load_decode_plan, native
-                if use_dt:
+                if use_decode:
                     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
                     profile_key = decode_key(sms, self.world, experts, hidden, intermediate, top_k, self.precision)
                     decode_plan = load_decode_plan(profile_key, decode_plan)
@@ -110,7 +110,7 @@ class TensorRuntime:
         for _, error in requests:
             if error is not None:
                 raise ValueError(f"Blackwell preparation failed: {error}")
-        if decode_plan is not None and not use_dt:
+        if decode_plan is not None and not use_decode:
             raise ValueError("decode_plan requires single-node SM103 decode inference")
         if nvfp4_scales is not None and self.precision != "nvfp4":
             raise ValueError("nvfp4_scales requires NVFP4 precision")
@@ -140,7 +140,7 @@ class TensorRuntime:
                 from .blackwell import BlackwellRuntime
                 from .nvfp4 import NVFP4Runtime
                 backend = NVFP4Runtime if nvfp4 else BlackwellRuntime
-                self.native = backend(*args, decode_only=use_dt, decode_plan=decode_plan)
+                self.native = backend(*args, decode_only=use_decode, decode_plan=decode_plan)
             elif max_tokens >= 4096:
                 from .blackwell_pipeline import PipelinedMultiNodeRuntime
                 self.native = PipelinedMultiNodeRuntime(*args, nodes=self.nodes, nvfp4=nvfp4)
@@ -315,7 +315,7 @@ class TensorRuntime:
     def forward_fp8(self, x, routes, gates, weights, *,
                     synchronize=True, retain_backward_state=True,
                     weight_grad_dtype=torch.float32):
-        """PF/DT forward with BF16 or prequantized rowwise FP8Tensor input.
+        """training/decode forward with BF16 or prequantized rowwise FP8Tensor input.
 
         Prepare weights with weftmoe.fp8.prepare_fp8_weights before this call.
         FP8Tensor inputs require block_rows=1 and finite positive power-of-two
@@ -401,7 +401,7 @@ class TensorRuntime:
 
         Warm each layer/token bucket before outer capture. Replacing prepared
         weights requires invalidate_inference_layer and recapture. X may be
-        BF16 or rowwise FP8Tensor; source preparation stays inside the DT kernel.
+        BF16 or rowwise FP8Tensor; source preparation stays inside the decode kernel.
         """
         from .fp8 import PreparedFP8Weights
         if self.training:

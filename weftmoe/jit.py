@@ -270,7 +270,7 @@ def main(argv=None):
     if args.experts % (args.nodes * args.gpus_per_node) or args.top_k > args.experts:
         parser.error('experts must be divisible by EP world size and top-k must not exceed experts')
     if args.mode == 'decode' and args.nodes != 1:
-        parser.error('DT only supports a single node')
+        parser.error('decode only supports a single node')
     torch.cuda.set_device(args.device)
     key = dict(gpu=torch.cuda.get_device_name(), hidden=args.hidden, intermediate=args.intermediate,
                experts=args.experts, top_k=args.top_k, nodes=args.nodes, gpus_per_node=args.gpus_per_node,

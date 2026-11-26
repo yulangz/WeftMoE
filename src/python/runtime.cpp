@@ -202,7 +202,7 @@ public:
     if (capacity.decode_only &&
         (training || nodes != 1 || max_tokens > ring_tokens))
       throw std::invalid_argument(
-          "DT requires single-node inference in one source window");
+          "decode requires single-node inference in one source window");
     capacity.static_forward_window_tokens = ring_tokens;
     if (const auto *depth =
             std::getenv("WEFTMOE_STATIC_RING_CONTRIBUTION_WINDOWS"))
@@ -429,7 +429,7 @@ public:
           hidden_, intermediate_);
     }
     // Output/weights do not depend on the plan. Only a deferred training
-    // tape needs the exact row count produced by standalone PF notify.
+    // tape needs the exact row count produced by standalone training notify.
     tape->output = empty({tokens, hidden_}, "bfloat16");
     ForwardTensorBuffers buffers;
     buffers.output = binding(tape->output);

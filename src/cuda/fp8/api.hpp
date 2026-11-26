@@ -15,7 +15,7 @@
 
 struct CUstream_st;
 
-// Internal launch ABI shared by the tensor bindings and native PF kernels.
+// Internal launch ABI shared by the tensor bindings and native training kernels.
 // All matrices are K-contiguous. Scales are dequantization multipliers:
 // value = e4m3_value * scale. The caller owns storage and stream dependencies.
 namespace weftmoe::cuda::fp8 {

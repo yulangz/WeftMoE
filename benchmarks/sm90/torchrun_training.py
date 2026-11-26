@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hopper PF and Megatron training benchmark."""
+"""Hopper training and Megatron training benchmark."""
 
 from pathlib import Path
 import sys

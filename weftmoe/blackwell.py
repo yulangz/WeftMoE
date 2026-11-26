@@ -1,4 +1,4 @@
-"""Single-node BF16 Blackwell PF and DT, using canonical expert parameters and NVLink."""
+"""Single-node BF16 Blackwell training and decode, using canonical expert parameters and NVLink."""
 
 import weakref
 
@@ -70,7 +70,7 @@ def _stage_inputs(
     tl.store(SX + offset, tl.load(X + offset, live, 0), live)
 
     # The combine warp visits slots in ascending order. Sort (expert, original
-    # slot) before dispatch so that its FP32 reduction follows the PF contract.
+    # slot) before dispatch so that its FP32 reduction follows the training contract.
     slots = tl.arange(0, BK)
     indices = rows[:, None] * K + slots[None, :]
     valid = (rows[:, None] < tokens) & (slots[None, :] < K)
