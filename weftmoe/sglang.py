@@ -395,11 +395,7 @@ def install(*, batch_invariant=True):
         capturing = api.capturing()
         rows_are_dp_sharded = _rows_are_dp_sharded and api.dp()
         if _runtime is None:
-            max_tokens = max(
-                api.schedule().chunked_prefill_size or 8192,
-                api.schedule().max_prefill_tokens or 16384,
-                api.graph_tokens(),
-            )
+            max_tokens = api.workspace_tokens(decode=False)
             if not rows_are_dp_sharded:
                 max_tokens = (max_tokens + world - 1) // world
             _runtime = _prepare_runtime(
@@ -480,9 +476,7 @@ def install(*, batch_invariant=True):
         decode = capturing if _decode_batch is None else _decode_batch
         if decode:
             if _decode_runtime is None:
-                capacity = max(
-                    api.graph_tokens(), api.schedule().max_running_requests or 1
-                )
+                capacity = api.workspace_tokens(decode=True)
                 if not rows_are_dp_sharded:
                     capacity = (capacity + world - 1) // world
                 _decode_runtime = _prepare_runtime(
